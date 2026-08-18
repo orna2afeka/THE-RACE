@@ -17,8 +17,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import time
 import struct
 import can
+import signal
 from PySide6.QtWidgets import QApplication
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, Signal, QTimer
 import subprocess
 # --- Core Logic & Parsing Modules ---
 # NOTE: `import dashboard` used to sit here and was dead code. dashboard.py is
@@ -870,6 +871,31 @@ def main():
 
     print("Auto-starting CAN Bus...")
     dashboard._start_can()
+
+    # ---- Clean shutdown on SIGTERM/SIGINT ------------------------------- #
+    # closeEvent() already stops the CAN worker (and so calls bus.shutdown())
+    # when a person closes the window — but start_hud.sh restarts the HUD on
+    # ANY non-42 exit, including a `kill`/systemd stop/session logout, which
+    # deliver SIGTERM and previously bypassed closeEvent entirely. With the
+    # worker thread just torn down alongside the process, bus.shutdown() was
+    # never called, and the next launch's PCAN open reported "not properly
+    # shut down" — a stale handle left over from the ungraceful exit, not
+    # from anything wrong in the current run. Catching the signal lets us
+    # stop the worker (and the bus) before the process actually dies.
+    def _handle_shutdown_signal(signum, _frame):
+        print(f"[HUD] received signal {signum} — stopping CAN worker cleanly.")
+        dashboard._stop_can()
+        app.quit()
+
+    signal.signal(signal.SIGTERM, _handle_shutdown_signal)
+    signal.signal(signal.SIGINT, _handle_shutdown_signal)
+
+    # Qt's C++ event loop can otherwise delay Python signal delivery
+    # indefinitely; a periodic no-op timer gives the interpreter a regular
+    # chance to run the handler above promptly.
+    _signal_pump = QTimer()
+    _signal_pump.timeout.connect(lambda: None)
+    _signal_pump.start(200)
 
     sys.exit(app.exec())
 
