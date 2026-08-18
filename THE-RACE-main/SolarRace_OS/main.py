@@ -18,6 +18,7 @@ import time
 import struct
 import can
 import signal
+import traceback
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import QObject, Signal, QTimer
 import subprocess
@@ -190,6 +191,52 @@ class SmartCANWorker(CANWorker):
         self._last_gps_log = ""
 
     def run(self) -> None:
+        """QThread entry point — runs the read loop with GUARANTEED teardown.
+
+        The loop body lives in _run_loop(); this wrapper exists solely so that
+        every CAN interface is released no matter HOW the loop ends.
+
+        Why it matters: the loop's own try/except only catches can.CanError,
+        but the loop also runs Firebase pushes, GPS sampling, lap/strategy
+        commands and frame decoding. An unexpected exception from any of those
+        used to propagate straight out of run(), killing the worker thread with
+        the buses still open — _shutdown_bus() was after the while loop, not in
+        a finally, so it never ran. The open PcanBus then survived until
+        interpreter exit, where python-can's BusABC.__del__ printed
+        "PcanBus was not properly shut down". That warning was the SYMPTOM; a
+        silently dead worker thread was the actual fault.
+        """
+        try:
+            self._run_loop()
+        except BaseException:
+            # Print it: a worker thread dying used to be invisible apart from
+            # the frozen gauges, which is far harder to diagnose than a stack.
+            print("💥 CAN worker thread died with an unhandled exception:")
+            traceback.print_exc()
+            raise
+        finally:
+            self._teardown()
+
+    def _teardown(self) -> None:
+        """Release everything the worker owns. Safe to call on any exit path.
+
+        Each step is independently guarded so that one failing helper cannot
+        stop the others — in particular it must never stop _shutdown_bus(),
+        which is the one that actually closes the CAN hardware.
+        """
+        for name, stop in (
+            ("gps", self.gps.stop),
+            ("lap inbox", self.lap_inbox.stop),
+            ("strategy inbox", self.strategy_inbox.stop),
+            ("vehicle inputs", self.vehicle_inputs.stop),
+            ("CAN bus(es)", self._shutdown_bus),
+        ):
+            try:
+                stop()
+            except Exception as exc:
+                print(f"⚠️ Error shutting down {name}: {exc}")
+
+    def _run_loop(self) -> None:
         """
         Always-real read loop (never replays a log), reading BOTH can0 and can1
         in parallel.
@@ -325,11 +372,9 @@ class SmartCANWorker(CANWorker):
             if not got_any:
                 time.sleep(0.05)  # yield the CPU while idle
 
-        self.gps.stop()
-        self.lap_inbox.stop()
-        self.strategy_inbox.stop()
-        self.vehicle_inputs.stop()
-        self._shutdown_bus()
+        # No teardown here on purpose — run()'s finally calls _teardown(), so
+        # it happens on EVERY exit path (clean stop, crash, or stop() request),
+        # not just when the loop ends normally.
 
     # ------------------------------------------------------------------ #
     # No-data handling (zero the HUD + report the reason)                 #
