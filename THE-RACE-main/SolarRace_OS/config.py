@@ -27,6 +27,7 @@ the candidates below are tried in order and the first that opens is used.
 SocketCAN reminder — bring the channel up at this bitrate first, e.g.:
     sudo ip link set can0 up type can bitrate 500000
 """
+import sys
 
 # ── Shared bus bitrate — ALL devices must match this ────────────────── #
 CAN_BITRATE = 1_000_000
@@ -137,7 +138,15 @@ def can_link_state(channels=CAN_LINK_CHANNELS):
 # Calling shutdown() normally (as _shutdown_bus does) is still the primary
 # path — this is only the safety net, and shutdown() is documented as safe to
 # call more than once.
+# Each entry: {"bus": BusABC, "label": str, "where": str}. "where" is the call
+# site that opened it, so if the safety net ever HAS to rescue a bus we can name
+# the code that leaked it instead of guessing.
 _OPEN_BUSES = []
+
+# Bumped whenever this registry changes. Printed at startup so a log from the
+# car proves which build is actually running — the fastest way to tell a real
+# bug from a file that was never copied to the Pi.
+CAN_REGISTRY_BUILD = "bus-registry/2"
 
 
 def _new_bus(interface, channel):
@@ -148,20 +157,51 @@ def _new_bus(interface, channel):
     pruned of already-closed buses on every call, so it only ever holds the
     interfaces that are actually open.
     """
-    import can  # local import so this module stays light for tooling
+    import can       # local import so this module stays light for tooling
+    import traceback
 
     # Drop buses that have already been shut down properly, so a car that
     # reconnects for hours doesn't accumulate dead entries.
-    _OPEN_BUSES[:] = [b for b in _OPEN_BUSES
-                      if not getattr(b, "_is_shutdown", True)]
+    _OPEN_BUSES[:] = [r for r in _OPEN_BUSES
+                      if not getattr(r["bus"], "_is_shutdown", True)]
 
     bus = can.interface.Bus(
         interface=interface,
         channel=channel,
         bitrate=CAN_BITRATE,
     )
-    _OPEN_BUSES.append(bus)
+    label = _bus_label(interface, channel)
+    where = "".join(traceback.format_stack(limit=4)[:-1]).strip().splitlines()
+    _OPEN_BUSES.append({
+        "bus": bus,
+        "label": label,
+        "where": where[-1].strip() if where else "unknown",
+    })
+    # _safe_print, not print: a bare print can raise UnicodeEncodeError when
+    # stdout is a log file opened in a non-UTF-8 locale, and the callers of
+    # this function treat ANY exception as "the adapter did not open" — so a
+    # failed log line would discard a bus that is in fact open and registered.
+    _safe_print(f"[can] opened {label} "
+                f"[{CAN_REGISTRY_BUILD}; {len(_OPEN_BUSES)} open]")
     return bus
+
+
+def _safe_print(msg):
+    """print() that can never raise, whatever stdout's encoding is.
+
+    Diagnostics must never be able to break the thing they are reporting on.
+    This is not hypothetical: an emoji in a shutdown message raised
+    UnicodeEncodeError under an ASCII locale and stopped the CAN bus from
+    being closed at all, which is precisely how a bus ends up leaked.
+    """
+    try:
+        print(msg)
+    except Exception:
+        try:                      # last resort: strip anything unencodable
+            enc = (getattr(sys.stdout, "encoding", None) or "ascii")
+            print(msg.encode(enc, errors="replace").decode(enc, errors="replace"))
+        except Exception:
+            pass                  # a log line is never worth raising over
 
 
 def _bus_label(interface, channel):
@@ -170,13 +210,25 @@ def _bus_label(interface, channel):
 
 
 def shutdown_all_buses():
-    """Close any interface still open. Idempotent; safe from any thread."""
-    for bus in list(_OPEN_BUSES):
+    """Close any interface still open. Idempotent; safe from any thread.
+
+    Anything this has to close was NOT closed by its owner, which is a real
+    defect worth seeing rather than silently papering over — so each rescue is
+    reported with the call site that opened it.
+    """
+    for rec in list(_OPEN_BUSES):
+        bus = rec["bus"]
         try:
-            if not getattr(bus, "_is_shutdown", True):
-                bus.shutdown()
-        except Exception:
-            pass  # best effort — we are shutting down regardless
+            if getattr(bus, "_is_shutdown", True):
+                continue                     # already closed by its owner
+            # shutdown() FIRST, reporting second. The reverse order is what
+            # broke this once already: the log line raised and the bus was
+            # left open — the safety net defeated by its own diagnostics.
+            bus.shutdown()
+            _safe_print(f"[can] SAFETY NET: {rec['label']} was still open at "
+                        f"exit and has been closed. Opened at: {rec['where']}")
+        except Exception as exc:
+            _safe_print(f"[can] SAFETY NET: failed to close {rec['label']}: {exc}")
     _OPEN_BUSES.clear()
 
 
