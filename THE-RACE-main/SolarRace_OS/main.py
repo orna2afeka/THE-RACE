@@ -935,6 +935,14 @@ def main():
     signal.signal(signal.SIGTERM, _handle_shutdown_signal)
     signal.signal(signal.SIGINT, _handle_shutdown_signal)
 
+    # Stop the worker on EVERY Qt exit route. closeEvent and _quit_for_good
+    # each call _stop_can() themselves, but aboutToQuit is the only hook that
+    # also covers routes neither of them sees (app.quit() from anywhere, the
+    # session manager ending the app, last-window-closed). _stop_can() is
+    # idempotent, so the overlap is harmless — and without this, a quit that
+    # skipped both left the CAN worker thread running with its buses open.
+    app.aboutToQuit.connect(dashboard._stop_can)
+
     # Qt's C++ event loop can otherwise delay Python signal delivery
     # indefinitely; a periodic no-op timer gives the interpreter a regular
     # chance to run the handler above promptly.

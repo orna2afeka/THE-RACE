@@ -121,6 +121,69 @@ def can_link_state(channels=CAN_LINK_CHANNELS):
     return states
 
 
+# ── Bus registry: guarantees every interface is closed exactly once ──── #
+#
+# python-can's BusABC.__del__ prints "<Bus> was not properly shut down"
+# whenever a successfully-opened bus is garbage-collected without shutdown()
+# having been called. On the Pi that message kept appearing because a QThread
+# is a C++ thread: the interpreter does NOT wait for it at exit, so any exit
+# path that does not stop the CAN worker first (a crash in the GUI thread, a
+# quit route that skips _stop_can(), or plain interpreter teardown) leaves the
+# worker's buses open and lets the garbage collector find them.
+#
+# Chasing every one of those paths individually is whack-a-mole. Instead every
+# bus this module opens is recorded here and closed by an atexit hook, so the
+# guarantee holds no matter HOW the process ends or which thread owned the bus.
+# Calling shutdown() normally (as _shutdown_bus does) is still the primary
+# path — this is only the safety net, and shutdown() is documented as safe to
+# call more than once.
+_OPEN_BUSES = []
+
+
+def _new_bus(interface, channel):
+    """Open one bus and register it for guaranteed cleanup at exit.
+
+    Strong references on purpose: a weak one would let the collector reach the
+    bus first, which is the very thing that produces the warning. The list is
+    pruned of already-closed buses on every call, so it only ever holds the
+    interfaces that are actually open.
+    """
+    import can  # local import so this module stays light for tooling
+
+    # Drop buses that have already been shut down properly, so a car that
+    # reconnects for hours doesn't accumulate dead entries.
+    _OPEN_BUSES[:] = [b for b in _OPEN_BUSES
+                      if not getattr(b, "_is_shutdown", True)]
+
+    bus = can.interface.Bus(
+        interface=interface,
+        channel=channel,
+        bitrate=CAN_BITRATE,
+    )
+    _OPEN_BUSES.append(bus)
+    return bus
+
+
+def _bus_label(interface, channel):
+    """The one place a connection's human-readable name is built."""
+    return f"{interface}:{channel} @ {CAN_BITRATE // 1000}kbps"
+
+
+def shutdown_all_buses():
+    """Close any interface still open. Idempotent; safe from any thread."""
+    for bus in list(_OPEN_BUSES):
+        try:
+            if not getattr(bus, "_is_shutdown", True):
+                bus.shutdown()
+        except Exception:
+            pass  # best effort — we are shutting down regardless
+    _OPEN_BUSES.clear()
+
+
+import atexit  # noqa: E402  (registered next to the registry it protects)
+atexit.register(shutdown_all_buses)
+
+
 # ── Connection helper ───────────────────────────────────────────────── #
 def open_bus():
     """
@@ -134,19 +197,11 @@ def open_bus():
     Catches broadly because a missing backend can raise CanError, OSError,
     or ImportError depending on the adapter/driver.
     """
-    import can  # local import so this module stays light for tooling
-
     last_exc = None
     for cand in CAN_CANDIDATES:
         try:
-            bus = can.interface.Bus(
-                interface=cand["interface"],
-                channel=cand["channel"],
-                bitrate=CAN_BITRATE,
-            )
-            label = (f"{cand['interface']}:{cand['channel']} "
-                     f"@ {CAN_BITRATE // 1000}kbps")
-            return bus, label, None
+            bus = _new_bus(cand["interface"], cand["channel"])
+            return bus, _bus_label(cand["interface"], cand["channel"]), None
         except Exception as exc:
             last_exc = exc
             continue
@@ -166,18 +221,13 @@ def open_buses():
     channel opens (e.g. running off-Pi through a USB adapter), fall back to the
     non-SocketCAN CAN_CANDIDATES and open the first that works.
     """
-    import can  # local import so this module stays light for tooling
-
     buses = []
     errors = []
 
     # 1) Both on-board SocketCAN channels.
     for ch in CAN_LINK_CHANNELS:            # ("can0", "can1")
         try:
-            bus = can.interface.Bus(
-                interface="socketcan", channel=ch, bitrate=CAN_BITRATE,
-            )
-            buses.append((bus, f"socketcan:{ch} @ {CAN_BITRATE // 1000}kbps"))
+            buses.append((_new_bus("socketcan", ch), _bus_label("socketcan", ch)))
         except Exception as exc:
             errors.append((ch, exc))
 
@@ -187,13 +237,8 @@ def open_buses():
             if cand["interface"] == "socketcan":
                 continue                    # already tried above
             try:
-                bus = can.interface.Bus(
-                    interface=cand["interface"],
-                    channel=cand["channel"],
-                    bitrate=CAN_BITRATE,
-                )
-                buses.append((bus, f"{cand['interface']}:{cand['channel']} "
-                                   f"@ {CAN_BITRATE // 1000}kbps"))
+                buses.append((_new_bus(cand["interface"], cand["channel"]),
+                              _bus_label(cand["interface"], cand["channel"])))
                 break
             except Exception as exc:
                 errors.append((cand["channel"], exc))
@@ -212,20 +257,12 @@ def open_usb_candidates():
     open and are still read in parallel; the USB bus is simply added alongside
     them if one turns up.
     """
-    import can  # local import so this module stays light for tooling
-
     for cand in CAN_CANDIDATES:
         if cand["interface"] == "socketcan":
             continue                    # that's the HAT, not USB
         try:
-            bus = can.interface.Bus(
-                interface=cand["interface"],
-                channel=cand["channel"],
-                bitrate=CAN_BITRATE,
-            )
-            label = (f"{cand['interface']}:{cand['channel']} "
-                     f"@ {CAN_BITRATE // 1000}kbps")
-            return bus, label
+            bus = _new_bus(cand["interface"], cand["channel"])
+            return bus, _bus_label(cand["interface"], cand["channel"])
         except Exception:
             continue
     return None, None
