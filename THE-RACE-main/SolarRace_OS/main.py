@@ -19,6 +19,27 @@ import struct
 import can
 import signal
 import traceback
+import logging
+
+# ---------------------------------------------------------------------------
+# Make stdout/stderr unbreakable BEFORE anything prints.
+#
+# deploy/start_hud.sh redirects all output to a log FILE, and Python takes that
+# stream's encoding from the locale. A desktop autostart session often has no
+# LANG set, which yields ASCII — and every emoji in this codebase (there are
+# dozens: the CAN status lines, the lap messages, the GPS banner) then raises
+# UnicodeEncodeError on print(). Inside the CAN worker loop that kills the
+# worker thread outright, leaving the CAN interfaces open, which is how
+# python-can ends up reporting "<Bus> was not properly shut down".
+#
+# errors="replace" means an unencodable character degrades to '?' instead of
+# raising. A log line must never be able to take the car off the air.
+# ---------------------------------------------------------------------------
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass        # Python <3.7 or an already-wrapped stream; best effort
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import QObject, Signal, QTimer
 import subprocess
@@ -55,6 +76,8 @@ from config import (
     open_buses,
     open_usb_candidates,
     can_link_state,
+    shutdown_all_buses,
+    CAN_REGISTRY_BUILD,
     CAN_BITRATE,
     CAN_SILENCE_TIMEOUT_S,
     USB_SILENCE_FALLBACK_S,
@@ -883,6 +906,21 @@ def bring_up_can_buses():
 
 def main():
     print("Starting Endurance Race Telemetry System v2.0...")
+
+    # Timestamp python-can's own log records. Its "<Bus> was not properly shut
+    # down" warning is emitted from BusABC.__del__, i.e. by the garbage
+    # collector — so the ONLY way to tell whether it fires mid-race or during
+    # interpreter teardown is to see the time next to it. Without this the
+    # message lands bare in the log and says nothing about when.
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    )
+    # Proves which build the car is actually running. If this line is missing
+    # from the log, the Pi is running an older copy of config.py and no amount
+    # of local fixing will change what it does.
+    print(f"🔖 CAN bus registry: {CAN_REGISTRY_BUILD}")
+
     bring_up_can_buses()
     db_url = "https://solar-race-telemetry-default-rtdb.europe-west1.firebasedatabase.app/"
     try:
