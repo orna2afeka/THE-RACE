@@ -1,0 +1,54 @@
+# Pit-wall Streamlit config.
+# Makes the dashboard reachable from other devices on the pit's local network
+# (phones/laptops), not just localhost. The collector laptop is the only machine
+# that runs this; everyone else just opens the Network URL in a browser.
+
+[server]
+# Bind to all interfaces so the LAN Network URL works.
+# NOTE: on first launch Windows Firewall will ask to allow this. If you click
+# Cancel, localhost still works but phones/laptops on the pit LAN cannot connect.
+address = "0.0.0.0"
+port = 8501
+# Don't try to launch a browser on a headless pit laptop / when autostarted.
+headless = true
+enableWebsocketCompression = true
+
+# ── Keeping the live stream up for hours, not minutes ────────────────────── #
+# The dashboard used to stop updating after a few minutes. Two defaults caused
+# it, and neither is obvious:
+#
+#   websocketPingInterval defaults to None -> Streamlit sends NO keepalive at
+#   all. A websocket carrying only server-push updates looks idle to the WiFi
+#   router / phone hotspot NAT, which drops the mapping after a couple of
+#   minutes. The browser then sits waiting on a socket nothing will ever arrive
+#   on. Pinging every 20s keeps the mapping alive (Streamlit sets the matching
+#   ping timeout automatically).
+websocketPingInterval = 20
+#
+#   disconnectedSessionTTL defaults to 120s -> if the link IS lost for longer
+#   than two minutes, the server throws the session away, so reconnecting gives
+#   a blank re-run instead of the dashboard you left. 30 minutes covers a lap
+#   out of WiFi range or a laptop lid closed during a driver change.
+disconnectedSessionTTL = 1800
+
+# Nothing here edits source files during a race, and the watcher costs CPU and
+# can restart the app mid-session if a file is touched.
+fileWatcherType = "none"
+
+# ⚠️ CLOSED-NETWORK SETTING. These two must move TOGETHER: Streamlit ignores
+# enableCORS=false while XSRF protection is on, so disabling one alone does
+# nothing. Safe here only because the pit runs on its own private hotspot (venue
+# WiFi isolates clients, so a shared network is not an option anyway). Do NOT
+# ship this on a network you do not control.
+enableCORS = false
+enableXsrfProtection = false
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+# Dark is the design's native look (neon accents on near-black). The sidebar
+# Dark/Light button re-themes the chrome + custom tiles via injected CSS on top
+# of this base. Native widgets (tables/charts) follow this base theme.
+base = "dark"
+primaryColor = "#00ffcc"

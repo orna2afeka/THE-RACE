@@ -1,0 +1,28 @@
+# requirements.txt
+# ==========================================
+# Raspberry Pi Telemetry Backend Dependencies
+# ==========================================
+# Run in the Pi : pip install -r SolarRace_OS/requirements.txt
+# Firebase Realtime Database connection
+# To run the main - python SolarRace_OS/main.py
+python-can==4.3.1
+firebase-admin==6.4.0
+
+# The driver HUD is a Qt app. PySide6 was missing from this file even though
+# main.py has always imported it — anyone installing from requirements alone
+# got a ModuleNotFoundError on first run.
+PySide6>=6.5.0
+
+# OPTIONAL — only for the standalone engineering dashboard (`python
+# SolarRace_OS/dashboard.py`). main.py does NOT need it: it runs the
+# driver_dash_v2 HUD, which uses no pyqtgraph. Uncomment if you use that tool.
+# pyqtgraph>=0.13.3
+
+# GPS needs NO pip packages. modules/gps_reader.py is a gpsd client speaking
+# gpsd's JSON protocol over a plain stdlib socket (the same stream as
+# `gpspipe -w`), so pyserial/pynmea2 are no longer used by anything here.
+# GPS is a SYSTEM dependency instead — install and configure it on the Pi:
+#   sudo apt install gpsd gpsd-clients
+#   sudo nano /etc/default/gpsd     # DEVICES="/dev/ttyUSB1", GPSD_OPTIONS="-n"
+#   sudo systemctl enable --now gpsd
+# Verify with:  gpspipe -w        (or: python3 SolarRace_OS/modules/gps_reader.py)
