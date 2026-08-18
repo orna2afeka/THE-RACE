@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Virtual environments
+venv/
+.venv/
+**/venv/
+**/.venv/
+
+
+# Launcher bookkeeping: hash of the last requirements file we pip-installed
+.deps_stamp
+**/.deps_stamp
+
+# Local pit-side telemetry store (collector output)
+*.db
+*.db-wal
+*.db-shm
+
+.idea/

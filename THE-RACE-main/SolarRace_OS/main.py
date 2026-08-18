@@ -1,0 +1,868 @@
+"""
+main.py — Master Race OS (Final Pit-Wall Edition)
+=================================================
+This is the core execution file for the Solar Car Telemetry System.
+It integrates background CAN bus reading, fallback simulation, 
+real-time data parsing (BMS/MMS), Firebase cloud synchronization, 
+and the PySide6 Driver HUD in a fully thread-safe architecture.
+"""
+import sys
+import os
+# Ensure this folder (SolarRace_OS/) is importable no matter how the app is
+# launched (repo root, inside the folder, or a systemd unit on the Pi).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Repo root too, for drivetrain.py — the speed/gearing definitions the pit
+# dashboard also imports, so both ends of the telemetry link agree.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import time
+import struct
+import can
+from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QObject, Signal
+import subprocess
+# --- Core Logic & Parsing Modules ---
+# NOTE: `import dashboard` used to sit here and was dead code. dashboard.py is
+# the SEPARATE standalone engineering dashboard; the HUD this app runs is
+# driver_dash_v2.RacingDashboard. Nothing here ever referenced the module —
+# main() binds a LOCAL variable also called `dashboard` (see below), which
+# shadowed it completely. All the import did was pull in pyqtgraph and a second
+# full Qt GUI at startup, so the app refused to boot with
+# "ModuleNotFoundError: No module named 'pyqtgraph'" on any machine that had
+# not installed a dependency it never used. Run dashboard.py directly if you
+# want that tool.
+from modules.bms_parser import parse_jbd_bms_message
+from modules.mms_parser import parse_mms_message
+from modules.temp_controller_parser import parse_temp_controller_message
+from modules.gps_reader import GPSReader
+from modules.lap_tracker import LapTracker
+from modules.lap_command import LapCommandInbox, StrategyCommandInbox
+from modules.vehicle_inputs import VehicleInputs
+
+# --- Cloud Sync Modules ---
+from cloud.firebase_client import (
+    initialize_firebase, push_telemetry_to_cloud, listen_driver_command,
+    ack_lap_command, ack_strategy)
+
+# --- Upgraded GUI Modules ---
+from can_worker import CANWorker, _word_to_alerts, _ERROR_BITS, _LIMIT_BITS
+import driver_dash_v2
+from driver_dash_v2 import RacingDashboard, RACING_QSS
+
+# --- Connection configuration (shared CAN bus + BMS polling) ---
+from config import (
+    open_buses,
+    open_usb_candidates,
+    can_link_state,
+    CAN_BITRATE,
+    CAN_SILENCE_TIMEOUT_S,
+    USB_SILENCE_FALLBACK_S,
+    USB_FALLBACK_RETRY_S,
+    BMS_POLL_IDS,
+    BMS_POLL_BYTE,
+    BMS_POLL_INTERVAL_S,
+)
+
+# --- Race & Vehicle Constants ---
+# Gear ratio and wheel size now come from drivetrain.py at the repo root, shared
+# with the pit so the odometer, the HUD speedometer and the pit tiles all agree.
+# Re-exported here because this module's own name for them is referenced widely.
+import drivetrain      # noqa: E402  (sys.path prepared at the top of this file)
+import track           # noqa: E402  circuit geometry, shared with the pit
+import speed_profile   # noqa: E402  target-speed curves, shared with the pit
+
+GEAR_RATIO = drivetrain.GEAR_RATIO
+WHEEL_CIRCUMFERENCE_METERS = drivetrain.TIRE_CIRCUMFERENCE_METERS
+TRACK_LENGTH_METERS = track.TRACK_LENGTH_METERS   # Circuit Zolder, Belgium
+
+# --- GPS publishing -------------------------------------------------------- #
+# Telemetry is normally pushed from _decode_message, i.e. only when a CAN frame
+# arrives. GPS is independent of CAN, so on its own that would mean no position
+# in the pit whenever the bus is quiet (car parked, ignition off, CAN unplugged)
+# — exactly when you most want to check the map is working. So the read loop
+# also publishes on this timer, which keeps the pit's position alive with or
+# without CAN traffic. Matches firebase_client's own 0.5s throttle, so this adds
+# no extra writes while CAN is live.
+GPS_PUBLISH_INTERVAL_S = 0.5
+
+# How often the lap trigger looks at GPS. Faster than the publish rate on
+# purpose — see _sample_lap_gps.
+LAP_GPS_SAMPLE_INTERVAL_S = 0.1
+
+# How often the brake/lights switches are read. 5 Hz is instant to a human eye
+# and costs nothing; gpiozero debounces the contacts for us.
+VEHICLE_INPUT_POLL_S = 0.2
+
+# Target speed + corner look-ahead refresh. 5 Hz: fast enough that the number
+# tracks the car down a straight, slow enough to be free.
+PROFILE_TICK_S = 0.2
+
+# Which profile the car runs until the pit says otherwise. The baseline is the
+# safe default — it is the lap the team actually measured.
+DEFAULT_STRATEGY = "base_210s"
+
+# How far ahead to look for a corner, and how big a speed drop is worth
+# interrupting the driver for. See speed_profile.look_ahead.
+TURN_LOOKAHEAD_M = 175.0
+TURN_MIN_DROP_KMH = 15.0
+
+# ==============================================================================
+# SMART CAN WORKER (Core Background Thread)
+# ==============================================================================
+class SmartCANWorker(CANWorker):
+    """
+    Extends the UI CANWorker to drive the full pit-wall build.
+
+    All three devices share ONE CAN bus (see config.py). This worker reads
+    that single bus and decodes BMS + MMS + temp frames off it (their IDs
+    don't overlap). The BMS is master/slave, so it is also polled here.
+
+    This worker is ALWAYS in real (live) mode — it never replays a log. When
+    the bus can't be opened, or is open but silent, every gauge is forced to
+    zero and the status bar reports why: "CAN NOT CONNECTED" when the OS says
+    the interface is down/absent, or "CAN CONNECTED — SILENCE" when the link
+    is up but no frames are arriving. That distinction is made with a bash
+    `ip link show` probe (see config.can_link_state).
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # All open CAN interfaces we read in parallel (can0 + can1). Each entry
+        # is a (bus, label) tuple. The base class keeps a single self._bus we
+        # don't use here.
+        self._buses: list = []
+        self.vehicle_state = {
+            "battery": {},          # JBD BMS
+            "motor": {},            # SiliXcon LYNX MMS
+            "temp_controller": {},  # J1939 battery-temperature module
+            "gps": {},
+        }
+        # Distance, energy, laps and lap timing all live in one object so they
+        # cannot drift apart — a lap is defined by distance, lap energy is the
+        # integral between two triggers, lap time the interval between them.
+        self.laps = LapTracker()
+        self.lap_inbox = LapCommandInbox()
+        self._last_lap_gps_sample = 0.0
+        # Parking brake + lights switches, wired to the Pi's GPIO (the motor
+        # controller has no visibility of them). Reports None until the pins
+        # are configured in modules/vehicle_inputs.py, which the HUD shows as
+        # UNKNOWN rather than as a confident "off".
+        self.vehicle_inputs = VehicleInputs()
+        self._last_input_poll = 0.0
+        # Target speed + corner look-ahead. The car holds every generated
+        # profile and the pit switches between them by name, so a strategy
+        # change is a few bytes over the link instead of a 400-row table.
+        self.strategy_inbox = StrategyCommandInbox()
+        self.profiles = speed_profile.load_all(
+            lap_length_m=track.TRACK_LENGTH_METERS)
+        self.active_strategy = DEFAULT_STRATEGY
+        self._last_profile_tick = 0.0
+        self._last_turn_alert = None
+        self.last_cloud_print = time.time()
+        self._last_bms_poll = 0.0
+        self._poll_fail_count = 0
+        self._have_bms_soc = False   # once True, ignore the LYNX SoC estimate
+        # Once the dedicated temp module reports a max cell temp, stop falling
+        # back to the BMS's own NTC probes (the module measures more points).
+        self._have_module_cell_temp = False
+        # The driver HUD's alert bar shows a SINGLE combined list, but MMS
+        # (0x600) and BMS (0x102) faults arrive on separate frames. Cache each
+        # so a fresh frame from one device doesn't wipe the other's alerts.
+        self._mms_alerts: list = []   # (label, severity) from the MMS status word
+        self._bms_alerts: list = []   # (label, severity) from the JBD protections
+        # Throttle for the "no data" status probe so we don't spawn `ip link`
+        # (a subprocess) on every idle loop iteration.
+        self._last_link_check = 0.0
+        self._last_status_text = ""
+        # USB fallback: when can0/can1 open but go silent, we start searching
+        # for a USB-to-CAN adapter too (see _maybe_fallback_to_usb). Tracks
+        # when the current silence began and whether a USB bus is already in
+        # self._buses, so we don't add it twice or hammer the device search.
+        self._silent_since = 0.0
+        self._usb_fallback_tried_at = 0.0
+        self._usb_bus_active = False
+        self._bus_label = None
+        # GPS via gpsd. Its own daemon thread does the blocking socket reads, so
+        # reading a position here never stalls the CAN loop. Constructing it
+        # cannot fail (no gpsd / no receiver just means "no fix yet").
+        self.gps = GPSReader()
+        self._last_gps_publish = 0.0
+        self._last_gps_log = ""
+
+    def run(self) -> None:
+        """
+        Always-real read loop (never replays a log), reading BOTH can0 and can1
+        in parallel.
+
+        Continuously:
+          • (re)open every available CAN interface if none are open;
+          • drain and decode every queued frame from ALL buses → LIVE;
+          • poll the BMS on a timer (on every bus) while live;
+          • when no bus opens, or all buses are silent for
+            CAN_SILENCE_TIMEOUT_S, force all gauges to zero and report the
+            reason ("NOT CONNECTED" vs "SILENCE", decided by a bash probe).
+        """
+        self._running = True
+        self._bus_label = None
+        last_real = 0.0
+        state = None  # one of: "live", "silent", "disconnected"
+
+        # Start streaming positions from gpsd in the background. Independent of
+        # CAN: GPS keeps working (and keeps reaching the pit) even if the bus
+        # never opens.
+        self.gps.start()
+        self._last_gps_log = self.gps.status()
+        print(f"🛰️ {self._last_gps_log}")
+        print(f"🏁 {track.TRACK_LENGTH_METERS:.0f} m lap, finish line "
+              f"{track.FINISH_LINE_LAT:.6f}, {track.FINISH_LINE_LON:.6f}")
+
+        # Pit lap commands. The car must run without Firebase (no network at
+        # scrutineering, credentials missing on a bench Pi), exactly as main()
+        # already tolerates a missing driver-command listener.
+        try:
+            self.lap_inbox.start()
+            print("🏁 Listening for pit lap commands...")
+        except Exception as exc:
+            print(f"🏁 Lap-command listener unavailable: {exc}")
+
+        self.vehicle_inputs.start()
+        print(f"🔌 {self.vehicle_inputs.status()}")
+
+        if self.profiles:
+            print(f"🎯 {len(self.profiles)} speed profile(s) loaded; "
+                  f"active: {self.active_strategy}")
+            try:
+                self.strategy_inbox.start()
+                print("🎯 Listening for pit strategy changes...")
+            except Exception as exc:
+                print(f"🎯 Strategy listener unavailable: {exc}")
+        else:
+            print("⚠️ No speed profiles found — no target speed and no turn "
+                  "alerts. Generate them with: python tools/generate_profiles.py")
+
+        while self._running:
+            # ---- Pit commands and lap detection, CAN or no CAN ------------ #
+            # First in the loop, deliberately: several branches below `continue`
+            # (no bus opened, CAN read error), and those are exactly the cases
+            # where a GPS-only push is the pit's only position source — and
+            # where the pit most needs its manual Cut Lap to still work.
+            self._apply_lap_commands()
+            self._apply_strategy_commands()
+            self._sample_lap_gps()
+            self._poll_vehicle_inputs()
+            self._tick_profile()
+            self._publish_gps()
+
+            # ---- (Re)open the buses if we have none ---------------------- #
+            if not self._buses:
+                self._buses, errors = open_buses()
+                if not self._buses:
+                    if state != "disconnected":
+                        state = "disconnected"
+                        print(f"⚠️ No CAN bus opened ({errors}).")
+                        self._emit_zeros()
+                    self._report_no_data(bus_open=False)
+                    self._interruptible_sleep(1.0)
+                    continue
+                self._bus_label = " + ".join(lbl for _, lbl in self._buses)
+                print(f"✅ CAN bus(es) open: {self._bus_label}. Live mode.")
+                last_real = time.time()   # brief grace before calling it silent
+                state = "silent"
+                self._silent_since = last_real
+
+            # ---- Drain whatever real traffic is queued on ANY bus -------- #
+            got_any = False
+            try:
+                for bus, _ in self._buses:
+                    while True:
+                        msg = bus.recv(timeout=0.0)
+                        if msg is None:
+                            break
+                        got_any = True
+                        last_real = time.time()
+                        if state != "live":
+                            state = "live"
+                            print("📡 Live CAN traffic detected.")
+                            self._set_status(f"● CAN LIVE  |  {self._bus_label}")
+                        self._decode_message(msg)
+            except can.CanError as exc:
+                print(f"⚠️ CAN read error: {exc} — reopening buses.")
+                self._shutdown_bus()          # forces a reopen next iteration
+                state = "disconnected"
+                self._emit_zeros()
+                self._report_no_data(bus_open=False)
+                self._interruptible_sleep(0.5)
+                continue
+
+            now = time.time()
+
+            if state == "live":
+                # Poll the BMS on a timer (it only answers when queried).
+                if now - self._last_bms_poll >= BMS_POLL_INTERVAL_S:
+                    self._poll_bms()
+                    self._last_bms_poll = now
+                # Fall to silent if ALL buses go completely quiet.
+                if CAN_SILENCE_TIMEOUT_S and now - last_real > CAN_SILENCE_TIMEOUT_S:
+                    state = "silent"
+                    self._silent_since = now
+                    print(f"⚠️ {CAN_SILENCE_TIMEOUT_S:.0f}s CAN silence — zeroing gauges.")
+                    self._emit_zeros()
+
+            if state == "silent":
+                # Buses are open but no frames — zero gauges & report why.
+                self._report_no_data(bus_open=True)
+                self._maybe_fallback_to_usb(now)
+
+            if not got_any:
+                time.sleep(0.05)  # yield the CPU while idle
+
+        self.gps.stop()
+        self.lap_inbox.stop()
+        self.strategy_inbox.stop()
+        self.vehicle_inputs.stop()
+        self._shutdown_bus()
+
+    # ------------------------------------------------------------------ #
+    # No-data handling (zero the HUD + report the reason)                 #
+    # ------------------------------------------------------------------ #
+    def _emit_zeros(self) -> None:
+        """Force every HUD gauge to zero and clear the alert bar."""
+        self.rpm_updated.emit(0)
+        self.voltage_updated.emit(0.0)
+        self.soc_updated.emit(0)
+        self.power_updated.emit(0)          # HUD derives current = P / V → 0
+        self.controller_temp_updated.emit(0)
+        # 0 Ω is below the PT1000's physical floor, so the HUD reads it as
+        # "no sensor data" and blanks both fields rather than showing the
+        # -246 °C that extrapolating 0 Ω would imply.
+        self.motor_temp_updated.emit(0.0, -1000.0, "no_reading")
+        self.alerts_updated.emit([])
+        # The controller has stopped talking, so we can no longer say it is on.
+        # Brake/lights are GPIO-sourced and unaffected by a dead CAN bus, so
+        # they keep whatever the Pi can actually read.
+        gpio = (self.vehicle_inputs.read() if self.vehicle_inputs is not None
+                else {"parking_brake": None, "lights_on": None})
+        self._last_flags = {"ecu_on": False, "reverse": False, **gpio}
+        self.vehicle_flags_updated.emit(dict(self._last_flags))
+        # Clear the power map too. A stale "Map 3" badge sitting on screen while
+        # the bus is dead would tell the driver something we no longer know.
+        self._last_motor_map = None
+        self.motor_map_updated.emit("", -1)
+
+    def _report_no_data(self, bus_open: bool) -> None:
+        """
+        Set the top-left status while no telemetry is arriving.
+
+        Uses a bash `ip link show` probe to tell the two cases apart:
+          • an interface is UP  → "CAN CONNECTED — SILENCE (no data)"
+          • all down / absent   → "CAN NOT CONNECTED"
+        The probe is throttled to once per second (it spawns a subprocess).
+        When `ip` isn't available (dev off-Pi) we fall back to whether the
+        python-can bus handle opened.
+        """
+        now = time.time()
+        if now - self._last_link_check < 1.0:
+            return
+        self._last_link_check = now
+
+        states = can_link_state()
+        up = [ch for ch, s in states.items() if s == "UP"]
+        if states:                              # bash probe worked
+            if up:
+                text = f"◐ CAN CONNECTED — SILENCE (no data)  |  {', '.join(up)}"
+            else:
+                text = "○ CAN NOT CONNECTED  |  interface down"
+        else:                                   # `ip` unavailable — use bus handle
+            text = ("◐ CAN CONNECTED — SILENCE (no data)" if bus_open
+                    else "○ CAN NOT CONNECTED")
+        self._set_status(text)
+
+    def _maybe_fallback_to_usb(self, now: float) -> None:
+        """
+        If can0/can1 opened fine but have produced no traffic for
+        USB_SILENCE_FALLBACK_S, also start listening on a USB-to-CAN adapter —
+        the car may be wired up that way this run instead of through the HAT.
+
+        Added ALONGSIDE the existing buses, not instead of them: if the HAT
+        starts talking again, both keep being read. Only ever adds one USB bus
+        per connection cycle (_usb_bus_active), and retries the device search
+        no more than every USB_FALLBACK_RETRY_S so a missing adapter doesn't
+        get probed on every loop iteration.
+        """
+        if not USB_SILENCE_FALLBACK_S or self._usb_bus_active:
+            return
+        if now - self._silent_since < USB_SILENCE_FALLBACK_S:
+            return
+        if now - self._usb_fallback_tried_at < USB_FALLBACK_RETRY_S:
+            return
+        self._usb_fallback_tried_at = now
+
+        bus, usb_label = open_usb_candidates()
+        if bus is None:
+            return
+        self._usb_bus_active = True
+        self._buses.append((bus, usb_label))
+        self._bus_label = " + ".join(lbl for _, lbl in self._buses)
+        print(f"🔌 No CAN traffic for {USB_SILENCE_FALLBACK_S:.0f}s — "
+              f"found a USB adapter too, now also listening on {usb_label}.")
+
+    def _set_status(self, text: str) -> None:
+        """Emit a status string only when it changes (avoids UI churn)."""
+        if text != self._last_status_text:
+            self._last_status_text = text
+            self.status_updated.emit(text)
+
+    def _interruptible_sleep(self, seconds: float) -> None:
+        """Sleep in small slices so stop() stays responsive."""
+        end = time.time() + seconds
+        while self._running and time.time() < end:
+            time.sleep(0.05)
+
+    def _poll_bms(self) -> None:
+        """
+        Send the JBD query frames so the BMS will answer. Each query is the
+        wanted ID carrying a single 0x5A byte; the BMS replies on the same
+        ID and those replies are decoded by the normal read loop.
+
+        We don't know which channel the BMS sits on, so every query is sent on
+        BOTH buses; the harmless copy on the wrong bus is simply not answered.
+        """
+        if not self._buses:
+            return
+        for query_id in BMS_POLL_IDS:
+            if not self._running:
+                break
+            msg = can.Message(
+                arbitration_id=query_id,
+                data=[BMS_POLL_BYTE],
+                is_extended_id=False,
+            )
+            for bus, _ in self._buses:
+                try:
+                    # timeout>0 makes SocketCAN wait briefly for TX-buffer space
+                    # instead of failing instantly when the queue is momentarily
+                    # full.
+                    bus.send(msg, timeout=0.05)
+                except can.CanError as exc:
+                    # ENOBUFS / TX timeout: frames aren't being ACKed, so the
+                    # queue never drains. Almost always a bus issue — BMS not
+                    # powered/on the bus, wrong bitrate, or missing 120Ω
+                    # termination. Warn only occasionally so we don't flood the
+                    # console.
+                    self._poll_fail_count += 1
+                    if self._poll_fail_count % 20 == 1:
+                        print(f"⚠️ BMS poll TX failed @ {hex(query_id)}: {exc} — "
+                              "check the BMS is powered & on the bus, the bitrate "
+                              "matches, and the bus is terminated (2× 120Ω).")
+                else:
+                    self._poll_fail_count = 0
+
+    # ------------------------------------------------------------------ #
+    # GPS (gpsd) → vehicle_state → Firebase → pit                         #
+    # ------------------------------------------------------------------ #
+    def _refresh_gps(self) -> None:
+        """Copy the newest gpsd fix into vehicle_state["gps"].
+
+        The pit reads car_data.gps.lat / .lon (Pit_Dashboard/db.py), so writing
+        those two keys here is the whole handoff. Extra keys (speed, altitude,
+        satellites, fix age) ride along and are kept in the pit's raw_json.
+
+        With no fix, the gps dict is left EMPTY rather than filled with zeros —
+        0,0 is a real place in the Atlantic, and the pit must be able to tell
+        "no position" from "position". Empty means lat/lon land as NULL.
+        """
+        fix = self.gps.get_coordinates()
+        if fix:
+            self.vehicle_state["gps"] = fix
+
+    def _sample_lap_gps(self) -> None:
+        """Feed GPS to the lap trigger at 10 Hz.
+
+        Deliberately NOT folded into _publish_gps: that is throttled to 0.5 s to
+        match the Firebase write rate, which is the wrong cadence for crossing
+        detection. Sampling faster guarantees every gpsd report is seen, so the
+        segments the swept-capsule test builds stay as short as gpsd allows.
+        Duplicate polls are free — LapTracker discards a fix it has already
+        seen — and get_coordinates() is just a brief lock plus a dict copy.
+        """
+        now = time.monotonic()
+        if now - self._last_lap_gps_sample < LAP_GPS_SAMPLE_INTERVAL_S:
+            return
+        self._last_lap_gps_sample = now
+
+        event = self.laps.update_gps(self.gps.get_coordinates(), now)
+        if event == "lap":
+            print(f"🏁 LAP {self.laps.lap_count} — "
+                  f"{self.laps.last_lap_time_s:.1f}s, "
+                  f"{self.laps.last_lap_energy_wh:.1f} Wh, "
+                  f"{self.laps.last_lap_distance_m:.0f} m ({self.laps.lap_source})")
+        elif event == "start":
+            print("🏁 Finish line acquired — lap timing armed.")
+        self.vehicle_state["motor"].update(self.laps.snapshot())
+
+    def _poll_vehicle_inputs(self) -> None:
+        """Refresh the GPIO-sourced indicators, independently of CAN.
+
+        The brake and lights switches are wired to the Pi, so their state must
+        keep updating when the motor controller is off or the bus is down —
+        which is exactly when someone is most likely to be walking around the
+        car pulling the parking brake.
+        """
+        now = time.monotonic()
+        if now - self._last_input_poll < VEHICLE_INPUT_POLL_S:
+            return
+        self._last_input_poll = now
+        # No frame argument: keep the CAN-derived flags and refresh only the
+        # GPIO ones. _emit_vehicle_flags emits only when something changed.
+        self._emit_vehicle_flags(None)
+
+    def _tick_profile(self) -> None:
+        """Target speed + corner look-ahead for the driver, from the active profile.
+
+        Runs on the CAN worker thread beside everything else that reads
+        LapTracker, so no locking is needed. Both values come from the SAME
+        shared module the pit uses, so the target the driver is chasing is the
+        target the strategist is judging them against.
+        """
+        now = time.monotonic()
+        if now - self._last_profile_tick < PROFILE_TICK_S:
+            return
+        self._last_profile_tick = now
+
+        profile = self.profiles.get(self.active_strategy)
+        if profile is None:
+            return
+
+        lap_distance = self.laps.odometer_m - self.laps._lap_start_odometer_m
+        target_kmh = profile.speed_kmh_at(lap_distance)
+        self.target_speed_updated.emit(float(target_kmh), self.active_strategy)
+        self.vehicle_state["motor"]["target_speed_kmh"] = round(target_kmh, 1)
+        self.vehicle_state["motor"]["active_strategy"] = self.active_strategy
+
+        ahead = profile.look_ahead(lap_distance, TURN_LOOKAHEAD_M,
+                                   TURN_MIN_DROP_KMH)
+        # Emit only on change: the HUD strip would otherwise be restyled five
+        # times a second for the whole approach to every corner.
+        key = None if ahead is None else (round(ahead[0] / 10), round(ahead[1]))
+        if key != self._last_turn_alert:
+            self._last_turn_alert = key
+            if ahead is None:
+                self.turn_alert_updated.emit(0.0, 0.0, 0.0)
+            else:
+                self.turn_alert_updated.emit(float(ahead[0]), float(ahead[1]),
+                                             float(ahead[2]))
+
+    def _apply_strategy_commands(self) -> None:
+        """Switch the active speed profile when the pit selects a new strategy.
+
+        Applied on THIS thread; the Firebase listener only queues (see
+        modules/lap_command.CommandInbox).
+        """
+        for cmd in self.strategy_inbox.drain():
+            wanted = str(cmd.get("value") or "").strip()
+            applied = wanted in self.profiles
+            note = None
+            if applied:
+                self.active_strategy = wanted
+                profile = self.profiles[wanted]
+                print(f"🎯 STRATEGY -> {wanted} "
+                      f"({profile.lap_time_s():.0f}s lap, "
+                      f"{profile.average_kmh():.1f} km/h avg)")
+                # Force the next tick to re-evaluate rather than suppress the
+                # alert as unchanged — the new profile may corner differently.
+                self._last_turn_alert = None
+                self._last_profile_tick = 0.0
+            else:
+                note = (f"unknown strategy {wanted!r}; "
+                        f"have {sorted(self.profiles)}")
+                print(f"⚠️ {note}")
+            ack_strategy(cmd.get("id"), self.active_strategy, applied, note)
+
+    def _apply_lap_commands(self) -> None:
+        """Apply queued pit commands ON THIS THREAD.
+
+        The Firebase listener runs on a background thread and only queues; every
+        mutation of the lap tracker happens here, on the CAN worker thread that
+        owns it. That is what keeps LapTracker and vehicle_state lock-free.
+        """
+        for cmd in self.lap_inbox.drain():
+            action = cmd.get("action")
+            applied = True
+            if action == "cut_lap":
+                self.laps.force_lap("manual")
+                print(f"🏁 PIT CUT LAP -> lap {self.laps.lap_count}")
+            elif action == "set_lap":
+                self.laps.set_lap(cmd.get("value") or 0)
+                print(f"🏁 PIT SET LAP -> {self.laps.lap_count}")
+            elif action == "reset_energy":
+                self.laps.reset_energy()
+                print("🏁 PIT RESET ENERGY")
+            else:
+                applied = False
+            self.vehicle_state["motor"].update(self.laps.snapshot())
+            ack_lap_command(cmd.get("id"), action, applied,
+                            lap=self.laps.lap_count)
+
+    def _publish_gps(self) -> None:
+        """Refresh GPS and push telemetry on a timer, independent of CAN.
+
+        Runs on the CAN worker thread — the SAME thread that pushes from
+        _decode_message — so vehicle_state is never serialised by one thread
+        while another mutates it. _decode_message needs no GPS call of its own:
+        this runs every pass of the read loop, so the gps dict it publishes is
+        already fresh, and we avoid touching a lock on every CAN frame.
+        """
+        now = time.time()
+        if now - self._last_gps_publish < GPS_PUBLISH_INTERVAL_S:
+            return
+        self._last_gps_publish = now
+        self._refresh_gps()
+
+        # Log GPS state only when the summary changes, so the console shows the
+        # moment a fix is acquired or lost without scrolling every second.
+        status = self.gps.status()
+        if status != self._last_gps_log:
+            self._last_gps_log = status
+            print(f"🛰️ {status}")
+
+        # Only push when we actually have a position. Without this guard a Pi
+        # left powered with the car off would write an all-empty payload to
+        # Firebase twice a second forever, growing telemetry_history for nothing.
+        # With no GPS the behaviour is exactly as before: _decode_message is the
+        # only publisher, so nothing is sent while the bus is quiet.
+        if self.vehicle_state["gps"]:
+            push_telemetry_to_cloud(self.vehicle_state)
+
+    def _shutdown_bus(self) -> None:
+        """Release every open CAN interface (overrides the single-bus base)."""
+        for bus, _ in self._buses:
+            try:
+                bus.shutdown()
+            except Exception:
+                pass  # best effort; we're tearing down regardless
+        self._buses = []
+        # A fresh reopen should be free to search for a USB adapter again.
+        self._usb_bus_active = False
+
+    def _decode_message(self, msg) -> None:
+        """
+        Intercepts incoming CAN frames, pushes to Firebase,
+        and then triggers the UI update signals.
+        """
+        data_bytes = bytes(msg.data)
+        msg_id = msg.arbitration_id
+
+        bms_data = parse_jbd_bms_message(msg_id, data_bytes)
+        if bms_data:
+            self.vehicle_state["battery"].update(bms_data)
+            # Drive the driver HUD's SoC gauge from the REAL BMS (same value the
+            # pit shows). The LYNX 0x618 SoC is only the controller's estimate
+            # and is suppressed once we have a real reading (see _decode_battery).
+            if "bms_soc_percent" in bms_data:
+                self._have_bms_soc = True
+                self.soc_updated.emit(int(round(bms_data["bms_soc_percent"])))
+            # Surface BMS protection faults on the HUD alert bar too — not just
+            # the pit. `bms_protections` is present only on the 0x102 frame and
+            # is [] when nothing is active, so this also CLEARS them on recovery.
+            # Prefixed "BMS" so the driver can tell them from MMS controller
+            # alerts (both have an "overvoltage", for instance).
+            # Real battery current for DS002 (the HUD otherwise derives it as
+            # P/V, which is only an estimate and goes wrong at low voltage).
+            if "bms_current_A" in bms_data:
+                self.battery_current_updated.emit(float(bms_data["bms_current_A"]))
+            # Hottest cell — the number that actually matters for battery
+            # safety. Prefer the dedicated temp module (below); fall back to the
+            # BMS's own NTC probes when it isn't reporting.
+            ntcs = [bms_data[k] for k in ("bms_temp_1_C", "bms_temp_2_C",
+                                          "bms_temp_3_C") if k in bms_data]
+            if ntcs and not self._have_module_cell_temp:
+                self.cell_temp_updated.emit(float(max(ntcs)))
+            if "bms_protections" in bms_data:
+                self._bms_alerts = [(f"BMS {label}", "error")
+                                    for label in bms_data["bms_protections"]]
+                self._emit_alerts()
+
+        # Battery-temperature controller (J1939) — pit/Firebase only,
+        # intentionally NOT surfaced on the driver HUD.
+        temp_data = parse_temp_controller_message(msg_id, data_bytes)
+        if temp_data:
+            self.vehicle_state["temp_controller"].update(temp_data)
+            # The J1939 module measures the pack directly and reports the
+            # highest cell it sees — the authoritative "max cell temp" for
+            # DS001/DS002. Once it speaks, it wins over the BMS NTC fallback.
+            if "battery_temp_high_C" in temp_data:
+                self._have_module_cell_temp = True
+                self.cell_temp_updated.emit(float(temp_data["battery_temp_high_C"]))
+
+        mms_data = parse_mms_message(msg_id, data_bytes)
+        if mms_data: 
+            self.vehicle_state["motor"].update(mms_data)
+
+            # Distance and energy are integrated ONLY from frames that actually
+            # carry the value. The old code advanced a single shared timestamp
+            # on every MMS frame — including status/battery/temperature frames,
+            # which carry no RPM — so those intervals were consumed without
+            # contributing any distance and the odometer read far low. Each
+            # accumulator now owns its own clock inside LapTracker.
+            if "mms_rpm" in mms_data:
+                self.laps.update_motion(mms_data["mms_rpm"])
+            if "mms_power_W" in mms_data:
+                self.laps.update_energy(mms_data["mms_power_W"])
+            # The controller broadcasts its own TRIP counter (0x620). Prefer it
+            # over our integration: it comes from the controller's configured
+            # wheel size rather than our unmeasured tire constant, and being a
+            # counter it cannot lose distance to a dropped frame.
+            if "mms_trip_m" in mms_data:
+                self.laps.update_odometer(mms_data["mms_trip_m"])
+
+            # Merged last so the tracker's derived keys (odometer_m,
+            # calculated_lap, energy, lap timing) always win over the parser's.
+            self.vehicle_state["motor"].update(self.laps.snapshot())
+
+        push_telemetry_to_cloud(self.vehicle_state)
+        
+        if time.time() - self.last_cloud_print > 1.0:
+            print(f"☁️ Cloud Sync Payload: Battery {len(self.vehicle_state['battery'])} keys, Motor {len(self.vehicle_state['motor'])} keys")
+            self.last_cloud_print = time.time()
+
+        super()._decode_message(msg)
+
+    def _decode_status(self, data: bytes) -> None:
+        """Override the MMS status decoder so it CACHES the controller alerts and
+        re-emits the combined (MMS + BMS) list, instead of overwriting the bar
+        with MMS-only alerts the way the base CANWorker does."""
+        # The base class emits the power map from here; this override does not
+        # call super(), so it has to do it too or the pit-wall build would never
+        # show a map at all.
+        self._emit_motor_map(data)
+
+        if len(data) < 8:
+            return
+        limit_word = struct.unpack_from("<H", data, 4)[0]
+        error_word = struct.unpack_from("<H", data, 6)[0]
+        self._mms_alerts = (
+            _word_to_alerts(error_word, _ERROR_BITS, "error")
+            + _word_to_alerts(limit_word, _LIMIT_BITS, "limit")
+        )
+        self._emit_alerts()
+
+    def _emit_alerts(self) -> None:
+        """Push the merged alert list to the HUD. Critical faults first — MMS
+        errors and BMS protections — then MMS limits, capped at 3 so the bar
+        never overflows (same cap the base worker used)."""
+        mms_errors = [a for a in self._mms_alerts if a[1] == "error"]
+        mms_limits = [a for a in self._mms_alerts if a[1] != "error"]
+        combined = mms_errors + self._bms_alerts + mms_limits
+        self.alerts_updated.emit(combined[:3])
+
+    def _decode_battery(self, data: bytes) -> None:
+        """
+        Override of the LYNX 0x618 decoder. The motor controller reports a rough
+        SoC ESTIMATE here; we prefer the real JBD BMS SoC (emitted from
+        _decode_message). So emit voltage as usual, but only use the LYNX SoC as
+        a fallback until the first real BMS reading arrives.
+        """
+        if len(data) < 6:
+            return
+        voltage_raw = struct.unpack_from("<H", data, 4)[0]
+        self.voltage_updated.emit(round(voltage_raw * 0.01, 2))
+        if not self._have_bms_soc:
+            soc = struct.unpack_from("<B", data, 2)[0]
+            self.soc_updated.emit(soc)
+
+# ==============================================================================
+# APPLICATION BOOTSTRAP
+# ==============================================================================
+def bring_up_can_buses():
+    """Bring up any CAN interface that isn't already up.
+
+    Preferred setup is the `can-up.service` systemd unit (see deploy/), which
+    runs as root at boot and has the buses live before this app starts. When
+    that is in place this function finds everything already UP and does nothing.
+
+    Why it checks first rather than always shelling out:
+
+    * `ip link set canX up` FAILS on an interface that is already up
+      ("Device or resource busy"), so the unconditional version printed errors
+      on every launch and taught everyone to ignore the startup output.
+    * Under the autostarted desktop session there is no terminal, so a `sudo`
+      that actually needs a password fails with "no tty present" — noisy, and
+      impossible to answer. Not attempting it is better than failing it.
+    * `can1` usually does not exist on a single-HAT car; probing avoids trying
+      to configure an interface that was never there.
+
+    Reuses config.can_link_state(), which already reports UP / DOWN / ABSENT per
+    channel via `ip link show`, and returns {} when `ip` is unavailable (a
+    laptop), in which case we skip the whole thing.
+    """
+    states = can_link_state()
+    if not states:
+        print("ℹ️ No `ip` command here — skipping CAN bring-up (not a Pi?).")
+        return
+
+    for channel, state in states.items():
+        if state == "UP":
+            print(f"✅ {channel} already up (systemd unit or a previous run).")
+            continue
+        if state == "ABSENT":
+            print(f"ℹ️ {channel} does not exist on this machine — skipping.")
+            continue
+
+        print(f"⚙️ {channel} is down — bringing it up at "
+              f"{CAN_BITRATE // 1000} kbit/s...")
+        for cmd in (
+            f"sudo -n ip link set {channel} up type can bitrate {CAN_BITRATE}",
+            f"sudo -n ip link set {channel} txqueuelen 65536",
+        ):
+            # -n = never prompt. Without a tty a prompt cannot be answered, so
+            # failing immediately with a clear message beats hanging the boot.
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            if result.returncode != 0:
+                err = (result.stderr or "").strip().splitlines()
+                print(f"⚠️ Could not configure {channel}: "
+                      f"{err[-1] if err else 'unknown error'}")
+                print("   Install the can-up.service unit (see deploy/README) so "
+                      "the bus is brought up at boot as root — that is the fix, "
+                      "not granting this app sudo.")
+                break
+
+
+def main():
+    print("Starting Endurance Race Telemetry System v2.0...")
+    bring_up_can_buses()
+    db_url = "https://solar-race-telemetry-default-rtdb.europe-west1.firebasedatabase.app/"
+    try:
+        initialize_firebase("SolarRace_OS/cloud/serviceAccountKey.json", db_url)
+    except Exception as e:
+        print(f"Firebase Init Error: {e}")
+
+    app = QApplication(sys.argv)
+    
+    app.setStyleSheet(RACING_QSS)
+    
+    driver_dash_v2.CANWorker = SmartCANWorker
+    
+    dashboard = RacingDashboard()
+    dashboard.showFullScreen()
+
+    # --- Pit-to-driver messages: subscribe to /driver_command (push, not poll) --
+    # The listener callback runs on a firebase-admin background thread, so it only
+    # emits a Qt signal; the connected slot updates the HUD on the GUI thread.
+    class _CmdBridge(QObject):
+        received = Signal(object)
+    _bridge = _CmdBridge()
+    _bridge.received.connect(dashboard.set_pit_message)
+    try:
+        dashboard._cmd_reg = listen_driver_command(
+            lambda e: _bridge.received.emit(e.data if getattr(e, "path", "/") == "/" else None))
+        print("Listening for pit driver commands...")
+    except Exception as cmd_err:
+        # HUD still runs without it (e.g. a Windows demo with no Firebase creds).
+        print(f"Driver-command listener unavailable: {cmd_err}")
+
+    print("Auto-starting CAN Bus...")
+    dashboard._start_can()
+
+    sys.exit(app.exec())
+
+if __name__ == "__main__":
+    main()

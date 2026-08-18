@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=SolarRace Driver HUD
+GenericName=Driver Dashboard
+Comment=Fullscreen driver HUD; restarts itself if it crashes
+# /bin/bash prefix on purpose: a repo cloned on Windows, or a file rewritten by
+# `git pull`, can lose the executable bit, and this still runs either way.
+# Edit the path if your username is not `pi` or the repo is elsewhere.
+Exec=/bin/bash /home/pi/THE-RACE/deploy/start_hud.sh
+Terminal=false
+StartupNotify=false
+X-GNOME-Autostart-enabled=true
+# Do NOT add OnlyShowIn= — it would exclude the wayfire/labwc sessions that
+# Raspberry Pi OS actually uses, and the HUD would silently never start.

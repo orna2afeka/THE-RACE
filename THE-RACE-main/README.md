@@ -1,0 +1,315 @@
+# 🏎️ Afeka Racing — 24H Endurance Telemetry & Strategy System
+
+[![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://www.python.org/)
+[![Raspberry Pi](https://img.shields.io/badge/Raspberry%20Pi-Edge-C51A4A.svg)](https://www.raspberrypi.org/)
+[![CAN Bus](https://img.shields.io/badge/CAN%20Bus-SocketCAN-2C3E50.svg)](https://www.kernel.org/doc/html/latest/networking/can.html)
+[![Firebase](https://img.shields.io/badge/Firebase-Realtime%20DB-FFCA28.svg)](https://firebase.google.com/)
+[![Streamlit](https://img.shields.io/badge/Pit%20Wall-Streamlit-FF4B4B.svg)](https://streamlit.io/)
+
+Telemetry and race-strategy software for the Afeka Solar & Electric Racing Team,
+built for the **iESC 24-Hour Endurance Race at Circuit Zolder, Belgium**.
+
+The system links the **car** (a Raspberry Pi reading the vehicle CAN bus) to the
+**pit wall** (a laptop dashboard) through the Google Firebase Realtime Database,
+giving engineers live battery, motor, temperature, and strategy data.
+
+---
+
+## 🏁 System Overview
+
+Two subsystems, synchronised through one Firebase node (`live_telemetry`):
+
+```
+   ┌─────────────────────── CAR (Raspberry Pi) ───────────────────────┐
+   │                                                                   │
+   │   CAN bus (can0)                                                  │
+   │   ├─ MMS  (SiliXcon LYNX motor controller)   IDs 0x600–0x628      │
+   │   ├─ BMS  (JBD battery, polled)              IDs 0x100–0x110      │
+   │   └─ TEMP (J1939 thermistor module)          ID  0x1839F380       │
+   │            │                                                      │
+   │            ▼                                                      │
+   │   SolarRace_OS  ──►  parsers  ──►  vehicle_state  ──►  PySide6    │
+   │   (main.py)                                │           Driver HUD │
+   │                                            ▼                      │
+   └──────────────────────────────────  Firebase  ────────────────────┘
+                                            │
+                                            ▼
+   ┌──────────────────────────── PIT WALL (laptop) ───────────────────┐
+   │   collector.py  ──(RTDB REST stream)──►  telemetry.db (SQLite)    │
+   │        the ONLY process that reads Firebase        │              │
+   │                                                    ▼              │
+   │   Pit_Dashboard (Streamlit, reads SQLite — never Firebase)        │
+   │   • Live speed / SoC / battery temp / motor temp / power          │
+   │   • Lap / sector tracking + velocity-profile pace guidance        │
+   │   • 24h energy-strategy matrix & SoC forecast                     │
+   │   • Open-Meteo solar/weather forecast for Zolder                  │
+   │   • Filtered CSV export (date/time + BMS/MMS/Temp subsystems)     │
+   └───────────────────────────────────────────────────────────────────┘
+```
+
+**SolarRace_OS (car / Raspberry Pi)**
+- Reads one shared CAN bus and decodes three protocols off it (motor, battery, temperature).
+- Polls the JBD BMS (it is master/slave — it only answers when queried).
+- Drives a distraction-free **PySide6 driver HUD**.
+- Pushes a live telemetry snapshot to Firebase ~once per second.
+- Falls back to **replaying a recorded log** when no CAN hardware is present, so the dashboards stay alive for development.
+
+**Pit_Dashboard (pit wall / laptop)**
+- `collector.py` is the **single** Firebase client: it streams the append-only
+  `telemetry_history` node (RTDB REST / Server-Sent Events) and stores every
+  sample into a local **SQLite** file (`telemetry.db`), the pit's source of truth.
+  It is idempotent (the RTDB push key is the primary key) and self-heals after a
+  pit dropout by resuming the stream from the last stored key.
+- The Streamlit dashboard reads **only** from SQLite — it never opens its own
+  Firebase connection. History/charts/exports therefore survive page refreshes.
+- Computes pace delta vs. the Zolder velocity profile, lap/sector position,
+  the 24h energy-strategy matrix and SoC forecast, and the Open-Meteo forecast.
+- `export.py` exports history to CSV, filtered by date/time and subsystem
+  (BMS / MMS / Temperature / Motion-GPS), from the dashboard or the command line.
+
+---
+
+## 🔌 CAN Bus Topology
+
+All devices share **one high-speed CAN bus** on the Pi's CAN HAT (`can0`).
+This works because the three message-ID ranges never overlap:
+
+| Device | Protocol | Message IDs | Direction |
+|--------|----------|-------------|-----------|
+| **MMS** (motor) | SiliXcon LYNX | `0x600`–`0x628` (11-bit) | broadcast → Pi |
+| **BMS** (battery) | JBD query/response | `0x100`–`0x110` (11-bit) | Pi polls → BMS replies |
+| **TEMP** (battery temp) | J1939 thermistor | `0x1839F380` (29-bit) | broadcast → Pi |
+
+> ⚠️ **Single-bus requirement:** because they share one wire, **every device must
+> run at the same bitrate** — set by `CAN_BITRATE` in `SolarRace_OS/config.py`
+> (default **500 kbit/s**, the MMS native rate). The BMS baud is user-definable, so
+> set it to match. The J1939 temp module is often fixed at 250 kbit/s; if it cannot
+> be changed to the bus rate, it needs its own adapter instead of the shared bus.
+
+---
+
+## 📂 Repository Structure
+
+```text
+THE RACE/
+│
+├── SolarRace_OS/                     # Edge code — runs on the Raspberry Pi
+│   ├── main.py                       # Entry point: opens CAN, polls BMS, runs the HUD, pushes to Firebase
+│   ├── config.py                     # ⭐ Central config: bus bitrate, connection candidates, BMS poll list
+│   ├── can_worker.py                 # CAN QThread + LYNX decoder + driver-HUD signals
+│   ├── driver_dash_v2.py             # PySide6 driver HUD (the active dashboard, RacingDashboard)
+│   ├── dashboard.py                  # Alternate standalone PySide6 engineering dashboard (pyqtgraph)
+│   ├── test_connection.py            # Quick CAN probe — which bus is live + sample frames
+│   ├── requirements.txt              # Pi dependencies
+│   ├── modules/
+│   │   ├── bms_parser.py             # JBD battery decoder (voltage, current, SoC, cells, temps, protections)
+│   │   ├── mms_parser.py             # SiliXcon LYNX motor decoder (RPM, power, errors)
+│   │   ├── temp_controller_parser.py # J1939 battery-temperature decoder (low/high/avg)
+│   │   └── gps_reader.py             # GPS position via gpsd (background thread, live in main.py)
+│   ├── cloud/
+│   │   ├── firebase_client.py        # Pushes telemetry to the Realtime DB (throttled)
+│   │   └── serviceAccountKey.json    # 🔒 Firebase admin key (keep out of git)
+│   └── data/
+│       └── can_dump.txt              # Recorded CAN log (MMS+BMS+temp) used for simulation fallback
+│
+└── Pit_Dashboard/                    # Pit-wall analytics — runs on an engineer's laptop
+    ├── collector.py                  # ⭐ ONLY Firebase client: streams telemetry_history -> SQLite
+    ├── db.py                         # SQLite schema + idempotent upsert + query helpers
+    ├── export.py                     # CSV export (date/time + subsystem filters); also a CLI
+    ├── pit_config.py                 # Pit-side config: DB URL, paths, sqlite path, device id
+    ├── pit_dashboard.py              # Streamlit dashboard (reads SQLite only, never Firebase)
+    ├── weather_service.py            # Open-Meteo Zolder forecast
+    ├── strategy_engine.py            # Strategy math, SoC forecast graph, velocity profile
+    ├── outputProfile.xlsx            # Zolder velocity profile
+    ├── telemetry.db                  # 🔒 local SQLite store (gitignored; created by collector.py)
+    ├── requirements_pit.txt          # Pit dependencies
+    └── serviceAccountKey.json        # 🔒 Firebase admin key (keep out of git)
+```
+
+---
+
+## ⚙️ Configuration
+
+Almost everything car-side is centralised in **`SolarRace_OS/config.py`**:
+
+| Setting | Purpose |
+|---------|---------|
+| `CAN_BITRATE` | Shared bus bitrate — **all devices must match this** (default `500_000`). |
+| `CAN_CANDIDATES` | Connections tried in order: CAN HAT (`socketcan:can0`) first, then a USB-to-CAN adapter. First that opens wins. |
+| `BMS_POLL_IDS` / `BMS_POLL_BYTE` / `BMS_POLL_INTERVAL_S` | Which BMS frames to request, the query byte (`0x5A`), and how often (1 Hz). |
+| `SIM_LOG_PATH` | Recorded log replayed when no CAN bus is found. |
+
+To use a USB adapter instead of the HAT, or change channels, just edit
+`CAN_CANDIDATES` — no other code changes needed.
+
+---
+
+## 🧰 Hardware
+
+- **Raspberry Pi** (3B+ / 4 / 5) running Raspberry Pi OS.
+- **CAN HAT** (MCP2515-based, e.g. Waveshare) — ensure 120 Ω termination is correct.
+  *(A USB-to-CAN adapter such as PEAK PCAN-USB also works via `CAN_CANDIDATES`.)*
+- **Touchscreen** (7"/10") for the driver HUD.
+- **Internet** for the Pi (hotspot / cellular dongle) to reach Firebase.
+- **GPS module** (NMEA, USB or GPIO) — read through **gpsd**, not directly. Install
+  `gpsd gpsd-clients`, point `/etc/default/gpsd` at the device (`DEVICES="/dev/ttyUSB1"`,
+  `GPSD_OPTIONS="-n"`), enable the service, and confirm with `gpspipe -w`. gpsd owns the
+  serial port; `gps_reader.py` is one of its clients, so nothing else should open that tty.
+
+---
+
+## 🚀 Installation & Running
+
+### A. Car — SolarRace_OS (Raspberry Pi)
+
+**1. Enable the CAN HAT** in `/boot/firmware/config.txt` (or `/boot/config.txt` on older OS), e.g.:
+```
+dtoverlay=mcp2515-can0,oscillator=16000000,interrupt=25
+```
+*(oscillator/interrupt values depend on your specific HAT — check its docs.)* Reboot after editing.
+
+**2. Bring the bus up** at the configured bitrate (1 Mbit/s — see
+`config.CAN_BITRATE`; every device on the shared bus must agree):
+```bash
+sudo ip link set can0 up type can bitrate 1000000
+sudo ip link set can0 txqueuelen 65536
+```
+To make it automatic at boot, install the ready-made unit — do not hand-write one:
+```bash
+sudo cp deploy/can-up.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now can-up.service
+```
+This is also what lets the driver HUD start at boot without needing `sudo`.
+See [deploy/README.md](deploy/README.md) for the full car setup.
+
+**3. Install dependencies and run** — from the **repo root**, not `SolarRace_OS/`
+(`main.py` opens the Firebase key by a relative path, so it silently fails to
+reach the cloud from anywhere else):
+```bash
+pip install -r SolarRace_OS/requirements.txt   # python-can, firebase-admin, PySide6
+python SolarRace_OS/main.py
+```
+On Raspberry Pi OS Bookworm the system Python is "externally managed" and pip
+will refuse — use a venv, and see [deploy/README.md](deploy/README.md) for the
+full setup including auto-boot.
+
+**Check the bus before launching the full app:**
+```bash
+python test_connection.py   # reports which connection is live + sample frames
+candump can0                # raw view (BMS frames appear only once main.py polls)
+```
+
+> **Graceful degradation:** if no CAN connection opens, `main.py` automatically
+> replays `data/can_dump.txt` so the HUD and cloud sync keep working for testing.
+
+### B. Pit wall — Pit_Dashboard (laptop)
+
+Run from the **repo root** (`THE RACE`), just like `SolarRace_OS` — no need to
+`cd` into the folder (all pit paths resolve relative to the package):
+
+```bash
+pip install -r Pit_Dashboard/requirements_pit.txt   # streamlit, pandas, matplotlib, requests, google-auth, openpyxl
+
+# 1. Start the collector FIRST — it ingests Firebase into telemetry.db.
+python Pit_Dashboard/collector.py
+
+# 2. In a second terminal, start the dashboard (reads telemetry.db only).
+streamlit run Pit_Dashboard/pit_dashboard.py
+```
+
+(You can still `cd Pit_Dashboard` and run `python collector.py` /
+`streamlit run pit_dashboard.py` if you prefer.)
+
+**One-click (Windows):** instead of the two commands above, just run
+`run_pit.bat` — it opens the collector and the dashboard in two windows for you.
+SQLite needs no install or setup: it's built into Python, and `telemetry.db` plus
+its table are created automatically on first run.
+The dashboard opens at `http://localhost:8501`. If it shows *"No data yet — is
+collector.py running?"*, start the collector. The collector backfills all history
+on first run and, after any pit-side network drop, resumes from the last stored
+sample (catch-up via `orderBy="$key"&startAt`), so no samples are lost as long as
+the car keeps pushing to `telemetry_history`.
+
+**Export.** The dashboard's Export panel produces a clean, readable **Excel
+workbook** (`.xlsx`): a formatted **Data** sheet (human-friendly columns with
+units, frozen header, filter), a **Charts** sheet of history graphs, and a
+**Faults** sheet. The systems multiselect picks which columns/charts/sheets
+appear. (Internal keys, redundant timestamps, and the raw fault columns from the
+old CSV dump are gone — no more `#NAME?` in Excel.)
+
+**From the command line** (same filters; output format follows the `--out`
+extension — `.xlsx` → workbook, anything else → raw CSV):
+```bash
+python export.py --out race.xlsx                        # Excel workbook (everything)
+python export.py --out race.csv                         # raw CSV (machine use)
+python export.py --out batt.xlsx --group "BMS (battery)" # one subsystem
+python export.py --out window.xlsx --start 2026-06-18T09:00 --end 2026-06-18T11:00
+python export.py --list-metrics                         # show metrics & groups
+```
+
+---
+
+## 📡 Telemetry Data Model
+
+`main.py` publishes to **two** Firebase nodes each push (~1 Hz):
+
+* **`live_telemetry`** — a single snapshot, **overwritten** every push (the "now").
+* **`telemetry_history`** — the same payload `.push()`ed under an auto-generated
+  chronological key, **append-only** (nothing is overwritten). This node is what
+  the pit collector streams to build local history and to catch up after a drop.
+
+Both carry the identical payload shape shown below. The pit `collector.py` reads
+`telemetry_history` only, keying each SQLite row on the RTDB push id so replays
+are idempotent.
+
+```jsonc
+live_telemetry/
+  timestamp: <unix seconds>
+  car_data:
+    battery:           // JBD BMS
+      bms_voltage_V, bms_current_A, bms_remaining_Ah,
+      bms_full_capacity_Ah, bms_cycles, bms_soc_percent,
+      bms_has_error, bms_error_code, bms_protections[], bms_balancing_active,
+      bms_string_count, bms_ntc_count,
+      bms_temp_1_C, bms_temp_2_C, bms_temp_3_C,
+      bms_cell_01_V ... bms_cell_NN_V
+    motor:             // SiliXcon LYNX MMS
+      mms_rpm, mms_power_W, mms_temperature_C,
+      mms_estimated_soc_percent, mms_measured_voltage_V,
+      mms_has_error, mms_error_code,
+      odometer_m, calculated_lap
+    temp_controller:   // J1939 battery-temperature module
+      battery_temp_C (= average), battery_temp_avg_C,
+      battery_temp_low_C, battery_temp_high_C, temp_module
+    gps:               // live from gpsd (gps_reader.py)
+      lat, lon,        // ABSENT entirely when there is no fix — never 0,0
+      fix_mode (2=2D, 3=3D), alt_m, speed_kmh, track_deg,
+      sats_used, fix_age_s, stale
+```
+
+**GPS is published independently of CAN.** Telemetry is normally pushed when a CAN
+frame is decoded, so a quiet bus used to mean no position at all. `main.py` also
+publishes every `GPS_PUBLISH_INTERVAL_S` whenever a fix exists, so the pit map works
+with the car parked and the bus down — which is how you check it before a race. With
+no fix nothing extra is sent, so a car without GPS behaves exactly as before.
+The pit stores only `lat`/`lon` as columns; the rest is kept in `raw_json`.
+
+**BMS polling:** the JBD BMS is master/slave — it stays silent until queried.
+`main.py` transmits each `BMS_POLL_IDS` frame (the ID carrying a single `0x5A` byte)
+once per second; the BMS replies on the same ID and those replies are decoded normally.
+
+---
+
+## 🔒 Security & Track Notes
+
+1. **Firebase keys** — `serviceAccountKey.json` (Firebase Admin SDK) is required in both
+   `SolarRace_OS/cloud/` and `Pit_Dashboard/`. It is listed in `.gitignore`; **never commit it**.
+   If a key was ever pushed, rotate it in the Google Cloud console.
+2. **Track adaptation** — the velocity profile, sector layout, and weather coordinates are
+   set for **Circuit Zolder (4000 m)**. For another venue, update the track constants in the
+   pit dashboard and the coordinates in `weather_service.py` / `fetch_zolder_weather`.
+
+---
+
+*Afeka Solar & Electric Racing Team — telemetry & strategy.*
