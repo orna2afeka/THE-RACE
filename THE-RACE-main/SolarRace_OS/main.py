@@ -268,6 +268,15 @@ class SmartCANWorker(CANWorker):
                 last_real = time.time()   # brief grace before calling it silent
                 state = "silent"
                 self._silent_since = last_real
+                # open_buses() already falls back to a USB adapter itself when
+                # NEITHER can0 nor can1 opens — if that's what happened, a USB
+                # bus (e.g. PCAN) is already in self._buses. Mark the fallback
+                # as done so _maybe_fallback_to_usb() never opens a SECOND
+                # handle to the same USB channel (that's what was producing
+                # "PCAN bus was not properly shut down" — two Bus() instances
+                # fighting over one physical adapter).
+                self._usb_bus_active = any(
+                    not lbl.startswith("socketcan:") for _, lbl in self._buses)
 
             # ---- Drain whatever real traffic is queued on ANY bus -------- #
             got_any = False
