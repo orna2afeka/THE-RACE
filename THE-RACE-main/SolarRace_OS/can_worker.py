@@ -164,20 +164,25 @@ class CANWorker(QThread):
         self.status_updated.emit(f"● CONNECTED  |  {label}")
 
         # ---- 2. Main read loop ---------------------------------------- #
-        while self._running:
-            try:
-                # recv() blocks for up to 1 s, returning None on timeout.
-                # The 1-second timeout lets the loop check self._running
-                # periodically so stop() can exit cleanly.
-                msg = self._bus.recv(timeout=1.0)
-                if msg is not None:
-                    self._decode_message(msg)
-            except can.CanError as exc:
-                self.connection_error.emit(f"CAN read error: {exc}")
-                break
-
-        # ---- 3. Teardown ---------------------------------------------- #
-        self._shutdown_bus()
+        # try/finally, so the bus is released even if _decode_message raises
+        # something that is not a CanError. Without it the thread would die
+        # with the interface still open, and python-can's BusABC.__del__ would
+        # later report "<Bus> was not properly shut down" at process exit.
+        try:
+            while self._running:
+                try:
+                    # recv() blocks for up to 1 s, returning None on timeout.
+                    # The 1-second timeout lets the loop check self._running
+                    # periodically so stop() can exit cleanly.
+                    msg = self._bus.recv(timeout=1.0)
+                    if msg is not None:
+                        self._decode_message(msg)
+                except can.CanError as exc:
+                    self.connection_error.emit(f"CAN read error: {exc}")
+                    break
+        finally:
+            # ---- 3. Teardown ------------------------------------------ #
+            self._shutdown_bus()
 
     # ================================================================== #
     # LYNX protocol decoder                                               #
