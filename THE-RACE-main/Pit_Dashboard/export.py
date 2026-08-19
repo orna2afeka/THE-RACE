@@ -41,11 +41,16 @@ METRIC_GROUPS = {
     "BMS (battery)": ["bms_soc_percent", "bms_voltage_V", "bms_current_A"],
     "MMS (motor)": ["mms_rpm", "mms_power_W", "mms_temperature_C",
                     "mms_motor_temp_C", "mms_motor_ohms",
-                    "mms_motor_map", "mms_motor_map_raw"],
+                    "mms_motor_map", "mms_motor_map_raw",
+                    # The controller's own measurements — see db.METRIC_COLUMNS.
+                    # mms_vehicle_speed_kmh and mms_estimated_soc_percent are
+                    # excluded on purpose; see the _XLSX_COLS note on both.
+                    "mms_measured_voltage_V", "mms_current_A", "mms_trip_m"],
     "Temperature": ["battery_temp_C"],
-    "Motion / GPS": ["odometer_m", "calculated_lap", "lat", "lon"],
+    "Motion / GPS": ["odometer_m", "calculated_lap", "lat", "lon",
+                     "target_speed_kmh"],
     "Laps / Energy": ["total_race_energy", "last_lap_energy", "last_lap_time_s",
-                      "lap_source"],
+                      "lap_source", "regen_energy"],
     "Errors / Faults": ["bms_has_error", "bms_error_code", "bms_protections",
                         "mms_has_error", "mms_error_code", "mms_alerts"],
 }
@@ -124,6 +129,114 @@ def to_csv_bytes(start_ts=None, end_ts=None, metrics=None, device_id=DEVICE_ID) 
 
 
 # ============================================================================
+# HISTORY-TAB CSV — one range, the metrics you charted, nothing else
+# ============================================================================
+# These build from the DataFrame the History chart actually drew, NOT from a
+# fresh query. `to_csv_bytes` above re-reads SQLite, which by now can hold rows
+# the chart never showed — so a file built that way could quietly disagree with
+# the picture it came from. Same frame in, same numbers out.
+
+def _csv_num(v, places=3):
+    """Format one metric cell.
+
+    A missing reading (None/NaN) becomes an EMPTY CELL. This matters: the pit
+    used to coalesce absent readings to 0, so a telemetry dropout exported as a
+    real "0 °C" and got averaged in. An empty cell is the honest version, and
+    both Excel and pandas treat it as missing rather than as a value."""
+    if v is None or v != v:          # NaN is the only value not equal to itself
+        return ""
+    try:
+        return f"{float(v):.{places}f}".rstrip("0").rstrip(".")
+    except (TypeError, ValueError):
+        return _safe(str(v))
+
+
+def _finite(df, column):
+    """Present, non-NaN values of a column — [] if the column isn't there."""
+    if column not in df:
+        return []
+    return [v for v in df[column] if v is not None and v == v]
+
+
+def _history_report_lines(df, charts, session, device_id):
+    """The `#` header block, so the file still explains itself months later.
+
+    Kept `#`-prefixed and ahead of the single header row, which keeps it
+    readable with pandas' `read_csv(..., comment="#")`."""
+    t0, t1 = df["Time"].iloc[0], df["Time"].iloc[-1]
+    now = datetime.now().astimezone()
+    lines = ["Solar Race - Pit Telemetry Export (History tab)"]
+    if session:
+        lines.append(f"Session:   {_safe(str(session))}")
+    lines += [
+        f"Device:    {device_id}",
+        f"Exported:  {now:%Y-%m-%d %H:%M:%S %z}",
+        f"Range:     {t0:%Y-%m-%d %H:%M:%S} -> {t1:%Y-%m-%d %H:%M:%S}",
+        f"Timezone:  pit-local, UTC{now:%z}",
+        f"Samples:   {len(df):,} (full resolution, not downsampled)",
+    ]
+    # Race context for the window, derived from columns already in the frame.
+    # Written whichever metrics were charted, because it describes the RANGE.
+    laps = _finite(df, "Lap")
+    if laps:
+        lines.append(f"Laps:      {int(min(laps))} -> {int(max(laps))}")
+    dist = _finite(df, "Distance")
+    if len(dist) > 1:
+        lines.append(f"Distance:  {max(dist) - min(dist):.2f} km in this range")
+    energy = _finite(df, "Energy")
+    if len(energy) > 1:
+        lines.append(f"Energy:    {max(energy) - min(energy):.0f} Wh in this range")
+    lines.append("Metrics:   " + ", ".join(f"{lbl} ({unit})"
+                                           for _c, lbl, unit, _k in charts))
+    lines += [
+        "Note:      an empty cell means the car never reported that reading.",
+        "           It is NOT a zero — skip those rows when averaging.",
+    ]
+    return lines
+
+
+def history_csv_bytes(df, charts, style="data", session="", device_id=DEVICE_ID) -> bytes:
+    """CSV for one History range.
+
+    `charts` is the dashboard's (column, label, unit, color) list — only those
+    metrics are written, in that order. `style` is "data" (bare table, opens
+    straight into Excel/Sheets) or "report" (the same table behind a documented
+    `#` header block).
+
+    Columns are `Time`, `Elapsed (s)`, then one per metric with its unit in the
+    header. Time is pit-local in a form Excel parses as a datetime; Elapsed lets
+    you plot against time without doing any date maths.
+    """
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
+    headers = ["Time", "Elapsed (s)"] + [f"{lbl} ({unit})"
+                                         for _c, lbl, unit, _k in charts]
+    if df is None or df.empty:
+        writer.writerow(headers)
+        return buf.getvalue().encode("utf-8-sig")
+
+    if style == "report":
+        for line in _history_report_lines(df, charts, session, device_id):
+            buf.write(f"# {line}\n")
+        buf.write("#\n")
+
+    writer.writerow(headers)
+    times = list(df["Time"])
+    t0 = times[0]
+    columns = [list(df[col]) for col, *_rest in charts]
+    for i, when in enumerate(times):
+        writer.writerow(
+            [when.strftime("%Y-%m-%d %H:%M:%S"),
+             f"{(when - t0).total_seconds():.1f}"]
+            + [_csv_num(values[i]) for values in columns]
+        )
+    # utf-8-SIG, not plain utf-8: without the BOM Excel guesses the codepage and
+    # mangles the unit symbols in the headers (°C, Ω) into mojibake. pandas and
+    # Sheets both read the BOM form transparently.
+    return buf.getvalue().encode("utf-8-sig")
+
+
+# ============================================================================
 # EXCEL (.xlsx) export — clean Data sheet + history-graph Charts sheet + Faults
 # ============================================================================
 # Clean, human-readable columns for the workbook. Maps an output key ->
@@ -145,8 +258,26 @@ _XLSX_COLS = {
     "mms_motor_map":     ("Power Map",            None,   None, None),
     "mms_motor_map_raw": ("Power Map (raw)",      "0",    None, "58D68D"),
     "bms_soc_percent":   ("Battery SoC (%)",     "0.0",       "%",    "F1C40F"),
-    "bms_voltage_V":     ("Battery Voltage (V)", "0.00",      "V",    "2ECC71"),
-    "bms_current_A":     ("Battery Current (A)", "0.00",      "A",    "E67E22"),
+    # BOTH voltage sources, each labelled with where it came from. They disagree
+    # (~50 V from the controller vs ~113 V from the BMS for the same pack); the
+    # controller matches the cell count and the JBD decode is a known open bug.
+    # An export that quietly picked one would destroy the evidence.
+    "mms_measured_voltage_V": ("Pack Voltage ctrl (V)", "0.00", "V", "16A085"),
+    "bms_voltage_V":     ("Pack Voltage BMS (V)", "0.00",     "V",    "2ECC71"),
+    "bms_current_A":     ("Battery Current BMS (A)", "0.00",  "A",    "E67E22"),
+    "mms_current_A":     ("Motor Current ctrl (A)", "0.00",   "A",    "D35400"),
+    # NOT exported, deliberately, though both are captured in telemetry.db:
+    #   mms_vehicle_speed_kmh      — reports RPM-like magnitudes, not km/h. Over
+    #     33k backfilled rows it peaks at 6583 while mms_rpm peaks at 6352, and
+    #     2,569 rows exceed 200 km/h. Whatever byte that field decodes, it is not
+    #     road speed. A column headed "km/h" holding 6583 would be worse than no
+    #     column at all.
+    #   mms_estimated_soc_percent  — 0 in all 33,972 rows; the controller never
+    #     populates it, so it is not the independent SoC cross-check it looked like.
+    # Re-add them here the moment the decode in mms_parser.py is fixed.
+    "target_speed_kmh":  ("Target Speed (km/h)", "0.0",       "km/h", "85C1E9"),
+    "regen_energy":      ("Regen Energy (Wh)",   "0.0",       "Wh",   "A9DFBF"),
+    "mms_trip_m":        ("Controller Trip (m)", "0",         "m",    None),
     "battery_temp_C":    ("Battery Temp (°C)", "0.0",    "°C", "FF9900"),
     "distance_km":       ("Distance (km)",       "0.000",     "km",   "1ABC9C"),
     "calculated_lap":    ("Lap",                 "0",         "#",    "7F8C9B"),

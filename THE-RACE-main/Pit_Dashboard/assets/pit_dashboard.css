@@ -223,6 +223,78 @@
 }
 
 /* ------------------------------------------------------------------ */
+/* History tab: LIVE / FROZEN badge. Same shape and weight as the      */
+/* .fault-* banners above so the tab reads as part of the same app.    */
+/* ------------------------------------------------------------------ */
+.hist-badge {
+	font-size: 13px;
+	font-weight: bold;
+	padding: 9px 14px;
+	border-radius: 8px;
+	margin-bottom: 10px;
+}
+.hist-badge.live {
+	background-color: var(--pit-ok-bg, #0d1117);
+	color: var(--pit-ok-text, #2ecc71);
+	border: 1px solid var(--pit-ok-border, #1e3a2a);
+}
+/* Amber, not red: frozen is a state you chose, not a fault. Static — a  */
+/* blinking badge over a deliberately still chart would fight itself.   */
+.hist-badge.frozen {
+	background-color: #3a2a00;
+	color: #ff9900;
+	border: 1px solid #5a4a10;
+}
+
+/* Thirteen metric chips is a lot of furniture above a chart. Tighten the pills  */
+/* so the picker reads as a compact legend rather than thirteen buttons          */
+/* competing with the graph for attention.                                      */
+[data-testid="stButtonGroup"] button {
+	padding: 2px 11px !important;
+	min-height: 30px !important;
+	font-size: 13px !important;
+}
+
+/* History stat cards: min/avg/max/now per metric. Reuses .metric-container */
+/* for the frame; the left border carries the metric's own series colour so  */
+/* a card and its trace are visually the same thing.                        */
+.hist-stat {
+	border-left: 3px solid #00ffcc;
+	padding: 11px 13px;
+}
+.hist-stat .metric-title {
+	font-size: 12px;
+}
+.hist-unit {
+	color: var(--pit-title, #888);
+	font-weight: normal;
+	text-transform: none;
+}
+.hist-now {
+	font-size: 27px;
+	font-weight: bold;
+	line-height: 1.15;
+}
+.hist-mmm {
+	display: flex;
+	gap: 11px;
+	flex-wrap: wrap;
+	font-size: 11px;
+	color: var(--pit-title, #888);
+	margin-top: 3px;
+}
+.hist-mmm b {
+	color: var(--pit-metric-accent, #00ffcc);
+	font-weight: bold;
+}
+.hist-foot {
+	font-size: 10px;
+	color: var(--pit-title, #888);
+	opacity: 0.75;
+	margin-top: 5px;
+}
+
+/* ------------------------------------------------------------------ */
 /* Readability fix: the selected multiselect "pills" (e.g. the group   */
 /* selector) use the bright mint primaryColor as their background.     */
 /* Streamlit paints their text WHITE by default -> white-on-mint is    */

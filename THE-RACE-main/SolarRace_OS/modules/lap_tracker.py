@@ -97,6 +97,14 @@ class LapTracker:
     def __init__(self):
         # --- distance ------------------------------------------------------ #
         self.odometer_m = 0.0
+        # Have we ever had a real basis for these totals? A fresh tracker holds
+        # 0.0, which is indistinguishable from "the car has genuinely covered
+        # 0 m" — so snapshot() used to publish a confident odometer_m: 0.0 and
+        # calculated_lap: 0 from boot, and the pit drew "0.00 km / Lap 0" over a
+        # dead bus. These flags let it publish null instead, which the pit
+        # already stores as NULL and now renders as a dash.
+        self._have_distance = False
+        self._have_energy = False
         self._last_motion_ts = None      # monotonic; owned by update_motion
         # Once the controller's 0x620 TRIP counter appears we follow it instead
         # of integrating RPM — a real counter beats an estimate built on an
@@ -151,6 +159,7 @@ class LapTracker:
             if 0.0 < dt < MAX_SAMPLE_GAP_S:
                 self.odometer_m += drivetrain.distance_metres(rpm, dt)
         self._last_motion_ts = now
+        self._have_distance = True
         self._check_distance_fallback(now)
 
     def update_odometer(self, trip_m, now=None):
@@ -189,6 +198,7 @@ class LapTracker:
         self._last_trip_m = trip_m
         self.using_controller_odo = True
         self._last_motion_ts = now      # distance is live; CAN is not dead
+        self._have_distance = True
         self._check_distance_fallback(now)
 
     def update_energy(self, power_w, now=None):
@@ -218,6 +228,7 @@ class LapTracker:
                 self.energy_gap_s += dt
         self._last_power_ts = now
         self._last_power_w = power_w
+        self._have_energy = True
 
     # ------------------------------------------------------------------ #
     # GPS finish-line detection                                           #
@@ -398,20 +409,29 @@ class LapTracker:
         of needing the two samples either side of a boundary.
 
         None values become JSON null, which the pit already stores as NULL.
+
+        Distance and energy are published as null until something has actually
+        fed them (`_have_distance` / `_have_energy`). Before that they were sent
+        as a flat 0.0 on every frame from boot, so the pit tile read a confident
+        "0.00 km, Lap 0, 0 Wh" while the CAN bus was dead — the same zero-means-
+        unknown lie the HUD gauges had. Lap count follows distance because it is
+        gated on it (see _check_distance_fallback).
         """
+        have_d, have_e = self._have_distance, self._have_energy
         return {
-            "odometer_m": self.odometer_m,
-            "calculated_lap": self.lap_count,
+            "odometer_m": self.odometer_m if have_d else None,
+            "calculated_lap": self.lap_count if have_d else None,
             "lap_source": self.lap_source,
-            "lap_distance_m": self.odometer_m - self._lap_start_odometer_m,
+            "lap_distance_m": (self.odometer_m - self._lap_start_odometer_m
+                               if have_d else None),
             "lap_started_ts": self.lap_started_ts,
             "last_lap_distance_m": self.last_lap_distance_m,
             "last_lap_time_s": self.last_lap_time_s,
             # Watt-hours. NET of regen — see update_energy.
-            "total_race_energy": round(self.total_energy_wh, 3),
+            "total_race_energy": round(self.total_energy_wh, 3) if have_e else None,
             "last_lap_energy": (round(self.last_lap_energy_wh, 3)
                                 if self.last_lap_energy_wh is not None else None),
-            "regen_energy": round(self.regen_energy_wh, 3),
+            "regen_energy": round(self.regen_energy_wh, 3) if have_e else None,
             "gps_lap_count": self.gps_lap_count,
             "finish_line_distance_m": (round(self.finish_line_distance_m, 1)
                                        if self.finish_line_distance_m is not None
@@ -459,6 +479,11 @@ class LapTracker:
             self._armed = bool(data.get("armed", False))
         except (TypeError, ValueError):
             return False
+        # A restored checkpoint IS a real basis for these totals, so they are
+        # known again even before the first post-reboot frame arrives — otherwise
+        # resuming a race would blank the pit's distance until the bus spoke.
+        self._have_distance = True
+        self._have_energy = True
         # Clocks are monotonic and meaningless across a reboot; start them fresh.
         self._last_motion_ts = None
         self._last_power_ts = None

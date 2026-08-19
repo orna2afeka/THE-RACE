@@ -403,12 +403,24 @@ class SmartCANWorker(CANWorker):
     # No-data handling (zero the HUD + report the reason)                 #
     # ------------------------------------------------------------------ #
     def _emit_zeros(self) -> None:
-        """Force every HUD gauge to zero and clear the alert bar."""
-        self.rpm_updated.emit(0)
-        self.voltage_updated.emit(0.0)
-        self.soc_updated.emit(0)
-        self.power_updated.emit(0)          # HUD derives current = P / V → 0
-        self.controller_temp_updated.emit(0)
+        """Blank every HUD gauge and clear the alert bar.
+
+        Blank, not zero. This runs when the bus has gone quiet, and a quiet bus
+        means we do not know any of these values — it does not mean they are 0.
+        Zeroing them was actively misleading: a driver glancing down saw 0 A and
+        0 °C and read a coasting car with a cold motor, when the truth was that
+        the car had stopped telling us anything. The gauges render None as an em
+        dash (see driver_dash_v2._NO_DATA), which the motor-temp field and the
+        map badge below already did via their own sentinels.
+        """
+        self.rpm_updated.emit(None)
+        self.voltage_updated.emit(None)
+        self.soc_updated.emit(None)
+        self.power_updated.emit(None)
+        self.controller_temp_updated.emit(None)
+        self.motor_current_updated.emit(None)
+        self.battery_current_updated.emit(None)
+        self.cell_temp_updated.emit(None)
         # 0 Ω is below the PT1000's physical floor, so the HUD reads it as
         # "no sensor data" and blanks both fields rather than showing the
         # -246 °C that extrapolating 0 Ω would imply.
