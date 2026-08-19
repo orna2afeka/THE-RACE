@@ -97,6 +97,33 @@ _ARC_SPAN  = -270
 
 SPEED_MAX = 140
 
+# Within this much of target counts as on-pace (green). Wide enough that a
+# driver holding a steady line is not nagged by a permanently amber readout.
+#
+# Module level rather than a HUD attribute because two widgets now steer by it:
+# the TARGET strip under the tacho, and the big speed number inside it. Both
+# have to agree on where "on pace" ends, or the number would go red while the
+# strip below it still said green.
+_TARGET_TOLERANCE_KMH = 5.0
+
+
+def _speed_delta_colour(delta_kmh: float) -> QColor:
+    """Colour for the big speed number, from `actual - target`.
+
+        below target   cyan   — room to push
+        on pace        lime   — hold this
+        above target   red    — burning charge the strategy did not budget
+
+    Direction is the whole point of splitting the two off-pace cases: amber in
+    both, as the strip below does, tells the driver something is wrong but not
+    which pedal fixes it. At 90 km/h in sun that distinction has to survive a
+    glance, so it is carried by hue rather than by the sign of a small number.
+    """
+    if abs(delta_kmh) <= _TARGET_TOLERANCE_KMH:
+        return C_LIME
+    return C_RED if delta_kmh > 0 else C_CYAN
+
+
 # Temperature thresholds are shared with the pit (limits.py at the repo root),
 # so a gauge that is red in the car is red on the pit wall too.
 from limits import (                # noqa: E402  (repo root added to sys.path above)
@@ -238,6 +265,11 @@ class TachometerWidget(QWidget):
     Big, bold digital speed readout painted with QPainter.
     Shows the km/h number large and clear (no dial/needle) so it's readable
     at a glance. Background flashes red when speed exceeds 120 km/h.
+
+    The number itself is coloured by how far it is from the active profile's
+    target (see `_speed_delta_colour`), so pace is legible without reading the
+    delta on the strip below. With no profile loaded there is nothing to be off
+    from and it stays white.
     """
 
     _SPEED_ALERT = 120
@@ -248,6 +280,11 @@ class TachometerWidget(QWidget):
         self._speed: float = 0.0
         self._flash_on: bool = False
         self._alert: bool = False
+        # None = no profile loaded. The TARGET, not the delta: this widget
+        # already derives its own speed from rpm, so holding the target lets
+        # every rpm frame recolour the number without the HUD having to push a
+        # delta on both the rpm and the target-speed paths.
+        self._target_kmh: Optional[float] = None
 
         self._flash_timer = QTimer(self)
         self._flash_timer.setInterval(500)
@@ -274,6 +311,11 @@ class TachometerWidget(QWidget):
         self._alert = alert
         self.update()
 
+    def set_target_speed(self, target_kmh: Optional[float]) -> None:
+        """Target for this point on the lap, or None when no profile is live."""
+        self._target_kmh = target_kmh
+        self.update()
+
     def _toggle_flash(self) -> None:
         self._flash_on = not self._flash_on
         self.update()
@@ -287,8 +329,18 @@ class TachometerWidget(QWidget):
         if self._flash_on:
             p.fillRect(0, 0, w, h, QColor(_FLASH))
 
-        # Number turns red past the alert threshold, otherwise crisp white.
-        num_color = C_RED if self._alert else C_WHITE
+        # Pace colouring owns the number whenever a profile is loaded. The
+        # over-speed alert keeps its flashing background either way, so the two
+        # signals stay readable at once rather than one masking the other —
+        # above 120 km/h off a high target the number is cyan on a flashing red
+        # wash, which is exactly the two facts the driver needs.
+        #
+        # With no profile there is no pace to show, so the original rule stands
+        # and the alert takes the number red as it always did.
+        if self._target_kmh is not None:
+            num_color = _speed_delta_colour(self._speed - self._target_kmh)
+        else:
+            num_color = C_RED if self._alert else C_WHITE
 
         # ── Big bold speed number ──────────────────────────────────────── #
         # Font scales with the panel; capped against width so 3 digits ("140")
@@ -549,10 +601,6 @@ class RacingDashboard(QMainWindow):
     # is hidden between corners rather than leaving an empty strip on screen.
     _TARGET_H = 40
     _TURN_ALERT_H = 44
-
-    # Within this much of target counts as on-pace (green). Wide enough that a
-    # driver holding a steady line is not nagged by a permanently amber readout.
-    _TARGET_TOLERANCE_KMH = 5.0
 
     def __init__(self):
         super().__init__()
@@ -1010,9 +1058,9 @@ class RacingDashboard(QMainWindow):
 
         bottom = QHBoxLayout()
         bottom.setSpacing(8)
-        self._ds2_batt_current = MiniGauge("BATT CURRENT", "A", 60.0, C_ORANGE,
-                                           alert_threshold=40.0, decimals=1)
-        self._ds2_motor_current = MiniGauge("MOTOR CURRENT", "A", 120.0, C_ORANGE,
+        self._ds2_batt_current = MiniGauge("BATT CURRENT", "A", 200.0, C_ORANGE,
+                                           alert_threshold=100.0, decimals=1)
+        self._ds2_motor_current = MiniGauge("MOTOR CURRENT", "A", 60.0, C_ORANGE,
                                             alert_threshold=90.0, decimals=1)
         self._ds2_motor_temp = MiniGauge(
             "MOTOR TEMP", "°C", 120.0, C_CYAN, decimals=0,
@@ -1365,7 +1413,7 @@ class RacingDashboard(QMainWindow):
         """
         if delta_kmh is None:
             colour = _OFF
-        elif abs(delta_kmh) <= self._TARGET_TOLERANCE_KMH:
+        elif abs(delta_kmh) <= _TARGET_TOLERANCE_KMH:
             colour = _LIME
         else:
             colour = _ORANGE
@@ -1433,6 +1481,7 @@ class RacingDashboard(QMainWindow):
         """Target speed for this point on the lap, from the active profile."""
         self._target_kmh = target_kmh
         self._target_strategy = strategy
+        self._tacho.set_target_speed(target_kmh)
         self._apply_target_style(self._last_speed_kmh - target_kmh)
 
     @Slot(float, float, float)

@@ -90,9 +90,16 @@ STATUS_MAP_BYTE = 2
 # also display the raw number so a mismatch is visible immediately.
 MOTOR_MAPS = {
     0: "Map 1",
-    1: "Map 2",
-    2: "Map 3",
+    1: "NORMAL MODE",
+    2: "ECO MODE-NOT CONFIG!",
     3: "Reverse",
+    4: "Map 4",
+    5: "Map 5",
+    6: "Map 6",
+    7: "Map 7",
+    8: "Map 8",
+    9: "Map 9",
+    10: "REVERSE MODE",
 }
 
 
