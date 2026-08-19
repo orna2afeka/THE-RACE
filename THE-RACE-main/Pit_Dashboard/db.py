@@ -34,6 +34,33 @@ METRIC_COLUMNS = [
     "mms_rpm",
     "mms_power_W",
     "mms_temperature_C",
+    # The motor controller's OWN measurements, from the LYNX frames. These were
+    # published by the car all along but had no column, so they were dropped on
+    # arrival and only recoverable by hand out of raw_json.
+    #
+    # `mms_measured_voltage_V` is the controller's pack voltage and is the one to
+    # trust: bench-confirmed against the cell count, whereas `bms_voltage_V` above
+    # reads ~2.25x high (112 V for a ~50 V pack) and its JBD decode is a known
+    # open bug. Both are stored so the disagreement stays visible and diagnosable.
+    "mms_measured_voltage_V",
+    "mms_current_A",
+    # The controller's own speed, derived from ITS configured wheel size rather
+    # than from drivetrain.TIRE_DIAMETER_METERS, which is an unmeasured
+    # placeholder. Worth having as a cross-check on the pit's derived speed.
+    "mms_vehicle_speed_kmh",
+    # Distance counter from the controller (0x620). A counter, not an integral,
+    # so it does not accumulate error across dropped frames.
+    "mms_trip_m",
+    # The controller's own SoC estimate — independent of the BMS's, so a
+    # disagreement between them is itself information.
+    "mms_estimated_soc_percent",
+    # Regen energy recovered, Wh. Sits beside total_race_energy, which is NET of
+    # this, so having both is what lets you see gross consumption.
+    "regen_energy",
+    # What the car was TOLD to do at each moment, from the active speed profile.
+    # Storing it makes "did the driver hold the target" answerable after the race
+    # instead of only watchable live.
+    "target_speed_kmh",
     # Motor PT1000 sensor. Both halves are stored: the converted °C is what the
     # pit reads during a race, and the raw Ω is what lets you re-derive it (or
     # spot a dead probe) afterwards without trusting the car's conversion.
@@ -237,6 +264,15 @@ def flatten_record(rtdb_key: str, record: dict, device_id: str = DEVICE_ID) -> d
         "mms_rpm": _num(motor.get("mms_rpm")),
         "mms_power_W": _signed16(motor.get("mms_power_W")),
         "mms_temperature_C": _num(motor.get("mms_temperature_C")),
+        # Controller-side measurements — see the METRIC_COLUMNS notes. All live in
+        # the "motor" block the car publishes.
+        "mms_measured_voltage_V": _num(motor.get("mms_measured_voltage_V")),
+        "mms_current_A": _num(motor.get("mms_current_A")),
+        "mms_vehicle_speed_kmh": _num(motor.get("mms_vehicle_speed_kmh")),
+        "mms_trip_m": _num(motor.get("mms_trip_m")),
+        "mms_estimated_soc_percent": _num(motor.get("mms_estimated_soc_percent")),
+        "regen_energy": _num(motor.get("regen_energy")),
+        "target_speed_kmh": _num(motor.get("target_speed_kmh")),
         "mms_motor_ohms": _num(motor.get("mms_motor_ohms")),
         "mms_motor_temp_C": _num(motor.get("mms_motor_temp_C")),
         "mms_motor_map_raw": _num(motor.get("mms_motor_map_raw")),
@@ -406,6 +442,18 @@ def latest_sample(conn: sqlite3.Connection, device_id: str = DEVICE_ID):
 def count_samples(conn: sqlite3.Connection, device_id: str = DEVICE_ID) -> int:
     row = conn.execute(
         "SELECT COUNT(*) AS n FROM telemetry WHERE device_id = ?", (device_id,)
+    ).fetchone()
+    return int(row["n"]) if row else 0
+
+
+def count_samples_since(conn: sqlite3.Connection, start_ts: float,
+                        device_id: str = DEVICE_ID) -> int:
+    """How many samples arrived at/after `start_ts`. Used by the History tab to
+    say how much new data piled up while a frozen chart was being examined —
+    a COUNT, so it never re-reads the rows it is counting."""
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM telemetry WHERE device_id = ? AND device_ts >= ?",
+        (device_id, start_ts),
     ).fetchone()
     return int(row["n"]) if row else 0
 

@@ -25,6 +25,16 @@ import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
 
+# The History chart needs Plotly: `uirevision` is what lets the browser keep the
+# SAME chart instance across a rerun, so a zoom survives the live refresh. If a
+# pit laptop is on stale requirements we fall back to the old native-chart grid
+# rather than crashing the tab mid-race.
+try:
+    import plotly.graph_objects as go
+    HAS_PLOTLY = True
+except ImportError:
+    HAS_PLOTLY = False
+
 import db
 import export
 from weather_service import fetch_zolder_weather
@@ -183,8 +193,18 @@ def read_live_state():
         conn.close()
 
     state = {
-        "soc": 0, "voltage": 0, "current": 0,
-        "rpm": 0, "temp": 0, "power_w": 0, "batt_temp": 0,
+        # None, not 0, for EVERY metric the car might not have reported. The
+        # motor PT1000 pair below already worked this way; the rest used to
+        # default to 0 and so claimed a flat pack, a cold battery and a stopped
+        # motor whenever the bus was quiet. Displays render None as MISSING_TEXT.
+        "soc": None, "voltage": None, "current": None,
+        "rpm": None, "temp": None, "power_w": None, "batt_temp": None,
+        # Controller-side measurements. `pack_voltage` is the trustworthy pack
+        # voltage (see METRIC_COLUMNS in db.py); `voltage` above is the BMS's
+        # known-suspect one, kept for comparison rather than for decisions.
+        "pack_voltage": None, "motor_current": None, "regen_energy": None,
+        "target_speed_kmh": None, "car_speed_kmh": None, "soc_ctrl": None,
+        "trip_m": None,
         # Motor PT1000: None (not 0) when the car sent no reading, so the pit
         # shows "—" instead of a 0 °C that reads like a freezing motor.
         "motor_temp": None, "motor_ohms": None,
@@ -195,25 +215,32 @@ def read_live_state():
         "last_lap_energy": None, "total_race_energy": None,
         "last_lap_time_s": None, "lap_distance_m": None, "lap_source": None,
         "lap_started_ts": None,
-        "auto_lap": 0, "odometer_km": 0.0,
+        "auto_lap": None, "odometer_km": None,
         # lat/lon fall back to the Zolder paddock purely so the map has somewhere
         # to centre before the car reports. has_gps says whether the position is
         # REAL: without it a placeholder pin is indistinguishable from a live
         # one, and "the map shows a dot" would look like working GPS.
-        "lat": 50.9895, "lon": 5.2568, "has_gps": False, "speed_kmh": 0.0,
+        "lat": 50.9895, "lon": 5.2568, "has_gps": False, "speed_kmh": None,
         "bms_has_error": 0, "bms_error_code": 0, "bms_protections": "",
         "mms_has_error": 0, "mms_error_code": 0, "mms_alerts": "",
     }
     if row is None:
         return state, None
 
-    state["soc"] = _val(row, "bms_soc_percent")
-    state["voltage"] = _val(row, "bms_voltage_V")
-    state["current"] = _val(row, "bms_current_A")
-    state["batt_temp"] = _val(row, "battery_temp_C")
-    state["rpm"] = _val(row, "mms_rpm")
-    state["temp"] = _val(row, "mms_temperature_C")
-    state["power_w"] = _val(row, "mms_power_W")
+    state["soc"] = _val(row, "bms_soc_percent", None)
+    state["voltage"] = _val(row, "bms_voltage_V", None)
+    state["current"] = _val(row, "bms_current_A", None)
+    state["pack_voltage"] = _val(row, "mms_measured_voltage_V", None)
+    state["motor_current"] = _val(row, "mms_current_A", None)
+    state["regen_energy"] = _val(row, "regen_energy", None)
+    state["target_speed_kmh"] = _val(row, "target_speed_kmh", None)
+    state["car_speed_kmh"] = _val(row, "mms_vehicle_speed_kmh", None)
+    state["soc_ctrl"] = _val(row, "mms_estimated_soc_percent", None)
+    state["trip_m"] = _val(row, "mms_trip_m", None)
+    state["batt_temp"] = _val(row, "battery_temp_C", None)
+    state["rpm"] = _val(row, "mms_rpm", None)
+    state["temp"] = _val(row, "mms_temperature_C", None)
+    state["power_w"] = _val(row, "mms_power_W", None)
     state["motor_temp"] = _val(row, "mms_motor_temp_C", None)
     state["motor_ohms"] = _val(row, "mms_motor_ohms", None)
     state["motor_map"] = _val(row, "mms_motor_map", None)
@@ -223,8 +250,10 @@ def read_live_state():
     state["last_lap_time_s"] = _val(row, "last_lap_time_s", None)
     state["lap_distance_m"] = _val(row, "lap_distance_m", None)
     state["lap_source"] = _val(row, "lap_source", None)
-    state["auto_lap"] = int(_val(row, "calculated_lap"))
-    state["odometer_km"] = _val(row, "odometer_m") / 1000.0
+    auto_lap = _val(row, "calculated_lap", None)
+    state["auto_lap"] = None if auto_lap is None else int(auto_lap)
+    odometer_m = _val(row, "odometer_m", None)
+    state["odometer_km"] = None if odometer_m is None else odometer_m / 1000.0
     # NULL lat/lon = the car sent no fix (no GPS, or still searching). Keep the
     # Zolder fallback for the map centre, but remember it isn't a real position.
     state["has_gps"] = _val(row, "lat", None) is not None and \
@@ -233,7 +262,8 @@ def read_live_state():
     state["lon"] = _val(row, "lon", 5.2568)
     # Shared with the driver HUD — see drivetrain.py. Was open-coded here with
     # different constants than the HUD used, which is why the two disagreed.
-    state["speed_kmh"] = speed_kmh(state["rpm"])
+    state["speed_kmh"] = (None if state["rpm"] is None
+                          else speed_kmh(state["rpm"]))
     state["bms_has_error"] = _val(row, "bms_has_error", 0)
     state["bms_error_code"] = _val(row, "bms_error_code", 0)
     state["bms_protections"] = _val(row, "bms_protections", "")
@@ -254,6 +284,12 @@ HISTORY_CHARTS = [
     ("Power",     "Motor Power",     "W",    "#00B3FF"),
     ("RPM",       "Motor RPM",       "rpm",  "#9b59b6"),
     ("SoC",       "Battery SoC",     "%",    "#f1c40f"),
+    # Sourced from the CONTROLLER's measurement, not the BMS's. Same name and
+    # same place in the list as before, but it now reads ~50 V instead of ~113 V
+    # for the same pack, because the controller's figure is the one that matches
+    # the cell count. The BMS decode in bms_parser.py is a known open bug; its
+    # value is still stored and still in the Excel export for diagnosis, it just
+    # isn't the number the pit reads during a race any more.
     ("Voltage",   "Battery Voltage", "V",    "#2ecc71"),
     ("Current",   "Battery Current", "A",    "#e67e22"),
     ("BattTemp",  "Battery Temp",    "°C",   "#ff9900"),
@@ -271,14 +307,45 @@ HISTORY_CHARTS = [
     # further down the History tab, which show one figure per completed lap.
     ("Energy",    "Total Race Energy", "Wh", "#58D68D"),
 ]
+# The other fields the car sends (regen energy, target speed, the controller's own
+# speed and SoC estimate, the trip counter) are stored in telemetry.db and land in
+# the Excel export, but are deliberately kept OUT of this list: they are analysis
+# data, and thirteen chips above the chart is already the most a pit wall wants to
+# read at a glance.
 HISTORY_LABELS = [label for _, label, _, _ in HISTORY_CHARTS]
 
 # Time windows offered above the charts (label -> minutes; None = all history).
-HISTORY_WINDOWS = {"5 min": 5, "15 min": 15, "1 hour": 60, "3 hours": 180,
-                   "12 hours": 720, "24 hours": 1440, "All": None}
+# Every one of these is offered as a one-click preset above the chart, so this
+# dict stays the single source of truth for the window options. The long ones
+# matter: this is a 24-hour race and "how are we doing over the whole night" is
+# a normal question to ask the chart.
+HISTORY_WINDOWS = {"1 min": 1, "5 min": 5, "15 min": 15, "1 hour": 60,
+                   "3 hours": 180, "12 hours": 720, "24 hours": 1440, "All": None}
+
+# What the History tab starts with. NOT all 13 — they now share one chart, and
+# thirteen overlaid traces is a scribble nobody can read. Exactly two units
+# (km/h + %) so the opening view fills both axes honestly and needs no warning;
+# adding a third unit is what prompts the switch to Normalize.
+HISTORY_DEFAULT_METRICS = ["Speed", "Battery SoC"]
 
 # Cap points drawn per chart — keeps wide windows ("All" = a whole race) snappy.
 MAX_PLOT_POINTS = 1500
+
+# Lower cap for the single overlay chart: several traces share it, and total SVG
+# point count is what makes hover go sluggish, not points-per-trace.
+OVERLAY_MAX_POINTS = 900
+
+# Refresh cadences for the History panels. The chart is the only thing that needs
+# to be anywhere near live; the tables were the expensive part of the old
+# everything-every-10s tick.
+CHART_TICK_S = 10
+STATUS_TICK_S = 5
+TABLE_TICK_S = 30
+
+# Shown wherever a reading was never received. The codebase already uses an em
+# dash for this (unknown lap time, unknown target speed, unknown MAP), so a
+# missing number looks the same everywhere instead of masquerading as a real 0.
+MISSING_TEXT = "—"
 
 # How long a history read is reused. Just under the 10s history refresh, so each
 # tick serves from cache instead of re-reading up to 100k rows on the main
@@ -318,24 +385,36 @@ def read_history_df(limit=100000, start_ts=None):
     if not rows:
         return pd.DataFrame(columns=cols)
 
+    # A reading the car never sent stays None -> pandas NaN, NOT 0. The old
+    # `or 0` coalescing turned every telemetry dropout into a confident lie: the
+    # pack "reaching 0 V", the battery "at 0 °C", and — worst — those zeros being
+    # averaged into stint statistics. NaN instead means charts draw an honest gap
+    # and min/avg/max skip the gap rather than being dragged down by it.
     recs = []
     for r in rows:
-        rpm = r["mms_rpm"] or 0
+        rpm = r["mms_rpm"]
+        odo = r["odometer_m"]
         recs.append({
             "Time": datetime.fromtimestamp(r["device_ts"]) if r["device_ts"] else None,
-            "Speed": speed_kmh(rpm),
-            "Power": r["mms_power_W"] or 0,
+            "Speed": speed_kmh(rpm) if rpm is not None else None,
+            "Power": r["mms_power_W"],
             "RPM": rpm,
-            "SoC": r["bms_soc_percent"] or 0,
-            "Voltage": r["bms_voltage_V"] or 0,
-            "Current": r["bms_current_A"] or 0,
-            "BattTemp": r["battery_temp_C"] or 0,
-            "MotorTemp": r["mms_motor_temp_C"] or 0,
-            "CtrlTemp": r["mms_temperature_C"] or 0,
-            "MotorOhms": r["mms_motor_ohms"] or 0,
-            "Distance": (r["odometer_m"] or 0) / 1000.0,
-            "Lap": r["calculated_lap"] or 0,
-            "Energy": r["total_race_energy"] or 0,
+            "SoC": r["bms_soc_percent"],
+            # The controller's measurement — see the HISTORY_CHARTS note. NO
+            # fallback to bms_voltage_V: the two disagree by ~2.25x, so filling
+            # gaps from the other source would draw a trace that steps between
+            # 50 V and 113 V and looks like a real electrical event. A gap is
+            # honest. Rows predating this column read empty until
+            # tools/backfill_columns.py recovers them from raw_json.
+            "Voltage": r["mms_measured_voltage_V"],
+            "Current": r["bms_current_A"],
+            "BattTemp": r["battery_temp_C"],
+            "MotorTemp": r["mms_motor_temp_C"],
+            "CtrlTemp": r["mms_temperature_C"],
+            "MotorOhms": r["mms_motor_ohms"],
+            "Distance": odo / 1000.0 if odo is not None else None,
+            "Lap": r["calculated_lap"],
+            "Energy": r["total_race_energy"],
         })
     return pd.DataFrame(recs)
 
@@ -353,8 +432,13 @@ def _mms_fault_detail(alerts, code):
             or f"error 0x{int(code or 0):X}")
 
 
+@st.cache_data(ttl=30, show_spinner=False)
 def read_fault_episodes(limit_rows=3000, gap_s=3.0):
     """Collapse the per-sample fault rows into discrete episodes.
+
+    Cached for 30s: this reads 3000 rows and collapses them in Python, which was
+    the most expensive thing on the History refresh path. Fault history barely
+    changes between ticks, so re-deriving it every time bought nothing.
 
     Consecutive fault rows with the same signature (and no time gap bigger than
     `gap_s`) become one episode with a start time and duration — so a fault that
@@ -407,6 +491,54 @@ def format_lap_time(seconds):
         return "—"
     minutes, rem = divmod(seconds, 60.0)
     return f"{int(minutes)}:{rem:06.3f}"
+
+
+def fmt(value, spec=".0f", missing=None):
+    """Format a possibly-unknown reading.
+
+    `None` means the car never reported it, and that is shown as an em dash
+    rather than a number. Every numeric readout on the dashboard goes through
+    here so a missing value can never reach the screen disguised as a real one —
+    a "0" battery temperature or "0 V" pack is a lie the pit wall acts on."""
+    if value is None:
+        return missing if missing is not None else MISSING_TEXT
+    try:
+        return format(value, spec)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _age_text(seconds):
+    """Data age in units a human reads at a glance.
+
+    "Stale · 77585s ago" is a number you have to do arithmetic on before you know
+    whether to worry; "21h 33m ago" is not."""
+    seconds = int(seconds)
+    if seconds < 90:
+        return f"{seconds}s"
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {sec}s"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h {minutes}m"
+    days, hours = divmod(hours, 24)
+    return f"{days}d {hours}h"
+
+
+def _over_cond(value, warn, crit):
+    """Tile severity for a reading where HIGH is bad (temperatures).
+
+    An unknown reading is styled "normal", not safe-looking-green and not
+    alarming red: we have no evidence either way, and the value itself already
+    shows as a dash so nobody mistakes it for a measurement."""
+    if value is None:
+        return "normal"
+    if value > crit:
+        return "critical"
+    if value > warn:
+        return "warning"
+    return "normal"
 
 
 def render_metric(col, title, val, unit, condition="normal"):
@@ -516,8 +648,14 @@ def _live_context():
     # step every lap. Fall back to the modulo for older rows that lack it.
     if state["lap_distance_m"] is not None:
         current_lap_dist_m = float(state["lap_distance_m"]) % TRACK_LENGTH_METERS
-    else:
+    elif odometer_km is not None:
         current_lap_dist_m = (odometer_km * 1000.0) % TRACK_LENGTH_METERS
+    else:
+        # Nothing to place the car with. Track POSITION still needs a number to
+        # render a strip, and 0 m is where it always sat before the car reported.
+        # The distance READOUTS stay None so they show a dash — position being
+        # unknown-but-drawn is fine, a fabricated odometer figure is not.
+        current_lap_dist_m = 0.0
     track_status = get_live_track_status(current_lap_dist_m,
                                          load_velocity_profile(VELOCITY_PROFILE_PATH))
     try:
@@ -532,8 +670,11 @@ def _live_context():
         "mins_left": int(time_left_min % 60),
         "secs_left": int((time_left_min * 60) % 60),
         "active_lap": active_lap,
-        "lap_delta": active_lap - expected_laps_now,
-        "gap_to_competitor": active_lap - comp_laps,
+        # None when the car has not reported a lap count and nobody has set one
+        # manually. Comparing an unknown lap tally against a target produces a
+        # deficit that looks like the car is losing the race.
+        "lap_delta": None if active_lap is None else active_lap - expected_laps_now,
+        "gap_to_competitor": None if active_lap is None else active_lap - comp_laps,
         "odometer_km": odometer_km,
         "current_lap_dist_m": current_lap_dist_m,
         "track_status": track_status,
@@ -552,16 +693,19 @@ def _sidebar_status_fragment():
     elif age is None:
         st.error("No data — is collector.py running?", icon=":material/cloud_off:")
     else:
-        st.warning(f"Stale · {age:.0f}s ago", icon=":material/warning:")
+        st.warning(f"Stale · {_age_text(age)} ago", icon=":material/warning:")
 
     st.metric(":material/timer: Time Remaining",
               f"{c['hours_left']:02d}:{c['mins_left']:02d}:{c['secs_left']:02d}")
     r1a, r1b = st.columns(2)
-    r1a.metric(":material/loop: Active Lap", f"{c['active_lap']}")
-    r1b.metric(":material/timelapse: Lap Delta", f"{c['lap_delta']:+.1f}")
+    r1a.metric(":material/loop: Active Lap", fmt(c["active_lap"], "d"))
+    r1b.metric(":material/timelapse: Lap Delta", fmt(c["lap_delta"], "+.1f"))
     r2a, r2b = st.columns(2)
-    r2a.metric(":material/compare_arrows: Gap (laps)", f"{c['gap_to_competitor']:+d}")
-    r2b.metric(":material/route: Distance", f"{c['odometer_km']:.1f} km")
+    r2a.metric(":material/compare_arrows: Gap (laps)",
+               fmt(c["gap_to_competitor"], "+d"))
+    r2b.metric(":material/route: Distance",
+               MISSING_TEXT if c["odometer_km"] is None
+               else f"{c['odometer_km']:.1f} km")
     st.metric(":material/pin_drop: Sector", f"S{c['current_sector_id']} · {c['sb_sector_name']}")
 
 
@@ -617,7 +761,7 @@ def _top_strip_fragment():
 
     soc, temp, batt_temp = state["soc"], state["temp"], state["batt_temp"]
     c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
-    render_metric(c1, "Speed", f"{state['speed_kmh']:.1f}", "KM/H")
+    render_metric(c1, "Speed", fmt(state["speed_kmh"], ".1f"), "KM/H")
 
     # Motor PT1000 — the converted °C is the headline, with the raw Ω beside it
     # so the pit can see the measurement the temperature came from (and tell a
@@ -638,18 +782,17 @@ def _top_strip_fragment():
 
     # Byte 4 of the same frame — the controller's own temperature. Previously
     # mislabelled "Motor Temp" here, back when the motor had no sensor of its own.
-    temp_cond = "normal"
-    if temp > CTRL_TEMP_WARN: temp_cond = "warning"
-    if temp > CTRL_TEMP_CRIT: temp_cond = "critical"
-    render_metric(c3, "Controller Temp", f"{temp}", "°C", temp_cond)
-    soc_cond = "critical" if soc < 20 else "normal"
-    render_metric(c4, "Battery SoC", f"{soc}", "%", soc_cond)
-    bt_cond = "normal"
-    if batt_temp > CELL_TEMP_WARN: bt_cond = "warning"
-    if batt_temp > CELL_TEMP_CRIT: bt_cond = "critical"
-    render_metric(c5, "Battery Temp", f"{batt_temp}", "°C", bt_cond)
-    render_metric(c6, "Power Out", f"{state['power_w']}", "W")
-    render_metric(c7, "Lap Dist", f"{c['current_lap_dist_m']:.0f}", "m")
+    render_metric(c3, "Controller Temp", fmt(temp), "°C",
+                  _over_cond(temp, CTRL_TEMP_WARN, CTRL_TEMP_CRIT))
+    # SoC is inverted — LOW is the dangerous end. Unknown is styled neutral
+    # either way: an absent reading is not evidence of a healthy pack, and it is
+    # not evidence of a flat one either.
+    soc_cond = "critical" if soc is not None and soc < 20 else "normal"
+    render_metric(c4, "Battery SoC", fmt(soc), "%", soc_cond)
+    render_metric(c5, "Battery Temp", fmt(batt_temp), "°C",
+                  _over_cond(batt_temp, CELL_TEMP_WARN, CELL_TEMP_CRIT))
+    render_metric(c6, "Power Out", fmt(state["power_w"]), "W")
+    render_metric(c7, "Lap Dist", fmt(c["current_lap_dist_m"]), "m")
 
     # ── Second row: per-lap analytics ─────────────────────────────────────── #
     # A second row rather than widening the first: seven tiles are already
@@ -899,69 +1042,598 @@ def _render_lap_charts():
             s4.metric("Average Wh/lap", f"{energy.mean():.1f}")
 
 
-@st.fragment(run_every=10)
-def _history_fragment():
-    """History tab — chart grid + recent samples + errors history. In place.
-    Reads the window/metric controls (rendered in main, outside this fragment)
-    from session_state."""
-    hist_window = st.session_state.get("hist_window", "15 min")
-    hist_metrics = st.session_state.get("hist_metrics", HISTORY_LABELS)
+# ============================================================================
+# HISTORY TAB
+# ============================================================================
+# The old version drew 13 st.line_charts inside one @st.fragment(run_every=10),
+# so every tick rebuilt every chart, re-read 3000 fault rows and redrew two
+# tables. You could not examine anything: the view was destroyed under you every
+# ten seconds.
+#
+# The fix is a FREEZE, not a smarter chart. Streamlit hashes the whole figure
+# JSON into the chart's element id and the browser uses that id as its React
+# key, so *any* data change tears the plot down and rebuilds it — `key=` and
+# `uirevision` cannot prevent it. The flip side is that identical JSON means an
+# identical id and therefore no rebuild at all. So:
+#
+#   LIVE   — refreshes every 10s. Zoom is REMOVED rather than offered and
+#            broken: dragging selects a time range, which freezes. Nobody gets
+#            to zoom and then have it yanked away.
+#   FROZEN — the chart fragment has no run_every at all, so nothing is redrawn
+#            and zoom / pan / hover are perfectly stable for as long as you like.
+#
+# What the server knows: a scroll or modebar zoom happens entirely in the
+# browser and is never reported back to Python. So the range used for stats and
+# exports is the *server-known* one — window preset, narrowed by a drag — and it
+# is printed on screen verbatim. Nothing here claims to export "what's visible",
+# because after a free zoom that would be a lie.
 
-    window_min = HISTORY_WINDOWS.get(hist_window)
-    # Quantise the window start to whole HISTORY_CACHE_S steps. `start_ts` is
-    # part of read_history_df's cache key, so a raw time.time() would produce a
-    # brand-new key on every tick and the cache would never hit once.
-    if window_min:
-        now_q = int(time.time() // HISTORY_CACHE_S) * HISTORY_CACHE_S
-        start_ts = now_q - window_min * 60
+HIST_CHART_KEY = "hist_chart"
+
+# The wrapper only injects its own default removals when we supply none, so this
+# list has to carry `sendDataToCloud` and `lasso2d` itself.
+_HIST_MODEBAR_BASE = ["sendDataToCloud", "lasso2d", "select2d", "toggleSpikelines",
+                      "hoverClosestCartesian", "hoverCompareCartesian"]
+
+
+def _hist_chart_config(frozen):
+    """Live: no zoom controls at all, so the only drag is "pick a range".
+    Frozen: the full kit, because now nothing will redraw and take it away."""
+    if frozen:
+        return {"displaylogo": False, "scrollZoom": True,
+                "modeBarButtonsToRemove": _HIST_MODEBAR_BASE}
+    return {
+        "displaylogo": False,
+        "scrollZoom": False,
+        "modeBarButtonsToRemove": _HIST_MODEBAR_BASE + [
+            "zoom2d", "pan2d", "zoomIn2d", "zoomOut2d", "autoScale2d",
+        ],
+    }
+
+
+def _hist_frozen_range():
+    """The frozen (t0, t1) unix range, or None when live."""
+    return st.session_state.get("hist_freeze")
+
+
+def _hist_span_text(t0, t1):
+    """Human range text. Includes dates the moment the span crosses midnight.
+
+    Bare %H:%M:%S was actively misleading on this data: a range covering two
+    months read as "19:24:38 → 15:11:58", which looks like it ends before it
+    starts. A 24-hour race means most interesting ranges cross a date boundary."""
+    same_day = t0.date() == t1.date()
+    if same_day:
+        return f"{t0:%H:%M:%S} → {t1:%H:%M:%S}"
+    if (t1 - t0) < pd.Timedelta(days=1):
+        return f"{t0:%H:%M:%S} → {t1:%H:%M:%S} (+1 day)"
+    return f"{t0:%d %b %H:%M} → {t1:%d %b %H:%M}"
+
+
+def _hist_bounds():
+    """Server-known range as (start_ts, end_ts); end_ts None means "up to now"."""
+    frozen = _hist_frozen_range()
+    if frozen:
+        return float(frozen[0]), float(frozen[1])
+    window_min = HISTORY_WINDOWS.get(st.session_state.get("hist_window") or "15 min")
+    if not window_min:
+        return None, None
+    # Quantise to whole HISTORY_CACHE_S steps: start_ts is part of
+    # read_history_df's cache key, so a raw time.time() would mint a brand-new
+    # key every tick and the cache would never hit once.
+    now_q = int(time.time() // HISTORY_CACHE_S) * HISTORY_CACHE_S
+    return now_q - window_min * 60, None
+
+
+def _hist_frame():
+    """(DataFrame, start_ts, end_ts) for the current range, full resolution."""
+    start_ts, end_ts = _hist_bounds()
+    df = read_history_df(start_ts=start_ts)
+    if end_ts is not None and not df.empty:
+        df = df[df["Time"] <= datetime.fromtimestamp(end_ts)]
+    return df, start_ts, end_ts
+
+
+def _hist_selected_charts():
+    labels = st.session_state.get("hist_metrics")
+    if not labels:
+        return []
+    return [c for c in HISTORY_CHARTS if c[1] in labels]
+
+
+@st.cache_data(ttl=4, show_spinner=False)
+def _hist_new_since(ts):
+    """How many samples landed after `ts` — the "new data buffered" counter."""
+    conn = db.get_conn()
+    try:
+        return db.count_samples_since(conn, ts)
+    finally:
+        conn.close()
+
+
+def _break_time_gaps(plot_df, factor=8.0):
+    """Insert a blank row wherever the car stopped reporting for a while.
+
+    `connectgaps=False` only breaks a line on a missing VALUE. Two samples three
+    weeks apart are still consecutive rows, so Plotly joins them with a straight
+    line — which is how a collection gap ended up drawn as a confident diagonal
+    sweep across the whole chart, looking like real telemetry. An all-NaN row at
+    each discontinuity makes a gap render as what it is: nothing.
+
+    `factor` is relative to the frame's own median interval, so this works the
+    same on a 1-minute window as on a whole race.
+    """
+    if len(plot_df) < 3:
+        return plot_df
+    deltas = plot_df.index.to_series().diff()
+    typical = deltas.median()
+    if pd.isna(typical) or typical <= pd.Timedelta(0):
+        return plot_df
+    gap_at = deltas[deltas > typical * factor].index
+    if len(gap_at) == 0:
+        return plot_df
+    # One blank sample-width before each resumption, so the break sits inside the
+    # gap rather than on top of the first real reading after it.
+    filler = pd.DataFrame(index=gap_at - typical, columns=plot_df.columns,
+                          dtype="float64")
+    return pd.concat([plot_df, filler]).sort_index()
+
+
+def _hist_axis_plan(charts, normalize):
+    """Which y-axis each unit lands on.
+
+    One chart can be asked to hold km/h, W, % and °C at once, so metrics are
+    grouped by unit: first group left, second right. A third has nowhere honest
+    to go — we refuse to plot it against someone else's axis and say so.
+    Returns (unit -> axis, units_plotted, units_refused)."""
+    units = []
+    for _key, _label, unit, _color in charts:
+        if unit not in units:
+            units.append(unit)
+    if normalize:
+        return {u: "y" for u in units}, units, []
+    plan = {u: ("y" if i == 0 else "y2") for i, u in enumerate(units[:2])}
+    return plan, units[:2], units[2:]
+
+
+def _hist_figure(plot_df, charts, normalize, dark, view_rev):
+    """The overlay figure. `view_rev` must change only when the view should be
+    reset (range, metrics, scale) — while it holds steady Plotly keeps whatever
+    the user did by hand."""
+    plan, plotted, refused = _hist_axis_plan(charts, normalize)
+    grid = "rgba(255,255,255,0.09)" if dark else "rgba(0,0,0,0.10)"
+    fg = "#c9d3dd" if dark else "#1c2733"
+
+    fig = go.Figure()
+    for key, label, unit, color in charts:
+        if unit in refused:
+            continue
+        series = plot_df[key]
+        trace = dict(x=plot_df.index, name=f"{label} ({unit})", mode="lines",
+                     line=dict(color=color, width=2.2),
+                     # NaN is a real gap in telemetry, so let it show as one
+                     # instead of bridging it with a line that never happened.
+                     connectgaps=False)
+        if normalize:
+            lo, hi = series.min(), series.max()
+            span = hi - lo
+            # A flat series has no range to scale into; park it mid-chart rather
+            # than dividing by zero.
+            trace["y"] = ((series - lo) / span * 100.0) if span else series * 0 + 50.0
+            # The SHAPE is normalised but the number you read is not: real values
+            # ride along in customdata and that is what the tooltip prints.
+            trace["customdata"] = series
+            trace["hovertemplate"] = f"{label} <b>%{{customdata:.2f}}</b> {unit}<extra></extra>"
+        else:
+            trace["y"] = series
+            trace["yaxis"] = plan[unit]
+            trace["hovertemplate"] = f"{label} <b>%{{y:.2f}}</b> {unit}<extra></extra>"
+        fig.add_trace(go.Scatter(**trace))
+
+    frozen = _hist_frozen_range() is not None
+    fig.update_layout(
+        uirevision=view_rev,
+        height=470,
+        # Zero side margins + automargin on the axes: Plotly then reserves
+        # exactly the width the tick labels need. A fixed l=10 clipped the
+        # leading digit off every y label ("50" rendered as "0").
+        margin=dict(l=0, r=0, t=30, b=0, pad=4, autoexpand=True),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color=fg, size=13),
+        # The modebar inherits the (transparent) paper colour otherwise, which
+        # left dark-on-dark icons that were effectively invisible.
+        modebar=dict(bgcolor="rgba(0,0,0,0)", color=fg,
+                     activecolor="#00ffcc" if dark else "#0a3d62"),
+        hovermode="x unified",
+        hoverlabel=dict(bgcolor="#0d1117" if dark else "#ffffff",
+                        bordercolor=grid, font=dict(color=fg, size=12)),
+        # Live: drag = pick a range (and freeze). Frozen: drag = pan, since the
+        # range is already chosen. Horizontal only — the vertical extent of a
+        # time selection is meaningless.
+        dragmode="pan" if frozen else "select",
+        selectdirection="h",
+        legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0,
+                    bgcolor="rgba(0,0,0,0)"),
+        xaxis=dict(gridcolor=grid, zeroline=False, showspikes=True,
+                   spikemode="across", spikesnap="cursor", spikethickness=1,
+                   spikedash="dot", spikecolor=fg, automargin=True),
+        # Unit as a horizontal caption above the axis, not a rotated title: a
+        # sideways "km/h" squeezed against the tick labels was unreadable and ate
+        # the width the labels needed.
+        yaxis=dict(gridcolor=grid, zeroline=False, automargin=True,
+                   ticksuffix=" ",
+                   title=dict(text=("% of range" if normalize
+                                    else (plotted[0] if plotted else "")),
+                              font=dict(size=11), standoff=6)),
+    )
+    if len(plotted) > 1 and not normalize:
+        fig.update_layout(yaxis2=dict(overlaying="y", side="right", showgrid=False,
+                                      zeroline=False, automargin=True,
+                                      title=dict(text=plotted[1],
+                                                 font=dict(size=11), standoff=6)))
+    return fig, refused
+
+
+def _hist_range_from_selection(selection, plot_df):
+    """Unix (t0, t1) from a Plotly box selection, or None.
+
+    Prefers `point_indices` — every trace shares one index, so the indices give
+    an exact window with no date parsing. Falls back to the box rectangle's own
+    x values (plotly date strings) for a drag that spans a gap and so caught no
+    points. This is a client-supplied payload, so it is parsed defensively."""
+    if not selection:
+        return None
+    idx = [i for i in (selection.get("point_indices") or [])
+           if isinstance(i, int) and 0 <= i < len(plot_df)]
+    if idx:
+        t0 = plot_df.index[min(idx)].timestamp()
+        t1 = plot_df.index[max(idx)].timestamp()
     else:
-        start_ts = None
-    hist_df = read_history_df(start_ts=start_ts)
-    selected = hist_metrics if hist_metrics is not None else HISTORY_LABELS
-    charts = [c for c in HISTORY_CHARTS if c[1] in selected]
+        boxes = selection.get("box") or []
+        xs = list(boxes[0].get("x") or []) if boxes else []
+        stamps = []
+        for v in xs:
+            try:
+                stamps.append(pd.Timestamp(v).timestamp())
+            except (ValueError, TypeError):
+                continue
+        if len(stamps) < 2:
+            return None
+        t0, t1 = min(stamps), max(stamps)
+    # A stray click reads as a zero-width box, which is not a range.
+    return (t0, t1) if t1 - t0 >= 1.0 else None
 
-    if hist_df.empty:
-        st.info("No telemetry in this window. Widen it or start collector.py.",
-                icon=":material/info:")
-    elif not charts:
-        st.info("No charts selected — pick metrics from the box above.",
-                icon=":material/info:")
+
+FILTER_OFF = "— none —"
+
+
+def _clear_hist_filter():
+    """Reset the value filter. Must run as a widget callback — see the caller."""
+    st.session_state["hist_filter_metric"] = FILTER_OFF
+    st.session_state["hist_filter_min"] = None
+    st.session_state["hist_filter_max"] = None
+
+
+def _apply_value_filter(df, plotted_labels=()):
+    """Blank the chosen metric outside its min/max band.
+
+    Returns (frame, note). Masks that metric's COLUMN rather than dropping rows,
+    so the other traces keep their full history — you are filtering one signal,
+    not deleting moments in time.
+
+    The masked cells become NaN, which is deliberate: NaN is already the "no
+    reading" value everywhere in this app, so the chart gaps there and min/avg/max
+    and both CSVs recompute without them automatically. The filter reaches the
+    numbers, not just the picture — which is the whole point of filtering out a
+    bad reading rather than just scrolling it off screen. `note` is what tells the
+    user it happened, so a filtered stat can never be mistaken for an unfiltered
+    one.
+    """
+    label = st.session_state.get("hist_filter_metric")
+    if not label or label == FILTER_OFF:
+        return df, None
+    entry = next((c for c in HISTORY_CHARTS if c[1] == label), None)
+    if entry is None or entry[0] not in df:
+        return df, None
+    lo = st.session_state.get("hist_filter_min")
+    hi = st.session_state.get("hist_filter_max")
+    if lo is None and hi is None:
+        return df, None
+
+    col, _lbl, unit, _colour = entry
+    # A band set on a metric that is not on the chart changes nothing, so saying
+    # "filter active" would be as misleading as saying nothing. Name the reason.
+    if plotted_labels and label not in plotted_labels:
+        return df, f"{label} filter is set but {label} is not plotted — no effect"
+    series = df[col]
+    keep = series.notna()
+    if lo is not None:
+        keep &= series >= lo
+    if hi is not None:
+        keep &= series <= hi
+    hidden = int((series.notna() & ~keep).sum())
+    if not hidden:
+        return df, None
+
+    df = df.copy()
+    df[col] = series.where(keep)
+    bounds = (f"{lo:g}–{hi:g}" if lo is not None and hi is not None
+              else (f"≥ {lo:g}" if hi is None else f"≤ {hi:g}"))
+    return df, f"{label} filtered to {bounds} {unit} · {hidden:,} reading(s) hidden"
+
+
+def _hist_count_between(df, span):
+    """How many samples of `df` fall inside a (t0, t1) unix span."""
+    t0, t1 = (datetime.fromtimestamp(span[0]), datetime.fromtimestamp(span[1]))
+    return int(((df["Time"] >= t0) & (df["Time"] <= t1)).sum())
+
+
+def _hist_fmt(value):
+    if value is None or pd.isna(value):
+        return MISSING_TEXT
+    if abs(value) >= 1000:
+        return f"{value:,.0f}"
+    return f"{value:.1f}"
+
+
+def _hist_stat_card(label, unit, color, series):
+    """min / avg / max / now for one metric over the server-known range.
+
+    NaN-aware throughout: pandas skips missing readings, so a dropout no longer
+    drags the average toward zero the way the old `or 0` coalescing did. The
+    count of missing samples is shown rather than hidden."""
+    clean = series.dropna()
+    if clean.empty:
+        return (f'<div class="metric-container hist-stat" style="border-left-color:{color}">'
+                f'<div class="metric-title">{label}</div>'
+                f'<div class="hist-now" style="color:{color}">{MISSING_TEXT}</div>'
+                f'<div class="hist-foot">no readings in range</div></div>')
+    missing = int(series.isna().sum())
+    foot = f"{len(clean):,} samples"
+    if missing:
+        foot += f" · {missing:,} missing"
+    return (
+        f'<div class="metric-container hist-stat" style="border-left-color:{color}">'
+        f'<div class="metric-title">{label} <span class="hist-unit">{unit}</span></div>'
+        f'<div class="hist-now" style="color:{color}">{_hist_fmt(clean.iloc[-1])}</div>'
+        f'<div class="hist-mmm"><span>min <b>{_hist_fmt(clean.min())}</b></span>'
+        f'<span>avg <b>{_hist_fmt(clean.mean())}</b></span>'
+        f'<span>max <b>{_hist_fmt(clean.max())}</b></span></div>'
+        f'<div class="hist-foot">{foot}</div></div>'
+    )
+
+
+def _render_hist_stats(df, charts):
+    per_row = 4
+    for i in range(0, len(charts), per_row):
+        cols = st.columns(per_row)
+        for col, (key, label, unit, color) in zip(cols, charts[i:i + per_row]):
+            col.markdown(_hist_stat_card(label, unit, color, df[key]),
+                         unsafe_allow_html=True)
+
+
+def _render_hist_export(df, charts):
+    """CSV for exactly the range the caption above names.
+
+    Built from the same DataFrame the chart and the stats used, so the picture,
+    the numbers and the file cannot disagree. `data=` takes a callable, which
+    Streamlit runs on click — so nothing is generated on the refresh tick."""
+    t0, t1 = df["Time"].iloc[0], df["Time"].iloc[-1]
+    stem = (f"history_{'-'.join(c[1].lower().replace(' ', '') for c in charts[:3])}"
+            f"{f'-plus{len(charts) - 3}' if len(charts) > 3 else ''}"
+            f"_{t0:%Y%m%d_%H%M%S}-{t1:%H%M%S}")
+
+    st.markdown("##### :material/download: Export this range")
+    c1, c2, c3 = st.columns([2, 1, 1])
+    c1.text_input("Session name", key="hist_session",
+                  placeholder="Session name for the report header (optional)",
+                  label_visibility="collapsed")
+    session = st.session_state.get("hist_session", "")
+    rows = len(df)
+    for col, style, label, tip in (
+        (c2, "data", "CSV (data)", "Clean table — opens straight into Excel or Sheets."),
+        (c3, "report", "CSV (report)", "Same table behind a documented header block."),
+    ):
+        col.download_button(
+            f":material/table_view: {label} · {rows:,}",
+            # A closure, not bytes: Streamlit only calls it if the user actually
+            # clicks. Must stay pure pandas/csv — st.* calls inside are ignored.
+            data=lambda s=style: export.history_csv_bytes(df, charts, style=s,
+                                                          session=session),
+            file_name=f"{stem}{'_report' if style == 'report' else ''}.csv",
+            mime="text/csv", key=f"hist_csv_{style}", help=tip,
+            on_click="ignore", width="stretch")
+
+
+@st.fragment(run_every=STATUS_TICK_S)
+def _history_status_fragment():
+    """The LIVE / FROZEN badge.
+
+    Its own tiny fragment on purpose: it keeps ticking to count incoming samples
+    while the chart fragment is completely stopped, so you get a live "new data
+    waiting" signal without anything redrawing under your cursor."""
+    frozen = _hist_frozen_range()
+    left, right = st.columns([5, 1])
+
+    if not frozen:
+        left.markdown(
+            f'<div class="hist-badge live">● LIVE · refreshing every {CHART_TICK_S}s'
+            f' · drag across the chart to freeze and examine a range</div>',
+            unsafe_allow_html=True)
+        if right.button(":material/pause: Freeze", key="hist_freeze_btn",
+                        width="stretch", help="Stop refreshing so you can zoom in."):
+            start_ts, _ = _hist_bounds()
+            now = time.time()
+            # Same guard as the drag: freezing a window that holds nothing would
+            # strand you on an empty chart. Nothing is in the future, so "samples
+            # at or after the window start" is exactly the window's own count.
+            if _hist_new_since(start_ts or 0.0) == 0:
+                st.toast("Nothing in this window to freeze yet.",
+                         icon=":material/info:")
+                return
+            st.session_state["hist_freeze"] = (start_ts or 0.0, now)
+            st.session_state["hist_frozen_at"] = now
+            # Full app rerun, NOT fragment scope: the run_every timer is only
+            # registered/cleared on a whole-app run, so a fragment rerun would
+            # leave the chart ticking while it is meant to be frozen.
+            st.rerun()
+        return
+
+    # Count from the moment you FROZE, not from the end of the selected range.
+    # Counting from the range end meant selecting a window in the middle of a
+    # race reported every later sample as "new samples waiting" — 19,541 of them,
+    # none of which were new.
+    since = st.session_state.get("hist_frozen_at") or frozen[1]
+    waiting = _hist_new_since(since)
+    extra = (f" · {waiting:,} new sample{'s' if waiting != 1 else ''} since you froze"
+             if waiting else "")
+    # The range itself is NOT repeated here — the caption under the chart owns it.
+    left.markdown(
+        f'<div class="hist-badge frozen">⏸ FROZEN · not refreshing · '
+        f'zoom and hover freely, nothing will move{extra}</div>',
+        unsafe_allow_html=True)
+    if right.button(":material/play_arrow: Resume", key="hist_resume_btn",
+                    width="stretch", help="Go back to live refreshing."):
+        st.session_state["hist_freeze"] = None
+        st.rerun()
+
+
+def _render_history_chart():
+    """Chart + stats + export. Deliberately undecorated — main() wraps this with
+    a run_every so freezing can stop the tick outright."""
+    charts = _hist_selected_charts()
+    if not charts:
+        st.info("Pick one or more metrics above.", icon=":material/info:")
+        return
+    df, start_ts, end_ts = _hist_frame()
+    if df.empty:
+        # Frozen-and-empty needs different advice from live-and-empty. Telling
+        # someone to "start collector.py" when they have simply frozen a span
+        # with nothing in it sends them to debug a process that is running fine,
+        # and the chart they need to drag on is no longer there to drag.
+        if _hist_frozen_range():
+            st.info("Nothing was recorded in the range you froze.",
+                    icon=":material/info:")
+            if st.button(":material/play_arrow: Resume live", key="hist_resume_empty",
+                         type="primary"):
+                st.session_state["hist_freeze"] = None
+                st.rerun()
+        else:
+            st.info("No telemetry in this range. Widen the window or start collector.py.",
+                    icon=":material/info:")
+        return
+
+    # Applied before anything else reads the frame, so the chart, the stats and
+    # both CSVs are all filtered identically — they cannot disagree.
+    df, filter_note = _apply_value_filter(df, [c[1] for c in charts])
+
+    thinned = _downsample(df.set_index("Time"), OVERLAY_MAX_POINTS)
+    # Count the real plotted samples BEFORE gap-breaking adds blank rows —
+    # otherwise the caption credits the fillers as drawn data.
+    drawn = len(thinned)
+    plot_df = _break_time_gaps(thinned)
+    frozen = _hist_frozen_range() is not None
+    normalize = st.session_state.get("hist_scale") == "Normalize"
+
+    # The one honesty line, and the ONLY place the range is stated — the frozen
+    # badge deliberately does not repeat it. Two range readouts on one screen
+    # disagreed the moment one of them rounded differently, which made both
+    # untrustworthy. min/max rather than the first and last rows, so an
+    # out-of-order timestamp in the store cannot invert it.
+    note = (f"Range **{_hist_span_text(df['Time'].min(), df['Time'].max())}** · "
+            f"{len(df):,} samples")
+    if drawn != len(df):
+        note += f" · chart drawing {drawn:,} of them (exports use all)"
+    if frozen:
+        note += " · zooming does not change this range — drag a new box to re-scope"
+    # A filter that is not announced is a silent edit to the numbers. The controls
+    # live in a popover, so this line is the only thing that says it is on.
+    if filter_note:
+        note += f"\n\n:orange[**Filter active** — {filter_note}]"
+    st.caption(note)
+
+    if HAS_PLOTLY:
+        # Changing this is what lets a new range take effect; while it holds
+        # steady Plotly keeps the user's own zoom instead of overriding it.
+        view_rev = "|".join(str(x) for x in (
+            st.session_state.get("hist_window"), _hist_frozen_range(), normalize,
+            ",".join(c[1] for c in charts),
+            # Filtering changes what the axes should span, so the view has to be
+            # allowed to rescale rather than keeping the old zoom.
+            st.session_state.get("hist_filter_metric"),
+            st.session_state.get("hist_filter_min"),
+            st.session_state.get("hist_filter_max")))
+        fig, refused = _hist_figure(plot_df, charts, normalize,
+                                    st.session_state.get("theme_mode") != "Light",
+                                    view_rev)
+        event = st.plotly_chart(fig, key=HIST_CHART_KEY, theme=None,
+                                on_select="rerun", selection_mode="box",
+                                config=_hist_chart_config(frozen))
+        if refused:
+            st.caption(
+                f":orange[{', '.join(refused)} not plotted] — one chart carries two "
+                f"units honestly, not more. Switch **Scale** to Normalize to compare "
+                f"every metric by shape.")
+        picked = _hist_range_from_selection(getattr(event, "selection", None), plot_df)
+        if picked and picked != _hist_frozen_range():
+            # Never freeze onto a span with nothing in it. On a wide window the
+            # data can occupy a small slice of the axis, so a drag across the
+            # empty part used to freeze you into "No telemetry in this range" —
+            # an empty chart with nothing left to drag on to get out of it.
+            if _hist_count_between(df, picked):
+                st.session_state["hist_freeze"] = picked
+                st.session_state["hist_frozen_at"] = time.time()
+                st.rerun()   # app scope — see _history_status_fragment
+            else:
+                st.toast("Nothing recorded in that span — still live. "
+                         "Drag across a part of the trace that has data.",
+                         icon=":material/info:")
     else:
-        plot_df = _downsample(hist_df.set_index("Time"))
-        note = f"{len(hist_df):,} samples · {hist_window}"
-        if len(plot_df) != len(hist_df):
-            note += f" · plotting {len(plot_df):,} points"
-        st.caption(note)
+        st.warning("Plotly is missing, so this falls back to basic charts with no "
+                   "zoom or freeze. Run `pip install -r requirements_pit.txt`.",
+                   icon=":material/warning:")
+        for i in range(0, len(charts), 3):
+            for col, (key, label, unit, color) in zip(st.columns(3), charts[i:i + 3]):
+                col.caption(f"{label} ({unit})")
+                col.line_chart(plot_df[key], color=color, height=200)
 
-        per_row = 3
-        for i in range(0, len(charts), per_row):
-            cols = st.columns(per_row)
-            for col, (key, label, unit, color) in zip(cols, charts[i:i + per_row]):
-                with col:
-                    st.caption(f"{label} ({unit})")
-                    st.line_chart(plot_df[key], color=color, height=200)
+    _render_hist_stats(df, charts)
+    _render_hist_export(df, charts)
 
-        st.markdown("#### :material/history: Recent Samples")
-        st.dataframe(hist_df.tail(200).round(2), width="stretch", hide_index=True)
 
-    # Per-lap charts sit OUTSIDE the `else`, deliberately: they are keyed to lap
-    # number, not to the selected time window, so completed laps stay visible
-    # even when the chosen window happens to contain no samples.
-    st.markdown("---")
-    _render_lap_charts()
+@st.fragment(run_every=TABLE_TICK_S)
+def _history_tables_fragment():
+    """Recent samples, per-lap charts and fault history.
 
-    st.markdown("#### :material/error: Errors History")
+    Split off the chart's cadence and slowed to 30s: these were most of the cost
+    of the old 10s tick and none of them need to be live while you read a chart.
+    (An st.expander still executes its body — it tidies the page, it does not
+    defer the work. The saving here comes from the slower tick plus caching.)"""
+    with st.expander(":material/history: Recent Samples"):
+        df, _s, _e = _hist_frame()
+        if df.empty:
+            st.caption("Nothing in this range.")
+        else:
+            st.dataframe(df.tail(200).round(2), width="stretch", hide_index=True)
+
+    # Per-lap charts are keyed to lap number, not the selected time window, so
+    # completed laps stay visible even when the window holds no samples.
+    with st.expander(":material/timer: Per-Lap Energy & Times", expanded=True):
+        _render_lap_charts()
+
     episodes = read_fault_episodes()
-    if episodes:
-        err_df = pd.DataFrame([{
-            "Start": datetime.fromtimestamp(e["start"]),
-            "Duration": f"{e['end'] - e['start']:.0f}s",
-            "Fault": e["sig"],
-        } for e in reversed(episodes)])   # newest first
-        st.caption(f"{len(episodes)} fault episode(s) recorded")
-        st.dataframe(err_df, width="stretch", hide_index=True)
-    else:
-        st.success("No faults recorded in history.", icon=":material/check_circle:")
+    with st.expander(f":material/error: Errors History ({len(episodes)})"):
+        if episodes:
+            err_df = pd.DataFrame([{
+                "Start": datetime.fromtimestamp(e["start"]),
+                "Duration": f"{e['end'] - e['start']:.0f}s",
+                "Fault": e["sig"],
+            } for e in reversed(episodes)])   # newest first
+            st.dataframe(err_df, width="stretch", hide_index=True)
+        else:
+            st.success("No faults recorded in history.",
+                       icon=":material/check_circle:")
 
 
 @st.fragment(run_every=10)
@@ -996,8 +1668,19 @@ def _strategy_fragment():
     # generated profiles can never disagree about what a strategy is.
     consumption_table = [{'label': s['label'], 'lap_time_min': s['lap_time_min'],
                           'energy_wh': s['energy_wh']} for s in STRATEGIES]
-    car_battery_wh = 8550 if soc == 0 else (soc / 100.0) * 8550
-    all_strategies = calculate_all_strategies(time_left_min, car_battery_wh, active_lap, consumption_table)
+    # `not soc` covers both a missing reading and a reported 0: neither is a
+    # usable capacity, so the matrix assumes a full pack rather than telling the
+    # strategist the car is empty. (This already treated 0 that way; None just
+    # joins it now that an unreported SoC stays None instead of becoming 0.)
+    car_battery_wh = 8550 if not soc else (soc / 100.0) * 8550
+    if soc is None or active_lap is None:
+        missing = " or ".join(n for n, v in (("battery SoC", soc),
+                                             ("lap count", active_lap))
+                              if v is None)
+        st.caption(f":orange[Assuming a full pack / lap 0 — no {missing} from the "
+                   f"car yet.] These figures are a placeholder until it reports.")
+    all_strategies = calculate_all_strategies(time_left_min, car_battery_wh,
+                                              active_lap or 0, consumption_table)
     display_df = pd.DataFrame(all_strategies)
     graph_data_list = display_df.pop('_graph_data').tolist()
     st.dataframe(display_df, width="stretch", hide_index=True)
@@ -1264,6 +1947,18 @@ def main():
         st.session_state.theme_mode = "Dark"
     if "font_scale" not in st.session_state:
         st.session_state.font_scale = 1.0
+    # History tab state. Seeded here rather than via each widget's `default=`,
+    # because Streamlit warns when a key is both pre-set and given a default.
+    for hist_key, hist_default in (("hist_window", "15 min"),
+                                   ("hist_metrics", HISTORY_DEFAULT_METRICS),
+                                   ("hist_scale", "Raw units"),
+                                   ("hist_freeze", None),
+                                   ("hist_frozen_at", None),
+                                   ("hist_filter_metric", FILTER_OFF),
+                                   ("hist_filter_min", None),
+                                   ("hist_filter_max", None),
+                                   ("hist_session", "")):
+        st.session_state.setdefault(hist_key, hist_default)
     is_dark = st.session_state.theme_mode == "Dark"
     if st.button(
         ":material/light_mode:" if is_dark else ":material/dark_mode:",
@@ -1370,16 +2065,54 @@ def main():
     with tab_driver:
         _driver_fragment()  # fast (2s)
     with tab_history:
-        # History controls live OUTSIDE the fragment (widgets that drive it); the
-        # fragment reads their values from session_state.
-        hctl1, hctl2 = st.columns([1, 3])
+        # Controls live OUTSIDE the fragments (they are what drives them), so
+        # changing one is a full app rerun — which is also what re-registers the
+        # chart's refresh timer. Changing the window also drops any freeze,
+        # otherwise picking "1 min" while frozen would appear to do nothing.
+        hctl1, hctl2, hctl3 = st.columns([5, 2, 1])
         with hctl1:
-            st.selectbox("Time window", list(HISTORY_WINDOWS.keys()),
-                         index=1, key="hist_window")
+            st.segmented_control("Time window", list(HISTORY_WINDOWS), key="hist_window",
+                                 on_change=lambda: st.session_state.update(hist_freeze=None),
+                                 label_visibility="collapsed")
         with hctl2:
-            st.multiselect("Charts to show", HISTORY_LABELS,
-                           default=HISTORY_LABELS, key="hist_metrics")
-        _history_fragment()  # slow (10s)
+            st.segmented_control("Scale", ["Raw units", "Normalize"], key="hist_scale",
+                                 label_visibility="collapsed",
+                                 help="Normalize scales every metric to 0-100% so "
+                                      "shapes can be compared; the tooltip still "
+                                      "shows real values.")
+        with hctl3:
+            # Behind a popover so it costs no space until wanted — but whenever it
+            # IS on, the caption under the chart says so, because a filter that
+            # quietly edits min/avg/max would be indistinguishable from bad data.
+            with st.popover(":material/filter_alt: Value filter", width="stretch"):
+                st.caption("Hide readings outside a band. Applies to the chart, "
+                           "the stats and both CSV exports.")
+                st.selectbox("Metric", [FILTER_OFF] + HISTORY_LABELS,
+                             key="hist_filter_metric")
+                fc1, fc2 = st.columns(2)
+                fc1.number_input("Min", value=None, key="hist_filter_min",
+                                 placeholder="none")
+                fc2.number_input("Max", value=None, key="hist_filter_max",
+                                 placeholder="none")
+                # on_click, NOT an `if st.button(...)` body: the widgets above
+                # already own these keys this run, and Streamlit refuses writes
+                # to an instantiated widget's state. A callback runs at the start
+                # of the next rerun, before the widgets exist, so it is allowed.
+                st.button("Clear filter", key="hist_filter_clear",
+                          width="stretch", on_click=_clear_hist_filter)
+        st.pills("Metrics", HISTORY_LABELS, selection_mode="multi",
+                 key="hist_metrics", label_visibility="collapsed")
+
+        _history_status_fragment()   # 5s — badge only, ticks even while frozen
+        # run_every is applied HERE rather than as a decorator so a freeze can
+        # stop the tick outright: a frozen chart is never redrawn, so nothing can
+        # shift under the cursor while it is being read. Fragment identity is
+        # module + function name + position (not run_every), so swapping the
+        # interval like this keeps the very same fragment.
+        st.fragment(run_every=None if _hist_frozen_range() else CHART_TICK_S)(
+            _render_history_chart)()
+        st.markdown("---")
+        _history_tables_fragment()   # 30s
         # Reset control — guarded behind a popover + confirm so it can't be hit by
         # accident mid-race. The collector keeps its stream position, so only past
         # data is cleared.

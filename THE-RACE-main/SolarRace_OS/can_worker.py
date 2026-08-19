@@ -86,21 +86,26 @@ class CANWorker(QThread):
     # ------------------------------------------------------------------ #
     # Public signals — connect these to GUI slots                         #
     # ------------------------------------------------------------------ #
-    rpm_updated             = Signal(int)    # Motor RPM           (signed RPM)
-    voltage_updated         = Signal(float)  # Battery voltage     (Volts)
-    soc_updated             = Signal(int)    # State of Charge     (0-100 %)
-    controller_temp_updated = Signal(int)    # Controller temp     (°C)
+    # The numeric metrics are Signal(object), not Signal(int)/Signal(float), so
+    # they can carry None for "the bus has not told us". A typed numeric signal
+    # coerces None to 0, which is how a silent sensor used to reach the driver
+    # looking like a real reading of zero — 0 °C reads as a cold motor, 0 A as a
+    # coasting car. The HUD widgets render None as an em dash (see _NO_DATA).
+    rpm_updated             = Signal(object)  # Motor RPM           (signed RPM)
+    voltage_updated         = Signal(object)  # Battery voltage     (Volts)
+    soc_updated             = Signal(object)  # State of Charge     (0-100 %)
+    controller_temp_updated = Signal(object)  # Controller temp     (°C)
     # Motor PT1000 sensor, sent as one atomic reading:
     #   (resistance Ω, temperature °C or -1000.0 if unconvertible, status)
     motor_temp_updated      = Signal(float, float, str)
-    power_updated           = Signal(int)    # Instant power       (Watts)
+    power_updated           = Signal(object)  # Instant power       (Watts)
     alerts_updated          = Signal(list)   # Active alerts: [(label, severity), ...]
     # Active power map: (display name, raw byte). Raw travels with the name so
     # an unrecognised value can be identified instead of just looking wrong.
     motor_map_updated       = Signal(str, int)
-    motor_current_updated   = Signal(float)  # Motor phase current (A, q axis)
-    battery_current_updated = Signal(float)  # Battery current from the BMS (A)
-    cell_temp_updated       = Signal(float)  # Hottest battery cell (°C)
+    motor_current_updated   = Signal(object)  # Motor phase current (A, q axis)
+    battery_current_updated = Signal(object)  # Battery current from the BMS (A)
+    cell_temp_updated       = Signal(object)  # Hottest battery cell (°C)
     # Boolean dashboard indicators: parking_brake / lights_on / ecu_on / reverse
     # (+ the raw status byte they came from). One dict so the HUD repaints the
     # whole indicator row from a single consistent snapshot.

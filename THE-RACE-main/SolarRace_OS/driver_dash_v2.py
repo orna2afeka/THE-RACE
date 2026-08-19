@@ -68,6 +68,16 @@ _FLASH  = "#3a0606"
 # the neon accent nor the same white as the value itself.
 _CAPTION = "#7d95ad"
 
+# Shown when the CAN bus has told us NOTHING about a metric. A gauge reading "0"
+# is a lie the driver acts on: 0 °C looks like a cold motor and 0 A looks like a
+# coasting car, when the truth is that we have no idea. The dash already uses an
+# em dash for exactly this (unknown motor Ω/°C, unknown MAP, no target speed), so
+# a missing number now looks the same everywhere.
+_NO_DATA = "—"
+# Deliberately the unlit-indicator slate, not white: "unknown" must never be the
+# brightest thing on the panel, for the same reason _OFF exists.
+_NO_DATA_COLOUR = _OFF
+
 
 def _tint(hex_colour: str, alpha: float) -> str:
     """`rgba(...)` string from a #rrggbb accent — a wash of the accent colour.
@@ -89,6 +99,7 @@ C_RED    = QColor(_RED)
 C_WHITE  = QColor(_WHITE)
 C_DIM    = QColor(_DIM)
 C_BORDER = QColor(_BORDER)
+C_NO_DATA = QColor(_NO_DATA_COLOUR)
 
 # Gauge arc geometry: 225° start (SW), sweeping CW 270° to 315° (SE).
 # In Qt: start=225, spanAngle=-270 (negative = clockwise).
@@ -96,33 +107,6 @@ _ARC_START = 225
 _ARC_SPAN  = -270
 
 SPEED_MAX = 140
-
-# Within this much of target counts as on-pace (green). Wide enough that a
-# driver holding a steady line is not nagged by a permanently amber readout.
-#
-# Module level rather than a HUD attribute because two widgets now steer by it:
-# the TARGET strip under the tacho, and the big speed number inside it. Both
-# have to agree on where "on pace" ends, or the number would go red while the
-# strip below it still said green.
-_TARGET_TOLERANCE_KMH = 5.0
-
-
-def _speed_delta_colour(delta_kmh: float) -> QColor:
-    """Colour for the big speed number, from `actual - target`.
-
-        below target   cyan   — room to push
-        on pace        lime   — hold this
-        above target   red    — burning charge the strategy did not budget
-
-    Direction is the whole point of splitting the two off-pace cases: amber in
-    both, as the strip below does, tells the driver something is wrong but not
-    which pedal fixes it. At 90 km/h in sun that distinction has to survive a
-    glance, so it is carried by hue rather than by the sign of a small number.
-    """
-    if abs(delta_kmh) <= _TARGET_TOLERANCE_KMH:
-        return C_LIME
-    return C_RED if delta_kmh > 0 else C_CYAN
-
 
 # Temperature thresholds are shared with the pit (limits.py at the repo root),
 # so a gauge that is red in the car is red on the pit wall too.
@@ -265,26 +249,18 @@ class TachometerWidget(QWidget):
     Big, bold digital speed readout painted with QPainter.
     Shows the km/h number large and clear (no dial/needle) so it's readable
     at a glance. Background flashes red when speed exceeds 120 km/h.
-
-    The number itself is coloured by how far it is from the active profile's
-    target (see `_speed_delta_colour`), so pace is legible without reading the
-    delta on the strip below. With no profile loaded there is nothing to be off
-    from and it stays white.
     """
 
     _SPEED_ALERT = 120
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._rpm: int = 0
-        self._speed: float = 0.0
+        # None until the motor controller reports RPM. A speedo reading 0 while
+        # the car is moving is worse than one admitting it does not know.
+        self._rpm: int | None = None
+        self._speed: float | None = None
         self._flash_on: bool = False
         self._alert: bool = False
-        # None = no profile loaded. The TARGET, not the delta: this widget
-        # already derives its own speed from rpm, so holding the target lets
-        # every rpm frame recolour the number without the HUD having to push a
-        # delta on both the rpm and the target-speed paths.
-        self._target_kmh: Optional[float] = None
 
         self._flash_timer = QTimer(self)
         self._flash_timer.setInterval(500)
@@ -299,7 +275,15 @@ class TachometerWidget(QWidget):
         self.setMinimumSize(160, 120)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
-    def set_rpm(self, rpm: int) -> None:
+    def set_rpm(self, rpm: int | None) -> None:
+        if rpm is None:
+            self._rpm = None
+            self._speed = None
+            self._flash_timer.stop()
+            self._flash_on = False
+            self._alert = False
+            self.update()
+            return
         self._rpm = max(0, rpm)
         self._speed = abs(_rpm_to_speed(rpm))
         alert = self._speed > self._SPEED_ALERT
@@ -309,11 +293,6 @@ class TachometerWidget(QWidget):
             self._flash_timer.stop()
             self._flash_on = False
         self._alert = alert
-        self.update()
-
-    def set_target_speed(self, target_kmh: Optional[float]) -> None:
-        """Target for this point on the lap, or None when no profile is live."""
-        self._target_kmh = target_kmh
         self.update()
 
     def _toggle_flash(self) -> None:
@@ -329,18 +308,11 @@ class TachometerWidget(QWidget):
         if self._flash_on:
             p.fillRect(0, 0, w, h, QColor(_FLASH))
 
-        # Pace colouring owns the number whenever a profile is loaded. The
-        # over-speed alert keeps its flashing background either way, so the two
-        # signals stay readable at once rather than one masking the other —
-        # above 120 km/h off a high target the number is cyan on a flashing red
-        # wash, which is exactly the two facts the driver needs.
-        #
-        # With no profile there is no pace to show, so the original rule stands
-        # and the alert takes the number red as it always did.
-        if self._target_kmh is not None:
-            num_color = _speed_delta_colour(self._speed - self._target_kmh)
-        else:
-            num_color = C_RED if self._alert else C_WHITE
+        # Number turns red past the alert threshold, otherwise crisp white —
+        # and goes slate when there is no reading to show at all.
+        unknown = self._speed is None
+        num_color = C_NO_DATA if unknown else (C_RED if self._alert else C_WHITE)
+        speed_txt = _NO_DATA if unknown else f"{self._speed:.0f}"
 
         # ── Big bold speed number ──────────────────────────────────────── #
         # Font scales with the panel; capped against width so 3 digits ("140")
@@ -353,7 +325,7 @@ class TachometerWidget(QWidget):
         p.drawText(
             QRectF(0, h * 0.06, w, h * 0.66),
             Qt.AlignCenter,
-            f"{self._speed:.0f}",
+            speed_txt,
         )
 
         # ── km/h unit label ────────────────────────────────────────────── #
@@ -411,7 +383,10 @@ class MiniGauge(QWidget):
         self._warn_threshold = warn_threshold
         self._warning: bool = False
         self._decimals = decimals
-        self._value: float = 0.0
+        # None until the bus actually reports this metric — see _NO_DATA. It is
+        # NOT seeded to 0.0, because "0" and "no reading" are different facts and
+        # the driver cannot tell them apart once they look the same.
+        self._value: float | None = None
         self._flash_on: bool = False
         self._alert: bool = False
 
@@ -425,12 +400,14 @@ class MiniGauge(QWidget):
         self.setMinimumSize(70, 56)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
-    def set_value(self, value: float) -> None:
+    def set_value(self, value: float | None) -> None:
         self._value = value
-        alert = value > self._threshold
+        # An unknown value cannot breach a threshold. Comparing None here would
+        # raise; treating it as 0 would silently mark a missing sensor as safe.
+        alert = value is not None and value > self._threshold
         # Warning is everything between the two thresholds. Critical wins, so a
         # gauge is never "warning" and "critical" at once.
-        self._warning = (not alert) and (value > self._warn_threshold)
+        self._warning = (not alert) and value is not None and value > self._warn_threshold
         if alert and not self._alert:
             self._flash_timer.start()
         elif not alert and self._alert:
@@ -483,8 +460,13 @@ class MiniGauge(QWidget):
         p.setPen(QPen(C_BORDER, 7, Qt.SolidLine, Qt.RoundCap))
         p.drawArc(rect, _ARC_START * 16, _ARC_SPAN * 16)
 
-        # Value arc
-        frac = min(1.0, self._value / self._max_val) if self._max_val > 0 else 0.0
+        # Value arc. No reading means no arc at all — an empty track ring reads
+        # as "nothing known" where a zero-length arc pinned at the start would
+        # read as a real reading of zero.
+        if self._value is None or self._max_val <= 0:
+            frac = 0.0
+        else:
+            frac = min(1.0, self._value / self._max_val)
         val_span = int(_ARC_SPAN * frac)
 
         if val_span != 0:
@@ -506,15 +488,17 @@ class MiniGauge(QWidget):
         # are sized to their own length as well as to the radius: "95" and "1828"
         # are the same gauge, and "SOC" sits beside "MOTOR CURRENT". Sized on the
         # radius alone, the long ones run straight through the arc around them.
-        value_txt = f"{self._value:.{self._decimals}f}"
+        unknown = self._value is None
+        value_txt = _NO_DATA if unknown else f"{self._value:.{self._decimals}f}"
 
         # 1.75 r, not the full 1.9 r of the rect: the widest point of the circle
         # is level with the value, so text taken right out to the rect edge
         # touches the stroke on both sides.
         vf = _fit_font(value_txt, radius * 0.60, radius * 1.75)
         p.setFont(vf)
-        p.setPen(QPen(C_RED if self._alert
-                      else (C_ORANGE if self._warning else C_WHITE)))
+        p.setPen(QPen(C_NO_DATA if unknown
+                      else (C_RED if self._alert
+                            else (C_ORANGE if self._warning else C_WHITE))))
         p.drawText(
             QRectF(cx - radius * 0.95, cy - radius * 0.58, radius * 1.9, radius * 0.68),
             Qt.AlignCenter,
@@ -602,6 +586,10 @@ class RacingDashboard(QMainWindow):
     _TARGET_H = 40
     _TURN_ALERT_H = 44
 
+    # Within this much of target counts as on-pace (green). Wide enough that a
+    # driver holding a steady line is not nagged by a permanently amber readout.
+    _TARGET_TOLERANCE_KMH = 5.0
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("EV Racing HUD  |  SiliXcon LYNX")
@@ -619,7 +607,9 @@ class RacingDashboard(QMainWindow):
         # rather than a target of zero the driver would try to match.
         self._target_kmh = None
         self._target_strategy: str = ""
-        self._last_speed_kmh: float = 0.0
+        # None until RPM arrives. Was 0.0, which made the target readout show a
+        # confident "Δ -92" before the car had reported any speed at all.
+        self._last_speed_kmh: float | None = None
         self._turn_active: bool = False
 
         # UI scale factor (1.0 at the 800×480 design size, grows on fullscreen
@@ -1058,9 +1048,9 @@ class RacingDashboard(QMainWindow):
 
         bottom = QHBoxLayout()
         bottom.setSpacing(8)
-        self._ds2_batt_current = MiniGauge("BATT CURRENT", "A", 200.0, C_ORANGE,
-                                           alert_threshold=100.0, decimals=1)
-        self._ds2_motor_current = MiniGauge("MOTOR CURRENT", "A", 60.0, C_ORANGE,
+        self._ds2_batt_current = MiniGauge("BATT CURRENT", "A", 60.0, C_ORANGE,
+                                           alert_threshold=40.0, decimals=1)
+        self._ds2_motor_current = MiniGauge("MOTOR CURRENT", "A", 120.0, C_ORANGE,
                                             alert_threshold=90.0, decimals=1)
         self._ds2_motor_temp = MiniGauge(
             "MOTOR TEMP", "°C", 120.0, C_CYAN, decimals=0,
@@ -1321,30 +1311,46 @@ class RacingDashboard(QMainWindow):
     # refreshed when a page becomes visible: the hidden page then already holds
     # live data, so switching screens shows the current value immediately
     # instead of a stale one that corrects itself a moment later.
-    @Slot(int)
-    def _on_rpm(self, rpm: int) -> None:
+    # Slots take `object`, not int/float: the worker's numeric signals carry None
+    # for "no reading from the bus" and a typed numeric slot would coerce that
+    # to 0 — the exact bug this is fixing.
+    @Slot(object)
+    def _on_rpm(self, rpm) -> None:
         self._tacho.set_rpm(rpm)
-        speed = _rpm_to_speed(rpm)
-        self._ds2_speed.set_value(speed)
         # Remembered so the target readout can show the delta without waiting
         # for the next profile tick.
-        self._last_speed_kmh = abs(speed)
-        if self._target_kmh is not None:
-            self._apply_target_style(self._last_speed_kmh - self._target_kmh)
+        speed = None if rpm is None else _rpm_to_speed(rpm)
+        self._ds2_speed.set_value(speed)
+        self._last_speed_kmh = None if speed is None else abs(speed)
+        self._apply_target_style(self._speed_delta())
 
-    @Slot(float)
-    def _on_voltage(self, volts: float) -> None:
-        self._last_voltage = max(volts, 0.1)   # guard against division by zero
+    def _speed_delta(self):
+        """Speed-minus-target, or None if either side is unknown.
+
+        Both halves can legitimately be unknown — no RPM yet, or no profile
+        loaded — and a delta computed against a stand-in zero would send the
+        driver chasing a number that means nothing."""
+        if self._last_speed_kmh is None or self._target_kmh is None:
+            return None
+        return self._last_speed_kmh - self._target_kmh
+
+    @Slot(object)
+    def _on_voltage(self, volts) -> None:
+        # The P/V current fallback needs a positive divisor, so an unknown
+        # voltage leaves the last usable one in place rather than poisoning it.
+        if volts is not None:
+            self._last_voltage = max(volts, 0.1)
         self._ds2_voltage.set_value(volts)
 
-    @Slot(int)
-    def _on_soc(self, pct: int) -> None:
-        self._soc_gauge.set_value(float(pct))
-        self._ds2_soc.set_value(float(pct))
+    @Slot(object)
+    def _on_soc(self, pct) -> None:
+        pct = None if pct is None else float(pct)
+        self._soc_gauge.set_value(pct)
+        self._ds2_soc.set_value(pct)
 
-    @Slot(int)
-    def _on_ctrl_temp(self, deg_c: int) -> None:
-        self._temp_gauge.set_value(float(deg_c))
+    @Slot(object)
+    def _on_ctrl_temp(self, deg_c) -> None:
+        self._temp_gauge.set_value(None if deg_c is None else float(deg_c))
 
     @Slot(float, float, str)
     def _on_motor_temp(self, ohms: float, celsius: float, status: str) -> None:
@@ -1358,8 +1364,10 @@ class RacingDashboard(QMainWindow):
         converted = celsius > -999.0
 
         # The gauge is the driver's display: only ever show a real temperature.
-        # On a bad or missing reading, hold it at 0 rather than inventing one.
-        shown = celsius if converted else 0.0
+        # A bad or missing reading blanks to an em dash — it used to be held at
+        # 0, which on a temperature gauge reads as a stone-cold motor and is the
+        # most dangerous possible way to render "the sensor is not answering".
+        shown = celsius if converted else None
         self._motor_temp_gauge.set_value(shown)
         self._ds2_motor_temp.set_value(shown)
 
@@ -1413,7 +1421,7 @@ class RacingDashboard(QMainWindow):
         """
         if delta_kmh is None:
             colour = _OFF
-        elif abs(delta_kmh) <= _TARGET_TOLERANCE_KMH:
+        elif abs(delta_kmh) <= self._TARGET_TOLERANCE_KMH:
             colour = _LIME
         else:
             colour = _ORANGE
@@ -1481,8 +1489,7 @@ class RacingDashboard(QMainWindow):
         """Target speed for this point on the lap, from the active profile."""
         self._target_kmh = target_kmh
         self._target_strategy = strategy
-        self._tacho.set_target_speed(target_kmh)
-        self._apply_target_style(self._last_speed_kmh - target_kmh)
+        self._apply_target_style(self._speed_delta())
 
     @Slot(float, float, float)
     def _on_turn_alert(self, distance_m: float, max_kmh: float,
@@ -1514,29 +1521,34 @@ class RacingDashboard(QMainWindow):
         self._last_flags_shown = dict(flags)
         self._apply_indicator_styles(flags)
 
-    @Slot(float)
-    def _on_motor_current(self, amps: float) -> None:
-        self._ds2_motor_current.set_value(abs(amps))
+    @Slot(object)
+    def _on_motor_current(self, amps) -> None:
+        self._ds2_motor_current.set_value(None if amps is None else abs(amps))
 
-    @Slot(float)
-    def _on_battery_current(self, amps: float) -> None:
+    @Slot(object)
+    def _on_battery_current(self, amps) -> None:
         """Real BMS current — preferred over the P/V estimate when available."""
-        self._have_real_current = True
-        self._ds2_batt_current.set_value(abs(amps))
+        # A None here means the bus went quiet, which is not evidence that the
+        # BMS can report current. Leaving the flag latched would permanently
+        # suppress the P/V fallback after one dropout.
+        if amps is not None:
+            self._have_real_current = True
+        self._ds2_batt_current.set_value(None if amps is None else abs(amps))
 
-    @Slot(float)
-    def _on_cell_temp(self, deg_c: float) -> None:
+    @Slot(object)
+    def _on_cell_temp(self, deg_c) -> None:
         self._cell_temp_gauge.set_value(deg_c)
         self._ds2_cell_temp.set_value(deg_c)
 
-    @Slot(int)
-    def _on_power(self, watts: int) -> None:
-        self._power_gauge.set_value(float(watts))
+    @Slot(object)
+    def _on_power(self, watts) -> None:
+        self._power_gauge.set_value(None if watts is None else float(watts))
         # Fall back to I = P / V only until the BMS reports real current. The
         # derived value is badly wrong at low voltage, so a true reading wins
         # the moment one arrives.
         if not self._have_real_current:
-            self._ds2_batt_current.set_value(abs(watts / self._last_voltage))
+            self._ds2_batt_current.set_value(
+                None if watts is None else abs(watts / self._last_voltage))
 
     @Slot(list)
     def _on_alerts(self, alerts: list) -> None:
@@ -1730,9 +1742,7 @@ class RacingDashboard(QMainWindow):
             warn="REVERSE" in self._map_lbl.text().upper(),
         )
         self._apply_indicator_styles(self._last_flags_shown)
-        self._apply_target_style(
-            None if self._target_kmh is None
-            else self._last_speed_kmh - self._target_kmh)
+        self._apply_target_style(self._speed_delta())
         # The LIVE severity, not a guess: re-applying "soft" here used to demote
         # a red corner warning to amber for as long as it stayed on screen.
         self._apply_turn_style(self._turn_severity)
