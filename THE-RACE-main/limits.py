@@ -28,8 +28,8 @@ when you have them — changing them here changes both dashboards at once.
 # Motor windings, measured by the PT1000 in the stator. Motors tolerate more
 # than this, but 90 °C is where a solar-car motor is working hard enough to be
 # worth backing off; sustained heat is what kills insulation.
-MOTOR_TEMP_WARN = 75.0
-MOTOR_TEMP_CRIT = 90.0
+MOTOR_TEMP_WARN = 100.0
+MOTOR_TEMP_CRIT = 130.0
 
 # Controller/ESC internal temperature. Most ESCs begin thermally derating around
 # 80-85 °C, so red here means "you are about to lose power", not "it is broken".
