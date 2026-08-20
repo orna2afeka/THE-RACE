@@ -9,6 +9,7 @@ pandas==2.2.1
 numpy==1.26.4
 matplotlib==3.8.3
 plotly==6.9.0             # History tab overlay chart (zoom/pan/freeze)
+pydeck==0.9.3             # Live GPS map deck (ships with Streamlit; pinned since we build the deck ourselves)
 openpyxl==3.1.2
 requests==2.31.0          # weather_service + collector REST streaming
 google-auth==2.29.0       # collector: OAuth2 access token from the service account

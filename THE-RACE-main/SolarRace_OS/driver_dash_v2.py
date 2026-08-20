@@ -145,20 +145,21 @@ def _fit_font(text: str, cap_pt: float, budget_px: float,
     return font
 
 
-def _rpm_to_speed(rpm: int) -> float:
-    """Convert motor RPM to km/h.
-
-    The formula that used to live here was `(rpm / 5.0) * 60 * (2π × 0.279) /
-    1000`: gear ratio 5.0 where the rest of the system used 5.09, and a 0.279 m
-    wheel RADIUS where the rest used a 1.727 m CIRCUMFERENCE. It made the
-    driver's speedometer read 3.3 % higher than the pit's for the same frame.
-
-    It carried a "do NOT change this formula" comment, which is why it survived
-    so long — but the instruction it encoded (keep the HUD and pit in step) is
-    exactly what it was violating. It now defers to drivetrain.py, the single
-    definition both dashboards, the odometer and the exporter share.
-    """
-    return drivetrain.speed_kmh(rpm)
+# _rpm_to_speed() used to live here and is deliberately gone.
+#
+# The speedometer no longer derives speed from RPM at all. It shows the speed
+# the CONTROLLER reports on 0x610 bytes 4-5, decoded by
+# mms_parser.decode_vehicle_speed_kmh() and delivered on CANWorker's
+# speed_updated signal — one CAN field, one path to the glass.
+#
+# Do not reintroduce a local rpm->kmh helper "as a fallback". A fallback here is
+# precisely the bug this replaced: two formulas, silently disagreeing, with no
+# way for the driver to tell which one is on screen. When 0x610 stops arriving
+# the speedo shows an em dash, which is the honest answer.
+#
+# drivetrain.speed_kmh() is still the right call for anything that must work
+# from a recorded RPM (the exporter's history, the odometer) — just not for the
+# live speedometer.
 
 
 def _pt1000_to_celsius(r_measured: float) -> float | None:
@@ -276,16 +277,32 @@ class TachometerWidget(QWidget):
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
     def set_rpm(self, rpm: int | None) -> None:
-        if rpm is None:
-            self._rpm = None
+        """Tachometer only. Speed arrives separately via set_speed().
+
+        The two were one call until the speedometer moved onto the controller's
+        own CAN speed field: RPM came in and a km/h was computed from it here.
+        They are now independent readings from independent fields, and either
+        can be unknown while the other is not.
+        """
+        self._rpm = None if rpm is None else max(0, rpm)
+        self.update()
+
+    def set_speed(self, kmh: float | None) -> None:
+        """Road speed from the controller (0x610 bytes 4-5), or None.
+
+        None blanks the number to an em dash and clears the over-speed flash.
+        Nothing here recomputes a speed from RPM: if the frame that carries
+        speed is not arriving, the honest display is "unknown", not a second
+        opinion derived from a different field.
+        """
+        if kmh is None:
             self._speed = None
             self._flash_timer.stop()
             self._flash_on = False
             self._alert = False
             self.update()
             return
-        self._rpm = max(0, rpm)
-        self._speed = abs(_rpm_to_speed(rpm))
+        self._speed = abs(kmh)
         alert = self._speed > self._SPEED_ALERT
         if alert and not self._alert:
             self._flash_timer.start()
@@ -1231,6 +1248,7 @@ class RacingDashboard(QMainWindow):
         self._worker = CANWorker(parent=self)
 
         self._worker.rpm_updated.connect(self._on_rpm)
+        self._worker.speed_updated.connect(self._on_speed)
         self._worker.voltage_updated.connect(self._on_voltage)
         self._worker.soc_updated.connect(self._on_soc)
         self._worker.controller_temp_updated.connect(self._on_ctrl_temp)
@@ -1363,11 +1381,20 @@ class RacingDashboard(QMainWindow):
     @Slot(object)
     def _on_rpm(self, rpm) -> None:
         self._tacho.set_rpm(rpm)
+
+    def _on_speed(self, kmh) -> None:
+        """Road speed straight from the controller's CAN field.
+
+        The single place a km/h reaches the HUD. Feeds the big speedo number,
+        the mini gauge and the target delta from the SAME value, so the three
+        can never disagree with one another the way the HUD and the pit once
+        did.
+        """
+        self._tacho.set_speed(kmh)
+        self._ds2_speed.set_value(kmh)
         # Remembered so the target readout can show the delta without waiting
         # for the next profile tick.
-        speed = None if rpm is None else _rpm_to_speed(rpm)
-        self._ds2_speed.set_value(speed)
-        self._last_speed_kmh = None if speed is None else abs(speed)
+        self._last_speed_kmh = None if kmh is None else abs(kmh)
         self._apply_target_style(self._speed_delta())
 
     def _speed_delta(self):

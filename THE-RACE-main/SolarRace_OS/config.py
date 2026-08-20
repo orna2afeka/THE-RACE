@@ -1,36 +1,79 @@
 """
 config.py — Hardware / connection configuration for SolarRace OS
 =================================================================
-Topology: ONE shared high-speed CAN bus (ISO 11898-2) on a single channel
-(the Pi's CAN HAT can0). All three devices sit on that one bus:
+Topology: TWO CAN buses, because the devices do not agree on a bitrate.
 
-    Device   Protocol             IDs                Notes
-    -------  -------------------  -----------------  ---------------------------
-    mms      SiliXcon LYNX        0x600-0x628 (11b)  Motor controller (HUD)
-    bms      JBD (query/response) 0x100-0x110 (11b)  Battery — must be POLLED
-    temp     J1939 thermistor     0x1839F3xx (29b)   Battery-temp module (broadcasts)
+    Channel  Rate       Device  Protocol             IDs
+    -------  ---------  ------  -------------------  -----------------
+    can0     1 Mbit/s   mms     SiliXcon LYNX        0x600-0x628 (11b)
+    can1     500 kbit/s bms     JBD query/response   0x100-0x110 (11b)
+    ?        ?          temp    J1939 thermistor     0x1839F3xx (29b)
 
-The three message-ID ranges don't overlap (11-bit BMS vs 11-bit MMS vs
-29-bit extended J1939), so every frame is decoded off the single bus with
-no collisions, and the BMS poller transmits on the same bus.
+The MMS runs at 1 Mbit/s and the BMS at 500 kbit/s. That is WHY there are two
+channels: a single CAN wire carries exactly one bitrate, and two nodes clocked
+differently do not "mostly work" — each corrupts the other's frames and the bus
+collapses. They are separate wires into separate controllers on the HAT.
 
-⚠️ SINGLE-BUS REQUIREMENT: because they share one wire, EVERY device must
-be configured to the SAME bitrate as CAN_BITRATE below. The MMS/LYNX runs
-at 500 kbit/s; the BMS baud is user-definable (set it to match); the J1939
-temp module is often fixed at 250 kbit/s — if it cannot be changed to this
-rate, it cannot share this bus and would need its own adapter. Verify all
-three agree before racing.
+    ⚠️ The J1939 temp module's channel is NOT yet recorded here. It is often
+    fixed at 250 kbit/s, in which case it can share neither of the above and
+    needs a third interface (a USB adapter). Confirm before racing.
+
+This file used to describe ONE shared bus with all three devices on it, and
+CAN_BITRATE was a single number. That was wrong about the hardware, and the
+contradiction was visible in the file itself: the prose said the LYNX ran at
+500 kbit/s while the constant said 1 Mbit/s.
+
+Reading is channel-agnostic on purpose: the three message-ID ranges don't
+overlap (11-bit BMS vs 11-bit MMS vs 29-bit extended J1939), so frames from
+every open bus are merged and dispatched by ID alone. Nothing downstream needs
+to know which wire a frame arrived on — which is what makes moving a device
+between channels a wiring change, not a code change.
 
 The same code also works through a USB-to-CAN adapter instead of the HAT:
 the candidates below are tried in order and the first that opens is used.
 
-SocketCAN reminder — bring the channel up at this bitrate first, e.g.:
-    sudo ip link set can0 up type can bitrate 500000
+SocketCAN reminder — bring each channel up at ITS OWN bitrate first, e.g.:
+    sudo ip link set can0 up type can bitrate 1000000
+    sudo ip link set can1 up type can bitrate 500000
 """
 import sys
 
-# ── Shared bus bitrate — ALL devices must match this ────────────────── #
+# ── Per-channel bitrates — every device on a channel must match ITS rate ─ #
+#
+# can0 and can1 are independent CAN controllers, so they are free to run at
+# different speeds. Devices on the SAME channel must still agree with each
+# other; devices on different channels need not.
+#
+# ⚠️ For SocketCAN this dict does NOT set the bitrate. python-can's socketcan
+# backend accepts `bitrate=` and ignores it — the real rate is whatever
+# `ip link set canX up type can bitrate N` established (deploy/can-up.service,
+# or bring_up_can_buses() in main.py, both of which read these numbers). So
+# this is the ONE place to edit, but it only takes effect on a channel that
+# this code brings up: change it here AND re-run the unit, or a channel left
+# up from a previous boot keeps its old rate while the logs claim the new one.
+CAN_BITRATES = {
+    "can0": 1_000_000,
+    "can1": 500_000,
+}
+
+# Fallback rate for anything not in CAN_BITRATES — in practice the USB-to-CAN
+# adapters (pcan/slcan), where python-can DOES apply this value for real. A USB
+# adapter is a single interface at a single rate, so the silent-bus escalation
+# in open_usb_candidates() can only ever stand in for ONE of the two channels;
+# this picks which. Kept under the old name because it is still imported
+# elsewhere and is still exactly what it always was: the default bitrate.
 CAN_BITRATE = 1_000_000
+
+
+def bitrate_for(channel):
+    """The configured bitrate for one channel, falling back to CAN_BITRATE.
+
+    Single source of truth so the bus we open, the label we print and the
+    `ip link` command we shell out to can never disagree about a channel's
+    rate — a mislabelled bus is worst precisely when you are debugging a
+    mixed-rate car, because the log then confirms the wrong theory.
+    """
+    return CAN_BITRATES.get(channel, CAN_BITRATE)
 
 # ── Connection candidates (tried in order; first that opens wins) ───── #
 # Lets the same code run via the Pi's CAN HAT or a USB-to-CAN adapter.
@@ -168,7 +211,7 @@ def _new_bus(interface, channel):
     bus = can.interface.Bus(
         interface=interface,
         channel=channel,
-        bitrate=CAN_BITRATE,
+        bitrate=bitrate_for(channel),
     )
     label = _bus_label(interface, channel)
     where = "".join(traceback.format_stack(limit=4)[:-1]).strip().splitlines()
@@ -206,7 +249,7 @@ def _safe_print(msg):
 
 def _bus_label(interface, channel):
     """The one place a connection's human-readable name is built."""
-    return f"{interface}:{channel} @ {CAN_BITRATE // 1000}kbps"
+    return f"{interface}:{channel} @ {bitrate_for(channel) // 1000}kbps"
 
 
 def shutdown_all_buses():
@@ -329,11 +372,14 @@ def open_usb_candidates():
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now can-up.service
 #
-# It uses CAN_BITRATE (1 Mbit/s) and txqueuelen 65536, matching what the app
-# expects, and brings up can1 as well when the car has a second channel. An
-# earlier version of this comment documented 500 kbit/s and txqueuelen 1000 for
-# can0 only — a unit built from that would put the bus at half speed with a
-# queue too small for the BMS burst, which presents exactly like a dead bus.
+# It uses the CAN_BITRATES above (can0 at 1 Mbit/s, can1 at 500 kbit/s) and
+# txqueuelen 65536, matching what the app expects, and brings up can1 as well
+# when the car has a second channel. The two rates are deliberately different —
+# keep the unit and CAN_BITRATES in step by hand, because systemd cannot read
+# this file. An earlier version of this comment documented one shared rate and
+# txqueuelen 1000 for can0 only — a unit built from that would put a bus at the
+# wrong speed with a queue too small for the BMS burst, which presents exactly
+# like a dead bus.
 #
 # The txqueuelen bump matters: the default CAN queue is tiny (~10 frames),
 # and the BMS poller sends a 16-frame burst — without it you can hit

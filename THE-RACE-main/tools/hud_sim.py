@@ -52,7 +52,11 @@ TICK_MS = 100                      # 10 Hz, the car's profile tick rate
 
 
 def raw_rpm_for_speed(kmh: float) -> int:
-    """Inverse of drivetrain.speed_kmh() — km/h back to a raw CAN speed value.
+    """Inverse of drivetrain.speed_kmh() — km/h back to a raw motor RPM.
+
+    Drives the TACHOMETER only. The speedometer is fed separately from the
+    controller's own speed field, so this no longer determines what the sim's
+    big km/h number reads.
 
     Derived from the drivetrain constants rather than a hard-coded factor, so a
     change to the sprockets or the tyre shows up in the simulator too. Getting
@@ -179,7 +183,11 @@ def build_sim(hud: RacingDashboard, car: FakeCar, strategy: str) -> QTimer:
         car.step(dt)
 
         speed = car.speed_kmh
+        # RPM and speed are separate readings on the car now (0x610 bytes 2-3
+        # and 4-5), delivered on separate signals. The sim has to drive both, or
+        # the tachometer moves while the speedometer sits at an em dash.
         hud._on_rpm(raw_rpm_for_speed(speed))
+        hud._on_speed(speed)
         hud._on_voltage(car.voltage)
         hud._on_soc(int(round(car.soc)))
         hud._on_power(int(car.power_w))

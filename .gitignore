@@ -1,0 +1,8 @@
+
+# Database backups (telemetry.db.*.bak) - tens of MB each, never source
+*.bak
+**/*.bak
+
+# Collector stdout/stderr when launched detached
+collector.out.log
+collector.err.log
