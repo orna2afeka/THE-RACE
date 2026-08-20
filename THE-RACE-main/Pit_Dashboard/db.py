@@ -207,7 +207,11 @@ def init_db(conn: sqlite3.Connection) -> None:
 # They differ by a factor of 50.909, so telling them apart is not a close call.
 # The boundary below is the geometric mean of the two, which sits ~7x away from
 # either regime — far outside any plausible measurement noise.
-_SPEED_RATIO_BOUNDARY = 0.145                        # sqrt(1.0366 x 0.020355)
+# Raw sits at rpm x 1.0366; a decoded value sits at rpm x (1.0366 / (10*GEAR)).
+# The boundary is their geometric mean, derived so it tracks GEAR_RATIO instead
+# of being a magic number that silently goes stale when the ratio is corrected.
+_SPEED_RATIO_RAW = 1.0366
+_SPEED_RATIO_BOUNDARY = _SPEED_RATIO_RAW / (10.0 * GEAR_RATIO) ** 0.5
 
 
 def _vehicle_speed(raw_speed, rpm):
