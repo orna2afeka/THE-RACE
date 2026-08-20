@@ -966,9 +966,15 @@ def main():
     # from anything wrong in the current run. Catching the signal lets us
     # stop the worker (and the bus) before the process actually dies.
     def _handle_shutdown_signal(signum, _frame):
-        print(f"[HUD] received signal {signum} — stopping CAN worker cleanly.")
-        dashboard._stop_can()
-        app.quit()
+        # _fast_exit() bounds the wait on the CAN worker and then exits the
+        # process outright. The old path called _stop_can() (an unbounded join
+        # across blocking Firebase calls) and then app.quit(), which left the
+        # interpreter waiting on the Firebase listener threads on top of that —
+        # so deploy/stop_hud.sh regularly hit its grace period and had to
+        # SIGKILL, which is precisely the ungraceful exit this handler exists
+        # to avoid. Exit code stays 0: a bare `kill` still means "restart" to
+        # start_hud.sh, and stop_hud.sh writes the stop file to say otherwise.
+        dashboard._fast_exit(0, f"received signal {signum}")
 
     signal.signal(signal.SIGTERM, _handle_shutdown_signal)
     signal.signal(signal.SIGINT, _handle_shutdown_signal)
