@@ -130,9 +130,14 @@ with SN65HVD230 transceivers. Correct `/boot/firmware/config.txt` for that board
 
 ```
 dtparam=spi=on
-dtoverlay=mcp2515-can0,oscillator=16000000,interrupt=23
 dtoverlay=mcp2515-can1,oscillator=16000000,interrupt=25
+dtoverlay=mcp2515-can0,oscillator=16000000,interrupt=23
+dtoverlay=spi-bcm2835-overlay
 ```
+
+Confirmed against the vendor wiki's pin table: INT_0 = BCM 23, INT_1 = BCM 25
+(alternates 22 / 24 exist but only if the PCB solder pads were moved). The
+`spi-bcm2835-overlay` line is part of the vendor config and is easy to miss.
 
 **can0 = GPIO23, can1 = GPIO25.** This repo's README used to say `can0 ...
 interrupt=25` with no can1 line - those are the settings for the SINGLE-channel
@@ -161,6 +166,30 @@ With the bus **unpowered**, measure across CANH/CANL on each channel:
 * **~40 ohm** - one terminator too many, set the HAT jumper OFF
 
 Report both readings.
+
+### Check the VIO jumper and the standoffs
+
+Two vendor-documented hardware faults that look exactly like a software problem:
+
+1. **VIO jumper must be on 3.3 V**, not 5 V. The Pi is a 3.3 V device; the wrong
+   position gives marginal signalling rather than a clean failure.
+2. **The CAN screw terminal can short against the Pi's HDMI connector** on a
+   2B/3B/4B. Waveshare ships a booster seat and nylon standoff specifically to
+   prevent this. Look underneath the HAT and confirm nothing is touching.
+
+Report the jumper position and whether the standoffs are fitted.
+
+### If can0 still reaches BUS-OFF after all of the above
+
+Suspect the **bitrate itself**. Waveshare's FAQ warns that "the data baud rate
+may not reach the nominal maximum rate" and that the usable speed should be
+chosen "according to actual measurements". can0 runs at 1 Mbit/s and keeps going
+BUS-OFF; can1 runs at 500 kbit/s and is healthy. Isolated transceivers add
+propagation delay and 1 Mbit/s leaves little timing margin over cable length.
+
+Test it: bring can0 up at 500 kbit/s in listen-only and see whether the errors
+stop. **Do not leave it there** - both ends of a wire must agree, so the MMS
+would have to be reconfigured too. Report the result; the decision is the pit's.
 
 ---
 
