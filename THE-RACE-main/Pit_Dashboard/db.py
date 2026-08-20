@@ -21,6 +21,7 @@ Design choices
 import json
 import sqlite3
 
+from constants import GEAR_RATIO
 from pit_config import SQLITE_PATH, DEVICE_ID
 
 # Hot columns extracted from each record for charting/filtering. The dashboard
@@ -45,8 +46,13 @@ METRIC_COLUMNS = [
     "mms_measured_voltage_V",
     "mms_current_A",
     # THE road-speed source for the HUD, the pit tiles, the history charts and
-    # the Excel export. Stored verbatim from 0x610 bytes 4-5 - no unit scaling
-    # and no gear correction are applied anywhere in the chain.
+    # the Excel export. Stored already decoded: the raw CAN field is 0.1 km/h
+    # and is not gear-corrected, so mms_parser.decode_vehicle_speed_kmh() has
+    # applied both corrections before it reaches here.
+    #
+    # ⚠️ Rows written before that decode fix hold the RAW value, roughly 50x
+    # too high. They are wrong, not just old — back-fill before reading
+    # historical speed (tools/backfill_columns.py).
     "mms_vehicle_speed_kmh",
     # Distance counter from the controller (0x620). A counter, not an integral,
     # so it does not accumulate error across dropped frames.
@@ -193,6 +199,58 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+# The two regimes the speed field can arrive in, as a ratio to motor RPM:
+#
+#   RAW        speed = rpm x 1.0366     (0.1 km/h, gear ratio never applied)
+#   CORRECTED  speed = rpm x 0.020355   (true km/h)
+#
+# They differ by a factor of 50.909, so telling them apart is not a close call.
+# The boundary below is the geometric mean of the two, which sits ~7x away from
+# either regime — far outside any plausible measurement noise.
+_SPEED_RATIO_BOUNDARY = 0.145                        # sqrt(1.0366 x 0.020355)
+
+
+def _vehicle_speed(raw_speed, rpm):
+    """Normalise the controller's speed field to true km/h.
+
+    WHY THIS IS HERE AND NOT ONLY ON THE CAR
+    mms_parser.decode_vehicle_speed_kmh() is the real fix, but it only takes
+    effect once SolarRace_OS is deployed to the Pi. A car already on track keeps
+    publishing the raw value, and those samples are useless if the pit stores
+    them as km/h. This normalises at ingest so the pit is correct immediately,
+    whichever firmware the car happens to be running.
+
+    It stays correct AFTER the car is updated too, which is the point of using a
+    ratio rather than a date or a version flag: an already-decoded value sits at
+    0.0204 x rpm and is passed through untouched. No cutover to get right, and
+    no window where the two ends disagree.
+
+    With no RPM to compare against, it falls back to plausibility: above
+    200 km/h the value is certainly still raw, and below that it is passed
+    through unchanged. That ambiguous band is narrow in practice — RPM and
+    speed ride in the same 0x610 frame, so one is rarely present without the
+    other.
+    """
+    speed = _num(raw_speed)
+    if speed is None:
+        return None
+    speed = abs(speed)
+    if speed == 0.0:
+        return 0.0                      # identical under either interpretation
+
+    r = _num(rpm)
+    if r is not None and abs(r) > 0:
+        ratio = speed / abs(r)
+        if ratio > _SPEED_RATIO_BOUNDARY:
+            return speed * 0.1 / GEAR_RATIO     # raw -> true km/h
+        return speed                            # already true km/h
+    # No usable RPM. Fall back to plausibility: this car does not exceed 200
+    # km/h, so anything above that is certainly still raw.
+    if speed > 200.0:
+        return speed * 0.1 / GEAR_RATIO
+    return speed
+
+
 def _num(value):
     """Coerce to float when possible, else None — RTDB values arrive as
     int/float/str/bool depending on the parser."""
@@ -268,8 +326,10 @@ def flatten_record(rtdb_key: str, record: dict, device_id: str = DEVICE_ID) -> d
         # the "motor" block the car publishes.
         "mms_measured_voltage_V": _num(motor.get("mms_measured_voltage_V")),
         "mms_current_A": _num(motor.get("mms_current_A")),
-        # Stored exactly as the car sends it - 0x610 bytes 4-5, verbatim.
-        "mms_vehicle_speed_kmh": _num(motor.get("mms_vehicle_speed_kmh")),
+        # Normalised, not stored verbatim: a car running pre-fix firmware sends
+        # this in 0.1 km/h without the gear reduction. See _vehicle_speed().
+        "mms_vehicle_speed_kmh": _vehicle_speed(
+            motor.get("mms_vehicle_speed_kmh"), motor.get("mms_rpm")),
         "mms_trip_m": _num(motor.get("mms_trip_m")),
         "mms_estimated_soc_percent": _num(motor.get("mms_estimated_soc_percent")),
         "regen_energy": _num(motor.get("regen_energy")),
