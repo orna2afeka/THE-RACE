@@ -5,18 +5,25 @@ Topology: TWO CAN buses, because the devices do not agree on a bitrate.
 
     Channel  Rate       Device  Protocol             IDs
     -------  ---------  ------  -------------------  -----------------
-    can0     1 Mbit/s   mms     SiliXcon LYNX        0x600-0x628 (11b)
-    can1     500 kbit/s bms     JBD query/response   0x100-0x110 (11b)
-    ?        ?          temp    J1939 thermistor     0x1839F3xx (29b)
+    can0     500 kbit/s bms     JBD query/response   0x100-0x110 (11b)
+    can0     500 kbit/s temp    J1939 thermistor     0x1839F3xx (29b)
+    can1     1 Mbit/s   mms     SiliXcon LYNX        0x600-0x628 (11b)
 
 The MMS runs at 1 Mbit/s and the BMS at 500 kbit/s. That is WHY there are two
 channels: a single CAN wire carries exactly one bitrate, and two nodes clocked
 differently do not "mostly work" — each corrupts the other's frames and the bus
-collapses. They are separate wires into separate controllers on the HAT.
+collapses. can0 and can1 are separate wires into separate controllers on the
+HAT; the BMS and the J1939 temp module happen to share the can0 wire since they
+both run at 500 kbit/s.
 
-    ⚠️ The J1939 temp module's channel is NOT yet recorded here. It is often
-    fixed at 250 kbit/s, in which case it can share neither of the above and
-    needs a third interface (a USB adapter). Confirm before racing.
+    Measured directly on the car by probing each channel in listen-only mode
+    across candidate rates and watching RX error counters: can0 decodes
+    cleanly only at 500 kbit/s, can1 only at 1 Mbit/s. Confirmed for the BMS
+    with a live query (0x5A on 0x100 got a valid ~48V pack-voltage reply on
+    can0); confirmed for the MMS by clean continuous traffic across
+    0x600-0x628 on can1. This is the OPPOSITE of an earlier assumption that
+    had the MMS on can0 and the BMS on can1 — that assumption drove can0 to
+    bus-off, because at the wrong bitrate nothing on the wire ever ACKed it.
 
 This file used to describe ONE shared bus with all three devices on it, and
 CAN_BITRATE was a single number. That was wrong about the hardware, and the
@@ -33,8 +40,8 @@ The same code also works through a USB-to-CAN adapter instead of the HAT:
 the candidates below are tried in order and the first that opens is used.
 
 SocketCAN reminder — bring each channel up at ITS OWN bitrate first, e.g.:
-    sudo ip link set can0 up type can bitrate 1000000
-    sudo ip link set can1 up type can bitrate 500000
+    sudo ip link set can0 up type can bitrate 500000
+    sudo ip link set can1 up type can bitrate 1000000
 """
 import sys
 
@@ -52,8 +59,8 @@ import sys
 # this code brings up: change it here AND re-run the unit, or a channel left
 # up from a previous boot keeps its old rate while the logs claim the new one.
 CAN_BITRATES = {
-    "can0": 1_000_000,
-    "can1": 500_000,
+    "can0": 500_000,
+    "can1": 1_000_000,
 }
 
 # Fallback rate for anything not in CAN_BITRATES — in practice the USB-to-CAN
@@ -88,6 +95,16 @@ CAN_CANDIDATES = [
 # replies on the SAME ID with DLC 8. These are the IDs we know how to parse.
 BMS_POLL_BYTE = 0x5A
 BMS_POLL_INTERVAL_S = 1.0          # how often to request a full refresh
+
+# Which channel to send BMS queries on. Confirmed on the car (a 0x5A query on
+# 0x100 got a valid pack-voltage reply) — the BMS is on can0. Restricting the
+# poll to that channel stops _poll_bms() from also transmitting unanswered
+# queries on can1, the MMS's channel — unacked transmit retries are exactly
+# what pushed a channel to bus-off before (see the module docstring above).
+# None means "poll every open bus", for a single-channel car or one where the
+# BMS channel hasn't been confirmed yet.
+BMS_POLL_CHANNEL = "can0"
+
 BMS_POLL_IDS = [
     0x100,  # Basic status: voltage / current / remaining capacity
     0x101,  # Capacity & cycles & SOC
@@ -372,7 +389,7 @@ def open_usb_candidates():
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now can-up.service
 #
-# It uses the CAN_BITRATES above (can0 at 1 Mbit/s, can1 at 500 kbit/s) and
+# It uses the CAN_BITRATES above (can0 at 500 kbit/s, can1 at 1 Mbit/s) and
 # txqueuelen 65536, matching what the app expects, and brings up can1 as well
 # when the car has a second channel. The two rates are deliberately different —
 # keep the unit and CAN_BITRATES in step by hand, because systemd cannot read
