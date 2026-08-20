@@ -169,9 +169,29 @@ To use a USB adapter instead of the HAT, or change channels, just edit
 
 **1. Enable the CAN HAT** in `/boot/firmware/config.txt` (or `/boot/config.txt` on older OS), e.g.:
 ```
-dtoverlay=mcp2515-can0,oscillator=16000000,interrupt=25
+dtparam=spi=on
+dtoverlay=mcp2515-can0,oscillator=16000000,interrupt=23
+dtoverlay=mcp2515-can1,oscillator=16000000,interrupt=25
 ```
-*(oscillator/interrupt values depend on your specific HAT — check its docs.)* Reboot after editing.
+
+> ⚠️ **These are the Waveshare 2-CH CAN HAT pins: can0 = GPIO23, can1 = GPIO25.**
+> This file previously listed `can0 ... interrupt=25` and no can1 line at all — those
+> are the settings for the **single-channel** RS485 CAN HAT, which is a different
+> board. On the 2-CH HAT that binds can0 to can1's interrupt line, so can0 either
+> never appears or behaves erratically. Check your own `config.txt` against this.
+
+The 2-CH HAT carries **two independent MCP2515 controllers** (plus SN65HVD230
+transceivers), which is what makes per-channel bitrates possible — can0 at
+1 Mbit/s and can1 at 500 kbit/s are genuinely separate hardware, not one
+controller time-shared.
+
+Each channel also has a **switchable 120 Ω termination jumper**. A CAN bus needs
+exactly two terminators, one at each physical end. Too few (or too many) causes
+reflections, error frames, and eventually `BUS-OFF`. With the bus unpowered,
+measure across CANH/CANL: **~60 Ω is correct** (two 120 Ω in parallel). 120 Ω
+means a terminator is missing; 40 Ω means there is one too many.
+
+Reboot after editing `config.txt`.
 
 **2. Bring each bus up** at *its own* configured bitrate (see
 `config.CAN_BITRATES`; every device on a given wire must agree with that wire):

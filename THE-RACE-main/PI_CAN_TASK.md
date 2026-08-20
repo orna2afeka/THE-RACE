@@ -123,11 +123,44 @@ ip -details link show can1 | grep -E "state|bitrate|restart"
 If `can0` returns to `BUS-OFF` within seconds, that is real: something on that
 wire is wrong. Continue to Task 3 — do not paper over it.
 
-If a channel reports **"Cannot find device can0"**, the HAT is not in the device
-tree. Check `/boot/firmware/config.txt` for the `dtoverlay=mcp2515-can0,...`
-line (and a `can1` counterpart for the second channel) and reboot. Mixed
-bitrates require **two independent controllers** — a single-channel HAT gives
-you `can0` only.
+### Check the overlay pins - likely the can0 fault
+
+The car uses a **Waveshare 2-CH CAN HAT**: two independent MCP2515 controllers
+with SN65HVD230 transceivers. Correct `/boot/firmware/config.txt` for that board:
+
+```
+dtparam=spi=on
+dtoverlay=mcp2515-can0,oscillator=16000000,interrupt=23
+dtoverlay=mcp2515-can1,oscillator=16000000,interrupt=25
+```
+
+**can0 = GPIO23, can1 = GPIO25.** This repo's README used to say `can0 ...
+interrupt=25` with no can1 line - those are the settings for the SINGLE-channel
+RS485 CAN HAT, a different board. If config.txt on this Pi still has can0 on
+interrupt 25, it is bound to can1's interrupt line, which would explain can0
+behaving erratically and reaching BUS-OFF.
+
+```bash
+grep -n "mcp2515\|spi" /boot/firmware/config.txt || grep -n "mcp2515\|spi" /boot/config.txt
+```
+
+**Report what those lines say.** If can0 is on interrupt 25, correct it to 23,
+make sure the can1 line exists, and reboot.
+
+### Check termination - the other prime suspect
+
+Each channel has a switchable **120 ohm jumper**. A CAN bus needs exactly two
+terminators, one at each physical end. Missing or extra termination causes
+reflections and error frames, and drives a channel to BUS-OFF - exactly what
+can0 did.
+
+With the bus **unpowered**, measure across CANH/CANL on each channel:
+
+* **~60 ohm** - correct (two 120 ohm in parallel)
+* **~120 ohm** - a terminator is MISSING, set the HAT jumper ON
+* **~40 ohm** - one terminator too many, set the HAT jumper OFF
+
+Report both readings.
 
 ---
 
