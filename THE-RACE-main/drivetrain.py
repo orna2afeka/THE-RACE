@@ -42,9 +42,27 @@ import math
 # A synchronous belt cannot slip, so this ratio is exact — no correction factor.
 # Re-sprocket the car and you only change these two integers.
 # --------------------------------------------------------------------------- #
+# ⚠️ THESE TOOTH COUNTS ARE UNCONFIRMED AND ARE CONTRADICTED BY MEASUREMENT.
+# They imply 112/22 = 5.0909, but see GEAR_RATIO below. Left here because they
+# are what the spec sheet said; the moment someone counts the real sprockets,
+# put the two integers here and delete the override.
 MOTOR_SPROCKET_TEETH = 22
 WHEEL_SPROCKET_TEETH = 112
-GEAR_RATIO = WHEEL_SPROCKET_TEETH / MOTOR_SPROCKET_TEETH      # 5.0909...
+
+# MEASURED, not derived from the teeth above.
+#
+# On 2026-08-20 the driver reported a true 74 km/h. The controller's speed
+# field (0x610 bytes 4-5) read 2035 at that moment, and that field is a speed
+# in 0.1 km/h computed with NO gear reduction. So:
+#
+#     2035 x 0.1 / 74 km/h = 2.7500
+#
+# 2.75 = 11/4 is a clean sprocket ratio (110/40, 88/32, 44/16), which is what
+# you would expect from a re-sprocket that the spec sheet never caught up with.
+# Using 5.0909 made every speed read 1.85x low - 40 km/h at a true 74.
+#
+# This is a single-point calibration and deserves confirming by counting teeth.
+GEAR_RATIO = 2.75
 
 # --------------------------------------------------------------------------- #
 # 2. ELECTRICAL vs MECHANICAL RPM  (TSRF-130, external motor)
