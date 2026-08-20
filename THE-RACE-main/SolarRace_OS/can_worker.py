@@ -27,8 +27,8 @@ from PySide6.QtCore import QThread, Signal
 
 from config import open_bus
 from modules.mms_parser import (
-    TEMP_FRAME_IDS, parse_driver_state, parse_motor_map, parse_motor_temp_frame,
-    reverse_active)
+    TEMP_FRAME_IDS, decode_vehicle_speed_kmh, parse_driver_state,
+    parse_motor_map, parse_motor_temp_frame, reverse_active)
 
 
 # ── SiliXcon LYNX — Status Word bit definitions ──────────────────────────── #
@@ -92,6 +92,12 @@ class CANWorker(QThread):
     # looking like a real reading of zero — 0 °C reads as a cold motor, 0 A as a
     # coasting car. The HUD widgets render None as an em dash (see _NO_DATA).
     rpm_updated             = Signal(object)  # Motor RPM           (signed RPM)
+    # Road speed as the CONTROLLER reports it (0x610 bytes 4-5, decoded by
+    # mms_parser.decode_vehicle_speed_kmh). This is the speedometer's only
+    # source: it is emitted from the frame that carries it and from nowhere
+    # else, so a car that stops sending 0x610 shows an em dash rather than a
+    # speed quietly recomputed from some other signal.
+    speed_updated           = Signal(object)  # Road speed          (km/h)
     voltage_updated         = Signal(object)  # Battery voltage     (Volts)
     soc_updated             = Signal(object)  # State of Charge     (0-100 %)
     controller_temp_updated = Signal(object)  # Controller temp     (°C)
@@ -159,7 +165,8 @@ class CANWorker(QThread):
                 f"Cannot open CAN bus:\n{err}\n\n"
                 "• Verify the USB-to-CAN adapter is plugged in, OR\n"
                 "• Verify the CAN HAT is mounted and can0 is up\n"
-                "    (sudo ip link set can0 up type can bitrate 500000).\n"
+                "    (sudo ip link set can0 up type can bitrate 1000000).\n"
+                "      can1 runs at 500000 - see config.CAN_BITRATES.\n"
                 "• Check CAN_CANDIDATES in config.py.\n"
                 "• Ensure no other application is using the channel."
             )
@@ -309,6 +316,7 @@ class CANWorker(QThread):
 
           Bytes 0-1  : Motor current — int16 LE ("Motor current [A] (q axis)")
           Bytes 2-3  : Motor RPM    — int16 LE (signed, direct RPM)
+          Bytes 4-5  : Vehicle speed — int16 LE, 0.1 km/h, NOT gear-corrected
           Bytes 6-7  : Motor Power  — int16 LE (signed Watts; negative on regen)
         """
         if len(data) < 8:
@@ -320,6 +328,12 @@ class CANWorker(QThread):
         # evidence the car is going backwards (see _emit_vehicle_flags).
         self._last_rpm = rpm
         self.rpm_updated.emit(rpm)
+
+        # Bytes 4-5: the controller's own speed, in 0.1 km/h and without the
+        # gear reduction applied. decode_vehicle_speed_kmh() owns both
+        # corrections; see the measurement note above its definition.
+        self.speed_updated.emit(
+            decode_vehicle_speed_kmh(struct.unpack_from("<h", data, 4)[0]))
 
         # Motor phase current — signed (negative on regen). Distinct from the
         # BATTERY current the BMS reports; DS002 shows both side by side.

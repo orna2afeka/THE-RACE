@@ -24,6 +24,10 @@ from datetime import datetime, timezone
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
+# The live GPS map is a hand-built deck rather than st.map, so that the view
+# centre is ours to control (Follow / Focus). pydeck ships with Streamlit — it
+# is what st.map itself renders through — so this adds no new install.
+import pydeck as pdk
 
 # The History chart needs Plotly: `uirevision` is what lets the browser keep the
 # SAME chart instance across a rerun, so a zoom survives the live refresh. If a
@@ -49,7 +53,11 @@ from constants import (
     MOTOR_TEMP_WARN, MOTOR_TEMP_CRIT, CTRL_TEMP_WARN, CTRL_TEMP_CRIT,
     CELL_TEMP_WARN, CELL_TEMP_CRIT,
     STRATEGIES, STRATEGY_BY_LABEL, DEFAULT_STRATEGY_KEY,
-    GEAR_RATIO, WHEEL_CIRCUMFERENCE_METERS, speed_kmh, TRACK_LENGTH_METERS,
+    # speed_kmh() is deliberately NOT imported: road speed comes from the
+    # controller's CAN field only (see build_state), and not importing the
+    # RPM-derived formula here is what stops it quietly coming back as a
+    # fallback.
+    GEAR_RATIO, WHEEL_CIRCUMFERENCE_METERS, TRACK_LENGTH_METERS,
     TARGET_LAP_TIME_MIN, DATA_STALE_AFTER_S,
     SECTION_NAMES, SECTION_TURN_LABELS, SECTION_RISK, SECTION_COLORS,
     BMS_PROTECTION_BITS, MMS_ERROR_BITS, decode_error_bits,
@@ -203,7 +211,9 @@ def read_live_state():
         # voltage (see METRIC_COLUMNS in db.py); `voltage` above is the BMS's
         # known-suspect one, kept for comparison rather than for decisions.
         "pack_voltage": None, "motor_current": None, "regen_energy": None,
-        "target_speed_kmh": None, "car_speed_kmh": None, "soc_ctrl": None,
+        # car_speed_kmh removed: it was mms_vehicle_speed_kmh under a second
+        # name, was never rendered, and is now simply speed_kmh above.
+        "target_speed_kmh": None, "soc_ctrl": None,
         "trip_m": None,
         # Motor PT1000: None (not 0) when the car sent no reading, so the pit
         # shows "—" instead of a 0 °C that reads like a freezing motor.
@@ -234,7 +244,6 @@ def read_live_state():
     state["motor_current"] = _val(row, "mms_current_A", None)
     state["regen_energy"] = _val(row, "regen_energy", None)
     state["target_speed_kmh"] = _val(row, "target_speed_kmh", None)
-    state["car_speed_kmh"] = _val(row, "mms_vehicle_speed_kmh", None)
     state["soc_ctrl"] = _val(row, "mms_estimated_soc_percent", None)
     state["trip_m"] = _val(row, "mms_trip_m", None)
     state["batt_temp"] = _val(row, "battery_temp_C", None)
@@ -260,10 +269,20 @@ def read_live_state():
                        _val(row, "lon", None) is not None
     state["lat"] = _val(row, "lat", 50.9895)
     state["lon"] = _val(row, "lon", 5.2568)
-    # Shared with the driver HUD — see drivetrain.py. Was open-coded here with
-    # different constants than the HUD used, which is why the two disagreed.
-    state["speed_kmh"] = (None if state["rpm"] is None
-                          else speed_kmh(state["rpm"]))
+    # Road speed comes from ONE place: the controller's own speed field on
+    # 0x610, decoded by mms_parser.decode_vehicle_speed_kmh() on the car and
+    # stored as mms_vehicle_speed_kmh. The driver HUD reads the same field from
+    # the same frame, so the two screens cannot drift apart.
+    #
+    # Deliberately NO fallback to speed_kmh(state["rpm"]). A fallback would let
+    # the tile show a number derived from a different field without saying so,
+    # which is exactly the class of bug that made the HUD read 3.3 % high for
+    # months. Missing speed renders as an em dash — see fmt().
+    #
+    # ⚠️ Rows written BEFORE the decode fix hold the raw uncorrected value
+    # (~50x too high). They are wrong here, not merely stale. Run the backfill
+    # before trusting historical speed — see tools/backfill_columns.py.
+    state["speed_kmh"] = _val(row, "mms_vehicle_speed_kmh", None)
     state["bms_has_error"] = _val(row, "bms_has_error", 0)
     state["bms_error_code"] = _val(row, "bms_error_code", 0)
     state["bms_protections"] = _val(row, "bms_protections", "")
@@ -396,7 +415,9 @@ def read_history_df(limit=100000, start_ts=None):
         odo = r["odometer_m"]
         recs.append({
             "Time": datetime.fromtimestamp(r["device_ts"]) if r["device_ts"] else None,
-            "Speed": speed_kmh(rpm) if rpm is not None else None,
+            # Same single source as the live tile and the driver HUD: the
+            # controller's own speed field, never re-derived from RPM.
+            "Speed": r["mms_vehicle_speed_kmh"],
             "Power": r["mms_power_W"],
             "RPM": rpm,
             "SoC": r["bms_soc_percent"],
@@ -822,6 +843,109 @@ def _top_strip_fragment():
                   "—" if total_wh is None else f"{total_wh:.1f}", "Wh net")
 
 
+# ── Live GPS map ──────────────────────────────────────────────────────────── #
+# Zoom 14 is about the whole Zolder circuit in frame — the level the map opened
+# at when it was an st.map call, kept so the first render looks the same.
+MAP_ZOOM = 14
+# The dot's RADIUS IN METRES. st.map defaults it to 100 — a 200 m blob that at
+# zoom 14 (~6 m/px at Zolder's latitude) covers a visible fraction of the lap
+# and hides the very corner you are looking at. 12 m is car-and-a-bit scale, so
+# the dot reads as a position rather than an area, and radiusMinPixels floors it
+# at a crisp ~6 px dot however far you zoom out.
+CAR_DOT_RADIUS_M = 12
+CAR_DOT_COLOR = [0, 255, 204]
+# ~11 cm of latitude — invisible on the map, but enough to make a view state
+# differ from the one already on screen. See the Focus handling below.
+FOCUS_NUDGE_DEG = 1e-6
+
+
+def _car_map_deck(lat, lon, center_lat, center_lon):
+    """One dot at the car, view centred wherever the caller says."""
+    return pdk.Deck(
+        # None, not pydeck's own "dark" default: it leaves the basemap to the
+        # frontend, which picks the Carto style matching the dashboard's
+        # light/dark theme. That is exactly what st.map did.
+        map_style=None,
+        initial_view_state=pdk.ViewState(latitude=center_lat, longitude=center_lon,
+                                         zoom=MAP_ZOOM, pitch=0, bearing=0),
+        layers=[pdk.Layer(
+            "ScatterplotLayer",
+            # A fixed id. pydeck otherwise mints a fresh uuid on every call, and
+            # deck.gl would tear the layer down and rebuild it twice a second
+            # instead of moving the dot it already has.
+            id="car-position",
+            data=[{"lat": lat, "lon": lon}],
+            get_position="[lon, lat]",
+            get_fill_color=CAR_DOT_COLOR,
+            get_radius=CAR_DOT_RADIUS_M,
+            radius_min_pixels=3,
+            # Quoted so pydeck passes the string through as-is: a bare string
+            # kwarg is wrapped as an "@@=" data accessor, which deck.gl would
+            # then try to evaluate against each row.
+            radius_units="'meters'",
+        )],
+    )
+
+
+def render_gps_map(state):
+    """Live GPS map with Google-Maps-style Follow, Focus and open-in-Maps.
+
+    Both modes fall out of one fact about the frontend: it diffs the deck's
+    initialViewState against the last one it received and pushes only the keys
+    that actually moved. Feed it the car's position every tick and the map
+    follows the car; hold the centre still and the pan/zoom the engineer set in
+    the browser is never touched, while the dot keeps moving underneath.
+    """
+    lat, lon = state["lat"], state["lon"]
+    fix = state["has_gps"]
+
+    b1, b2, b3 = st.columns([1.1, 1, 1.3], vertical_alignment="center")
+    # Deliberately never disabled, not even while following: with the car parked
+    # in the pit its position stops changing, so following stops re-centring,
+    # and this is then the only way back from a stray pan.
+    focus = b1.button(":material/my_location: Focus car", width="stretch",
+                      key="map_focus", help="Centre the map on the car.")
+    follow = b2.toggle("Follow", value=True, key="map_follow",
+                       help="Keep the map centred on the car. Switch off to pan "
+                            "and zoom freely — the dot still moves live.")
+    # Google's documented Maps URL: opens the web map on the pit laptop and
+    # deep-links into the Maps app on a phone. Disabled without a fix, because
+    # the fallback centre is the Zolder paddock — sending a marshal to a pin
+    # that is not the car is worse than giving them no link at all.
+    b3.link_button(
+        ":material/open_in_new: Google Maps",
+        f"https://www.google.com/maps/search/?api=1&query={lat:.6f},{lon:.6f}",
+        width="stretch", disabled=not fix,
+        help=("Open the car's position in Google Maps." if fix
+              else "No GPS fix from the car — nothing real to open."))
+
+    center = st.session_state.get("map_center")
+    if follow or focus or center is None:
+        center = (lat, lon)
+    st.session_state["map_center"] = center
+
+    nudge = st.session_state.get("map_focus_nudge", 0)
+    if focus:
+        # Pressing Focus twice with the car parked would otherwise send a view
+        # state identical to the one on screen — and "unchanged centre" is
+        # precisely how we tell the frontend to leave the pan alone, so the
+        # second press would do nothing. Alternate a hand-width offset and
+        # every press is a real change.
+        nudge = 0 if nudge else 1
+        st.session_state["map_focus_nudge"] = nudge
+
+    st.pydeck_chart(_car_map_deck(lat, lon,
+                                  center[0] + nudge * FOCUS_NUDGE_DEG, center[1]))
+
+    # Say plainly whether that dot is the car or just the default map centre.
+    if fix:
+        st.caption(f":green[● GPS fix] — {lat:.5f}, {lon:.5f}")
+    else:
+        st.caption(":orange[○ No GPS position from the car] — "
+                   "pin is the default Zolder centre, not the car. "
+                   "Check gpsd on the Pi (`gpspipe -w`).")
+
+
 @st.fragment(run_every=2)
 def _driver_fragment():
     """Driver Telemetry tab — track position + live GPS map. Updates in place."""
@@ -834,22 +958,7 @@ def _driver_fragment():
     lap, splits, deltas = read_sector_times()
     render_sector_times(lap, splits, deltas)
     st.markdown("### :material/map: Live GPS Map")
-    state = c["state"]
-    # size is the dot's RADIUS IN METRES, and st.map defaults it to 100 — a
-    # 200 m blob that, at zoom 14 (~6 m/px at Zolder's latitude), covers a
-    # visible fraction of the lap and hides the very corner you are looking at.
-    # 12 m is car-and-a-bit scale, so the dot reads as a position rather than
-    # an area. It cannot vanish when zoomed out: st.map floors the marker at
-    # radiusMinPixels 3, so this stays a crisp ~6 px dot however far you zoom.
-    st.map(pd.DataFrame({"lat": [state["lat"]], "lon": [state["lon"]]}),
-           zoom=14, color="#00FFCC", size=12)
-    # Say plainly whether that dot is the car or just the default map centre.
-    if state["has_gps"]:
-        st.caption(f":green[● GPS fix] — {state['lat']:.5f}, {state['lon']:.5f}")
-    else:
-        st.caption(":orange[○ No GPS position from the car] — "
-                   "pin is the default Zolder centre, not the car. "
-                   "Check gpsd on the Pi (`gpspipe -w`).")
+    render_gps_map(c["state"])
 
 
 # Sector boundaries, straight from the definitions the pit already displays.

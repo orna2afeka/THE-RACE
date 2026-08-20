@@ -14,15 +14,22 @@ Before=network-pre.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-# 1 Mbit/s — must match config.CAN_BITRATE. Every device on the shared bus has
-# to agree, and a wrong bitrate looks exactly like a dead bus.
+# The two channels run at DIFFERENT rates and must match config.CAN_BITRATES
+# entry for entry. systemd cannot read config.py, so these numbers are copied
+# by hand — change one, change the other. Every device on a given wire has to
+# agree with that wire's rate, and a wrong bitrate looks exactly like a dead
+# bus: the interface comes up clean and simply never decodes a frame.
+#
+# can0 — 1 Mbit/s
 ExecStart=/usr/sbin/ip link set can0 up type can bitrate 1000000
 # The default CAN TX queue is ~10 frames and the BMS poller sends a 16-frame
 # burst, which overflows it as ENOBUFS. This is why the queue is raised.
 ExecStart=/usr/sbin/ip link set can0 txqueuelen 65536
-# can1 is optional: a single-HAT car does not have it. The leading '-' makes
-# systemd ignore the failure instead of marking the whole unit failed.
-ExecStart=-/usr/sbin/ip link set can1 up type can bitrate 1000000
+# can1 — 500 kbit/s. Optional: a single-HAT car does not have it, and mixed
+# rates need two independent controllers (a 2-channel HAT), not one MCP2515.
+# The leading '-' makes systemd ignore the failure instead of marking the
+# whole unit failed.
+ExecStart=-/usr/sbin/ip link set can1 up type can bitrate 500000
 ExecStart=-/usr/sbin/ip link set can1 txqueuelen 65536
 ExecStop=-/usr/sbin/ip link set can0 down
 ExecStop=-/usr/sbin/ip link set can1 down

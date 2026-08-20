@@ -80,11 +80,15 @@ This works because the three message-ID ranges never overlap:
 | **BMS** (battery) | JBD query/response | `0x100`–`0x110` (11-bit) | Pi polls → BMS replies |
 | **TEMP** (battery temp) | J1939 thermistor | `0x1839F380` (29-bit) | broadcast → Pi |
 
-> ⚠️ **Single-bus requirement:** because they share one wire, **every device must
-> run at the same bitrate** — set by `CAN_BITRATE` in `SolarRace_OS/config.py`
-> (default **500 kbit/s**, the MMS native rate). The BMS baud is user-definable, so
-> set it to match. The J1939 temp module is often fixed at 250 kbit/s; if it cannot
-> be changed to the bus rate, it needs its own adapter instead of the shared bus.
+> ⚠️ **Per-wire bitrate:** every device sharing **one wire** must run at that
+> wire's bitrate — set per channel by `CAN_BITRATES` in `SolarRace_OS/config.py`
+> (**can0 at 1 Mbit/s, can1 at 500 kbit/s**). The two channels are independent
+> controllers and need not agree with each other, which is what lets a device
+> that cannot be reconfigured (the J1939 temp module is often fixed at
+> 250 kbit/s) sit on its own channel instead of dragging the whole car down to
+> its rate. The BMS baud is user-definable — set it to match whichever channel
+> it is wired to. Mixed rates require a **2-channel HAT** (two independent
+> MCP2515s); a single-channel HAT gives you `can0` only.
 
 ---
 
@@ -134,7 +138,8 @@ Almost everything car-side is centralised in **`SolarRace_OS/config.py`**:
 
 | Setting | Purpose |
 |---------|---------|
-| `CAN_BITRATE` | Shared bus bitrate — **all devices must match this** (default `500_000`). |
+| `CAN_BITRATES` | Per-channel bitrate map — **every device on a channel must match its rate** (`can0: 1_000_000`, `can1: 500_000`). For SocketCAN this does not set the rate; `ip link` does (see `deploy/can-up.service`), so keep the two in step. |
+| `CAN_BITRATE` | Fallback rate for channels absent from `CAN_BITRATES` — in practice the USB-to-CAN adapters, where python-can really does apply it. |
 | `CAN_CANDIDATES` | Connections tried in order: CAN HAT (`socketcan:can0`) first, then a USB-to-CAN adapter. First that opens wins. |
 | `BMS_POLL_IDS` / `BMS_POLL_BYTE` / `BMS_POLL_INTERVAL_S` | Which BMS frames to request, the query byte (`0x5A`), and how often (1 Hz). |
 | `SIM_LOG_PATH` | Recorded log replayed when no CAN bus is found. |
@@ -168,11 +173,13 @@ dtoverlay=mcp2515-can0,oscillator=16000000,interrupt=25
 ```
 *(oscillator/interrupt values depend on your specific HAT — check its docs.)* Reboot after editing.
 
-**2. Bring the bus up** at the configured bitrate (1 Mbit/s — see
-`config.CAN_BITRATE`; every device on the shared bus must agree):
+**2. Bring each bus up** at *its own* configured bitrate (see
+`config.CAN_BITRATES`; every device on a given wire must agree with that wire):
 ```bash
-sudo ip link set can0 up type can bitrate 1000000
+sudo ip link set can0 up type can bitrate 1000000   # can0 — 1 Mbit/s
 sudo ip link set can0 txqueuelen 65536
+sudo ip link set can1 up type can bitrate 500000    # can1 — 500 kbit/s
+sudo ip link set can1 txqueuelen 65536
 ```
 To make it automatic at boot, install the ready-made unit — do not hand-write one:
 ```bash

@@ -29,7 +29,9 @@ import sys
 from datetime import datetime, timezone
 
 import db
-from constants import GEAR_RATIO, WHEEL_CIRCUMFERENCE_METERS, speed_kmh
+# No drivetrain constants are needed here any more: the Speed column is the
+# controller's own CAN field, not a formula applied to RPM. Importing
+# speed_kmh() again would be the first step back to two disagreeing speeds.
 from pit_config import DEVICE_ID
 
 # Fixed identity/time columns that always lead the raw CSV.
@@ -43,8 +45,11 @@ METRIC_GROUPS = {
                     "mms_motor_temp_C", "mms_motor_ohms",
                     "mms_motor_map", "mms_motor_map_raw",
                     # The controller's own measurements — see db.METRIC_COLUMNS.
-                    # mms_vehicle_speed_kmh and mms_estimated_soc_percent are
-                    # excluded on purpose; see the _XLSX_COLS note on both.
+                    # mms_vehicle_speed_kmh is the SPEED source now that its
+                    # decode is fixed; it drives the derived "Speed (km/h)"
+                    # column rather than appearing under its raw name.
+                    # mms_estimated_soc_percent stays excluded; see _XLSX_COLS.
+                    "mms_vehicle_speed_kmh",
                     "mms_measured_voltage_V", "mms_current_A", "mms_trip_m"],
     "Temperature": ["battery_temp_C"],
     "Motion / GPS": ["odometer_m", "calculated_lap", "lat", "lon",
@@ -266,15 +271,19 @@ _XLSX_COLS = {
     "bms_voltage_V":     ("Pack Voltage BMS (V)", "0.00",     "V",    "2ECC71"),
     "bms_current_A":     ("Battery Current BMS (A)", "0.00",  "A",    "E67E22"),
     "mms_current_A":     ("Motor Current ctrl (A)", "0.00",   "A",    "D35400"),
-    # NOT exported, deliberately, though both are captured in telemetry.db:
-    #   mms_vehicle_speed_kmh      — reports RPM-like magnitudes, not km/h. Over
-    #     33k backfilled rows it peaks at 6583 while mms_rpm peaks at 6352, and
-    #     2,569 rows exceed 200 km/h. Whatever byte that field decodes, it is not
-    #     road speed. A column headed "km/h" holding 6583 would be worse than no
-    #     column at all.
+    # mms_vehicle_speed_kmh is no longer excluded — its decode is fixed. It used
+    # to peak at 6583 against an mms_rpm peak of 6352, with 2,569 rows over
+    # 200 km/h, because the raw field was read as km/h when it is really
+    # 0.1 km/h WITHOUT the gear reduction applied (mms_parser
+    # .decode_vehicle_speed_kmh has the measurement). It now feeds the
+    # "Speed (km/h)" column above and is not exported again under its raw name.
+    #
+    # ⚠️ Rows recorded before that fix still hold the raw value and will export
+    # as ~50x too fast. Back-fill before exporting a race that spans the change.
+    #
+    # NOT exported, deliberately, though it is captured in telemetry.db:
     #   mms_estimated_soc_percent  — 0 in all 33,972 rows; the controller never
     #     populates it, so it is not the independent SoC cross-check it looked like.
-    # Re-add them here the moment the decode in mms_parser.py is fixed.
     "target_speed_kmh":  ("Target Speed (km/h)", "0.0",       "km/h", "85C1E9"),
     "regen_energy":      ("Regen Energy (Wh)",   "0.0",       "Wh",   "A9DFBF"),
     "mms_trip_m":        ("Controller Trip (m)", "0",         "m",    None),
@@ -300,10 +309,15 @@ _MAX_CHART_POINTS = 2000
 
 def _data_columns(metrics):
     """Ordered output keys for the Data sheet, derived from the selected raw
-    metrics. Adds derived Speed (needs mms_rpm) and Distance (needs odometer_m)."""
+    metrics. Adds derived Speed (needs mms_vehicle_speed_kmh) and Distance
+    (needs odometer_m)."""
     m = set(metrics)
     present = {
-        "speed_kmh": "mms_rpm" in m,
+        # Speed is the controller's field, NOT a function of RPM. Gating this
+        # on mms_rpm would emit a Speed column from a source that no longer
+        # feeds it, and produce an empty column whenever RPM was selected and
+        # speed was not.
+        "speed_kmh": "mms_vehicle_speed_kmh" in m,
         "mms_rpm": "mms_rpm" in m,
         "mms_power_W": "mms_power_W" in m,
         "mms_temperature_C": "mms_temperature_C" in m,
@@ -332,7 +346,10 @@ def _cell_value(key, r):
     if key == "device_ts_iso":
         return _iso(r["device_ts"])
     if key == "speed_kmh":
-        return speed_kmh(r["mms_rpm"] or 0)   # shared formula — see drivetrain.py
+        # Straight from the controller's decoded speed field. No `or 0`: a row
+        # the car never reported speed for stays None -> an empty cell, not a
+        # confident 0 km/h averaged into the stint statistics.
+        return r["mms_vehicle_speed_kmh"]
     if key == "distance_km":
         return (r["odometer_m"] or 0) / 1000.0
     return r[key]

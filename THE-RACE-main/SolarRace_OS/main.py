@@ -79,6 +79,7 @@ from config import (
     shutdown_all_buses,
     CAN_REGISTRY_BUILD,
     CAN_BITRATE,
+    bitrate_for,
     CAN_SILENCE_TIMEOUT_S,
     USB_SILENCE_FALLBACK_S,
     USB_FALLBACK_RETRY_S,
@@ -414,6 +415,10 @@ class SmartCANWorker(CANWorker):
         map badge below already did via their own sentinels.
         """
         self.rpm_updated.emit(None)
+        # Speed is its own reading now, not a function of RPM, so it has to be
+        # blanked explicitly — otherwise the speedo would freeze on the last
+        # number the controller sent while everything around it went to dashes.
+        self.speed_updated.emit(None)
         self.voltage_updated.emit(None)
         self.soc_updated.emit(None)
         self.power_updated.emit(None)
@@ -897,10 +902,15 @@ def bring_up_can_buses():
             print(f"ℹ️ {channel} does not exist on this machine — skipping.")
             continue
 
+        # Per-channel: can0 and can1 are independent controllers and the car
+        # runs them at different rates. Using one global bitrate here is how a
+        # channel ends up silently misconfigured — it opens fine and simply
+        # never decodes a frame, which looks identical to unplugged wiring.
+        rate = bitrate_for(channel)
         print(f"⚙️ {channel} is down — bringing it up at "
-              f"{CAN_BITRATE // 1000} kbit/s...")
+              f"{rate // 1000} kbit/s...")
         for cmd in (
-            f"sudo -n ip link set {channel} up type can bitrate {CAN_BITRATE}",
+            f"sudo -n ip link set {channel} up type can bitrate {rate}",
             f"sudo -n ip link set {channel} txqueuelen 65536",
         ):
             # -n = never prompt. Without a tty a prompt cannot be answered, so
