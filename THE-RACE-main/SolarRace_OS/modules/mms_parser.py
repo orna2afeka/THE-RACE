@@ -1,84 +1,34 @@
-import os
 import struct
-import sys
 
 try:                        # normal import (package layout on the Pi)
     from modules import pt1000
 except ImportError:         # when modules/ is itself on sys.path
     import pt1000
 
-# drivetrain.py lives at the repo root, shared with the pit. Needed here for
-# GEAR_RATIO alone — see decode_vehicle_speed_kmh() for why a speed field the
-# controller already reports in km/h still has to be divided by the gear ratio.
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
-
-import drivetrain           # noqa: E402
 
 # ==============================================================================
-# VEHICLE SPEED — 0x610 bytes 4-5
+# VEHICLE SPEED - 0x610 bytes 4-5
 # ==============================================================================
-# The raw field is NOT km/h, despite the LYNX docs labelling it "Vehicle speed
-# [km/h]". Reading it as km/h is what put 2,569 rows over 200 km/h in
-# telemetry.db and got the field barred from the Excel export.
-#
-# What it actually is, measured against two independent captures (377 frames in
-# data/can_dump.txt and 3,923 moving rows in Pit_Dashboard/telemetry.db):
-#
-#   raw / motor_rpm  ->  median 1.036359   (p1 1.0072, p99 1.0400)
-#
-# That constant is not arbitrary. A speed in 0.1 km/h units, computed from a
-# 1.7273 m wheel circumference with NO gear reduction, predicts exactly
-# 1.7273 x 60 / 1000 x 10 = 1.03638. So the controller is:
-#
-#   * reporting in 0.1 km/h, not km/h            -> divide by 10
-#   * using its own configured wheel size, which
-#     independently implies 1.7273 m — within
-#     0.03 % of drivetrain's 1.7276 m            -> nothing to do
-#   * treating the motor as DIRECT DRIVE: its gear
-#     ratio was never configured, so it is 1:1    -> divide by GEAR_RATIO
-#
-# Applying both corrections agrees with drivetrain.speed_kmh() to a mean of
-# 0.014 km/h (worst case 0.147 km/h) over those 3,923 rows, and puts zero rows
-# above 200 km/h.
-#
-# ⚠️ CONSEQUENCE, worth knowing before trusting this as a cross-check: because
-# the controller's configured circumference happens to match drivetrain's
-# placeholder, this field is numerically almost IDENTICAL to the RPM-derived
-# speed. It does not escape the unmeasured-tire problem — it relocates it from
-# TIRE_DIAMETER_METERS into the controller's own configuration. If you
-# re-measure the tire and update drivetrain.py, reconfigure the controller too
-# or the two numbers will start to disagree by exactly the correction you made.
-#
-# The right permanent fix is to configure the gear ratio in the controller; then
-# GEAR_CORRECTION below becomes 1.0 and this comment becomes history. Verify
-# with a re-capture before changing it — do not assume a firmware update did it.
+# Read DIRECTLY off the wire, exactly as the controller sends it. No unit
+# scaling, no gear correction, no tire constants: whatever bytes 4-5 hold IS
+# the km/h we publish.
 # ==============================================================================
-VEHICLE_SPEED_UNIT_KMH = 0.1        # raw counts -> km/h
-VEHICLE_SPEED_GEAR_CORRECTED = True # controller's gear ratio is unset (1:1)
-
-
 def decode_vehicle_speed_kmh(raw):
-    """0x610 bytes 4-5 (raw INT16) -> true road speed in km/h, or None.
+    """0x610 bytes 4-5 -> km/h, verbatim.
 
-    None, never 0.0, when there is nothing to decode: a missing speed and a
-    stationary car are different facts and the dashboards render them
-    differently.
+    None (never 0.0) when there is nothing to read, so a missing reading stays
+    distinguishable from a stationary car.
     """
     if raw is None:
         return None
-    kmh = abs(raw) * VEHICLE_SPEED_UNIT_KMH
-    if VEHICLE_SPEED_GEAR_CORRECTED:
-        kmh /= drivetrain.GEAR_RATIO
-    return kmh
+    return float(raw)
 
 
 # ==============================================================================
 # LYNX PROTOCOL CAN IDs (Silixcon MMS)
 # ==============================================================================
 ID_STATUS  = 0x600   # Status, mode, power map, protections, limits, errors
-ID_MOTOR   = 0x610   # Motor current, RPM, VEHICLE SPEED (0.1 km/h), power
+ID_MOTOR   = 0x610   # Motor current, RPM, VEHICLE SPEED (km/h), power
 ID_BATTERY = 0x618   # Controller's estimation of Battery Voltage & SOC
 ID_ODO     = 0x620   # TRIP (0.01 km) + ODO (0.1 km), broadcast at 1 Hz
 ID_TEMP    = 0x628   # Motor thermistor resistance, PTC temp, controller temp
@@ -388,10 +338,7 @@ def parse_mms_message(arb_id, data_bytes):
         # current the BMS reports; DS002 shows both.
         motor_current_A = struct.unpack_from("<h", data_bytes, 0)[0]
 
-        # Bytes 4-5: the controller's own vehicle speed. The raw value is in
-        # 0.1 km/h and is NOT gear-corrected — see decode_vehicle_speed_kmh()
-        # above for the measurement that establishes both. Decoding it raw is
-        # what produced the "6583 km/h" rows.
+        # Bytes 4-5: the controller's vehicle speed, taken verbatim.
         vehicle_kmh = decode_vehicle_speed_kmh(
             struct.unpack_from("<h", data_bytes, 4)[0])
 
