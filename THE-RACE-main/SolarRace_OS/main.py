@@ -910,7 +910,10 @@ def bring_up_can_buses():
         print(f"⚙️ {channel} is down — bringing it up at "
               f"{rate // 1000} kbit/s...")
         for cmd in (
-            f"sudo -n ip link set {channel} up type can bitrate {rate}",
+            # restart-ms 100 arms automatic bus-off recovery. Without it a
+            # controller that hits 256 TX errors stays off the bus for good,
+            # keeping the UP flag while carrying nothing - see can-up.service.
+            f"sudo -n ip link set {channel} up type can bitrate {rate} restart-ms 100",
             f"sudo -n ip link set {channel} txqueuelen 65536",
         ):
             # -n = never prompt. Without a tty a prompt cannot be answered, so
