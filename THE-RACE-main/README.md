@@ -170,9 +170,22 @@ To use a USB adapter instead of the HAT, or change channels, just edit
 **1. Enable the CAN HAT** in `/boot/firmware/config.txt` (or `/boot/config.txt` on older OS), e.g.:
 ```
 dtparam=spi=on
-dtoverlay=mcp2515-can0,oscillator=16000000,interrupt=23
 dtoverlay=mcp2515-can1,oscillator=16000000,interrupt=25
+dtoverlay=mcp2515-can0,oscillator=16000000,interrupt=23
+dtoverlay=spi-bcm2835-overlay
 ```
+
+Straight from the Waveshare wiki, including the `spi-bcm2835-overlay` line that is
+easy to miss. The interrupt pins come from the board's own table:
+
+| Signal | BCM pin | Purpose |
+|--------|---------|---------|
+| CS_0   | 8 (CE0)  | CAN_0 chip select |
+| INT_0  | **23** (default) / 22 | CAN_0 interrupt |
+| CS_1   | 7 (CE1)  | CAN_1 chip select |
+| INT_1  | **25** (default) / 24 | CAN_1 interrupt |
+
+The alternates (22 / 24) only apply if the solder pads on the PCB were moved.
 
 > ⚠️ **These are the Waveshare 2-CH CAN HAT pins: can0 = GPIO23, can1 = GPIO25.**
 > This file previously listed `can0 ... interrupt=25` and no can1 line at all — those
@@ -191,7 +204,33 @@ reflections, error frames, and eventually `BUS-OFF`. With the bus unpowered,
 measure across CANH/CANL: **~60 Ω is correct** (two 120 Ω in parallel). 120 Ω
 means a terminator is missing; 40 Ω means there is one too many.
 
+### Two hardware gotchas from the vendor
+
+**VIO jumper must be set to 3.3 V.** The HAT ships with a selectable 3.3 V/5 V
+level translator and the Pi is a 3.3 V device. Waveshare: *"The working voltage
+level of Raspberry Pi is 3.3V, therefore we need to set the VIO of 2-CH CAN HAT
+to 3.3V."* Wrong position gives marginal, flaky signalling rather than a clean
+failure.
+
+**Use the standoffs.** On a 2B/3B/4B the back of the CAN screw terminal can
+touch the HDMI connector and short out. Waveshare calls this out explicitly and
+ships a booster seat and nylon post for it. A short here kills the channel in a
+way no amount of software debugging will explain.
+
 Reboot after editing `config.txt`.
+
+### 1 Mbit/s may not be achievable
+
+Waveshare's own FAQ: *"During high-speed communication, the data baud rate may
+not reach the nominal maximum rate ... Users need to ensure stability and select
+a suitable communication speed according to actual measurements."*
+
+This matters here. `can0` runs at 1 Mbit/s and has been observed in `BUS-OFF`,
+while `can1` at 500 kbit/s stays healthy. Isolated transceivers add propagation
+delay, and 1 Mbit/s leaves little timing margin over any real cable length. If
+`can0` keeps dropping to `BUS-OFF` after the wiring and termination check out,
+**the bitrate itself is the suspect** - but the MMS has to be reconfigured to
+match, since both ends of a wire must agree.
 
 **2. Bring each bus up** at *its own* configured bitrate (see
 `config.CAN_BITRATES`; every device on a given wire must agree with that wire):
