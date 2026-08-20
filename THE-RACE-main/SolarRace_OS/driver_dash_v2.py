@@ -1295,11 +1295,27 @@ class RacingDashboard(QMainWindow):
         It is not a risk to the driver: the car's HUD has no keyboard attached
         during a race, and F4 is nowhere near a gloved hand on a touchscreen.
         """
-        QShortcut(QKeySequence("Ctrl+R"), self, activated=self._restart_can)
-        QShortcut(QKeySequence("Ctrl+T"), self, activated=self._stop_can)
-        QShortcut(QKeySequence("Ctrl+Shift+Q"), self, activated=self._quit_for_good)
-        QShortcut(QKeySequence("Alt+F4"), self, activated=self._quit_for_good)
-        QShortcut(QKeySequence("Ctrl+Shift+C"), self, activated=self._toggle_cursor)
+        def bind(seq: str, slot) -> None:
+            # ApplicationShortcut, not the default WindowShortcut: the HUD's
+            # gauges and nav buttons are focusable children, and a window-scoped
+            # shortcut is only guaranteed to fire when the window itself — not a
+            # child — has focus. That is why the quit chord felt unreliable:
+            # whether it worked depended on what had been clicked last.
+            sc = QShortcut(QKeySequence(seq), self, activated=slot)
+            sc.setContext(Qt.ApplicationShortcut)
+
+        bind("Ctrl+R", self._restart_can)
+        bind("Ctrl+T", self._stop_can)
+        bind("Ctrl+Shift+Q", self._quit_for_good)
+        bind("Ctrl+Q", self._quit_for_good)      # the chord most people try first
+        bind("Alt+F4", self._quit_for_good)
+        bind("Ctrl+Shift+C", self._toggle_cursor)
+
+    # How long a quit will wait for the CAN worker to release the hardware
+    # before giving up and exiting anyway. Short on purpose: a quit that takes
+    # longer than this reads as "frozen" and the next thing a person does is
+    # pull the power, which is worse for the bus than the deadline ever is.
+    QUIT_GRACE_MS = 700
 
     def _quit_for_good(self) -> None:
         """Exit with code 42 — the wrapper's "stay down" signal.
@@ -1307,9 +1323,39 @@ class RacingDashboard(QMainWindow):
         deploy/start_hud.sh treats every other exit code as a crash and relaunches
         the HUD. 42 is how an engineer says the exit was intentional.
         """
-        print("[HUD] quit requested — exiting with code 42 (wrapper will stay down).")
-        self._stop_can()
-        QApplication.exit(42)
+        self._fast_exit(42, "quit requested")
+
+    def _fast_exit(self, code: int, why: str) -> None:
+        """Release the CAN hardware if it can be done quickly, then exit NOW.
+
+        Quitting used to call _stop_can(), whose wait() joins the worker
+        thread with no timeout. That join covers a whole loop iteration —
+        which makes blocking Firebase calls — plus _teardown(), which closes
+        two more Firebase listeners. On a slow link that ran to tens of
+        seconds with a frozen HUD on screen, so the HUD looked hung at exactly
+        the moment someone had decided to shut it down.
+
+        So: ask the worker to stop, give it QUIT_GRACE_MS to release the buses
+        on its own, then leave regardless. os._exit() is deliberate — it skips
+        interpreter shutdown, which otherwise waits on the Firebase listener
+        threads and can hang for as long again after the window has gone.
+
+        Missing the deadline is safe. socketcan sockets are closed by the
+        kernel when the process dies, so can0/can1 come back clean; only the
+        USB adapter's tidy CAN_Uninitialize is skipped, and re-opening it
+        already handles a stale handle.
+        """
+        print(f"[HUD] {why} — exiting with code {code}.")
+        worker, self._worker = self._worker, None
+        if worker is not None:
+            worker.request_stop()                       # returns immediately
+            if not worker.wait(self.QUIT_GRACE_MS):
+                print(f"[HUD] CAN worker still busy after "
+                      f"{self.QUIT_GRACE_MS} ms — exiting without it.")
+        # os._exit() bypasses normal flushing, and this output is the boot log.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(code)
 
     def _toggle_cursor(self) -> None:
         """Show or hide the mouse pointer (hidden by default for the driver)."""
@@ -1746,17 +1792,16 @@ class RacingDashboard(QMainWindow):
         deploy/start_hud.sh reads it as a crash and relaunches the HUD a second
         later, which is exactly the "can't close it on the Pi" problem.
         """
-        self._stop_can()
         # Close the pit-command Firebase stream if one was attached (main.py).
+        # Best effort and non-blocking in practice; _fast_exit() below will not
+        # wait on it either way.
         reg = getattr(self, "_cmd_reg", None)
         if reg is not None:
             try:
                 reg.close()
             except Exception:
                 pass
-        print("[HUD] window closed — exiting with code 42 (wrapper will stay down).")
-        QApplication.exit(42)
-        super().closeEvent(event)
+        self._fast_exit(42, "window closed")
 
 
 if __name__ == "__main__":
