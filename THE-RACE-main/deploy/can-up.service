@@ -20,7 +20,12 @@ RemainAfterExit=yes
 # agree with that wire's rate, and a wrong bitrate looks exactly like a dead
 # bus: the interface comes up clean and simply never decodes a frame.
 #
-# can0 — 1 Mbit/s
+# Measured directly on the car (listen-only sweep + a live BMS query reply):
+# can0 is the 500 kbit/s wire (BMS + J1939 temp module), can1 is the
+# 1 Mbit/s wire (MMS). This is swapped from an earlier assumption that had
+# the MMS on can0 — that mismatch is what drove can0 to bus-off, since
+# nothing on the wire at the wrong bitrate ever ACKed it.
+#
 # Reset both links first. `ip link set canX up` FAILS with "Device or resource
 # busy" on an interface that is already up — which is exactly what happens when
 # main.py brought the bus up itself, or when this unit is restarted after a
@@ -35,15 +40,23 @@ ExecStartPre=-/usr/sbin/ip link set can1 down
 # "ip -details link show" reports "can state BUS-OFF" and not one frame moves.
 # That is a race lost to a wiring glitch nobody can fix without an SSH session.
 # 100 ms means it re-arms ten times a second instead.
-ExecStart=/usr/sbin/ip link set can0 up type can bitrate 1000000 restart-ms 100
+#
+# listen-only off is explicit, not cosmetic: a controller left in listen-only
+# mode by a prior diagnostic session (e.g. probing bitrates with candump)
+# stays in listen-only across a plain down/up unless told otherwise, since
+# only the flags you pass are changed. That bus never transmits, never ACKs,
+# and never errors either — it just looks healthy while doing nothing.
+#
+# can0 — 500 kbit/s (BMS + J1939 temp module)
+ExecStart=/usr/sbin/ip link set can0 up type can bitrate 500000 restart-ms 100 listen-only off
 # The default CAN TX queue is ~10 frames and the BMS poller sends a 16-frame
 # burst, which overflows it as ENOBUFS. This is why the queue is raised.
 ExecStart=/usr/sbin/ip link set can0 txqueuelen 65536
-# can1 — 500 kbit/s. Optional: a single-HAT car does not have it, and mixed
-# rates need two independent controllers (a 2-channel HAT), not one MCP2515.
-# The leading '-' makes systemd ignore the failure instead of marking the
-# whole unit failed.
-ExecStart=-/usr/sbin/ip link set can1 up type can bitrate 500000 restart-ms 100
+# can1 — 1 Mbit/s (MMS). Optional: a single-HAT car does not have it, and
+# mixed rates need two independent controllers (a 2-channel HAT), not one
+# MCP2515. The leading '-' makes systemd ignore the failure instead of
+# marking the whole unit failed.
+ExecStart=-/usr/sbin/ip link set can1 up type can bitrate 1000000 restart-ms 100 listen-only off
 ExecStart=-/usr/sbin/ip link set can1 txqueuelen 65536
 ExecStop=-/usr/sbin/ip link set can0 down
 ExecStop=-/usr/sbin/ip link set can1 down
