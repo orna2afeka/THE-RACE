@@ -382,12 +382,23 @@ class CANWorker(QThread):
     # ================================================================== #
     # Lifecycle helpers                                                    #
     # ================================================================== #
+    def request_stop(self) -> None:
+        """Ask the run loop to exit. Returns IMMEDIATELY — does not join.
+
+        Split out of stop() so a quit path can start the teardown and then
+        decide for itself how long to wait. stop() joins forever, which is
+        right for a CAN restart (Ctrl+R must not reopen a bus the old thread
+        still holds) but wrong for quitting: one loop iteration runs blocking
+        Firebase calls, so the join can outlast a person's patience.
+        """
+        self._running = False
+
     def stop(self) -> None:
         """
         Ask the run loop to exit and block the caller until it does.
         Safe to call from the GUI thread.
         """
-        self._running = False
+        self.request_stop()
         # wait() joins the OS thread — guaranteed clean exit before we return.
         self.wait()
 

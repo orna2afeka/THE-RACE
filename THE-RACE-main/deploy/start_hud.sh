@@ -16,7 +16,7 @@
 set -u
 
 # ── configuration ────────────────────────────────────────────────────────── #
-REPO="${HOME}/THE-RACE"                  # repo ROOT, not SolarRace_OS/
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # repo ROOT (derived from this script's location)
 APP="${REPO}/SolarRace_OS/main.py"
 VENV_PY="${REPO}/.venv/bin/python3"
 LOG_DIR="${HOME}/hud-logs"

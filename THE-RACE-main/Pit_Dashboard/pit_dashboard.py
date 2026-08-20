@@ -835,8 +835,14 @@ def _driver_fragment():
     render_sector_times(lap, splits, deltas)
     st.markdown("### :material/map: Live GPS Map")
     state = c["state"]
+    # size is the dot's RADIUS IN METRES, and st.map defaults it to 100 — a
+    # 200 m blob that, at zoom 14 (~6 m/px at Zolder's latitude), covers a
+    # visible fraction of the lap and hides the very corner you are looking at.
+    # 12 m is car-and-a-bit scale, so the dot reads as a position rather than
+    # an area. It cannot vanish when zoomed out: st.map floors the marker at
+    # radiusMinPixels 3, so this stays a crisp ~6 px dot however far you zoom.
     st.map(pd.DataFrame({"lat": [state["lat"]], "lon": [state["lon"]]}),
-           zoom=14, color="#00FFCC")
+           zoom=14, color="#00FFCC", size=12)
     # Say plainly whether that dot is the car or just the default map centre.
     if state["has_gps"]:
         st.caption(f":green[● GPS fix] — {state['lat']:.5f}, {state['lon']:.5f}")
