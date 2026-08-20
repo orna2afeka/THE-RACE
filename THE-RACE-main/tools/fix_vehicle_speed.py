@@ -116,8 +116,16 @@ def backup(path):
     return dest
 
 
-def plan(conn, through):
-    """Rows to correct, rows to skip, and why - without writing anything."""
+def plan(conn, through, redecode=False):
+    """Rows to correct, rows to skip, and why - without writing anything.
+
+    redecode=True recomputes EVERY row from raw_json regardless of what the
+    column currently holds. That is the right thing when the decode itself
+    changed - a new GEAR_RATIO, say - because then the existing values are
+    stale rather than correct, and the untouched-signature guard would skip
+    exactly the rows that need redoing. raw_json is never rewritten, so this
+    stays safe to repeat.
+    """
     fix, skipped, no_evidence = [], 0, 0
     sql = (f"SELECT rowid, {COL}, raw_json FROM telemetry "
            f"WHERE {COL} IS NOT NULL AND rowid <= ? ORDER BY rowid")
@@ -127,7 +135,7 @@ def plan(conn, through):
             no_evidence += 1          # cannot prove it is untouched -> leave it
             continue
         # Untouched means the column still carries exactly what the car sent.
-        if abs(float(value) - float(raw)) > 1e-6:
+        if not redecode and abs(float(value) - float(raw)) > 1e-6:
             skipped += 1              # already corrected, or edited by something
             continue
         fix.append((decode_vehicle_speed_kmh(raw), rowid))
@@ -141,6 +149,10 @@ def main():
                     help="report what would change and exit without writing")
     ap.add_argument("--db", default=DEFAULT_DB, help="path to telemetry.db")
     ap.add_argument("--no-backup", action="store_true", help="skip the backup copy")
+    ap.add_argument("--redecode", action="store_true",
+                    help="recompute every row from raw_json, ignoring the "
+                         "already-corrected guard; use when the decode changed "
+                         "(e.g. a corrected GEAR_RATIO)")
     ap.add_argument("--through-rowid", type=int, default=None,
                     help="highest rowid still holding RAW values; required to "
                          "re-run after the first pass")
@@ -154,7 +166,7 @@ def main():
     conn.execute("PRAGMA busy_timeout = 30000")
 
     done = _marker(conn)
-    if done and a.through_rowid is None:
+    if done and a.through_rowid is None and not a.redecode:
         print(f"Already applied {done.get('applied_at')}: "
               f"{done.get('rows_changed')} rows through rowid "
               f"{done.get('through_rowid')}.")
@@ -164,12 +176,12 @@ def main():
 
     top = conn.execute("SELECT MAX(rowid) FROM telemetry").fetchone()[0] or 0
     through = a.through_rowid if a.through_rowid is not None else top
-    floor = done.get("through_rowid", 0) if done else 0
+    floor = 0 if a.redecode else (done.get("through_rowid", 0) if done else 0)
     if through <= floor:
         sys.exit(f"--through-rowid {through} is at or below the {floor} already "
                  f"corrected; nothing to do.")
 
-    fix, skipped, no_evidence = plan(conn, through)
+    fix, skipped, no_evidence = plan(conn, through, redecode=a.redecode)
 
     print(f"database      : {a.db}")
     print(f"max rowid     : {top:,}")

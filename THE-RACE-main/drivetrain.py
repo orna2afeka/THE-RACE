@@ -38,31 +38,23 @@ import math
 #
 # Derived from the tooth counts rather than hard-coding 5.09, because the teeth
 # are the physical truth and the decimal is a rounding of them:
-#     112 / 22 = 5.090909...   (the spec sheet's "1:5.09")
+#     144 / 22 = 6.545454...   (counted; the spec sheet's "1:5.09" was wrong)
 # A synchronous belt cannot slip, so this ratio is exact — no correction factor.
 # Re-sprocket the car and you only change these two integers.
 # --------------------------------------------------------------------------- #
-# ⚠️ THESE TOOTH COUNTS ARE UNCONFIRMED AND ARE CONTRADICTED BY MEASUREMENT.
-# They imply 112/22 = 5.0909, but see GEAR_RATIO below. Left here because they
-# are what the spec sheet said; the moment someone counts the real sprockets,
-# put the two integers here and delete the override.
+# COUNTED ON THE CAR 2026-08-20. These are the physical truth; the ratio is
+# derived from them rather than hard-coded, so a re-sprocket means editing two
+# integers and nothing else.
+#
+# The spec sheet said 112/22 = 5.09 and was simply wrong about the wheel
+# sprocket - it has 144 teeth, not 112. A brief override of 2.75 sat here,
+# fitted to a single chase-car reading of 74 km/h; the counted teeth supersede
+# it. See the note on TIRE_DIAMETER_METERS: 74 km/h cannot be reconciled with
+# these teeth and a 275 mm wheel, so that reading is treated as unreliable
+# (a chase car reads its own speed, and its speedometer reads optimistically).
 MOTOR_SPROCKET_TEETH = 22
-WHEEL_SPROCKET_TEETH = 112
-
-# MEASURED, not derived from the teeth above.
-#
-# On 2026-08-20 the driver reported a true 74 km/h. The controller's speed
-# field (0x610 bytes 4-5) read 2035 at that moment, and that field is a speed
-# in 0.1 km/h computed with NO gear reduction. So:
-#
-#     2035 x 0.1 / 74 km/h = 2.7500
-#
-# 2.75 = 11/4 is a clean sprocket ratio (110/40, 88/32, 44/16), which is what
-# you would expect from a re-sprocket that the spec sheet never caught up with.
-# Using 5.0909 made every speed read 1.85x low - 40 km/h at a true 74.
-#
-# This is a single-point calibration and deserves confirming by counting teeth.
-GEAR_RATIO = 2.75
+WHEEL_SPROCKET_TEETH = 144
+GEAR_RATIO = WHEEL_SPROCKET_TEETH / MOTOR_SPROCKET_TEETH      # 6.5454...
 
 # --------------------------------------------------------------------------- #
 # 2. ELECTRICAL vs MECHANICAL RPM  (TSRF-130, external motor)
