@@ -13,6 +13,24 @@ The system links the **car** (a Raspberry Pi reading the vehicle CAN bus) to the
 **pit wall** (a laptop dashboard) through the Google Firebase Realtime Database,
 giving engineers live battery, motor, temperature, and strategy data.
 
+### New here? Start with these
+
+| I want to… | Go to |
+|---|---|
+| Understand how the two halves fit together | [System Overview](#-system-overview) below |
+| Find my way around the files | [Repository Structure](#-repository-structure) |
+| Run the pit dashboard on a laptop | Double-click **`Start Pit Dashboard.bat`**, or [§ B](#b-pit-wall--pit_dashboard-laptop) |
+| Run the car software on the Pi | [§ A](#a-car--solarrace_os-raspberry-pi), then [`deploy/README.md`](deploy/README.md) |
+| Get CAN working on the Pi | [`docs/PI_CAN_TASK.md`](docs/PI_CAN_TASK.md) |
+| Change a gear ratio, lap length, or temp limit | `drivetrain.py`, `track.py`, `limits.py` at the repo root — **both** subsystems read them |
+| Change CAN bitrate / channels / BMS polling | `SolarRace_OS/config.py` |
+
+> **Two things that surprise everyone:**
+> 1. `Pit_Dashboard` never talks to Firebase — only `collector.py` does. The dashboard
+>    reads the local `telemetry.db` SQLite file. Start the collector first.
+> 2. Metrics that were not reported are `NULL` and render as `—`. They are **never** zero;
+>    do not coalesce a missing reading to `0` anywhere in this codebase.
+
 ---
 
 ## 🏁 System Overview
@@ -94,41 +112,111 @@ This works because the three message-ID ranges never overlap:
 
 ## 📂 Repository Structure
 
+The repository root **is** the project root: `SolarRace_OS/` (car) and
+`Pit_Dashboard/` (pit wall) sit side by side, with the physics/geometry modules
+they *both* import directly at the root.
+
 ```text
-THE RACE/
+THE RACE/                             # ← repo root
+│
+├── drivetrain.py                     # ⭐ SHARED: gear ratio, wheel size, speed_kmh()
+├── track.py                          # ⭐ SHARED: lap length, finish-line coordinates
+├── limits.py                         # ⭐ SHARED: temperature warn/crit thresholds
+├── speed_profile.py                  # ⭐ SHARED: target-speed curves along a lap
+│   #  These four live at the ROOT ON PURPOSE. The car and the pit had drifted
+│   #  onto different gear ratios and lap lengths and disagreed about speed by
+│   #  3.3 %. Both sides now import them by adding the repo root to sys.path
+│   #  (as parent-of-their-own-folder), so DO NOT move them into a subfolder
+│   #  — every importer breaks. See "Shared modules" below.
+│
+├── Start Pit Dashboard.bat           # Double-click launcher → Pit_Dashboard/run_pit.bat
+├── requirements.txt                  # Shared/root-tool dependencies
 │
 ├── SolarRace_OS/                     # Edge code — runs on the Raspberry Pi
-│   ├── main.py                       # Entry point: opens CAN, polls BMS, runs the HUD, pushes to Firebase
-│   ├── config.py                     # ⭐ Central config: bus bitrate, connection candidates, BMS poll list
+│   ├── main.py                       # Entry point: opens CAN, polls BMS, runs HUD, pushes to Firebase
+│   ├── config.py                     # ⭐ Central config: bitrates, connection candidates, BMS poll list
 │   ├── can_worker.py                 # CAN QThread + LYNX decoder + driver-HUD signals
-│   ├── driver_dash_v2.py             # PySide6 driver HUD (the active dashboard, RacingDashboard)
-│   ├── dashboard.py                  # Alternate standalone PySide6 engineering dashboard (pyqtgraph)
+│   ├── driver_dash_v2.py             # PySide6 driver HUD (the ACTIVE dashboard, RacingDashboard)
+│   ├── dashboard.py                  # Alternate standalone engineering dashboard (pyqtgraph)
 │   ├── test_connection.py            # Quick CAN probe — which bus is live + sample frames
 │   ├── requirements.txt              # Pi dependencies
 │   ├── modules/
-│   │   ├── bms_parser.py             # JBD battery decoder (voltage, current, SoC, cells, temps, protections)
+│   │   ├── bms_parser.py             # JBD battery decoder (voltage, current, SoC, cells, temps)
 │   │   ├── mms_parser.py             # SiliXcon LYNX motor decoder (RPM, power, errors)
 │   │   ├── temp_controller_parser.py # J1939 battery-temperature decoder (low/high/avg)
-│   │   └── gps_reader.py             # GPS position via gpsd (background thread, live in main.py)
+│   │   ├── pt1000.py                 # PT1000 thermistor linearisation
+│   │   ├── gps_reader.py             # GPS position via gpsd (background thread)
+│   │   ├── lap_tracker.py            # Lap/sector detection from GPS + wheel distance
+│   │   ├── lap_command.py            # Manual lap triggers / pit commands
+│   │   └── vehicle_inputs.py         # Throttle, brake, and switch inputs
 │   ├── cloud/
 │   │   ├── firebase_client.py        # Pushes telemetry to the Realtime DB (throttled)
-│   │   └── serviceAccountKey.json    # 🔒 Firebase admin key (keep out of git)
+│   │   └── serviceAccountKey.json    # 🔒 Firebase admin key — SEE SECURITY NOTE BELOW
 │   └── data/
-│       └── can_dump.txt              # Recorded CAN log (MMS+BMS+temp) used for simulation fallback
+│       └── can_dump.txt              # Recorded CAN log, replayed when no CAN hardware is present
 │
-└── Pit_Dashboard/                    # Pit-wall analytics — runs on an engineer's laptop
-    ├── collector.py                  # ⭐ ONLY Firebase client: streams telemetry_history -> SQLite
-    ├── db.py                         # SQLite schema + idempotent upsert + query helpers
-    ├── export.py                     # CSV export (date/time + subsystem filters); also a CLI
-    ├── pit_config.py                 # Pit-side config: DB URL, paths, sqlite path, device id
-    ├── pit_dashboard.py              # Streamlit dashboard (reads SQLite only, never Firebase)
-    ├── weather_service.py            # Open-Meteo Zolder forecast
-    ├── strategy_engine.py            # Strategy math, SoC forecast graph, velocity profile
-    ├── outputProfile.xlsx            # Zolder velocity profile
-    ├── telemetry.db                  # 🔒 local SQLite store (gitignored; created by collector.py)
-    ├── requirements_pit.txt          # Pit dependencies
-    └── serviceAccountKey.json        # 🔒 Firebase admin key (keep out of git)
+├── Pit_Dashboard/                    # Pit-wall analytics — runs on an engineer's laptop
+│   ├── run_pit.bat                   # Real launcher: finds Python, installs deps, starts both processes
+│   ├── collector.py                  # ⭐ The ONLY Firebase client: streams telemetry_history → SQLite
+│   ├── pit_dashboard.py              # Streamlit dashboard (reads SQLite ONLY, never Firebase)
+│   ├── db.py                         # SQLite schema + idempotent upsert + query helpers
+│   ├── constants.py                  # Pit constants; re-exports the shared root modules
+│   ├── pit_config.py                 # DB URL, paths, sqlite path, device id
+│   ├── strategy_engine.py            # Strategy math, SoC forecast, velocity profile
+│   ├── driver_message.py             # Pit → driver messaging
+│   ├── weather_service.py            # Open-Meteo Zolder forecast
+│   ├── export.py                     # CSV export (date/time + subsystem filters); also a CLI
+│   ├── ui.py                         # Shared Streamlit UI helpers
+│   ├── assets/pit_dashboard.css      # Dashboard styling
+│   ├── .streamlit/config.toml        # Streamlit server/theme settings
+│   ├── 210s.xlsx                     # Baseline 210 s Zolder velocity profile
+│   ├── requirements_pit.txt          # Pit dependencies
+│   ├── serviceAccountKey.json        # 🔒 Firebase admin key — SEE SECURITY NOTE BELOW
+│   └── telemetry.db                  # Local SQLite store (gitignored; created by collector.py)
+│
+├── profiles/                         # Pre-generated target-speed CSVs, one per lap time
+│   ├── fast_189s.csv  med_fast_199s.csv  base_210s.csv
+│   └── med_slow_220s.csv  slow_231s.csv
+│
+├── tools/                            # One-off / offline utilities (not part of the live system)
+│   ├── generate_profiles.py          # Builds profiles/*.csv from Pit_Dashboard/210s.xlsx
+│   ├── hud_sim.py                    # Drives the driver HUD without a car, for UI work
+│   ├── backfill_columns.py           # Adds new columns to an existing telemetry.db
+│   └── fix_vehicle_speed.py          # Re-derives stored speed after a decode fix
+│
+├── deploy/                           # Raspberry Pi provisioning (systemd + desktop launcher)
+│   ├── README.md                     # ⭐ Pi setup guide — read this before touching the Pi
+│   ├── can-up.service                # Brings can0/can1 up at boot at the right bitrate
+│   ├── solarrace-hud.desktop         # Autostart entry for the driver HUD
+│   └── start_hud.sh / stop_hud.sh    # HUD start/stop scripts
+│
+└── docs/                             # Standalone task briefs (no code depends on these)
+    ├── PI_CAN_TASK.md                # Step-by-step: MMS + BMS on two CAN channels
+    └── REACT_MIGRATION_PROMPT.md     # Plan for a future React + FastAPI pit rewrite (NOT built)
 ```
+
+### Shared modules — the one layout rule
+
+`drivetrain.py`, `track.py`, `limits.py`, and `speed_profile.py` are imported by
+both subsystems. Importers locate them by computing the repo root **relative to
+their own file** and prepending it to `sys.path`, e.g. in
+`Pit_Dashboard/constants.py`:
+
+```python
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+from drivetrain import GEAR_RATIO, WHEEL_CIRCUMFERENCE_METERS, speed_kmh
+```
+
+That expression means *"the folder containing my folder."* So the invariant is:
+**`Pit_Dashboard/`, `SolarRace_OS/`, and `tools/` must remain exactly one level
+below the four shared modules.** Nesting the project inside another folder, or
+moving the shared modules into a package, breaks every one of these imports.
+
+Everything else resolves relatively too — the `.bat` launchers use `%~dp0` and
+the Python paths are all `__file__`-based — so the repo can be cloned or renamed
+anywhere without edits.
 
 ---
 
@@ -370,8 +458,16 @@ once per second; the BMS replies on the same ID and those replies are decoded no
 ## 🔒 Security & Track Notes
 
 1. **Firebase keys** — `serviceAccountKey.json` (Firebase Admin SDK) is required in both
-   `SolarRace_OS/cloud/` and `Pit_Dashboard/`. It is listed in `.gitignore`; **never commit it**.
-   If a key was ever pushed, rotate it in the Google Cloud console.
+   `SolarRace_OS/cloud/` and `Pit_Dashboard/` (the two copies are identical). Both are
+   **deliberately committed to this repository**, so that a teammate cloning it gets a
+   working setup with no extra setup step. That is a conscious trade-off, and it means:
+   - **This repository must stay private.** The file contains a live RSA private key with
+     admin access to the `solar-race-telemetry` Realtime Database.
+   - If the repo is ever made public, forked outside the team, or the key otherwise leaks,
+     **rotate it** in the Google Cloud console (IAM → Service Accounts → Keys). Removing
+     the file in a later commit is *not* sufficient — it stays in git history.
+   - `.gitignore` intentionally does **not** list this file, because ignoring an
+     already-tracked file has no effect and would be misleading.
 2. **Track adaptation** — the velocity profile, sector layout, and weather coordinates are
    set for **Circuit Zolder (4000 m)**. For another venue, update the track constants in the
    pit dashboard and the coordinates in `weather_service.py` / `fetch_zolder_weather`.
