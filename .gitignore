@@ -1,8 +1,44 @@
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+**/__pycache__/
+*.pyc
 
-# Database backups (telemetry.db.*.bak) - tens of MB each, never source
+# Virtual environments
+venv/
+.venv/
+**/venv/
+**/.venv/
+
+# ---------------------------------------------------------------------------
+# Pit-side telemetry store
+# ---------------------------------------------------------------------------
+# collector.py writes telemetry.db locally on each pit machine. It is local
+# state, not source: never commit it.
+*.db
+*.db-wal
+*.db-shm
+
+# Manual snapshots taken before risky migrations (tens of MB each).
 *.bak
 **/*.bak
 
-# Collector stdout/stderr when launched detached
+# ---------------------------------------------------------------------------
+# Launcher / runtime bookkeeping
+# ---------------------------------------------------------------------------
+# Hash of the last requirements file run_pit.bat pip-installed.
+.deps_stamp
+**/.deps_stamp
+
+# collector stdout/stderr when launched detached by run_pit.bat
 collector.out.log
 collector.err.log
+
+# ---------------------------------------------------------------------------
+# Editors / OS
+# ---------------------------------------------------------------------------
+.idea/
+.Rhistory
+Thumbs.db
+desktop.ini
