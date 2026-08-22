@@ -40,8 +40,9 @@ Two subsystems, synchronised through one Firebase node (`live_telemetry`):
 ```
    ┌─────────────────────── CAR (Raspberry Pi) ───────────────────────┐
    │                                                                   │
-   │   CAN bus (can0)                                                  │
-   │   ├─ MMS  (SiliXcon LYNX motor controller)   IDs 0x600–0x628      │
+   │   can1 @ 1 Mbit/s                                                 │
+   │   └─ MMS  (SiliXcon LYNX motor controller)   IDs 0x600–0x628      │
+   │   can0 @ 500 kbit/s                                               │
    │   ├─ BMS  (JBD battery, polled)              IDs 0x100–0x110      │
    │   └─ TEMP (J1939 thermistor module)          ID  0x1839F380       │
    │            │                                                      │
@@ -89,18 +90,26 @@ Two subsystems, synchronised through one Firebase node (`live_telemetry`):
 
 ## 🔌 CAN Bus Topology
 
-All devices share **one high-speed CAN bus** on the Pi's CAN HAT (`can0`).
-This works because the three message-ID ranges never overlap:
+The car uses **two independent CAN channels** on a 2-CH HAT, at different
+bitrates. The motor controller sits alone on the fast wire; the battery and the
+temperature module share the slow one. Message-ID ranges never overlap, so the
+parsers can tell the protocols apart regardless of channel:
 
-| Device | Protocol | Message IDs | Direction |
-|--------|----------|-------------|-----------|
-| **MMS** (motor) | SiliXcon LYNX | `0x600`–`0x628` (11-bit) | broadcast → Pi |
-| **BMS** (battery) | JBD query/response | `0x100`–`0x110` (11-bit) | Pi polls → BMS replies |
-| **TEMP** (battery temp) | J1939 thermistor | `0x1839F380` (29-bit) | broadcast → Pi |
+| Device | Channel | Bitrate | Protocol | Message IDs | Direction |
+|--------|---------|---------|----------|-------------|-----------|
+| **MMS** (motor) | `can1` | 1 Mbit/s | SiliXcon LYNX | `0x600`–`0x628` (11-bit) | broadcast → Pi |
+| **BMS** (battery) | `can0` | 500 kbit/s | JBD query/response | `0x100`–`0x110` (11-bit) | Pi polls → BMS replies |
+| **TEMP** (battery temp) | `can0` | 500 kbit/s | J1939 thermistor | `0x1839F380` (29-bit) | broadcast → Pi |
+
+> 📐 **This split was measured on the car**, with a listen-only bitrate sweep
+> plus a live BMS query reply — not assumed. An earlier revision had the MMS on
+> `can0`, and that mismatch is precisely what drove `can0` to `BUS-OFF`: at the
+> wrong bitrate nothing on the wire ever ACKed a frame. If you change the
+> wiring, re-measure; do not infer.
 
 > ⚠️ **Per-wire bitrate:** every device sharing **one wire** must run at that
 > wire's bitrate — set per channel by `CAN_BITRATES` in `SolarRace_OS/config.py`
-> (**can0 at 1 Mbit/s, can1 at 500 kbit/s**). The two channels are independent
+> (**can0 at 500 kbit/s, can1 at 1 Mbit/s**). The two channels are independent
 > controllers and need not agree with each other, which is what lets a device
 > that cannot be reconfigured (the J1939 temp module is often fixed at
 > 250 kbit/s) sit on its own channel instead of dragging the whole car down to
@@ -226,7 +235,7 @@ Almost everything car-side is centralised in **`SolarRace_OS/config.py`**:
 
 | Setting | Purpose |
 |---------|---------|
-| `CAN_BITRATES` | Per-channel bitrate map — **every device on a channel must match its rate** (`can0: 1_000_000`, `can1: 500_000`). For SocketCAN this does not set the rate; `ip link` does (see `deploy/can-up.service`), so keep the two in step. |
+| `CAN_BITRATES` | Per-channel bitrate map — **every device on a channel must match its rate** (`can0: 500_000`, `can1: 1_000_000`). For SocketCAN this does not set the rate; `ip link` does (see `deploy/can-up.service`), so keep the two in step. |
 | `CAN_BITRATE` | Fallback rate for channels absent from `CAN_BITRATES` — in practice the USB-to-CAN adapters, where python-can really does apply it. |
 | `CAN_CANDIDATES` | Connections tried in order: CAN HAT (`socketcan:can0`) first, then a USB-to-CAN adapter. First that opens wins. |
 | `BMS_POLL_IDS` / `BMS_POLL_BYTE` / `BMS_POLL_INTERVAL_S` | Which BMS frames to request, the query byte (`0x5A`), and how often (1 Hz). |
@@ -283,7 +292,7 @@ The alternates (22 / 24) only apply if the solder pads on the PCB were moved.
 
 The 2-CH HAT carries **two independent MCP2515 controllers** (plus SN65HVD230
 transceivers), which is what makes per-channel bitrates possible — can0 at
-1 Mbit/s and can1 at 500 kbit/s are genuinely separate hardware, not one
+500 kbit/s and can1 at 1 Mbit/s are genuinely separate hardware, not one
 controller time-shared.
 
 Each channel also has a **switchable 120 Ω termination jumper**. A CAN bus needs
@@ -313,19 +322,24 @@ Waveshare's own FAQ: *"During high-speed communication, the data baud rate may
 not reach the nominal maximum rate ... Users need to ensure stability and select
 a suitable communication speed according to actual measurements."*
 
-This matters here. `can0` runs at 1 Mbit/s and has been observed in `BUS-OFF`,
-while `can1` at 500 kbit/s stays healthy. Isolated transceivers add propagation
-delay, and 1 Mbit/s leaves little timing margin over any real cable length. If
-`can0` keeps dropping to `BUS-OFF` after the wiring and termination check out,
-**the bitrate itself is the suspect** - but the MMS has to be reconfigured to
-match, since both ends of a wire must agree.
+This matters here, though note the `BUS-OFF` history on this car had a simpler
+cause: `can0` was being brought up at 1 Mbit/s while the devices actually on it
+(BMS + temp module) ran at 500 kbit/s, so nothing ever ACKed and the controller
+walked itself to `BUS-OFF`. Fixing the channel/bitrate mapping fixed that.
+
+The vendor caveat still stands for `can1`, which now carries the MMS at
+1 Mbit/s. Isolated transceivers add propagation delay, and 1 Mbit/s leaves
+little timing margin over any real cable length. So if `can1` starts dropping to
+`BUS-OFF` after the wiring and termination check out, **the bitrate itself is
+the suspect** — but the MMS has to be reconfigured to match, since both ends of
+a wire must agree.
 
 **2. Bring each bus up** at *its own* configured bitrate (see
 `config.CAN_BITRATES`; every device on a given wire must agree with that wire):
 ```bash
-sudo ip link set can0 up type can bitrate 1000000   # can0 — 1 Mbit/s
+sudo ip link set can0 up type can bitrate 500000 listen-only off   # BMS + temp
 sudo ip link set can0 txqueuelen 65536
-sudo ip link set can1 up type can bitrate 500000    # can1 — 500 kbit/s
+sudo ip link set can1 up type can bitrate 1000000 listen-only off  # MMS
 sudo ip link set can1 txqueuelen 65536
 ```
 To make it automatic at boot, install the ready-made unit — do not hand-write one:
