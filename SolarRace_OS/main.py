@@ -86,6 +86,7 @@ from config import (
     BMS_POLL_IDS,
     BMS_POLL_BYTE,
     BMS_POLL_INTERVAL_S,
+    BMS_POLL_CHANNEL,
 )
 
 # --- Race & Vehicle Constants ---
@@ -518,11 +519,20 @@ class SmartCANWorker(CANWorker):
         wanted ID carrying a single 0x5A byte; the BMS replies on the same
         ID and those replies are decoded by the normal read loop.
 
-        We don't know which channel the BMS sits on, so every query is sent on
-        BOTH buses; the harmless copy on the wrong bus is simply not answered.
+        BMS_POLL_CHANNEL restricts the query to the channel the BMS is
+        actually on, confirmed by a live query response (see config.py). If
+        unset, we don't know which channel the BMS sits on, so every query is
+        sent on every open bus; the harmless copy on the wrong bus is simply
+        not answered — except it isn't harmless on a bus with nothing to
+        answer it, since the unacked retries are what push a channel to
+        bus-off.
         """
         if not self._buses:
             return
+        target_buses = [
+            (bus, lbl) for bus, lbl in self._buses
+            if BMS_POLL_CHANNEL is None or getattr(bus, "channel", None) == BMS_POLL_CHANNEL
+        ]
         for query_id in BMS_POLL_IDS:
             if not self._running:
                 break
@@ -531,7 +541,7 @@ class SmartCANWorker(CANWorker):
                 data=[BMS_POLL_BYTE],
                 is_extended_id=False,
             )
-            for bus, _ in self._buses:
+            for bus, _ in target_buses:
                 try:
                     # timeout>0 makes SocketCAN wait briefly for TX-buffer space
                     # instead of failing instantly when the queue is momentarily
