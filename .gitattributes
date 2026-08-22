@@ -1,0 +1,33 @@
+# Normalise line endings. Without this, files committed from Windows land in
+# the repository with CRLF, and anything the Raspberry Pi executes then breaks
+# in a way that reads as a missing file: `#!/bin/bash\r` fails with
+# "bad interpreter: No such file or directory", and each line reports
+# "$'\r': command not found".
+* text=auto
+
+# Files the Pi runs or parses: force LF in the working tree on every platform,
+# so a Windows checkout cannot reintroduce CRLF into the index.
+*.sh        text eol=lf
+*.service   text eol=lf
+*.desktop   text eol=lf
+*.toml      text eol=lf
+*.csv       text eol=lf
+
+# Windows batch files are the mirror image: cmd.exe wants CRLF.
+*.bat       text eol=crlf
+
+# Binary — never diff, never munge line endings.
+*.xlsx      binary
+*.db        binary
+*.db-wal    binary
+*.db-shm    binary
+*.bak       binary
+*.pyc       binary
+*.png       binary
+*.jpg       binary
+*.ico       binary
+
+# Keep GitHub's language stats meaningful: recorded CAN logs and generated
+# speed-profile CSVs are data, not authored source.
+SolarRace_OS/data/**  linguist-generated=true
+profiles/**           linguist-generated=true
