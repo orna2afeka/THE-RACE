@@ -120,6 +120,13 @@ fi
 export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-wayland;xcb}"
 export PYTHONUNBUFFERED=1
 
+# Which output the HUD goes fullscreen on (see config.py: HUD_SCREEN_NAME).
+# This car's driver panel is DSI-2 — `wlr-randr` names outputs, and
+# ~/.config/kanshi/config pins DSI-2 to position 0,0 so it stays the primary
+# screen even if kanshi re-evaluates. Override per-run, e.g. on a bench with
+# only one screen attached: SOLARRACE_HUD_SCREEN=DSI-1 ./start_hud.sh
+export SOLARRACE_HUD_SCREEN="${SOLARRACE_HUD_SCREEN:-DSI-2}"
+
 # ── 5. supervise ─────────────────────────────────────────────────────────── #
 backoff="${RESTART_MIN_S}"
 while :; do

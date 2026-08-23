@@ -41,6 +41,7 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:
         pass        # Python <3.7 or an already-wrapped stream; best effort
 from PySide6.QtWidgets import QApplication
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtCore import QObject, Signal, QTimer
 import subprocess
 # --- Core Logic & Parsing Modules ---
@@ -87,6 +88,7 @@ from config import (
     BMS_POLL_BYTE,
     BMS_POLL_INTERVAL_S,
     BMS_POLL_CHANNEL,
+    HUD_SCREEN_NAME,
 )
 
 # --- Race & Vehicle Constants ---
@@ -982,6 +984,29 @@ def main():
     driver_dash_v2.CANWorker = SmartCANWorker
     
     dashboard = RacingDashboard()
+
+    # Wayland gives a client no window positioning, but it CAN request
+    # fullscreen on a specific output — QWindow.setScreen() before going
+    # fullscreen. windowHandle() is None until the native window exists, so
+    # winId() is called first to force its creation. HUD_SCREEN_NAME is None
+    # unless SOLARRACE_HUD_SCREEN is set (see config.py), in which case this
+    # block is a no-op and behaviour is exactly what it was before screen
+    # targeting existed — a panel that's unplugged or renamed must never stop
+    # the HUD from starting.
+    if HUD_SCREEN_NAME:
+        dashboard.winId()
+        handle = dashboard.windowHandle()
+        available = QGuiApplication.screens()
+        target = next((s for s in available if s.name() == HUD_SCREEN_NAME), None)
+        if handle is not None and target is not None:
+            handle.setScreen(target)
+            print(f"🖥️ HUD targeting screen '{HUD_SCREEN_NAME}'")
+        else:
+            logging.warning(
+                "SOLARRACE_HUD_SCREEN=%r not applied (windowHandle=%s, "
+                "available screens=%s) — falling back to compositor default.",
+                HUD_SCREEN_NAME, handle is not None, [s.name() for s in available],
+            )
     dashboard.showFullScreen()
 
     # --- Pit-to-driver messages: subscribe to /driver_command (push, not poll) --

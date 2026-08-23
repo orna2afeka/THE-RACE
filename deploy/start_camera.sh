@@ -30,11 +30,17 @@ RESTART_MIN_S=2
 RESTART_MAX_S=20
 HEALTHY_RUN_S=20
 
-# Which screen the camera goes fullscreen on. 0 is the first output, 1 the
-# second. If the camera and the HUD come up on the same screen, or swapped,
-# change this to the other value — that is the whole fix, and it is the first
-# thing to try. `wlr-randr` on the Pi lists the outputs in index order.
-FS_SCREEN="${SOLARRACE_CAM_SCREEN:-1}"
+# Which screen the camera goes fullscreen on, by OUTPUT NAME (`wlr-randr` on
+# the Pi lists them, e.g. DSI-1 / DSI-2) rather than by index: this mpv build
+# (0.35.1) supports --fs-screen-name, and a name survives a re-plug or a
+# kanshi re-ordering where a numeric index would not.
+#
+# This car: DSI-2 is the driver HUD (see deploy/start_hud.sh /
+# SOLARRACE_HUD_SCREEN), DSI-1 is the reverse camera — set 2026-08-23 against
+# the layout in ~/.config/kanshi/config, which pins DSI-2 to position 0,0.
+# If the camera and the HUD come up on the same screen, or swapped, change
+# this — that is the whole fix, and it is the first thing to try.
+FS_SCREEN="${SOLARRACE_CAM_SCREEN:-DSI-1}"
 
 # Capture format. MJPEG because a USB capture dongle that offers it hands over
 # already-compressed frames, so the Pi does not spend a core on raw YUV at
@@ -161,7 +167,7 @@ MPV_OPTS=(
     --cursor-autohide=always
     --no-border
     --fs
-    "--fs-screen=${FS_SCREEN}"
+    "--fs-screen-name=${FS_SCREEN}"
     --keep-open=no
     --msg-level=all=warn
 )
