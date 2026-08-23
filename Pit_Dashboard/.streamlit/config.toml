@@ -35,6 +35,13 @@ disconnectedSessionTTL = 1800
 # can restart the app mid-session if a file is touched.
 fileWatcherType = "none"
 
+# Serve Pit_Dashboard/static/ at /app/static/. Needed for the Live GPS Map's
+# satellite basemap: Streamlit's deck.gl component requires mapStyle to be a
+# string URL, so the MapLibre style document has to be fetchable rather than
+# passed inline. Serving it ourselves keeps the pit off any third-party style
+# host - only the imagery tiles come from outside.
+enableStaticServing = true
+
 # ⚠️ CLOSED-NETWORK SETTING. These two must move TOGETHER: Streamlit ignores
 # enableCORS=false while XSRF protection is on, so disabling one alone does
 # nothing. Safe here only because the pit runs on its own private hotspot (venue

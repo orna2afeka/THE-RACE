@@ -6,6 +6,9 @@ from constants import (
     SECTION_TURN_LABELS,
     SECTION_RISK,
     SECTION_COLORS,
+    NORMAL,
+    WARNING,
+    CRITICAL,
 )
 
 # Sharp inline-SVG glyphs for the sector card (raw HTML can't use Streamlit's
@@ -20,23 +23,46 @@ _SVG_BOLT = (
     'margin-right:3px" aria-hidden="true"><path fill="currentColor" d="M7 2v11h3v9l7-12h-4l4-8z"/></svg>'
 )
 
-def render_metric(col, title, val, unit, condition="normal"):
-    color_class = ""
-    if condition == "warning": color_class = "warning"
-    if condition == "critical": color_class = "critical"
+def render_metric(col, title, val, unit, condition=NORMAL, large=False,
+                  note=None):
+    """One tile. `condition` is a tier from limits.classify().
+
+    Until now this function existed twice, byte-identical, here and in
+    pit_dashboard.py -- and the pit_dashboard copy shadowed the import, so this
+    file was dead code. Editing it changed nothing, which is a trap worth more
+    than the duplication saved.
+
+    `large` grows the number for the Live Metrics tab, where the tiles are the
+    whole point of the page rather than a strip above it.
+
+    `note` is a small line under the value, for a reading that needs a caveat
+    attached to it wherever it appears -- the BMS pack voltage is known to
+    decode about 2.3x high, and a number like that must never be shown bare.
+    """
+    # An unrecognised tier deliberately falls through to no class rather than
+    # raising: a tile with the default colour is a far better failure than a
+    # dashboard that will not render.
+    color_class = condition if condition in (WARNING, CRITICAL) else ""
+    size_class = " large" if large else ""
+    unit_px = 22 if large else 16
+    note_html = (f'<div class="metric-note">{note}</div>' if note else "")
     col.markdown(f"""
-    <div class="metric-container">
+    <div class="metric-container{size_class}">
         <div class="metric-title">{title}</div>
-        <div class="metric-value {color_class}">{val} <span style="font-size:16px;">{unit}</span></div>
+        <div class="metric-value{size_class} {color_class}">{val} <span style="font-size:{unit_px}px;">{unit}</span></div>
+        {note_html}
     </div>
     """, unsafe_allow_html=True)
 
 
 def render_sector_display(track_status, current_dist_m, sector_id):
     """Sector card with the velocity-profile TARGET SPEED for this point."""
-    risk = SECTION_RISK.get(sector_id, "normal")
+    risk = SECTION_RISK.get(sector_id, NORMAL)
     color = SECTION_COLORS[risk]
-    current_class = "current" if risk == "normal" else f"current-{risk}"
+    # Class names follow the tier names, so .current-warning / .current-critical
+    # in the stylesheet. They were .current-warn / .current-crit when the risk
+    # values used the short spelling.
+    current_class = "current" if risk == NORMAL else f"current-{risk}"
     sector_name = SECTION_NAMES.get(sector_id, f"Section {sector_id}")
     target_speed = track_status.get("target_speed", 0)
     next_name = track_status.get("next_feature", "N/A")

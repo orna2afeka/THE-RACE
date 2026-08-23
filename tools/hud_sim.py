@@ -40,6 +40,7 @@ from PySide6.QtGui import QKeySequence, QShortcut           # noqa: E402
 from PySide6.QtWidgets import QApplication                  # noqa: E402
 
 import drivetrain                                           # noqa: E402
+import limits                                               # noqa: E402
 import speed_profile                                        # noqa: E402
 from driver_dash_v2 import RacingDashboard, RACING_QSS      # noqa: E402
 from modules import pt1000                                  # noqa: E402
@@ -52,7 +53,12 @@ TICK_MS = 100                      # 10 Hz, the car's profile tick rate
 
 
 def raw_rpm_for_speed(kmh: float) -> int:
-    """Inverse of drivetrain.speed_kmh() — km/h back to a raw motor RPM.
+    """Inverse of drivetrain.speed_kmh() — km/h back to a TRUE motor RPM.
+
+    "True", not the controller's halved figure, because this feeds the HUD
+    directly and bypasses mms_parser - and mms_parser is where the real car's
+    2x under-report is corrected. Feeding the raw halved value here would make
+    the simulator disagree with the car it is meant to stand in for.
 
     Drives the TACHOMETER only. The speedometer is fed separately from the
     controller's own speed field, so this no longer determines what the sim's
@@ -92,7 +98,7 @@ class FakeCar:
         self.motor_c = 31.0
         self.ctrl_c = 34.0
         self.cell_c = 27.0
-        self.voltage = 96.4
+        self.voltage = 53.5              # 13S near full charge
         self.t = 0.0                       # simulated seconds since start
         self.paused = False
         self._script_idx = 0
@@ -117,8 +123,23 @@ class FakeCar:
         # movement that every gauge on both screens has something to show.
         load = self.speed_kmh / 90.0
         self.soc = max(4.0, self.soc - 0.02 * dt_s * load)
-        self.voltage = 84.0 + 0.16 * self.soc + random.uniform(-0.2, 0.2)
-        self.motor_c += (32.0 + 46.0 * load - self.motor_c) * dt_s * 0.05
+        # 13S pack: 3.0 V/cell empty to 4.2 V/cell full, i.e. 39.0-54.6 V. The
+        # old model was `84.0 + 0.16 * soc`, which produced 84-99 V - a leftover
+        # from when the gauge was scaled to 120 V for the misdecoded BMS
+        # voltage. Against the real 60 V scale that pegged the arc at 100 % for
+        # the whole run AND never crossed the low-voltage threshold, so the
+        # simulator could not exercise the thing it exists to show.
+        self.voltage = (limits.CELL_COUNT
+                        * (limits.CELL_V_CRIT
+                           + (limits.CELL_V_MAX - limits.CELL_V_CRIT)
+                           * self.soc / 100.0)
+                        + random.uniform(-0.2, 0.2))
+        # Asymptote 32 + 105*load, so a flat-out lap settles near 137 C. The old
+        # 46*load capped out at 78 C, which is below even the OLD warning level:
+        # no amount of simulated driving could turn the motor gauge amber. The
+        # real car's recorded median is 90 C with a peak of 135.5 C, so this is
+        # also simply closer to the truth.
+        self.motor_c += (32.0 + 105.0 * load - self.motor_c) * dt_s * 0.05
         self.ctrl_c += (34.0 + 30.0 * load - self.ctrl_c) * dt_s * 0.05
         self.cell_c += (26.0 + 16.0 * load - self.cell_c) * dt_s * 0.03
 

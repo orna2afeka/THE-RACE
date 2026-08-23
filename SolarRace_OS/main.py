@@ -872,7 +872,19 @@ class SmartCANWorker(CANWorker):
         self.voltage_updated.emit(round(voltage_raw * 0.01, 2))
         if not self._have_bms_soc:
             soc = struct.unpack_from("<B", data, 2)[0]
-            self.soc_updated.emit(soc)
+            # Zero means "not populated", not "empty pack". This controller
+            # never fills the field in: it reads exactly 0 in all 44,088
+            # recorded samples, and a car that is driving cannot be at 0 % SoC
+            # anyway. Emitting that 0 as a measurement would be the exact lie
+            # the em dash exists to prevent.
+            #
+            # It matters more now than it used to. SoC has a LOW-side threshold
+            # (limits.SOC), so a literal 0 would show a blinking red gauge from
+            # the moment the car wakes up until the first BMS reply lands - and
+            # forever if the BMS never answers, which is a failure this class
+            # already handles elsewhere. None leaves an em dash instead, which
+            # is the truth: we do not know the charge yet.
+            self.soc_updated.emit(soc if soc > 0 else None)
 
 # ==============================================================================
 # APPLICATION BOOTSTRAP

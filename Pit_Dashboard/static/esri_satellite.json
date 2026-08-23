@@ -1,0 +1,50 @@
+{
+  "version": 8,
+  "name": "Esri World Imagery",
+  "metadata": {
+    "comment": [
+      "MapLibre style for the pit wall's Live GPS Map: satellite imagery.",
+      "",
+      "Served by Streamlit itself from Pit_Dashboard/static/ (which needs",
+      "server.enableStaticServing = true in .streamlit/config.toml), so the pit",
+      "depends on no third-party style host. Only the imagery tiles come from",
+      "outside, and no API key is involved anywhere.",
+      "",
+      "Why a file at all: Streamlit's deck.gl component calls .indexOf() on",
+      "mapStyle, so it must be a string URL - passing the same document inline",
+      "as a dict throws 'e.mapStyle?.indexOf is not a function'.",
+      "",
+      "Raster-only on purpose: no glyphs and no sprite, because nothing here",
+      "draws text or icons. Adding a labels layer later would need both."
+    ]
+  },
+  "sources": {
+    "esri-imagery": {
+      "type": "raster",
+      "tiles": [
+        "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+      ],
+      "tileSize": 256,
+      "minzoom": 0,
+      "maxzoom": 19,
+      "attribution": "Esri, Maxar, Earthstar Geographics"
+    }
+  },
+  "layers": [
+    {
+      "id": "ground",
+      "type": "background",
+      "paint": {
+        "background-color": "#0c1624"
+      }
+    },
+    {
+      "id": "esri-imagery",
+      "type": "raster",
+      "source": "esri-imagery",
+      "paint": {
+        "raster-opacity": 1
+      }
+    }
+  ]
+}

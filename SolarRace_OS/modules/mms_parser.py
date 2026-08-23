@@ -56,7 +56,7 @@ import drivetrain           # noqa: E402
 # with a re-capture before changing it — do not assume a firmware update did it.
 # ==============================================================================
 VEHICLE_SPEED_UNIT_KMH = 0.1        # raw counts -> km/h
-VEHICLE_SPEED_GEAR_CORRECTED = True # controller's gear ratio is unset (1:1)
+VEHICLE_SPEED_GEAR_CORRECTED = True # the field still needs scaling; see below
 
 
 def decode_vehicle_speed_kmh(raw):
@@ -70,7 +70,13 @@ def decode_vehicle_speed_kmh(raw):
         return None
     kmh = abs(raw) * VEHICLE_SPEED_UNIT_KMH
     if VEHICLE_SPEED_GEAR_CORRECTED:
-        kmh /= drivetrain.GEAR_RATIO
+        # CONTROLLER_SPEED_DIVISOR, *not* GEAR_RATIO. These were the same
+        # constant until 2026-08-22 and that coincidence hid a 2x RPM error for
+        # two days: the speed here looked perfect while everything derived from
+        # RPM was out by 2.57x. They are separate quantities - one is the belt,
+        # the other is how this controller happens to scale a field it computes
+        # from its own halved RPM. See drivetrain section 3b.
+        kmh /= drivetrain.CONTROLLER_SPEED_DIVISOR
     return kmh
 
 
@@ -376,8 +382,17 @@ def parse_mms_message(arb_id, data_bytes):
     
     # 1. Motor Data (RPM & Power)
     if arb_id == ID_MOTOR and len(data_bytes) >= 8:
-        # <h = Little-Endian, signed int16 (2 bytes) starting at index 2
-        rpm = struct.unpack_from("<h", data_bytes, 2)[0]
+        # <h = Little-Endian, signed int16 (2 bytes) starting at index 2.
+        # Negative means reverse - the field is documented signed.
+        #
+        # Corrected to the TRUE motor speed right here, because this controller
+        # reports exactly half of it (measured against gpsd over 1,955 moving
+        # samples: multiplier 2.0101). Doing it at the decoder means every
+        # consumer - the driver's gauge, the pit chart, the stored column - gets
+        # a real RPM, and there is exactly one place doing the correction.
+        # See drivetrain.RPM_REPORT_SCALE for the measurement and the real fix.
+        rpm = drivetrain.true_motor_rpm(
+            struct.unpack_from("<h", data_bytes, 2)[0])
         # <h = Little-Endian, SIGNED int16 (2 bytes) at index 6. Power is signed:
         # it goes negative during regen/coasting. Decoding it unsigned ("<H") made
         # small negatives wrap to ~65000 W (the "unrealistic power" on the pit/HUD).

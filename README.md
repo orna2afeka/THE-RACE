@@ -22,7 +22,8 @@ giving engineers live battery, motor, temperature, and strategy data.
 | Run the pit dashboard on a laptop | Double-click **`Start Pit Dashboard.bat`**, or [§ B](#b-pit-wall--pit_dashboard-laptop) |
 | Run the car software on the Pi | [§ A](#a-car--solarrace_os-raspberry-pi), then [`deploy/README.md`](deploy/README.md) |
 | Get CAN working on the Pi | [`docs/PI_CAN_TASK.md`](docs/PI_CAN_TASK.md) |
-| Change a gear ratio, lap length, or temp limit | `drivetrain.py`, `track.py`, `limits.py` at the repo root — **both** subsystems read them |
+| Change a gear ratio, lap length, or alarm threshold | `drivetrain.py`, `track.py`, `limits.py` at the repo root — **both** subsystems read them |
+| Retune when a gauge goes amber or red | `limits.py`, then re-run `python tools/replay_limits.py` to see how often the new number would have fired |
 | Change CAN bitrate / channels / BMS polling | `SolarRace_OS/config.py` |
 
 > **Two things that surprise everyone:**
@@ -130,7 +131,7 @@ THE RACE/                             # ← repo root
 │
 ├── drivetrain.py                     # ⭐ SHARED: gear ratio, wheel size, speed_kmh()
 ├── track.py                          # ⭐ SHARED: lap length, finish-line coordinates
-├── limits.py                         # ⭐ SHARED: temperature warn/crit thresholds
+├── limits.py                         # ⭐ SHARED: every alarm threshold + tier colours
 ├── speed_profile.py                  # ⭐ SHARED: target-speed curves along a lap
 │   #  These four live at the ROOT ON PURPOSE. The car and the pit had drifted
 │   #  onto different gear ratios and lap lengths and disagreed about speed by
@@ -188,6 +189,8 @@ THE RACE/                             # ← repo root
 │   └── med_slow_220s.csv  slow_231s.csv
 │
 ├── tools/                            # One-off / offline utilities (not part of the live system)
+│   ├── check_limits.py               # Headless checks: gauge tiers, blink edges, no-data
+│   ├── replay_limits.py              # Replays telemetry.db: how often each tier would fire
 │   ├── generate_profiles.py          # Builds profiles/*.csv from Pit_Dashboard/210s.xlsx
 │   ├── hud_sim.py                    # Drives the driver HUD without a car, for UI work
 │   ├── backfill_columns.py           # Adds new columns to an existing telemetry.db
@@ -197,6 +200,8 @@ THE RACE/                             # ← repo root
 │   ├── README.md                     # ⭐ Pi setup guide — read this before touching the Pi
 │   ├── can-up.service                # Brings can0/can1 up at boot at the right bitrate
 │   ├── solarrace-hud.desktop         # Autostart entry for the driver HUD
+│   ├── solarrace-camera.desktop      # Autostart entry for the USB reverse camera
+│   ├── start_camera.sh               # Reverse camera on screen 2 (mpv, no Python)
 │   └── start_hud.sh / stop_hud.sh    # HUD start/stop scripts
 │
 └── docs/                             # Standalone task briefs (no code depends on these)

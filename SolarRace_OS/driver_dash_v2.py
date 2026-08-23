@@ -19,6 +19,16 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 import drivetrain  # noqa: E402  (path set up immediately above)
+# Every threshold, gauge full scale and tier colour is shared with the pit
+# (limits.py at the repo root), so a gauge that is amber in the car is amber on
+# the pit wall too. Imported as a MODULE rather than as loose scalars:
+# `limits.MOTOR_TEMP` at the point of use says where the number came from, and
+# leaves no local name that can drift from it. SPEED_MAX used to live further
+# down as a bare 140; it is limits.SPEED.full_scale now.
+#
+# It has to be imported HERE, above the palette, because the tier colours below
+# are built from limits.TIER_COLOURS.
+import limits      # noqa: E402  (same path bootstrap as drivetrain above)
 
 from PySide6.QtCore import (
     Qt, QEasingCurve, QPropertyAnimation, QRectF, QTimer, Slot,
@@ -101,20 +111,20 @@ C_DIM    = QColor(_DIM)
 C_BORDER = QColor(_BORDER)
 C_NO_DATA = QColor(_NO_DATA_COLOUR)
 
+# The two colours that MEAN something rather than merely look like something.
+# Taken from limits.TIER_COLOURS so the pit renders an identical breach in an
+# identical colour. Deliberately NOT reusing the _ORANGE/_RED names: those also
+# paint the stop button, the alert bar, the turn-severity strip and the fault
+# text, none of which are measurement tiers, and repointing them would restyle
+# five unrelated things at once.
+C_WARNING = QColor(limits.TIER_COLOURS[limits.WARNING])
+C_CRITICAL = QColor(limits.TIER_COLOURS[limits.CRITICAL])
+
 # Gauge arc geometry: 225° start (SW), sweeping CW 270° to 315° (SE).
 # In Qt: start=225, spanAngle=-270 (negative = clockwise).
 _ARC_START = 225
 _ARC_SPAN  = -270
 
-SPEED_MAX = 140
-
-# Temperature thresholds are shared with the pit (limits.py at the repo root),
-# so a gauge that is red in the car is red on the pit wall too.
-from limits import (                # noqa: E402  (repo root added to sys.path above)
-    MOTOR_TEMP_WARN, MOTOR_TEMP_CRIT,
-    CTRL_TEMP_WARN, CTRL_TEMP_CRIT,
-    CELL_TEMP_WARN, CELL_TEMP_CRIT,
-)
 
 
 def _fit_font(text: str, cap_pt: float, budget_px: float,
@@ -249,10 +259,12 @@ class TachometerWidget(QWidget):
     """
     Big, bold digital speed readout painted with QPainter.
     Shows the km/h number large and clear (no dial/needle) so it's readable
-    at a glance. Background flashes red when speed exceeds 120 km/h.
-    """
+    at a glance. Background flashes red past limits.SPEED's critical level.
 
-    _SPEED_ALERT = 120
+    That threshold used to be a bare `_SPEED_ALERT = 120` here, which the pit
+    wall could not see and so could not stay in step with. It had also never
+    once fired: the car's recorded maximum is 100.6 km/h.
+    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -262,6 +274,7 @@ class TachometerWidget(QWidget):
         self._speed: float | None = None
         self._flash_on: bool = False
         self._alert: bool = False
+        self._warning: bool = False
 
         self._flash_timer = QTimer(self)
         self._flash_timer.setInterval(500)
@@ -300,10 +313,13 @@ class TachometerWidget(QWidget):
             self._flash_timer.stop()
             self._flash_on = False
             self._alert = False
+            self._warning = False
             self.update()
             return
         self._speed = abs(kmh)
-        alert = self._speed > self._SPEED_ALERT
+        tier = limits.classify(self._speed, limits.SPEED)
+        alert = tier == limits.CRITICAL
+        self._warning = tier == limits.WARNING
         if alert and not self._alert:
             self._flash_timer.start()
         elif not alert and self._alert:
@@ -325,10 +341,14 @@ class TachometerWidget(QWidget):
         if self._flash_on:
             p.fillRect(0, 0, w, h, QColor(_FLASH))
 
-        # Number turns red past the alert threshold, otherwise crisp white —
-        # and goes slate when there is no reading to show at all.
+        # Amber over the warning level, red over critical, otherwise crisp
+        # white, and slate when there is no reading at all. The amber tier is
+        # new: the big number used to jump straight from white to red, which
+        # made it the one readout on the HUD not following the shared rule.
         unknown = self._speed is None
-        num_color = C_NO_DATA if unknown else (C_RED if self._alert else C_WHITE)
+        num_color = (C_NO_DATA if unknown else
+                     C_CRITICAL if self._alert else
+                     C_WARNING if self._warning else C_WHITE)
         speed_txt = _NO_DATA if unknown else f"{self._speed:.0f}"
 
         # ── Big bold speed number ──────────────────────────────────────── #
@@ -376,28 +396,38 @@ class MiniGauge(QWidget):
     learned to ignore it. Flashing has to be rare to mean anything, so it is now
     reserved for the critical tier alone.
 
-    `warn_threshold` defaults to infinity, so a gauge that passes only
-    `alert_threshold` behaves exactly as before.
+    A metric may declare crit=None (see limits.MOTOR_CURRENT), which means
+    amber-only: that gauge warns but never turns red and never flashes.
+
+    Low-side metrics work the same way with the comparison inverted, so the SoC
+    and pack-voltage gauges colour as they fall rather than as they rise.
     """
 
     def __init__(
         self,
         title: str,
         unit: str,
-        max_val: float,
         color: QColor,
-        alert_threshold: float = float("inf"),
+        limit,
         decimals: int = 0,
         parent=None,
-        warn_threshold: float = float("inf"),
     ):
+        """`limit` is a limits.Threshold, carrying BOTH thresholds and the scale.
+
+        The old signature took max_val, alert_threshold and warn_threshold as
+        three unrelated numbers, which is how the motor gauge ended up scaled to
+        120 with a critical threshold of 130: nothing tied the two together, so
+        the arc saturated before it was allowed to turn red. Passing one object
+        makes that combination unrepresentable (limits._validate rejects it at
+        import) and stops a gauge carrying an ad-hoc threshold the pit wall has
+        never heard of.
+        """
         super().__init__(parent)
         self._title = title
         self._unit = unit
-        self._max_val = max_val
+        self._limit = limit
+        self._max_val = limit.full_scale
         self._color = color
-        self._threshold = alert_threshold
-        self._warn_threshold = warn_threshold
         self._warning: bool = False
         self._decimals = decimals
         # None until the bus actually reports this metric — see _NO_DATA. It is
@@ -419,12 +449,18 @@ class MiniGauge(QWidget):
 
     def set_value(self, value: float | None) -> None:
         self._value = value
-        # An unknown value cannot breach a threshold. Comparing None here would
-        # raise; treating it as 0 would silently mark a missing sensor as safe.
-        alert = value is not None and value > self._threshold
-        # Warning is everything between the two thresholds. Critical wins, so a
-        # gauge is never "warning" and "critical" at once.
-        self._warning = (not alert) and value is not None and value > self._warn_threshold
+        # The comparison lives in limits.classify, so this gauge and the matching
+        # pit tile cannot disagree, and so low-side metrics (SoC, pack voltage,
+        # where LOW is the danger) need no second code path here.
+        #
+        # None-safety is now a property of classify rather than two hand-written
+        # guards in a Qt widget: a missing reading returns NORMAL, so it can
+        # never breach a threshold and is never mistaken for a healthy zero.
+        # "Critical wins over warning" is likewise classify's job -- it tests
+        # crit first and returns, so a value is never both.
+        tier = limits.classify(value, self._limit)
+        alert = tier == limits.CRITICAL
+        self._warning = tier == limits.WARNING
         if alert and not self._alert:
             self._flash_timer.start()
         elif not alert and self._alert:
@@ -432,6 +468,21 @@ class MiniGauge(QWidget):
             self._flash_on = False
         self._alert = alert
         self.update()
+
+    def _tier_colour(self, at_rest: QColor | None = None) -> QColor:
+        """Critical red, warning amber, otherwise `at_rest` (default: the
+        gauge's own accent).
+
+        One helper because three things need the same answer -- the arc, the
+        value text and the title -- and they had drifted: the title was painted
+        from the arc's colour, so a blanked gauge showed a slate em dash under a
+        fully bright heading.
+        """
+        if self._alert:
+            return C_CRITICAL
+        if self._warning:
+            return C_WARNING
+        return self._color if at_rest is None else at_rest
 
     def _toggle_flash(self) -> None:
         self._flash_on = not self._flash_on
@@ -463,14 +514,7 @@ class MiniGauge(QWidget):
         cx, cy = w / 2.0, h / 2.0
 
         rect = QRectF(cx - radius, cy - radius, radius * 2, radius * 2)
-        # Three tiers: red at critical, amber at warning, the gauge's own colour
-        # when all is well. Only the red tier also flashes (see set_value).
-        if self._alert:
-            color = C_RED
-        elif self._warning:
-            color = C_ORANGE
-        else:
-            color = self._color
+        color = self._tier_colour()
 
         # Track arc
         p.setBrush(Qt.NoBrush)
@@ -483,7 +527,12 @@ class MiniGauge(QWidget):
         if self._value is None or self._max_val <= 0:
             frac = 0.0
         else:
-            frac = min(1.0, self._value / self._max_val)
+            # max(0.0, ...) is not defensive padding. mms_power_W is signed and
+            # goes NEGATIVE under regen, and a negative fraction flips the sign
+            # of val_span, which makes drawArc sweep anticlockwise out of the
+            # gauge's bottom-left gap -- an arc growing the wrong way to mean
+            # "recovering energy". Clamped, regen simply reads as empty.
+            frac = min(1.0, max(0.0, self._value / self._max_val))
         val_span = int(_ARC_SPAN * frac)
 
         if val_span != 0:
@@ -513,9 +562,9 @@ class MiniGauge(QWidget):
         # touches the stroke on both sides.
         vf = _fit_font(value_txt, radius * 0.60, radius * 1.75)
         p.setFont(vf)
-        p.setPen(QPen(C_NO_DATA if unknown
-                      else (C_RED if self._alert
-                            else (C_ORANGE if self._warning else C_WHITE))))
+        # White at rest rather than the gauge's own accent, so the NUMBER stays
+        # the high-contrast thing to read and only a breach recolours it.
+        p.setPen(QPen(C_NO_DATA if unknown else self._tier_colour(C_WHITE)))
         p.drawText(
             QRectF(cx - radius * 0.95, cy - radius * 0.58, radius * 1.9, radius * 0.68),
             Qt.AlignCenter,
@@ -716,10 +765,9 @@ class RacingDashboard(QMainWindow):
         vbox.setContentsMargins(6, 8, 6, 8)
         vbox.setSpacing(8)
 
-        self._soc_gauge = MiniGauge("SOC", "%", 100.0, C_LIME, decimals=0)
+        self._soc_gauge = MiniGauge("SOC", "%", C_LIME, limits.SOC, decimals=0)
         self._motor_temp_gauge = MiniGauge(
-            "MOTOR TEMP", "°C", 120.0, C_CYAN, decimals=0,
-            warn_threshold=MOTOR_TEMP_WARN, alert_threshold=MOTOR_TEMP_CRIT,
+            "MOTOR TEMP", "°C", C_CYAN, limits.MOTOR_TEMP, decimals=0,
         )
 
         # ── VALIDATION READOUT (temporary) ────────────────────────────────── #
@@ -1055,26 +1103,28 @@ class RacingDashboard(QMainWindow):
 
         top = QHBoxLayout()
         top.setSpacing(8)
-        self._ds2_speed = MiniGauge("SPEED", "km/h", float(SPEED_MAX), C_CYAN,
+        self._ds2_speed = MiniGauge("SPEED", "km/h", C_CYAN, limits.SPEED,
                                     decimals=0)
-        self._ds2_soc = MiniGauge("SOC", "%", 100.0, C_LIME, decimals=0)
-        self._ds2_voltage = MiniGauge("BATT VOLTS", "V", 120.0, C_LIME, decimals=1)
+        self._ds2_soc = MiniGauge("SOC", "%", C_LIME, limits.SOC, decimals=0)
+        self._ds2_voltage = MiniGauge("BATT VOLTS", "V", C_LIME,
+                                      limits.PACK_VOLTAGE, decimals=1)
         for g in (self._ds2_speed, self._ds2_soc, self._ds2_voltage):
             top.addWidget(g, stretch=1)
         vbox.addLayout(top, stretch=1)
 
         bottom = QHBoxLayout()
         bottom.setSpacing(8)
-        self._ds2_batt_current = MiniGauge("BATT CURRENT", "A", 60.0, C_ORANGE,
-                                           alert_threshold=40.0, decimals=1)
-        self._ds2_motor_current = MiniGauge("MOTOR CURRENT", "A", 120.0, C_ORANGE,
-                                            alert_threshold=90.0, decimals=1)
+        # Both current gauges rest in CYAN, not amber as before. That is not a
+        # cosmetic choice: amber is now the warning tier, and a warning is
+        # invisible on a gauge whose healthy colour is already amber.
+        self._ds2_batt_current = MiniGauge("BATT CURRENT", "A", C_CYAN,
+                                           limits.BATT_CURRENT, decimals=1)
+        self._ds2_motor_current = MiniGauge("MOTOR CURRENT", "A", C_CYAN,
+                                            limits.MOTOR_CURRENT, decimals=1)
         self._ds2_motor_temp = MiniGauge(
-            "MOTOR TEMP", "°C", 120.0, C_CYAN, decimals=0,
-            warn_threshold=MOTOR_TEMP_WARN, alert_threshold=MOTOR_TEMP_CRIT)
+            "MOTOR TEMP", "°C", C_CYAN, limits.MOTOR_TEMP, decimals=0)
         self._ds2_cell_temp = MiniGauge(
-            "MAX CELL", "°C", 80.0, C_CYAN, decimals=0,
-            warn_threshold=CELL_TEMP_WARN, alert_threshold=CELL_TEMP_CRIT)
+            "MAX CELL", "°C", C_CYAN, limits.CELL_TEMP, decimals=0)
         for g in (self._ds2_batt_current, self._ds2_motor_current,
                   self._ds2_motor_temp, self._ds2_cell_temp):
             bottom.addWidget(g, stretch=1)
@@ -1117,18 +1167,16 @@ class RacingDashboard(QMainWindow):
         # battery cell. Battery current moved to DS002, where the full
         # electrical picture lives — it was the least glanceable of the four.
         self._power_gauge = MiniGauge(
-            "MOTOR POWER", "W", 3000.0, C_CYAN, decimals=0
+            "MOTOR POWER", "W", C_CYAN, limits.POWER, decimals=0
         )
         self._temp_gauge = MiniGauge(
-            "CTRL TEMP", "°C", 100.0, C_CYAN, decimals=0,
-            warn_threshold=CTRL_TEMP_WARN, alert_threshold=CTRL_TEMP_CRIT,
+            "CTRL TEMP", "°C", C_CYAN, limits.CTRL_TEMP, decimals=0,
         )
         # Hottest cell in the pack — the battery-safety number. Its resting
         # colour is cyan like the others; red is reserved for the alert tier, so
         # a red gauge always means the same thing wherever it appears.
         self._cell_temp_gauge = MiniGauge(
-            "MAX CELL", "°C", 80.0, C_CYAN, decimals=0,
-            warn_threshold=CELL_TEMP_WARN, alert_threshold=CELL_TEMP_CRIT,
+            "MAX CELL", "°C", C_CYAN, limits.CELL_TEMP, decimals=0,
         )
 
         vbox.addWidget(self._power_gauge, stretch=1)
@@ -1409,6 +1457,11 @@ class RacingDashboard(QMainWindow):
 
     @Slot(object)
     def _on_voltage(self, volts) -> None:
+        # Drop physically impossible readings before anything sees them: on a 13S
+        # pack anything under 2.5 V/cell is a bad frame, not a flat battery, and
+        # now that voltage has a low-side threshold those frames would blink the
+        # gauge red. See limits.plausible_pack_voltage.
+        volts = limits.plausible_pack_voltage(volts)
         # The P/V current fallback needs a positive divisor, so an unknown
         # voltage leaves the last usable one in place rather than poisoning it.
         if volts is not None:

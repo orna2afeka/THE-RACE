@@ -13,3 +13,9 @@ pydeck==0.9.3             # Live GPS map deck (ships with Streamlit; pinned sinc
 openpyxl==3.1.2
 requests==2.31.0          # weather_service + collector REST streaming
 google-auth==2.29.0       # collector: OAuth2 access token from the service account
+
+# Timezone database for zoneinfo. Windows ships no system tz database, so
+# without this the Excel export cannot resolve Asia/Jerusalem or
+# Europe/Brussels and raises ZoneInfoNotFoundError. Linux/macOS have one
+# already, but the pit laptop is Windows.
+tzdata==2026.3
