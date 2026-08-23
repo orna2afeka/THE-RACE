@@ -44,6 +44,19 @@ SocketCAN reminder — bring each channel up at ITS OWN bitrate first, e.g.:
     sudo ip link set can1 up type can bitrate 1000000
 """
 import sys
+import os
+
+# ── HUD screen targeting (Wayland: wayfire or labwc) ─────────────────── #
+# Which output (by name, as reported by `wlr-randr` and by
+# QGuiApplication.screens()) the driver HUD should request fullscreen on.
+#
+# None (the default here) means "let the compositor choose" — today's
+# behaviour, and the only safe default for code that runs on more than one
+# car: a screen name that doesn't exist on THIS Pi must never stop the HUD
+# from starting. Per-car targeting belongs in the environment, not here —
+# e.g. deploy/start_hud.sh exports SOLARRACE_HUD_SCREEN for the car whose
+# HUD panel is DSI-2.
+HUD_SCREEN_NAME = os.environ.get("SOLARRACE_HUD_SCREEN") or None
 
 # ── Per-channel bitrates — every device on a channel must match ITS rate ─ #
 #
