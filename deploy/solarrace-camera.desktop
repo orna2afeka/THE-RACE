@@ -1,0 +1,20 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=SolarRace Reverse Camera
+GenericName=Reverse Camera
+Comment=Fullscreen USB reverse camera on the second screen; restarts if it dies
+# /bin/bash prefix on purpose: a repo cloned on Windows, or a file rewritten by
+# `git pull`, can lose the executable bit, and this still runs either way.
+# Edit the path if your username is not `pi` or the repo is elsewhere.
+Exec=/bin/bash /home/pi/THE-RACE/deploy/start_camera.sh
+Terminal=false
+StartupNotify=false
+X-GNOME-Autostart-enabled=true
+# Do NOT add OnlyShowIn= — it would exclude the wayfire/labwc sessions that
+# Raspberry Pi OS actually uses, and the camera would silently never start.
+#
+# No dependency ordering against the HUD entry, and none is needed: the two
+# share no device. The HUD owns the CAN bus, the camera owns /dev/video*, and
+# start_camera.sh waits for the compositor by itself. Whichever the session
+# starts first is fine.

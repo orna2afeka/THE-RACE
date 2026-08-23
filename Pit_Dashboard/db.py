@@ -21,7 +21,8 @@ Design choices
 import json
 import sqlite3
 
-from constants import GEAR_RATIO
+from constants import (CONTROLLER_SPEED_DIVISOR, CONTROLLER_SPEED_DIVISOR_LEGACY,
+                       RPM_REPORT_SCALE)
 from pit_config import SQLITE_PATH, DEVICE_ID
 
 # Hot columns extracted from each record for charting/filtering. The dashboard
@@ -207,11 +208,35 @@ def init_db(conn: sqlite3.Connection) -> None:
 # They differ by a factor of 50.909, so telling them apart is not a close call.
 # The boundary below is the geometric mean of the two, which sits ~7x away from
 # either regime — far outside any plausible measurement noise.
-# Raw sits at rpm x 1.0366; a decoded value sits at rpm x (1.0366 / (10*GEAR)).
-# The boundary is their geometric mean, derived so it tracks GEAR_RATIO instead
-# of being a magic number that silently goes stale when the ratio is corrected.
-_SPEED_RATIO_RAW = 1.0366
-_SPEED_RATIO_BOUNDARY = _SPEED_RATIO_RAW / (10.0 * GEAR_RATIO) ** 0.5
+# Raw sits at rpm x 0.5183; a decoded value sits at rpm x (0.5183 / (10*DIV)).
+# The boundary is their geometric mean, derived from the constants so it cannot
+# silently go stale when one of them is corrected.
+#
+# 0.5183, not the 1.0366 that was here before, because mms_rpm now arrives
+# ALREADY CORRECTED for the controller's 2x under-report (see
+# drivetrain.RPM_REPORT_SCALE). The raw speed field did not change, so its ratio
+# to a doubled RPM is halved. Getting this wrong would not fail loudly - it
+# would quietly misfile decoded speeds as raw and divide them a second time.
+_SPEED_RATIO_RAW = 1.0366 * RPM_REPORT_SCALE                    # 0.5183, legacy
+_SPEED_RATIO_RAW_RECONFIGURED = 2.6656 * RPM_REPORT_SCALE        # 1.3328, current
+
+# THREE regimes, not two, and a row says which it belongs to by the ratio of its
+# speed field to its RPM. Boundaries are the geometric means, so each sits a
+# factor of ~3 from either regime - far outside measurement noise.
+#
+#   ratio ~ 0.0204  the value is already true km/h        -> pass through
+#   ratio ~ 0.5183  raw field, controller pre-2026-08-20  -> / 2.5455
+#   ratio ~ 1.3328  raw field, controller post-2026-08-20 -> / 6.5455
+#
+# The middle regime is why this is not one constant: the controller was
+# reconfigured mid-history and the same raw number means different speeds on
+# either side of it. Using one divisor for both made every pre-reconfiguration
+# row come out 2.57x too low.
+_SPEED_DECODED_RATIO = _SPEED_RATIO_RAW / (10.0 * CONTROLLER_SPEED_DIVISOR_LEGACY)
+_SPEED_BOUNDARY_DECODED = (_SPEED_DECODED_RATIO * _SPEED_RATIO_RAW) ** 0.5
+_SPEED_BOUNDARY_ERA = (_SPEED_RATIO_RAW * _SPEED_RATIO_RAW_RECONFIGURED) ** 0.5
+# Kept under the old name: fix_vehicle_speed.py imports it.
+_SPEED_RATIO_BOUNDARY = _SPEED_BOUNDARY_DECODED
 
 
 def _vehicle_speed(raw_speed, rpm):
@@ -245,13 +270,20 @@ def _vehicle_speed(raw_speed, rpm):
     r = _num(rpm)
     if r is not None and abs(r) > 0:
         ratio = speed / abs(r)
-        if ratio > _SPEED_RATIO_BOUNDARY:
-            return speed * 0.1 / GEAR_RATIO     # raw -> true km/h
-        return speed                            # already true km/h
+        if ratio >= _SPEED_BOUNDARY_ERA:
+            # Raw, from the reconfigured controller.
+            return speed * 0.1 / CONTROLLER_SPEED_DIVISOR
+        if ratio > _SPEED_BOUNDARY_DECODED:
+            # Raw, from the controller as it was configured before 2026-08-20.
+            return speed * 0.1 / CONTROLLER_SPEED_DIVISOR_LEGACY
+        return speed                                        # already true km/h
     # No usable RPM. Fall back to plausibility: this car does not exceed 200
     # km/h, so anything above that is certainly still raw.
     if speed > 200.0:
-        return speed * 0.1 / GEAR_RATIO
+        # No RPM, so the era is unknowable. Assume the current controller: it is
+        # what a live car is running, and this branch only fires on a row that
+        # arrived without RPM in the same frame, which is rare.
+        return speed * 0.1 / CONTROLLER_SPEED_DIVISOR
     return speed
 
 

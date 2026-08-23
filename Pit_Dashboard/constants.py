@@ -18,6 +18,11 @@ if _REPO_ROOT not in sys.path:
 
 from drivetrain import (          # noqa: E402  (path set up immediately above)
     GEAR_RATIO,
+    # NOT the gear ratio, despite once being the same number - see the note in
+    # drivetrain. db.py needs it to normalise the controller's speed field.
+    CONTROLLER_SPEED_DIVISOR,
+    CONTROLLER_SPEED_DIVISOR_LEGACY,
+    RPM_REPORT_SCALE,
     WHEEL_CIRCUMFERENCE_METERS,
     TIRE_DIAMETER_METERS,
     MOTOR_POLE_PAIRS,
@@ -33,13 +38,26 @@ from track import (                # noqa: E402  (path set up above)
     FINISH_LINE_LAT,
     FINISH_LINE_LON,
 )
-# Temperature thresholds, shared with the driver HUD (limits.py at the repo
-# root) so the two screens never disagree about whether a reading is a warning.
+# Alarm thresholds, shared with the driver HUD (limits.py at the repo root) so
+# the two screens never disagree about whether a reading is a warning.
+#
+# These are re-exported through this module rather than imported straight from
+# `limits` by every consumer, because THIS file is what bootstraps the repo root
+# onto sys.path (see the top). Importing `limits` directly from pit_dashboard.py
+# would work only because constants happens to be imported first -- an invisible
+# ordering dependency waiting to bite.
+#
+# The six loose MOTOR_TEMP_WARN/CRIT-style scalars and temp_condition() are gone.
+# They were replaced by Threshold objects and one classify() call, because
+# handing out bare numbers is exactly how three separate copies of the same
+# comparison came to exist (one here, one in the HUD, one inlined in a tile).
 from limits import (                # noqa: E402  (path set up above)
-    MOTOR_TEMP_WARN, MOTOR_TEMP_CRIT,
-    CTRL_TEMP_WARN, CTRL_TEMP_CRIT,
-    CELL_TEMP_WARN, CELL_TEMP_CRIT,
-    temp_condition,
+    NORMAL, WARNING, CRITICAL,
+    TIER_COLOURS,
+    classify,
+    MOTOR_TEMP, CTRL_TEMP, CELL_TEMP,
+    SOC, PACK_VOLTAGE, BATT_CURRENT,
+    MOTOR_CURRENT, POWER, SPEED,
 )
 
 TARGET_LAP_TIME_MIN = 3.5
@@ -79,12 +97,22 @@ SECTION_TURN_LABELS = {
 # =========================
 # RISK LEVELS & COLORS
 # =========================
+# Spelled with the SHARED tier names, not the old "warn"/"crit" shorthand. The
+# shorthand was a silent-failure trap in one direction: a "warn" string handed to
+# anything expecting a tier fell through to "normal" and simply lost the colour,
+# with no error to notice. Using the imported constants means a future
+# divergence is a NameError at import instead.
+#
+# These stay a SEPARATE palette from TIER_COLOURS on purpose. Section risk is a
+# static property of the circuit -- "this corner is dangerous" -- not a live
+# measurement breach. Making them pixel-identical would teach the crew that
+# amber means one thing when it means two.
 SECTION_RISK = {
-    1: "normal", 2: "normal", 3: "normal",
-    4: "warn",   5: "normal", 6: "crit",
-    7: "normal", 8: "crit",   9: "warn",
+    1: NORMAL,  2: NORMAL, 3: NORMAL,
+    4: WARNING, 5: NORMAL, 6: CRITICAL,
+    7: NORMAL,  8: CRITICAL, 9: WARNING,
 }
-SECTION_COLORS = {"normal": "#00FFCC", "warn": "#FF9900", "crit": "#FF4444"}
+SECTION_COLORS = {NORMAL: "#00FFCC", WARNING: "#FF9900", CRITICAL: "#FF4444"}
 
 # =========================
 # FAULT / ERROR-CODE DECODING

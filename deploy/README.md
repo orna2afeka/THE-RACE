@@ -115,6 +115,64 @@ is a bad morning.
 Restart-on-crash is handled by `start_hud.sh`, which is the one thing systemd
 would otherwise have provided.
 
+### 6b. Autostart the reverse camera (second screen)
+
+Only needed on a car with the reverse camera fitted. Nothing in this repo
+decodes video: the camera is a USB UVC device and `mpv` reads it directly, so
+this step is entirely Pi-side and touches no Python.
+
+```bash
+sudo apt install -y mpv v4l-utils
+chmod +x ~/THE-RACE/deploy/start_camera.sh
+cp ~/THE-RACE/deploy/solarrace-camera.desktop ~/.config/autostart/
+nano ~/.config/autostart/solarrace-camera.desktop   # fix the path if not /home/pi
+```
+
+**Check the camera is seen, and on which node**, before trusting the autostart:
+
+```bash
+v4l2-ctl --list-devices          # what is attached
+ls -l /dev/v4l/by-id/            # the stable names start_camera.sh prefers
+~/THE-RACE/deploy/start_camera.sh   # run it by hand once, from the desktop
+tail -f ~/hud-logs/camera.log       # what it decided
+```
+
+A USB capture dongle normally registers **two** `/dev/video` nodes and only one
+of them captures; opening the other gives a black window and no error. That is
+why the script picks by capability rather than by number, and prefers
+`/dev/v4l/by-id/` — those names survive a reboot and a change of USB port,
+which `/dev/video0` does not once the GPS dongle is also enumerating.
+
+**Which screen it lands on** is the one thing that needs a real test. The script
+fullscreens on output index 1 (the second screen); if the camera and the HUD end
+up on the same screen, or swapped, flip it:
+
+```bash
+wlr-randr                        # lists the outputs in index order
+# then either edit FS_SCREEN in start_camera.sh, or set it per-boot:
+SOLARRACE_CAM_SCREEN=0 ~/THE-RACE/deploy/start_camera.sh
+```
+
+⚠️ **Adding a second screen can move the HUD.** The HUD asks to be fullscreen
+and lets the compositor choose where, which with one screen was never a
+question. If it comes up on the camera's screen, pin it in
+`~/.config/wayfire.ini` with a window rule matching the HUD, or simply swap
+which physical HDMI each panel is plugged into — the cable is the quicker fix
+and it cannot rot across an OS upgrade.
+
+To stop the camera without touching the autostart (it clears on reboot, exactly
+like the HUD's):
+
+```bash
+touch "${XDG_RUNTIME_DIR}/solarrace-camera.stop"
+pkill -f start_camera.sh
+```
+
+Latency is tuned over picture quality on purpose (`--profile=low-latency
+--untimed`): a reverse view a second behind reality is worse than a slightly
+choppy one. If the feed is choppy rather than late, drop `input_format=mjpeg`
+from the script and let mpv negotiate, or lower `SOLARRACE_CAM_FPS`.
+
 ### 7. Test before trusting it
 
 ```bash
@@ -233,6 +291,13 @@ chmod +x deploy/start_hud.sh
 mkdir -p ~/.config/autostart
 cp deploy/solarrace-hud.desktop ~/.config/autostart/
 nano ~/.config/autostart/solarrace-hud.desktop   # fix the path if not /home/pi
+
+# 6b. Reverse camera at boot (only on a car that has one)
+sudo apt install -y mpv v4l-utils
+chmod +x deploy/start_camera.sh
+cp deploy/solarrace-camera.desktop ~/.config/autostart/
+nano ~/.config/autostart/solarrace-camera.desktop
+wlr-randr                                        # confirm which screen is which
 
 # 7. Test, then reboot
 cd ~/THE-RACE && ./.venv/bin/python3 -u SolarRace_OS/main.py

@@ -17,11 +17,36 @@
 	font-weight: bold;
 	color: var(--pit-metric-accent, #00ffcc);
 }
+/* Live Metrics tab: same tile, bigger number. The strip above the tabs stays
+   at 32px because it competes with the tabs for attention; on a page whose only
+   job is the numbers, they can have the room. */
+.metric-container.large {
+	padding: 14px 12px;
+	min-height: 104px;
+}
+.metric-value.large {
+	font-size: 46px;
+	line-height: 1.05;
+}
+/* A caveat carried by the reading itself, e.g. a decode known to be wrong.
+   Deliberately quiet: it must be readable without competing with the number. */
+.metric-note {
+	margin-top: 4px;
+	font-size: 11px;
+	line-height: 1.3;
+	color: #8b98a5;
+	font-style: italic;
+}
+
+/* Tier colours come from limits.TIER_COLOURS, injected as CSS variables by
+   apply_theme() so the pit renders a breach in the same colour the driver sees.
+   The literals are FALLBACKS: if injection ever fails the tiles degrade to the
+   old appearance rather than to unstyled text. */
 .metric-value.warning {
-	color: #ff9900;
+	color: var(--pit-warning, #ff9900);
 }
 .metric-value.critical {
-	color: #ff3333;
+	color: var(--pit-critical, #ff3333);
 }
 .alert-fast {
 	background-color: #ff3333;
@@ -128,14 +153,14 @@
 	box-shadow: 0 0 14px rgba(0, 255, 204, 0.45);
 	animation: sector-pulse 1.8s ease-in-out infinite;
 }
-.sector-seg.current-warn {
+.sector-seg.current-warning {
 	background: rgba(255, 153, 0, 0.12);
 	border: 2px solid #ff9900;
 	color: #ff9900;
 	box-shadow: 0 0 14px rgba(255, 153, 0, 0.45);
 	animation: sector-pulse-warn 1.8s ease-in-out infinite;
 }
-.sector-seg.current-crit {
+.sector-seg.current-critical {
 	background: rgba(255, 68, 68, 0.12);
 	border: 2px solid #ff4444;
 	color: #ff4444;

@@ -32,6 +32,7 @@ import db
 # No drivetrain constants are needed here any more: the Speed column is the
 # controller's own CAN field, not a formula applied to RPM. Importing
 # speed_kmh() again would be the first step back to two disagreeing speeds.
+import pit_config          # export_local(): the Tel Aviv -> Brussels switch
 from pit_config import DEVICE_ID
 
 # Fixed identity/time columns that always lead the raw CSV.
@@ -71,9 +72,42 @@ def metrics_for_groups(groups):
 
 
 def _iso(ts):
+    """Local time, ISO-8601, WITH the offset: 2026-08-20T15:12:25+03:00.
+
+    Still ISO and still machine-readable, but in the timezone the team was in
+    when the sample was recorded (see pit_config.export_local). The offset is
+    what keeps it unambiguous across the mid-season Tel Aviv -> Brussels switch,
+    so a reader never has to know which side of the switch a row came from.
+
+    The CSV also carries device_ts_epoch beside this, which stays a plain UTC
+    epoch - the anchor for anything that needs to compute rather than read.
+    """
     if ts is None:
         return ""
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+    return pit_config.export_local(ts).isoformat()
+
+
+def _excel_dt(ts):
+    """`ts` as a NAIVE local datetime, for a real Excel date cell.
+
+    Naive because openpyxl refuses a timezone-aware datetime outright - Excel
+    has no timezone type. The zone is not lost: it is spelled out in the "Zone"
+    column beside it, which is also the only honest way to show a workbook whose
+    rows are in two different zones.
+
+    A real datetime rather than a string so Excel sorts, filters and charts it
+    as a time instead of as text, which the old UTC ISO string could not do.
+    """
+    local = pit_config.export_local(ts)
+    return None if local is None else local.replace(tzinfo=None)
+
+
+def _zone_label(ts):
+    """Short zone for the Zone column, e.g. "IDT +03:00"."""
+    local = pit_config.export_local(ts)
+    if local is None:
+        return ""
+    return f"{local.tzname()} {local.strftime('%z')[:3]}:{local.strftime('%z')[3:]}"
 
 
 def _parse_time(value):
@@ -249,7 +283,8 @@ def history_csv_bytes(df, charts, style="data", session="", device_id=DEVICE_ID)
 # axis; `speed_kmh` and `distance_km` are derived (see _cell_value). Order here
 # is the display order on the Data sheet.
 _XLSX_COLS = {
-    "device_ts_iso":     ("Time (UTC)",          None,        None,  None),
+    "device_ts_iso":     ("Time (local)",  "yyyy-mm-dd hh:mm:ss", None, None),
+    "tz_label":          ("Zone",                None,        None,  None),
     "speed_kmh":         ("Speed (km/h)",        "0.0",       "km/h", "00FFCC"),
     "mms_rpm":           ("Motor RPM",           "0",         "rpm",  "9B59B6"),
     "mms_power_W":       ("Motor Power (W)",     "0",         "W",    "00B3FF"),
@@ -338,13 +373,19 @@ def _data_columns(metrics):
         "lat": "lat" in m,
         "lon": "lon" in m,
     }
-    return ["device_ts_iso"] + [k for k in _XLSX_COLS if k != "device_ts_iso" and present.get(k)]
+    # Time and Zone always lead, and Zone is never optional: a workbook whose
+    # rows span the Tel Aviv -> Brussels switch is unreadable without it.
+    return ["device_ts_iso", "tz_label"] + [
+        k for k in _XLSX_COLS
+        if k not in ("device_ts_iso", "tz_label") and present.get(k)]
 
 
 def _cell_value(key, r):
     """Value for one Data-sheet cell from a telemetry row."""
     if key == "device_ts_iso":
-        return _iso(r["device_ts"])
+        return _excel_dt(r["device_ts"])
+    if key == "tz_label":
+        return _zone_label(r["device_ts"])
     if key == "speed_kmh":
         # Straight from the controller's decoded speed field. No `or 0`: a row
         # the car never reported speed for stays None -> an empty cell, not a
@@ -428,7 +469,8 @@ def write_xlsx(fileobj_or_path, start_ts=None, end_ts=None, metrics=None,
 
     # --- Charts sheet (from a hidden, downsampled data block) ------------- #
     chart_keys = [k for k in cols
-                  if k not in ("device_ts_iso", "lat", "lon") and _XLSX_COLS[k][3]]
+                  if k not in ("device_ts_iso", "tz_label", "lat", "lon")
+                  and _XLSX_COLS[k][3]]
     if nrows and chart_keys:
         step = max(1, math.ceil(nrows / _MAX_CHART_POINTS))
         sampled = rows[::step]
@@ -438,7 +480,8 @@ def write_xlsx(fileobj_or_path, start_ts=None, end_ts=None, metrics=None,
         cd.sheet_state = "hidden"
         cd.append(["Time"] + [_XLSX_COLS[k][0] for k in chart_keys])
         for r in sampled:
-            cd.append([_iso(r["device_ts"])] + [_cell_value(k, r) for k in chart_keys])
+            cd.append([_excel_dt(r["device_ts"])]
+                      + [_cell_value(k, r) for k in chart_keys])
 
         charts = wb.create_sheet("Charts")
         cats = Reference(cd, min_col=1, min_row=2, max_row=m + 1)
@@ -446,7 +489,7 @@ def write_xlsx(fileobj_or_path, start_ts=None, end_ts=None, metrics=None,
             chart = LineChart()
             chart.title = _XLSX_COLS[k][0]
             chart.y_axis.title = _XLSX_COLS[k][2] or ""
-            chart.x_axis.title = "Time (UTC)"
+            chart.x_axis.title = "Time (local)"
             chart.x_axis.delete = False
             chart.y_axis.delete = False
             chart.height = 7.5
@@ -467,13 +510,14 @@ def write_xlsx(fileobj_or_path, start_ts=None, end_ts=None, metrics=None,
     # --- Faults sheet ----------------------------------------------------- #
     if include_faults:
         fs = wb.create_sheet("Faults")
-        fheaders = ["Time (UTC)", "BMS error code", "BMS protections",
+        fheaders = ["Time (local)", "Zone", "BMS error code", "BMS protections",
                     "Motor error code", "Motor alerts"]
         fs.append(fheaders)
         if fault_rows:
             for r in fault_rows:
                 fs.append([
-                    _iso(r["device_ts"]),
+                    _excel_dt(r["device_ts"]),
+                    _zone_label(r["device_ts"]),
                     r["bms_error_code"],
                     _safe(r["bms_protections"]),
                     r["mms_error_code"],

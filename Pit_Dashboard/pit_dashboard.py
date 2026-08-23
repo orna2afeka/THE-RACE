@@ -50,8 +50,11 @@ from strategy_engine import (
     SECTIONS_INFO,          # sector boundaries — the same ones already displayed
 )
 from constants import (
-    MOTOR_TEMP_WARN, MOTOR_TEMP_CRIT, CTRL_TEMP_WARN, CTRL_TEMP_CRIT,
-    CELL_TEMP_WARN, CELL_TEMP_CRIT,
+    # One classify() and a Threshold per metric, replacing six loose scalars.
+    # The tile code no longer knows what a threshold IS -- it asks limits.
+    NORMAL, WARNING, CRITICAL, TIER_COLOURS, classify,
+    MOTOR_TEMP, CTRL_TEMP, CELL_TEMP, SOC, POWER,
+    PACK_VOLTAGE, BATT_CURRENT, MOTOR_CURRENT, SPEED,
     STRATEGIES, STRATEGY_BY_LABEL, DEFAULT_STRATEGY_KEY,
     # speed_kmh() is deliberately NOT imported: road speed comes from the
     # controller's CAN field only (see build_state), and not importing the
@@ -106,6 +109,30 @@ _SVG_BOLT = (
 # and dataframe widgets still follow the config base theme — that's a Streamlit
 # limitation runtime CSS can't reach — so they stay dark in Light mode.
 # ---------------------------------------------------------------------------- #
+# Light-mode tier colours. limits.TIER_COLOURS is the canonical pair and is
+# tuned for the driver's near-black cockpit screen; #ff6500 on the pit's white
+# background is about 2.9:1 contrast, which is too low to read a number in.
+#
+# So the TIER and its THRESHOLD are shared -- both screens agree a reading is a
+# warning at the same value -- and only the light-mode rendering differs. That
+# is a deliberate accessibility concession, not drift: pretending one hex works
+# on both backgrounds would trade a real legibility problem for a nominal
+# consistency win.
+_PIT_WARNING_LIGHT = "#b35400"
+_PIT_CRITICAL_LIGHT = "#c62828"
+
+
+def _tier_css_vars(warning_hex: str, critical_hex: str) -> str:
+    """The two tier colours as CSS custom properties.
+
+    Concatenated into the blocks below rather than interpolated with an f-string:
+    these blocks are full of literal CSS braces, and doubling every one of them
+    to satisfy an f-string is a large edit with a lot of room to be wrong.
+    """
+    return (f"    --pit-warning: {warning_hex};\n"
+            f"    --pit-critical: {critical_hex};\n")
+
+
 _THEME_DARK_CSS = """
 <style>
 :root {
@@ -117,7 +144,7 @@ _THEME_DARK_CSS = """
     --pit-ok-bg: #0d1117;
     --pit-ok-border: #1e3a2a;
     --pit-ok-text: #2ecc71;
-}
+""" + _tier_css_vars(TIER_COLOURS[WARNING], TIER_COLOURS[CRITICAL]) + """}
 </style>
 """
 
@@ -132,7 +159,7 @@ _THEME_LIGHT_CSS = """
     --pit-ok-bg: #eafaf1;
     --pit-ok-border: #b7e4c7;
     --pit-ok-text: #1a7f4b;
-}
+""" + _tier_css_vars(_PIT_WARNING_LIGHT, _PIT_CRITICAL_LIGHT) + """}
 .stApp, [data-testid="stHeader"] { background-color: #f5f7fa !important; }
 [data-testid="stSidebar"] { background-color: #eaeef3 !important; }
 .stApp, .stApp p, .stApp label, .stApp li,
@@ -547,87 +574,6 @@ def _age_text(seconds):
     return f"{days}d {hours}h"
 
 
-def _over_cond(value, warn, crit):
-    """Tile severity for a reading where HIGH is bad (temperatures).
-
-    An unknown reading is styled "normal", not safe-looking-green and not
-    alarming red: we have no evidence either way, and the value itself already
-    shows as a dash so nobody mistakes it for a measurement."""
-    if value is None:
-        return "normal"
-    if value > crit:
-        return "critical"
-    if value > warn:
-        return "warning"
-    return "normal"
-
-
-def render_metric(col, title, val, unit, condition="normal"):
-    color_class = ""
-    if condition == "warning": color_class = "warning"
-    if condition == "critical": color_class = "critical"
-    col.markdown(f"""
-    <div class="metric-container">
-        <div class="metric-title">{title}</div>
-        <div class="metric-value {color_class}">{val} <span style="font-size:16px;">{unit}</span></div>
-    </div>
-    """, unsafe_allow_html=True)
-
-
-def render_sector_display(track_status, current_dist_m, sector_id):
-    """Sector card with the velocity-profile TARGET SPEED for this point."""
-    risk = SECTION_RISK.get(sector_id, "normal")
-    color = SECTION_COLORS[risk]
-    current_class = "current" if risk == "normal" else f"current-{risk}"
-    sector_name = SECTION_NAMES.get(sector_id, f"Section {sector_id}")
-    target_speed = track_status.get("target_speed", 0)
-    next_name = track_status.get("next_feature", "N/A")
-    next_dist = track_status.get("distance_to_next", 0)
-    next_desc = track_status.get("next_feature_desc", "")
-    next_speed = track_status.get("next_feature_speed", 0)
-
-    segs_html = ""
-    for i in range(1, 10):
-        if i < sector_id:
-            cls = "past"
-        elif i == sector_id:
-            cls = current_class
-        else:
-            cls = "future"
-        turn = SECTION_TURN_LABELS.get(i, "") if i == sector_id else ""
-        segs_html += (
-            f'<div class="sector-seg {cls}"><div>S{i}</div>'
-            f'<div style="font-size:13px;margin-top:2px;opacity:0.9">{turn}</div></div>'
-        )
-
-    return f"""
-    <div class="sector-card">
-        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;">
-            <div>
-                <div class="sector-sub">CURRENT SECTOR</div>
-                <div class="sector-headline" style="color:{color}">SECTOR {sector_id}</div>
-                <div style="color:#8899aa;font-size:13px;margin-top:5px;">{sector_name}</div>
-            </div>
-            <div style="text-align:right;">
-                <div class="sector-sub">TARGET SPEED</div>
-                <div style="font-size:30px;font-weight:800;color:{color}">{target_speed:.0f}<span style="font-size:13px;color:#556;font-weight:400;"> km/h</span></div>
-                <div style="color:#445566;font-size:11px;margin-top:3px;">{current_dist_m:.0f} m / 4000 m</div>
-            </div>
-        </div>
-        <div class="sector-strip">{segs_html}</div>
-        <div class="next-feature-panel">
-            <div class="sector-sub">NEXT FEATURE</div>
-            <div style="display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-top:5px;">
-                <span class="next-feature-name">{_SVG_CHEVRON}{next_name}</span>
-                <span class="dist-badge">in&nbsp;<b>{next_dist:.0f}m</b></span>
-                <span class="speed-badge">{_SVG_BOLT}{next_speed} km/h</span>
-            </div>
-            <div class="next-feature-desc">"{next_desc}"</div>
-        </div>
-    </div>
-    """
-
-
 # ============================================================================
 # FRAGMENTS
 # Two cadences: live numbers refresh fast (2s); the heavy history / weather /
@@ -795,24 +741,29 @@ def _top_strip_fragment():
         render_metric(c2, "Motor Temp", "—",
                       ohms_txt.lstrip(" ·") or "no sensor data")
     else:
-        motor_cond = "normal"
-        if motor_temp > MOTOR_TEMP_WARN: motor_cond = "warning"
-        if motor_temp > MOTOR_TEMP_CRIT: motor_cond = "critical"
+        motor_cond = classify(motor_temp, MOTOR_TEMP)
         render_metric(c2, "Motor Temp", f"{motor_temp:.1f}",
                       f"°C{ohms_txt}", motor_cond)
 
     # Byte 4 of the same frame — the controller's own temperature. Previously
     # mislabelled "Motor Temp" here, back when the motor had no sensor of its own.
     render_metric(c3, "Controller Temp", fmt(temp), "°C",
-                  _over_cond(temp, CTRL_TEMP_WARN, CTRL_TEMP_CRIT))
-    # SoC is inverted — LOW is the dangerous end. Unknown is styled neutral
-    # either way: an absent reading is not evidence of a healthy pack, and it is
-    # not evidence of a flat one either.
-    soc_cond = "critical" if soc is not None and soc < 20 else "normal"
-    render_metric(c4, "Battery SoC", fmt(soc), "%", soc_cond)
+                  classify(temp, CTRL_TEMP))
+    # SoC is inverted — LOW is the dangerous end, which limits.SOC expresses as
+    # low_side=True. Unknown stays neutral either way: an absent reading is not
+    # evidence of a healthy pack, and not evidence of a flat one either.
+    #
+    # This used to be a bare `soc < 20 -> critical` with nothing in between, so
+    # the pack went from green straight to red. It now has the amber tier the
+    # driver HUD also gained.
+    render_metric(c4, "Battery SoC", fmt(soc), "%", classify(soc, SOC))
     render_metric(c5, "Battery Temp", fmt(batt_temp), "°C",
-                  _over_cond(batt_temp, CELL_TEMP_WARN, CELL_TEMP_CRIT))
-    render_metric(c6, "Power Out", fmt(state["power_w"]), "W")
+                  classify(batt_temp, CELL_TEMP))
+    # Power was the one tile with no tier at all. Regen is negative and so never
+    # trips a high-side threshold, which is what we want: recovering energy is
+    # not a fault.
+    render_metric(c6, "Power Out", fmt(state["power_w"]), "W",
+                  classify(state["power_w"], POWER))
     render_metric(c7, "Lap Dist", fmt(c["current_lap_dist_m"]), "m")
 
     # ── Second row: per-lap analytics ─────────────────────────────────────── #
@@ -854,6 +805,41 @@ MAP_ZOOM = 14
 # at a crisp ~6 px dot however far you zoom out.
 CAR_DOT_RADIUS_M = 12
 CAR_DOT_COLOR = [0, 255, 204]
+# A dark outline round the dot. On the Carto basemap the cyan fill was legible
+# on its own; over satellite imagery it is not, because the ground underneath
+# swings from bright concrete to near-black tree cover within one lap.
+CAR_DOT_OUTLINE = [8, 12, 18]
+
+# Satellite basemap. Esri's World Imagery, not a Mapbox satellite style: Mapbox
+# styles need an access token, and a token the pit crew has to provision is a
+# thing that will be missing at 3 a.m. on race night. This needs no key.
+#
+# The tile URL, its zoom ceiling and its attribution all live in
+# static/esri_satellite.json now, NOT here. They were duplicated in both places
+# for a while, which is one edit away from a style that points somewhere the
+# comment says it does not.
+# The satellite view is a BASEMAP STYLE, not a deck.gl layer, and the style has
+# to be a URL rather than an inline document. Two dead ends worth recording so
+# nobody spends the afternoon on them again:
+#
+#  1. A deck.gl TileLayer under the car dot renders NOTHING, silently. TileLayer
+#     only fetches tiles; turning them into pixels is the job of a
+#     `renderSubLayers` callback that wraps each tile in a BitmapLayer, and
+#     deck.gl's default callback builds a GeoJsonLayer, which draws nothing at
+#     all for a JPEG. That callback is a JavaScript function and pydeck's JSON
+#     cannot express one. The layer appears in the generated JSON, deck.gl
+#     accepts it, and the map just stays on the old basemap.
+#  2. Passing the MapLibre style inline as a dict throws
+#     "e.mapStyle?.indexOf is not a function" in the browser: Streamlit's
+#     deck.gl component calls .indexOf() on mapStyle, so it must be a string.
+#
+# So the style lives in static/esri_satellite.json and Streamlit serves it
+# (server.enableStaticServing in .streamlit/config.toml). Relative, not
+# root-absolute, so it still resolves if the app is ever mounted under a
+# baseUrlPath. No API key anywhere: MapLibre has never needed one, and nothing
+# in the style points at a mapbox:// URL.
+SATELLITE_MAP_STYLE = "app/static/esri_satellite.json"
+
 # ~11 cm of latitude — invisible on the map, but enough to make a view state
 # differ from the one already on screen. See the Focus handling below.
 FOCUS_NUDGE_DEG = 1e-6
@@ -862,10 +848,11 @@ FOCUS_NUDGE_DEG = 1e-6
 def _car_map_deck(lat, lon, center_lat, center_lon):
     """One dot at the car, view centred wherever the caller says."""
     return pdk.Deck(
-        # None, not pydeck's own "dark" default: it leaves the basemap to the
-        # frontend, which picks the Carto style matching the dashboard's
-        # light/dark theme. That is exactly what st.map did.
-        map_style=None,
+        # Satellite imagery instead of the theme-following Carto basemap. The
+        # map no longer changes with Light/Dark mode, which is the intended
+        # trade: aerial imagery is the same picture in either theme, and a
+        # marshal being sent to a corner wants to recognise the corner.
+        map_style=SATELLITE_MAP_STYLE,
         initial_view_state=pdk.ViewState(latitude=center_lat, longitude=center_lon,
                                          zoom=MAP_ZOOM, pitch=0, bearing=0),
         layers=[pdk.Layer(
@@ -883,6 +870,10 @@ def _car_map_deck(lat, lon, center_lat, center_lon):
             # kwarg is wrapped as an "@@=" data accessor, which deck.gl would
             # then try to evaluate against each row.
             radius_units="'meters'",
+            # See CAR_DOT_OUTLINE: needed for contrast over imagery.
+            stroked=True,
+            get_line_color=CAR_DOT_OUTLINE,
+            line_width_min_pixels=2,
         )],
     )
 
@@ -944,6 +935,218 @@ def render_gps_map(state):
         st.caption(":orange[○ No GPS position from the car] — "
                    "pin is the default Zolder centre, not the car. "
                    "Check gpsd on the Pi (`gpspipe -w`).")
+
+
+# ── Live Metrics tab ──────────────────────────────────────────────────────── #
+# Every live reading the car sends, in one place, at the size you can read from
+# a folding chair two metres from the screen.
+#
+# This is the UNION of three sets that had drifted apart: the tile strip above
+# the tabs, the gauges on the driver's HUD, and the metrics the History tab can
+# chart. Each of those showed a different subset, so "what is the car doing
+# right now" meant looking in three places and still missing things -- regen
+# energy, trip, target speed and the two currents were on no pit screen at all.
+#
+# Declared as data rather than a wall of render calls so the set is auditable:
+# you can read the whole inventory in one screenful, and _assert_no_duplicates()
+# below makes a copy-paste slip an import error instead of a tile shown twice.
+#
+# Fields:
+#   label   what the tile says. Must be unique across ALL groups.
+#   unit    shown small beside the number.
+#   get     (state, ctx) -> value. A callable so derived readings (delta to
+#           target) and ctx-sourced ones (lap, lap distance) fit the same shape.
+#   spec    format for fmt(); ignored when text=True.
+#   limit   a limits.Threshold to colour against, or None to stay neutral.
+#   mag     colour on abs(value). The currents are signed - discharge is
+#           negative - so the magnitude is what the threshold means, while the
+#           SIGN is information the pit wants to keep seeing.
+#   note    a small caveat under the number, for a reading that must never be
+#           shown bare.
+#   text    value is already a string; skip formatting and colouring.
+LIVE_METRICS_PER_ROW = 4
+
+LIVE_METRIC_GROUPS = [
+    ("Motion", [
+        dict(label="Speed", unit="km/h", spec=".1f", limit=SPEED,
+             get=lambda s, c: s["speed_kmh"]),
+        dict(label="Target Speed", unit="km/h", spec=".1f",
+             get=lambda s, c: s["target_speed_kmh"],
+             note="from the active velocity profile"),
+        # Deliberately uncoloured. The HUD colours the equivalent readout against
+        # a symmetric +/-5 km/h tolerance, which is a band rather than a
+        # threshold and so has no limits.Threshold to share. Inventing a
+        # one-sided limit here would let the pit and the car disagree about
+        # whether the driver is on pace.
+        dict(label="Delta to Target", unit="km/h", spec="+.1f",
+             get=lambda s, c: (None if s["speed_kmh"] is None
+                               or s["target_speed_kmh"] is None
+                               else s["speed_kmh"] - s["target_speed_kmh"]),
+             note="actual minus target"),
+        dict(label="Motor RPM", unit="rpm", spec=".0f",
+             get=lambda s, c: s["rpm"]),
+    ]),
+    ("Motor", [
+        dict(label="Motor Power", unit="W", spec=".0f", limit=POWER,
+             get=lambda s, c: s["power_w"],
+             note="negative = regen"),
+        dict(label="Motor Temp", unit="\u00b0C", spec=".1f", limit=MOTOR_TEMP,
+             get=lambda s, c: s["motor_temp"]),
+        # Its own tile here, where the strip above only appends it to the motor
+        # temperature. The raw resistance is what separates a genuinely hot
+        # motor from a failing PT1000.
+        dict(label="Motor Sensor", unit="\u03a9", spec=".1f",
+             get=lambda s, c: s["motor_ohms"],
+             note="raw PT1000; the temp is derived from this"),
+        dict(label="Motor Current", unit="A", spec=".1f", limit=MOTOR_CURRENT,
+             mag=True, get=lambda s, c: s["motor_current"],
+             note="amber only; high current is normal"),
+        dict(label="Power Map", unit="", text=True,
+             get=lambda s, c: s["motor_map"]),
+    ]),
+    ("Controller", [
+        dict(label="Controller Temp", unit="\u00b0C", spec=".1f", limit=CTRL_TEMP,
+             get=lambda s, c: s["temp"]),
+    ]),
+    ("Battery", [
+        dict(label="Battery SoC", unit="%", spec=".0f", limit=SOC,
+             get=lambda s, c: s["soc"], note="BMS coulomb count"),
+        dict(label="Pack Voltage", unit="V", spec=".2f", limit=PACK_VOLTAGE,
+             get=lambda s, c: s["pack_voltage"],
+             note="controller measurement - the one to trust"),
+        # Kept beside the controller's figure so the two can be compared at a
+        # glance. This decode WAS wrong - it read 2.25x high - and was fixed on
+        # 2026-08-20 at 12:12, after which the two agree to within 0.4 %. The
+        # tile stays because that is how the fix was confirmed, and how a
+        # regression would be spotted.
+        #
+        # Note the asymmetry this leaves: the LIVE number is trustworthy now,
+        # but 82 % of the stored history predates the fix, so the History tab's
+        # BMS-voltage trace is still 2.25x high over most of its range.
+        dict(label="Pack Voltage (BMS)", unit="V", spec=".2f",
+             get=lambda s, c: s["voltage"],
+             note="agrees since 2026-08-20 12:12; older history reads 2.25x high"),
+        dict(label="Battery Current", unit="A", spec=".1f", limit=BATT_CURRENT,
+             mag=True, get=lambda s, c: s["current"],
+             note="negative = discharge"),
+        dict(label="Battery Temp", unit="\u00b0C", spec=".1f", limit=CELL_TEMP,
+             get=lambda s, c: s["batt_temp"], note="hottest cell in the pack"),
+        # Also shown despite being useless, for the same reason: it reads 0.00 in
+        # all 44,088 recorded samples, so an empty tile here is the evidence that
+        # the controller never populates the field.
+        dict(label="SoC (controller est.)", unit="%", spec=".0f",
+             get=lambda s, c: s["soc_ctrl"],
+             note="unimplemented on this controller - always 0"),
+    ]),
+    ("Energy", [
+        dict(label="Total Race Energy", unit="Wh", spec=".0f",
+             get=lambda s, c: s["total_race_energy"],
+             note="integrated on the car, net of regen"),
+        dict(label="Last Lap Energy", unit="Wh", spec=".1f",
+             get=lambda s, c: s["last_lap_energy"]),
+        dict(label="Regen Energy", unit="Wh", spec=".0f",
+             get=lambda s, c: s["regen_energy"],
+             note="recovered under braking"),
+    ]),
+    ("Lap & Distance", [
+        dict(label="Lap", unit="", spec=".0f",
+             get=lambda s, c: c["active_lap"]),
+        dict(label="Lap Distance", unit="m", spec=".0f",
+             get=lambda s, c: c["current_lap_dist_m"]),
+        dict(label="Last Lap Time", unit="", text=True,
+             get=lambda s, c: (None if s["last_lap_time_s"] is None
+                               else format_lap_time(s["last_lap_time_s"]))),
+        dict(label="Odometer", unit="km", spec=".2f",
+             get=lambda s, c: c["odometer_km"]),
+        dict(label="Trip", unit="m", spec=".0f",
+             get=lambda s, c: s["trip_m"],
+             note="controller trip counter"),
+        dict(label="Lap Source", unit="", text=True,
+             get=lambda s, c: s["lap_source"],
+             note="what triggered the last lap"),
+    ]),
+]
+
+
+def _assert_no_duplicates():
+    """A label may appear once across the whole tab.
+
+    The set is a union of three overlapping displays - the strip above the tabs,
+    the driver HUD and the History charts - and six metrics were already in all
+    three. Catching a repeat at import is the difference between noticing it now
+    and someone reading two tiles on race night wondering why they disagree.
+    """
+    seen = {}
+    for group, metrics in LIVE_METRIC_GROUPS:
+        for m in metrics:
+            label = m["label"]
+            if label in seen:
+                raise ValueError(
+                    f"Live Metrics: {label!r} appears in both {seen[label]!r} "
+                    f"and {group!r}")
+            seen[label] = group
+    return len(seen)
+
+
+LIVE_METRIC_COUNT = _assert_no_duplicates()
+
+
+def _render_live_metric(col, m, state, ctx):
+    """One large tile from a LIVE_METRIC_GROUPS entry."""
+    value = m["get"](state, ctx)
+    note = m.get("note")
+
+    if m.get("text"):
+        # Strings carry no tier: there is nothing to compare them against.
+        render_metric(col, m["label"], value or MISSING_TEXT, m.get("unit", ""),
+                      large=True, note=note)
+        return
+
+    limit = m.get("limit")
+    condition = NORMAL
+    if limit is not None:
+        # Colour on the magnitude where the threshold is about magnitude, but
+        # still DISPLAY the signed value below - losing the sign would hide
+        # regen entirely.
+        judged = abs(value) if (m.get("mag") and value is not None) else value
+        condition = classify(judged, limit)
+    render_metric(col, m["label"], fmt(value, m.get("spec", ".0f")),
+                  m["unit"], condition, large=True, note=note)
+
+
+@st.fragment(run_every=2)
+def _live_metrics_fragment():
+    """Live Metrics tab. 2 s, matching the strip above the tabs.
+
+    Same cadence and the same one cached SQLite read (_live_context is
+    @st.cache_data), so this tab costs a little markdown rather than another
+    query per tick.
+    """
+    ctx = _live_context()
+    state = ctx["state"]
+
+    if not ctx["fresh"]:
+        # Every tile below is from the same stale sample, so say it once here
+        # rather than decorating twenty-three tiles. Without this the page looks
+        # identical to a live one, which is the worst way to read old numbers.
+        st.warning(f":material/warning: Not live \u2014 every reading below is from "
+                   f"the last sample received, {_age_text(ctx['age'])} ago.")
+
+    for group, metrics in LIVE_METRIC_GROUPS:
+        st.markdown(f"##### {group}")
+        for i in range(0, len(metrics), LIVE_METRICS_PER_ROW):
+            chunk = metrics[i:i + LIVE_METRICS_PER_ROW]
+            # Always a full-width row of columns even when the group does not
+            # fill it, so tiles line up down the page instead of stretching to
+            # different widths per group.
+            cols = st.columns(LIVE_METRICS_PER_ROW)
+            for col, m in zip(cols, chunk):
+                _render_live_metric(col, m, state, ctx)
+
+    st.caption(
+        f"{LIVE_METRIC_COUNT} metrics \u00b7 refreshing every 2 s \u00b7 "
+        f"\u2014 means the car has not reported that field. Thresholds and "
+        f"colours come from limits.py, shared with the driver HUD.")
 
 
 @st.fragment(run_every=2)
@@ -1294,6 +1497,56 @@ def _break_time_gaps(plot_df, factor=8.0):
     return pd.concat([plot_df, filler]).sort_index()
 
 
+def _hist_rangebreaks(plot_df, factor=8.0, max_breaks=60):
+    """Spans containing no samples, for Plotly to leave OUT of the x axis.
+
+    Why this exists: the store spans months but the car only runs in short
+    sessions, so on a wide window ("All" = 22 Jun -> 20 Aug here) more than 99 %
+    of the axis is time when nothing was recorded. Every real burst then
+    compresses into a slice a pixel or two wide, and a metric that swings hard
+    inside a burst - RPM going -2,152 to 6,352 - renders as a bare vertical
+    line. The chart was technically correct and completely unreadable.
+
+    Handing those spans to xaxis.rangebreaks removes them from the axis, so the
+    sessions expand to fill the width and the shape of each one becomes visible.
+    The ticks stay real dates; only the empty stretches between them go.
+
+    Deliberately NOT a fix for the line-bridging problem - _break_time_gaps
+    already handles that, and the two work together: the break keeps a session
+    boundary from being drawn as a diagonal, this stops the boundary being three
+    weeks wide.
+    """
+    # Filler rows from _break_time_gaps are all-NaN by construction; they mark
+    # gaps rather than data, so a gap must not be measured from one.
+    real = plot_df.dropna(how="all")
+    if len(real) < 3:
+        return []
+    deltas = real.index.to_series().diff()
+    typical = deltas.median()
+    if pd.isna(typical) or typical <= pd.Timedelta(0):
+        return []
+    threshold = typical * factor
+    big = deltas[deltas > threshold]
+    if big.empty:
+        return []
+
+    # Widest gaps first, so a cap keeps the ones actually distorting the axis.
+    breaks = []
+    for end_ts in big.sort_values(ascending=False).index[:max_breaks]:
+        gap = deltas.loc[end_ts]
+        start_ts = end_ts - gap
+        # Leave a sliver of real gap at each end. Without it the two sessions
+        # butt together and read as continuous telemetry, which is the very
+        # illusion _break_time_gaps exists to prevent. 2 % of the gap, capped so
+        # a month-long break does not leave a visible week.
+        pad = min(gap * 0.02, typical * 3)
+        lo, hi = start_ts + pad, end_ts - pad
+        if hi <= lo:
+            continue
+        breaks.append(dict(bounds=[lo.isoformat(), hi.isoformat()]))
+    return breaks
+
+
 def _hist_axis_plan(charts, normalize):
     """Which y-axis each unit lands on.
 
@@ -1370,9 +1623,13 @@ def _hist_figure(plot_df, charts, normalize, dark, view_rev):
         selectdirection="h",
         legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0,
                     bgcolor="rgba(0,0,0,0)"),
+        # rangebreaks: drop the stretches where nothing was recorded. See
+        # _hist_rangebreaks - without it a two-month window is 99 % dead air and
+        # every session is a one-pixel spike.
         xaxis=dict(gridcolor=grid, zeroline=False, showspikes=True,
                    spikemode="across", spikesnap="cursor", spikethickness=1,
-                   spikedash="dot", spikecolor=fg, automargin=True),
+                   spikedash="dot", spikecolor=fg, automargin=True,
+                   rangebreaks=_hist_rangebreaks(plot_df)),
         # Unit as a horizontal caption above the axis, not a rotated title: a
         # sideways "km/h" squeezed against the tick labels was unreadable and ate
         # the width the labels needed.
@@ -2173,12 +2430,15 @@ def main():
     # Each fragment below renders directly into its spot and refreshes in place.
     _top_strip_fragment()  # fast (2s)
 
-    tab_driver, tab_history, tab_weather, tab_strategy = st.tabs(
-        [":material/speed: Driver Telemetry", ":material/show_chart: History",
+    tab_driver, tab_live, tab_history, tab_weather, tab_strategy = st.tabs(
+        [":material/speed: Driver Telemetry", ":material/dashboard: Live Metrics",
+         ":material/show_chart: History",
          ":material/cloud: Weather", ":material/insights: Strategy"]
     )
     with tab_driver:
         _driver_fragment()  # fast (2s)
+    with tab_live:
+        _live_metrics_fragment()  # fast (2s)
     with tab_history:
         # Controls live OUTSIDE the fragments (they are what drives them), so
         # changing one is a full app rerun — which is also what re-registers the

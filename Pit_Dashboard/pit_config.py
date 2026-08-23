@@ -39,6 +39,54 @@ SQLITE_PATH = os.path.join(_HERE, "telemetry.db")
 # change, and export can filter by it.
 DEVICE_ID = "solarcar"
 
+# ── Export timezone: Tel Aviv before the team travels, Belgium after ─────── #
+# Exports used to be UTC, which is unambiguous and useless: nobody comparing a
+# stint to a radio call wants to do arithmetic first. So the workbook is written
+# in the timezone the team was actually IN when the sample was recorded.
+#
+# It changes mid-season, which is why this is a pair and not one setting: the
+# car runs in Israel now and the race is at Zolder in Belgium. A single zone
+# would misdate one half of the history by an hour or two.
+#
+# THE SWITCH INSTANT is read in EXPORT_TZ_BEFORE, so "2026-09-14T00:00:00"
+# means: everything up to midnight at the end of 13 September, Tel Aviv time,
+# is Tel Aviv; from that moment on it is Brussels. Change this one string if the
+# travel date moves - nothing else needs touching.
+#
+# Both zones are IANA names, not fixed offsets, deliberately: they carry their
+# own daylight-saving rules. Israel and Belgium both leave summer time in late
+# October, on different dates, and a hard-coded +3/+2 would silently rot then.
+EXPORT_TZ_BEFORE = "Asia/Jerusalem"
+EXPORT_TZ_AFTER = "Europe/Brussels"
+EXPORT_TZ_SWITCH_LOCAL = "2026-09-14T00:00:00"
+
+
+def _switch_epoch():
+    """The switch instant as a unix timestamp, resolved once at import."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    naive = datetime.fromisoformat(EXPORT_TZ_SWITCH_LOCAL)
+    return naive.replace(tzinfo=ZoneInfo(EXPORT_TZ_BEFORE)).timestamp()
+
+
+EXPORT_TZ_SWITCH_EPOCH = _switch_epoch()
+
+
+def export_zone(ts):
+    """The ZoneInfo a sample recorded at unix time `ts` should be shown in."""
+    from zoneinfo import ZoneInfo
+    if ts is None or ts >= EXPORT_TZ_SWITCH_EPOCH:
+        return ZoneInfo(EXPORT_TZ_AFTER)
+    return ZoneInfo(EXPORT_TZ_BEFORE)
+
+
+def export_local(ts):
+    """`ts` as a timezone-AWARE datetime in the right zone for that instant."""
+    from datetime import datetime
+    if ts is None:
+        return None
+    return datetime.fromtimestamp(ts, tz=export_zone(ts))
+
 # --- Collector tuning -------------------------------------------------------- #
 # Exponential backoff bounds for reconnects (seconds).
 RECONNECT_BACKOFF_START = 1.0
