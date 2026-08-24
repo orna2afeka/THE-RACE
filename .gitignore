@@ -10,7 +10,7 @@ venv/
 .venv/
 **/venv/
 **/.venv/
-
+REACT_MIGRATION_PROMPT.md
 # ---------------------------------------------------------------------------
 # Pit-side telemetry store
 # ---------------------------------------------------------------------------
@@ -30,7 +30,7 @@ venv/
 # Hash of the last requirements file run_pit.bat pip-installed.
 .deps_stamp
 **/.deps_stamp
-
+docs/
 # collector stdout/stderr when launched detached by run_pit.bat
 collector.out.log
 collector.err.log
