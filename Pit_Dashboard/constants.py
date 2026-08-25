@@ -58,6 +58,9 @@ from limits import (                # noqa: E402  (path set up above)
     MOTOR_TEMP, CTRL_TEMP, CELL_TEMP,
     SOC, PACK_VOLTAGE, BATT_CURRENT,
     MOTOR_CURRENT, POWER, SPEED,
+    # Solar charge current. Carries only a full_scale (no warn/crit) so the pit
+    # tile and the driver's SOLAR IN gauge share one arc scale.
+    SOLAR_CURRENT,
 )
 
 TARGET_LAP_TIME_MIN = 3.5

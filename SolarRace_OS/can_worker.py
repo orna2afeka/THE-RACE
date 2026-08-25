@@ -17,6 +17,9 @@ Decoded parameters (LYNX / SiliXcon protocol):
                    Battery SOC      (byte 2,    uint8  %)
   CAN ID 0x628  →  Controller Temp  (byte 4,    uint8  °C)
                    Motor Thermistor (bytes 0-1,  uint16 LE, raw ADC)
+  CAN ID 0x150  →  Throttle pedal   (GPIO0, uint16 BE, mV) — REQUESTED, not
+                   broadcast, and big-endian unlike everything above. main.py
+                   asks for it on 0x147; see the GPIO section of mms_parser.
 """
 
 import struct
@@ -27,8 +30,9 @@ from PySide6.QtCore import QThread, Signal
 
 from config import open_bus
 from modules.mms_parser import (
-    TEMP_FRAME_IDS, decode_vehicle_speed_kmh, parse_driver_state,
-    parse_motor_map, parse_motor_temp_frame, reverse_active)
+    GPIO_REPORT_ID_SET, TEMP_FRAME_IDS, decode_vehicle_speed_kmh,
+    parse_driver_state, parse_motor_map, parse_motor_temp_frame,
+    parse_throttle_frame, reverse_active)
 
 
 # ── SiliXcon LYNX — Status Word bit definitions ──────────────────────────── #
@@ -105,6 +109,17 @@ class CANWorker(QThread):
     #   (resistance Ω, temperature °C or -1000.0 if unconvertible, status)
     motor_temp_updated      = Signal(float, float, str)
     power_updated           = Signal(object)  # Instant power       (Watts)
+    # Throttle pedal position, 0-100 %. object (not float) for the usual reason:
+    # None means "the ESC has not reported the pedal", and 0 % means "the driver
+    # is off the throttle". Those are completely different things to tell a
+    # driver who is being coached on how they use the pedal.
+    throttle_updated        = Signal(object)  # Throttle position   (0-100 %)
+    # Solar charge current, AMPS, from the Yocto-Amp on USB — NOT from CAN.
+    # It lives on this worker anyway because this is the thread that owns the
+    # telemetry cadence and vehicle_state, exactly like the GPIO-sourced
+    # brake/lights indicators. Being off-CAN has one important consequence:
+    # _emit_zeros() must NOT blank it (see the note there).
+    solar_current_updated   = Signal(object)  # Solar charge current (A)
     alerts_updated          = Signal(list)   # Active alerts: [(label, severity), ...]
     # Active power map: (display name, raw byte). Raw travels with the name so
     # an unrecognised value can be identified instead of just looking wrong.
@@ -165,8 +180,8 @@ class CANWorker(QThread):
                 f"Cannot open CAN bus:\n{err}\n\n"
                 "• Verify the USB-to-CAN adapter is plugged in, OR\n"
                 "• Verify the CAN HAT is mounted and can0 is up\n"
-                "    (sudo ip link set can0 up type can bitrate 1000000).\n"
-                "      can1 runs at 500000 - see config.CAN_BITRATES.\n"
+                "    (sudo ip link set can0 up type can bitrate 500000).\n"
+                "      can1 runs at 500000 too - see config.CAN_BITRATES.\n"
                 "• Check CAN_CANDIDATES in config.py.\n"
                 "• Ensure no other application is using the channel."
             )
@@ -212,6 +227,8 @@ class CANWorker(QThread):
             self._decode_battery(data)
         elif arb_id in TEMP_FRAME_IDS:
             self._decode_temp(data)
+        elif arb_id in GPIO_REPORT_ID_SET:
+            self._decode_throttle(arb_id, data)
         # All other IDs are silently ignored — future extensibility here.
 
     def _decode_status(self, data: bytes) -> None:
@@ -392,6 +409,25 @@ class CANWorker(QThread):
                 float(fields.get("mms_motor_temp_C", -1000.0)),
                 fields.get("mms_motor_temp_status", ""),
             )
+
+    def _decode_throttle(self, arb_id: int, data: bytes) -> None:
+        """GPIO bank report -> the throttle percentage on the efficiency bar.
+
+        Decoding lives in mms_parser.parse_throttle_frame so the HUD bar and
+        the pit's throttle trace are the same conversion of the same bytes —
+        the driver must not be coached against a percentage the pit computed
+        differently.
+
+        Emits NOTHING when the frame carries no throttle value (a report
+        covering other GPIOs, an error-flagged frame, or a raw voltage outside
+        the plausible pedal range). Staying silent leaves the last good reading
+        on screen for a frame or two, which is right for a 10 Hz signal;
+        emitting None here would make the bar strobe blank on every unrelated
+        GPIO frame. Real loss of signal is handled by _emit_zeros().
+        """
+        fields = parse_throttle_frame(arb_id, data)
+        if "mms_throttle_percent" in fields:
+            self.throttle_updated.emit(float(fields["mms_throttle_percent"]))
 
     # ================================================================== #
     # Lifecycle helpers                                                    #

@@ -15,6 +15,9 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 import drivetrain           # noqa: E402
+# Pedal calibration + the Eco/Normal/Power boundaries, shared with the pit wall
+# so the driver's zone bar and the pit's throttle tile cannot disagree.
+import efficiency           # noqa: E402
 
 # ==============================================================================
 # VEHICLE SPEED — 0x610 bytes 4-5
@@ -159,10 +162,18 @@ TEMP_NOT_AVAILABLE = 0x7FFF
 # ------------------------------------------------------------------------------
 STATUS_MAP_BYTE = 2
 
-# Confirmed against the car: raw 0 = Map 1 ... raw 3 = Reverse.
-# If the controller ever turns out to send 1-4 instead, shift these four keys
-# and nothing else changes — every screen reads the name from here, and both
-# also display the raw number so a mismatch is visible immediately.
+# MEASURED against 46,836 recorded samples. What this controller actually sends:
+#
+#     raw  1  ->  22,985 samples   normal driving
+#     raw 10  ->     260 samples   reverse
+#     raw  3  ->      86 samples   reverse (an older configuration)
+#     raw  2  ->      35 samples
+#
+# raw 0 has never once been seen, so the old note claiming "raw 0 = Map 1 ...
+# raw 3 = Reverse" described a numbering the car does not use.
+#
+# Note there are TWO reverse values, which is why REVERSE_MAP_RAWS below exists
+# and why nothing may test the reverse condition by comparing display names.
 MOTOR_MAPS = {
     0: "Map 1",
     1: "NORMAL MODE",
@@ -219,23 +230,52 @@ def parse_driver_state(data_bytes):
     }
 
 
+# Raw power-map values that mean reverse. Both are real: 3 is an older
+# controller configuration and 10 is what the car sends now, and recorded
+# telemetry contains both.
+#
+# ⚠️ MATCH ON THESE NUMBERS, NEVER ON THE DISPLAY NAME. This used to be
+# `motor_map_name(map_raw) == "Reverse"`, which silently failed for raw 10
+# because that renders as "REVERSE MODE" — so selecting reverse lit nothing,
+# and the REV lamp only came on later via the negative-RPM path, i.e. once the
+# car was already rolling backwards. The HUD badge had the same bug one layer
+# up: `"Reverse" in name` is case-sensitive and does not match "REVERSE MODE".
+#
+# A name is for a human to read. Renaming a map must never be able to turn a
+# safety indicator off.
+REVERSE_MAP_RAWS = frozenset({3, 10})
+
+
+def is_reverse_map(map_raw):
+    """Is this raw power-map value one of the reverse maps?
+
+    Tolerates None and a float (the pit reads these back out of SQLite as REAL)
+    so callers do not each need their own guard.
+    """
+    if map_raw is None:
+        return False
+    try:
+        return int(map_raw) in REVERSE_MAP_RAWS
+    except (TypeError, ValueError):
+        return False
+
+
 def reverse_active(map_raw=None, rpm=None):
     """Is the car in reverse? Decided from real, documented signals only.
 
-    A negative motor RPM is a direct physical measurement — bytes 2-3 of 0x610
-    are a documented signed INT16 "Motor speed [rpm]", so a negative value means
-    the motor is physically turning backwards. That is the strongest evidence
-    available and it needs no undocumented bit.
+    Two independent signals, either one sufficient:
 
-    The reverse POWER MAP corroborates it. Note the map NUMBERING is still a
-    placeholder (see MOTOR_MAPS), so it is treated as supporting evidence rather
-    than proof — but a car in the reverse map with negative RPM is unambiguous.
+    * A negative motor RPM — bytes 2-3 of 0x610 are a documented signed INT16
+      "Motor speed [rpm]", so a negative value means the motor is physically
+      turning backwards. The strongest evidence available, needing no
+      undocumented bit. But it is also LATE: it cannot be true until the car has
+      actually started moving backwards.
+    * The reverse power map — true the moment the driver selects it, which is
+      when the warning is actually wanted. This is the half that was broken.
     """
     if rpm is not None and rpm < 0:
         return True
-    if map_raw is not None and motor_map_name(map_raw) == "Reverse":
-        return True
-    return False
+    return is_reverse_map(map_raw)
 
 
 def motor_map_name(raw):
@@ -373,6 +413,175 @@ def parse_motor_temp_frame(data_bytes):
 
     return parsed
 
+
+# ==============================================================================
+# THROTTLE PEDAL — GPIO0 over CAN (siliXcon ESC API)
+# ==============================================================================
+# Reference: https://docs.silixcon.com/docs/fw/modules/esc_api/examples/read_gpio_can
+#
+# ⚠️ THIS ONE IS NOT A BROADCAST. Every other frame in this file arrives on its
+# own without being asked. GPIO readings do not: the controller sends NOTHING
+# on 0x150 until a configuration frame is transmitted to 0x147 telling it which
+# inputs to sample, how often, and which of its four reporting "banks" to use.
+# That request is sent by main.py (see config.THROTTLE_GPIO_*), and it has to be
+# re-sent after the controller reboots, because the configuration does not
+# survive a power cycle. A silent throttle is therefore far more likely to mean
+# "nobody armed the report" than "the pedal is broken" — check that first.
+#
+# ⚠️ AND IT IS BIG-ENDIAN. Every LYNX broadcast frame decoded above is
+# little-endian ("<h", "<H"); the ESC API is documented as "All payloads use
+# big-endian byte order" and uses ">H" here. Reading a 2058 mV pedal with the
+# wrong endianness gives 2568 mV — not an obviously wrong number, just a wrong
+# one, which is the kind that survives a bench test and lies all race.
+#
+# REQUEST — 8 bytes to CAN ID 0x147:
+#     byte  0    UINT8   receiver address (the ESC's node address; 0 by default)
+#     byte  1    UINT8   bank selector, 0x8..0xB for banks 0..3
+#     byte  2    UINT8   start input ID
+#     byte  3    UINT8   end input ID   (inclusive)
+#     bytes 4-5  UINT16  sampling period [ms], big-endian
+#     bytes 6-7  UINT16  delay between transmissions [ms], big-endian; 0 disables
+#
+# RESPONSE — periodic frames on the bank's ID (0x150/0x158/0x160/0x168):
+#     byte  0    UINT8   device signature; BIT 0 IS AN ERROR FLAG
+#     byte  1    UINT8   the input ID of the FIRST value in this frame
+#     bytes 2-3  UINT16  value for that ID, in MILLIVOLTS, big-endian
+#     bytes 4-5  UINT16  value for ID+1   (present when the range is wider)
+#     bytes 6-7  UINT16  value for ID+2
+# A range of more than three inputs continues in a second frame on the same ID,
+# whose byte 1 names where it resumes — which is why the decode below walks IDs
+# from byte 1 rather than assuming the frame starts at the requested start ID.
+# ==============================================================================
+
+# Where the ESC sends each bank's readings. Fixed by the protocol, not by the
+# node address — unlike the 0x600/0x630 broadcast bases, these IDs do not shift
+# with the controller's address; the address travels inside the REQUEST payload.
+GPIO_REQUEST_ID = 0x147
+GPIO_REPORT_IDS = {0: 0x150, 1: 0x158, 2: 0x160, 3: 0x168}
+GPIO_REPORT_ID_SET = frozenset(GPIO_REPORT_IDS.values())
+
+# The bank selector is NOT the bank number: bank 0 is requested as 0x8.
+GPIO_BANK_SELECTOR_BASE = 0x8
+
+# Input IDs. The docs' example reads "Start ID 0x8 (GPIO0)" through "End ID 0xC
+# (GPIO4)", so the GPIOs are contiguous from 0x8.
+GPIO_INPUT_ID_BASE = 0x8
+
+
+def gpio_input_id(gpio_number):
+    """GPIO number (0, 1, 2...) -> the input ID the ESC API addresses it by."""
+    return GPIO_INPUT_ID_BASE + gpio_number
+
+
+# Which GPIO the throttle pedal is wired to. GPIO0 per the feature request.
+#
+# ⚠️ UNVERIFIED ON THIS CAR. Nothing in the recorded telemetry proves the pedal
+# is on GPIO0 rather than the ESC's dedicated throttle input — this is the
+# number the feature was specified with, not a measurement. If the throttle
+# trace stays flat while the car is clearly accelerating, widen the requested
+# range (config.THROTTLE_GPIO_END_ID) to sweep GPIO0..GPIO4 and watch which one
+# moves with the pedal; then set this to that GPIO.
+THROTTLE_GPIO_NUMBER = 0
+THROTTLE_INPUT_ID = gpio_input_id(THROTTLE_GPIO_NUMBER)
+
+# Bit 0 of byte 0 means the controller could not serve the request (unknown
+# input ID, bank misconfigured). The values in such a frame are meaningless.
+GPIO_ERROR_FLAG = 0x01
+
+
+def build_gpio_request(bank=0, start_id=THROTTLE_INPUT_ID,
+                       end_id=THROTTLE_INPUT_ID, period_ms=100,
+                       delay_ms=100, address=0):
+    """The 8 payload bytes that ask the ESC to start reporting inputs.
+
+    Defaults mirror the documented example (100 ms period, 100 ms delay)
+    narrowed to a single input, because that is a configuration the vendor
+    actually shows working. 100 ms is also the right cadence for the pit's
+    throttle trace: fast enough to show a driver dabbing the pedal, slow enough
+    that it costs one frame per 10 Hz on a 500 kbit/s wire.
+
+    Raises ValueError on a request the ESC cannot answer, rather than putting a
+    malformed frame on the motor controller's bus.
+    """
+    if bank not in GPIO_REPORT_IDS:
+        raise ValueError(f"GPIO bank must be 0-3, got {bank!r}")
+    if not 0 <= start_id <= 0xFF or not 0 <= end_id <= 0xFF:
+        raise ValueError(f"input IDs must be a byte, got {start_id}..{end_id}")
+    if end_id < start_id:
+        raise ValueError(f"end ID {end_id:#x} is below start ID {start_id:#x}")
+    if not 0 <= period_ms <= 0xFFFF or not 0 <= delay_ms <= 0xFFFF:
+        raise ValueError("period and delay must fit in a UINT16 (ms)")
+    return struct.pack(
+        ">BBBBHH",                       # '>' — big-endian, see the note above
+        address & 0xFF,
+        GPIO_BANK_SELECTOR_BASE + bank,
+        start_id,
+        end_id,
+        period_ms,
+        delay_ms,
+    )
+
+
+def parse_gpio_report(arb_id, data_bytes):
+    """A bank report frame -> {input_id: millivolts}, or {} if not one.
+
+    Returns {} — not zeros — for a frame the controller flagged as an error,
+    for a truncated frame, and for any ID that is not a GPIO report. Callers
+    therefore cannot accidentally read a failed request as a pedal at rest.
+    """
+    if arb_id not in GPIO_REPORT_ID_SET:
+        return {}
+    if data_bytes is None or len(data_bytes) < 4:
+        return {}          # signature + ID + at least one value
+    if data_bytes[0] & GPIO_ERROR_FLAG:
+        # The ESC is telling us the request itself was bad. Whatever is in the
+        # value bytes is not a measurement.
+        return {}
+
+    first_id = data_bytes[1]
+    values = {}
+    # Walk 16-bit words from byte 2, assigning consecutive input IDs. Driven by
+    # the frame's own length so a 6-byte continuation frame yields two values
+    # rather than one real value and one read off the end.
+    for slot in range((len(data_bytes) - 2) // 2):
+        offset = 2 + slot * 2
+        values[first_id + slot] = struct.unpack_from(">H", data_bytes, offset)[0]
+    return values
+
+
+def parse_throttle_frame(arb_id, data_bytes, input_id=THROTTLE_INPUT_ID):
+    """A bank report frame -> the throttle fields both dashboards consume.
+
+    Returns {} when this frame carries nothing about the throttle input, so a
+    report covering other GPIOs never blanks a good reading.
+
+        mms_throttle_mv        the raw millivolts, ALWAYS published when present
+        mms_throttle_percent   0-100, or absent when the raw value is implausible
+        mms_throttle_status    efficiency.THROTTLE_* — why the percent is missing
+        mms_throttle_zone      "eco" | "normal" | "power" (absent with no percent)
+
+    The raw mV is published even when it converts to nothing, for exactly the
+    reason mms_motor_ohms is: an out-of-range raw value is what diagnoses a
+    disconnected pedal, and it is also the number the team reads off the pit
+    wall to replace efficiency.py's placeholder calibration.
+    """
+    values = parse_gpio_report(arb_id, data_bytes)
+    if input_id not in values:
+        return {}
+
+    millivolts = values[input_id]
+    percent, status = efficiency.throttle_percent(millivolts)
+
+    parsed = {
+        "mms_throttle_mv": millivolts,
+        "mms_throttle_status": status,
+    }
+    if percent is not None:
+        parsed["mms_throttle_percent"] = percent
+        parsed["mms_throttle_zone"] = efficiency.zone(percent)
+    return parsed
+
+
 def parse_mms_message(arb_id, data_bytes):
     """
     Parses LYNX protocol messages from the Silixcon Motor Management System (MMS).
@@ -433,6 +642,12 @@ def parse_mms_message(arb_id, data_bytes):
     # 4. Temperature Data — controller temp + the PT1000 motor sensor
     elif arb_id in TEMP_FRAME_IDS:
         parsed_data.update(parse_motor_temp_frame(data_bytes))
+
+    # 5. Throttle pedal — the GPIO bank report we asked the ESC for. Unlike
+    # every branch above, this frame only exists because main.py transmitted a
+    # request for it; see the GPIO section near the top of this file.
+    elif arb_id in GPIO_REPORT_ID_SET:
+        parsed_data.update(parse_throttle_frame(arb_id, data_bytes))
 
     # 4. Status, Limits, and Errors (same decode the driver HUD uses)
     elif arb_id == ID_STATUS and len(data_bytes) >= 8:

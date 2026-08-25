@@ -30,7 +30,8 @@ REACT_MIGRATION_PROMPT.md
 # Hash of the last requirements file run_pit.bat pip-installed.
 .deps_stamp
 **/.deps_stamp
-docs/
+docs/*
+!docs/REACT_MIGRATION_PLAN.md
 # collector stdout/stderr when launched detached by run_pit.bat
 collector.out.log
 collector.err.log

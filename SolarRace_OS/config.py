@@ -1,34 +1,37 @@
 """
 config.py — Hardware / connection configuration for SolarRace OS
 =================================================================
-Topology: TWO CAN buses, because the devices do not agree on a bitrate.
+Topology: TWO CAN buses — as of 2026-08-25 both at the SAME bitrate.
 
     Channel  Rate       Device  Protocol             IDs
     -------  ---------  ------  -------------------  -----------------
     can0     500 kbit/s bms     JBD query/response   0x100-0x110 (11b)
     can0     500 kbit/s temp    J1939 thermistor     0x1839F3xx (29b)
-    can1     1 Mbit/s   mms     SiliXcon LYNX        0x600-0x628 (11b)
+    can1     500 kbit/s mms     SiliXcon LYNX        0x600-0x628 (11b)
 
-The MMS runs at 1 Mbit/s and the BMS at 500 kbit/s. That is WHY there are two
-channels: a single CAN wire carries exactly one bitrate, and two nodes clocked
+The engineering team reconfigured BOTH the BMS and the MMS to 500 kbit/s. The
+MMS previously ran at 1 Mbit/s, and that disagreement is what USED to force the
+split: a single CAN wire carries exactly one bitrate, and two nodes clocked
 differently do not "mostly work" — each corrupts the other's frames and the bus
-collapses. can0 and can1 are separate wires into separate controllers on the
-HAT; the BMS and the J1939 temp module happen to share the can0 wire since they
-both run at 500 kbit/s.
+collapses.
 
-    Measured directly on the car by probing each channel in listen-only mode
-    across candidate rates and watching RX error counters: can0 decodes
-    cleanly only at 500 kbit/s, can1 only at 1 Mbit/s. Confirmed for the BMS
-    with a live query (0x5A on 0x100 got a valid ~48V pack-voltage reply on
-    can0); confirmed for the MMS by clean continuous traffic across
-    0x600-0x628 on can1. This is the OPPOSITE of an earlier assumption that
-    had the MMS on can0 and the BMS on can1 — that assumption drove can0 to
-    bus-off, because at the wrong bitrate nothing on the wire ever ACKed it.
+That constraint is now gone, so the two channels are a WIRING fact rather than
+a bitrate requirement. can0 and can1 are separate wires into separate
+controllers on the HAT; the MMS is on can1 because that is where its wire
+lands, and the BMS shares can0 with the J1939 temp module. Reading is
+channel-agnostic (see below), so collapsing the car onto one wire would be a
+wiring job plus a re-measure — not an edit to this file.
 
-This file used to describe ONE shared bus with all three devices on it, and
-CAN_BITRATE was a single number. That was wrong about the hardware, and the
-contradiction was visible in the file itself: the prose said the LYNX ran at
-500 kbit/s while the constant said 1 Mbit/s.
+    Both ends of a wire must be re-flashed together. Do NOT change the numbers
+    below on their own: at a mismatched bitrate the interface comes up
+    perfectly clean and simply never decodes a frame, and a node whose frames
+    are never ACKed walks itself to bus-off. That is not hypothetical on this
+    car — an earlier revision had the MMS on can0 and the BMS on can1, and the
+    mismatch is exactly what drove can0 to BUS-OFF.
+
+    After any rate change, re-verify on the car rather than assuming: a 0x5A
+    query on 0x100 should draw a valid ~48V pack-voltage reply from the BMS on
+    can0, and 0x600-0x628 should stream continuously from the MMS on can1.
 
 Reading is channel-agnostic on purpose: the three message-ID ranges don't
 overlap (11-bit BMS vs 11-bit MMS vs 29-bit extended J1939), so frames from
@@ -39,9 +42,10 @@ between channels a wiring change, not a code change.
 The same code also works through a USB-to-CAN adapter instead of the HAT:
 the candidates below are tried in order and the first that opens is used.
 
-SocketCAN reminder — bring each channel up at ITS OWN bitrate first, e.g.:
+SocketCAN reminder — bring each channel up at ITS OWN bitrate first. Both are
+500 kbit/s today, but each is set independently and they may diverge again:
     sudo ip link set can0 up type can bitrate 500000
-    sudo ip link set can1 up type can bitrate 1000000
+    sudo ip link set can1 up type can bitrate 500000
 """
 import sys
 import os
@@ -62,7 +66,10 @@ HUD_SCREEN_NAME = os.environ.get("SOLARRACE_HUD_SCREEN") or None
 #
 # can0 and can1 are independent CAN controllers, so they are free to run at
 # different speeds. Devices on the SAME channel must still agree with each
-# other; devices on different channels need not.
+# other; devices on different channels need not. Both are at 500 kbit/s today;
+# the map stays per-channel because that is a fact about the current hardware
+# rather than a guarantee, and one device being re-flashed again must not mean
+# restructuring this.
 #
 # ⚠️ For SocketCAN this dict does NOT set the bitrate. python-can's socketcan
 # backend accepts `bitrate=` and ignores it — the real rate is whatever
@@ -73,16 +80,18 @@ HUD_SCREEN_NAME = os.environ.get("SOLARRACE_HUD_SCREEN") or None
 # up from a previous boot keeps its old rate while the logs claim the new one.
 CAN_BITRATES = {
     "can0": 500_000,
-    "can1": 1_000_000,
+    "can1": 500_000,
 }
 
 # Fallback rate for anything not in CAN_BITRATES — in practice the USB-to-CAN
 # adapters (pcan/slcan), where python-can DOES apply this value for real. A USB
 # adapter is a single interface at a single rate, so the silent-bus escalation
-# in open_usb_candidates() can only ever stand in for ONE of the two channels;
-# this picks which. Kept under the old name because it is still imported
-# elsewhere and is still exactly what it always was: the default bitrate.
-CAN_BITRATE = 1_000_000
+# in open_usb_candidates() can only ever stand in for ONE of the two channels.
+# While both channels run at 500 kbit/s that choice is moot and one adapter can
+# read either wire; if the rates ever diverge again, this is what picks. Kept
+# under the old name because it is still imported elsewhere and is still
+# exactly what it always was: the default bitrate.
+CAN_BITRATE = 500_000
 
 
 def bitrate_for(channel):
@@ -127,6 +136,71 @@ BMS_POLL_IDS = [
     0x107, 0x108, 0x109, 0x10A, 0x10B,  # Cell voltages (3 cells per ID)
     0x10C, 0x10D, 0x10E, 0x10F, 0x110,
 ]
+
+# ── Throttle pedal via the ESC's GPIO-over-CAN API ──────────────────── #
+#
+# The motor controller does NOT broadcast its GPIO readings. It reports them
+# only after being asked, so the car transmits one 8-byte request frame to
+# 0x147 and the ESC then answers periodically on the selected bank's ID (bank 0
+# -> 0x150). Protocol details and the byte layout live in
+# modules/mms_parser.py; these are the knobs for it.
+#
+# ⚠️ THIS MAKES THE PI TRANSMIT TO THE MOTOR CONTROLLER. Set
+# THROTTLE_GPIO_REQUEST_ENABLED = False if you would rather arm the report once
+# with siliXcon's own configuration tool and have the Pi only listen — the
+# decoder works either way and needs no other change. Two things to know before
+# leaving it on:
+#
+#   * Unacked transmits are what drove can0 to BUS-OFF on this car (see the
+#     module docstring at the top of this file). The request therefore goes out
+#     on the MMS's channel ONLY, exactly like BMS_POLL_CHANNEL restricts the
+#     BMS poll to can0, and main.py counts consecutive TX failures rather than
+#     retrying blindly.
+#   * The frame configures a REPORT. It does not change a power map, a current
+#     limit, or anything the motor acts on.
+THROTTLE_GPIO_REQUEST_ENABLED = True
+
+# Which wire the ESC is on. can1, for the same reason BMS_POLL_CHANNEL is can0:
+# a request sent down the other wire is never answered, and unanswered
+# transmits are the thing that kills a channel. None = send on every open bus,
+# which is only appropriate on a single-channel car.
+THROTTLE_GPIO_CHANNEL = "can1"
+
+# The ESC's node address, which travels in byte 0 of the request. 0 is the
+# default address and matches the documented example. If the controller has
+# been readdressed, this must follow it or the request is ignored — note the
+# broadcast frames give a hint: they arrive at 0x600 + ADDR.
+THROTTLE_GPIO_ADDRESS = 0
+
+# Reporting bank 0..3, each with its own reply ID and sampling rate. Bank 0
+# replies on 0x150. Pick a different bank only if something else on this car is
+# already using bank 0 — two configurations of the same bank overwrite each
+# other, silently.
+THROTTLE_GPIO_BANK = 0
+
+# Which inputs to sample. Both default to the throttle pedal alone (GPIO0), so
+# the ESC sends exactly one frame per period and nothing else on the bus has to
+# be filtered out.
+#
+# To find the pedal when GPIO0 turns out to be the wrong pin, widen this to
+# sweep the block — set END_ID to mms_parser.gpio_input_id(4) — and watch which
+# value moves on the pit's raw-mV tile while somebody presses the pedal.
+THROTTLE_GPIO_START_ID = None    # None = mms_parser.THROTTLE_INPUT_ID (GPIO0)
+THROTTLE_GPIO_END_ID = None      # None = same as start; one input only
+
+# How often the ESC samples and reports, in milliseconds. 100 ms (10 Hz) is the
+# documented example and the right cadence for the pit's throttle trace: fast
+# enough to show the driver dabbing the pedal, cheap enough to be invisible on
+# a 500 kbit/s wire.
+THROTTLE_GPIO_PERIOD_MS = 100
+THROTTLE_GPIO_DELAY_MS = 100
+
+# How often the car RE-SENDS the request. The ESC's report configuration does
+# not survive a controller power cycle, and the controller can be power-cycled
+# without the Pi noticing, so a one-shot request at startup would leave the
+# throttle dead for the rest of the race. Re-arming every 5 s costs one frame
+# per 5 s and makes recovery automatic.
+THROTTLE_REQUEST_INTERVAL_S = 5.0
 
 # ── Simulation ──────────────────────────────────────────────────────── #
 # Recorded CAN log replayed for simulation (contains MMS + BMS + temp frames).
@@ -402,14 +476,14 @@ def open_usb_candidates():
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now can-up.service
 #
-# It uses the CAN_BITRATES above (can0 at 500 kbit/s, can1 at 1 Mbit/s) and
-# txqueuelen 65536, matching what the app expects, and brings up can1 as well
-# when the car has a second channel. The two rates are deliberately different —
-# keep the unit and CAN_BITRATES in step by hand, because systemd cannot read
-# this file. An earlier version of this comment documented one shared rate and
-# txqueuelen 1000 for can0 only — a unit built from that would put a bus at the
-# wrong speed with a queue too small for the BMS burst, which presents exactly
-# like a dead bus.
+# It uses the CAN_BITRATES above (both channels at 500 kbit/s) and txqueuelen
+# 65536, matching what the app expects, and brings up can1 as well when the car
+# has a second channel. Keep the unit and CAN_BITRATES in step by hand, because
+# systemd cannot read this file — that is the whole reason the rates are
+# written out twice, and it stays true now that they are equal: whoever changes
+# one number has to change the other. A unit still carrying the old 1 Mbit/s
+# for can1 would hold the MMS wire at the wrong speed, and a wrong bitrate
+# presents exactly like a dead bus.
 #
 # The txqueuelen bump matters: the default CAN queue is tiny (~10 frames),
 # and the BMS poller sends a 16-frame burst — without it you can hit

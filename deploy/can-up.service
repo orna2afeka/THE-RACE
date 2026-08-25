@@ -14,17 +14,24 @@ Before=network-pre.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-# The two channels run at DIFFERENT rates and must match config.CAN_BITRATES
-# entry for entry. systemd cannot read config.py, so these numbers are copied
-# by hand — change one, change the other. Every device on a given wire has to
-# agree with that wire's rate, and a wrong bitrate looks exactly like a dead
-# bus: the interface comes up clean and simply never decodes a frame.
+# Both channels must match config.CAN_BITRATES entry for entry. systemd cannot
+# read config.py, so these numbers are copied by hand — change one, change the
+# other. Every device on a given wire has to agree with that wire's rate, and a
+# wrong bitrate looks exactly like a dead bus: the interface comes up clean and
+# simply never decodes a frame.
 #
-# Measured directly on the car (listen-only sweep + a live BMS query reply):
-# can0 is the 500 kbit/s wire (BMS + J1939 temp module), can1 is the
-# 1 Mbit/s wire (MMS). This is swapped from an earlier assumption that had
-# the MMS on can0 — that mismatch is what drove can0 to bus-off, since
-# nothing on the wire at the wrong bitrate ever ACKed it.
+# 2026-08-25: the engineering team put BOTH the BMS and the MMS on 500 kbit/s,
+# so both channels now run at 500 kbit/s. can1 was 1 Mbit/s until then — a Pi
+# still running the old unit holds the MMS wire at 1 Mbit/s and decodes nothing
+# from it, so `systemctl daemon-reload && systemctl restart can-up` after
+# copying this file, and confirm with `ip -details link show can1`.
+#
+# The channel split itself was measured on the car (listen-only sweep + a live
+# BMS query reply): BMS + J1939 temp module on can0, MMS on can1. That is
+# swapped from an earlier assumption which had the MMS on can0 — that mismatch
+# is what drove can0 to bus-off, since nothing on the wire at the wrong bitrate
+# ever ACKed it. Equal rates do not make the mapping moot: the ranges are read
+# channel-agnostically, but the BMS poll only goes out on can0.
 #
 # Reset both links first. `ip link set canX up` FAILS with "Device or resource
 # busy" on an interface that is already up — which is exactly what happens when
@@ -52,11 +59,12 @@ ExecStart=/usr/sbin/ip link set can0 up type can bitrate 500000 restart-ms 100 l
 # The default CAN TX queue is ~10 frames and the BMS poller sends a 16-frame
 # burst, which overflows it as ENOBUFS. This is why the queue is raised.
 ExecStart=/usr/sbin/ip link set can0 txqueuelen 65536
-# can1 — 1 Mbit/s (MMS). Optional: a single-HAT car does not have it, and
-# mixed rates need two independent controllers (a 2-channel HAT), not one
-# MCP2515. The leading '-' makes systemd ignore the failure instead of
-# marking the whole unit failed.
-ExecStart=-/usr/sbin/ip link set can1 up type can bitrate 1000000 restart-ms 100 listen-only off
+# can1 — 500 kbit/s (MMS). Optional: a single-HAT car does not have it. Two
+# channels still need two independent controllers (a 2-channel HAT), not one
+# MCP2515 — equal bitrates do not let one controller serve two wires. The
+# leading '-' makes systemd ignore the failure instead of marking the whole
+# unit failed.
+ExecStart=-/usr/sbin/ip link set can1 up type can bitrate 500000 restart-ms 100 listen-only off
 ExecStart=-/usr/sbin/ip link set can1 txqueuelen 65536
 ExecStop=-/usr/sbin/ip link set can0 down
 ExecStop=-/usr/sbin/ip link set can1 down

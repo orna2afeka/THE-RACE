@@ -56,11 +56,21 @@ import subprocess
 # want that tool.
 from modules.bms_parser import parse_jbd_bms_message
 from modules.mms_parser import parse_mms_message
+# The same module again, by name: _request_gpio_report() needs the GPIO-over-CAN
+# protocol constants and the request builder, and writing them as
+# `mms_parser.GPIO_REQUEST_ID` at the point of use says where they came from
+# instead of leaving four more bare names in this file's namespace.
+from modules import mms_parser
 from modules.temp_controller_parser import parse_temp_controller_message
 from modules.gps_reader import GPSReader
 from modules.lap_tracker import LapTracker
 from modules.lap_command import LapCommandInbox, StrategyCommandInbox
 from modules.vehicle_inputs import VehicleInputs
+# Solar charge current over USB (Yoctopuce Yocto-Amp). Importing this is safe
+# with no sensor fitted and even with the yoctopuce package absent — the module
+# degrades to reporting "no_library" rather than failing the import, so the HUD
+# still starts on a laptop.
+from modules.solar_current import SolarCurrentReader, safe_print
 
 # --- Cloud Sync Modules ---
 from cloud.firebase_client import (
@@ -88,6 +98,15 @@ from config import (
     BMS_POLL_BYTE,
     BMS_POLL_INTERVAL_S,
     BMS_POLL_CHANNEL,
+    THROTTLE_GPIO_REQUEST_ENABLED,
+    THROTTLE_GPIO_CHANNEL,
+    THROTTLE_GPIO_ADDRESS,
+    THROTTLE_GPIO_BANK,
+    THROTTLE_GPIO_START_ID,
+    THROTTLE_GPIO_END_ID,
+    THROTTLE_GPIO_PERIOD_MS,
+    THROTTLE_GPIO_DELAY_MS,
+    THROTTLE_REQUEST_INTERVAL_S,
     HUD_SCREEN_NAME,
 )
 
@@ -120,6 +139,11 @@ LAP_GPS_SAMPLE_INTERVAL_S = 0.1
 # How often the brake/lights switches are read. 5 Hz is instant to a human eye
 # and costs nothing; gpiozero debounces the contacts for us.
 VEHICLE_INPUT_POLL_S = 0.2
+
+# How often the solar-current snapshot is collected. 5 Hz, and it is FREE: the
+# Yocto-Amp is polled on its own background thread, so this only copies a small
+# dict under a lock. Nothing here touches USB.
+SOLAR_POLL_S = 0.2
 
 # Target speed + corner look-ahead refresh. 5 Hz: fast enough that the number
 # tracks the car down a straight, slow enough to be free.
@@ -164,6 +188,13 @@ class SmartCANWorker(CANWorker):
             "motor": {},            # SiliXcon LYNX MMS
             "temp_controller": {},  # J1939 battery-temperature module
             "gps": {},
+            # Solar charge current from the Yocto-Amp on USB. Its OWN block
+            # rather than a key inside "battery": that block is the JBD BMS's
+            # view of the pack and everything in it is prefixed bms_. This is a
+            # different device on a different bus measuring a different
+            # conductor, and mixing them would make "where did this number come
+            # from" unanswerable the next time the two disagree.
+            "solar": {},
         }
         # Distance, energy, laps and lap timing all live in one object so they
         # cannot drift apart — a lap is defined by distance, lap energy is the
@@ -177,6 +208,12 @@ class SmartCANWorker(CANWorker):
         # UNKNOWN rather than as a confident "off".
         self.vehicle_inputs = VehicleInputs()
         self._last_input_poll = 0.0
+        # Solar charge current. Constructed here and started with the CAN loop;
+        # its own daemon thread does the blocking USB reads and reconnects by
+        # itself when the cable vibrates loose, so this loop never waits on it.
+        self.solar = SolarCurrentReader()
+        self._last_solar_poll = 0.0
+        self._last_solar_status = None
         # Target speed + corner look-ahead. The car holds every generated
         # profile and the pit switches between them by name, so a strategy
         # change is a few bytes over the link instead of a 400-row table.
@@ -189,6 +226,12 @@ class SmartCANWorker(CANWorker):
         self.last_cloud_print = time.time()
         self._last_bms_poll = 0.0
         self._poll_fail_count = 0
+        # Throttle report: the ESC only sends GPIO readings after being asked,
+        # and forgets the request when it reboots — so this is re-armed on a
+        # timer rather than sent once. See _request_gpio_report().
+        self._last_gpio_request = 0.0
+        self._gpio_fail_count = 0
+        self._gpio_requested_ok = False
         self._have_bms_soc = False   # once True, ignore the LYNX SoC estimate
         # Once the dedicated temp module reports a max cell temp, stop falling
         # back to the BMS's own NTC probes (the module measures more points).
@@ -256,6 +299,7 @@ class SmartCANWorker(CANWorker):
             ("lap inbox", self.lap_inbox.stop),
             ("strategy inbox", self.strategy_inbox.stop),
             ("vehicle inputs", self.vehicle_inputs.stop),
+            ("solar sensor", self.solar.stop),
             ("CAN bus(es)", self._shutdown_bus),
         ):
             try:
@@ -285,6 +329,10 @@ class SmartCANWorker(CANWorker):
         # CAN: GPS keeps working (and keeps reaching the pit) even if the bus
         # never opens.
         self.gps.start()
+        # Independent of CAN for the same reason GPS is: the array charges the
+        # pack whether or not the motor controller is powered, and the pit wants
+        # to see it while the car sits in the paddock in the sun.
+        self.solar.start()
         self._last_gps_log = self.gps.status()
         print(f"🛰️ {self._last_gps_log}")
         print(f"🏁 {track.TRACK_LENGTH_METERS:.0f} m lap, finish line "
@@ -324,6 +372,7 @@ class SmartCANWorker(CANWorker):
             self._apply_strategy_commands()
             self._sample_lap_gps()
             self._poll_vehicle_inputs()
+            self._poll_solar()
             self._tick_profile()
             self._publish_gps()
 
@@ -384,6 +433,14 @@ class SmartCANWorker(CANWorker):
                 if now - self._last_bms_poll >= BMS_POLL_INTERVAL_S:
                     self._poll_bms()
                     self._last_bms_poll = now
+                # Re-arm the ESC's throttle report. Deliberately on its own
+                # timer and not folded into the BMS poll: they go to different
+                # devices on different wires at different rates, and a change
+                # to one must not silently retime the other.
+                if (THROTTLE_GPIO_REQUEST_ENABLED and
+                        now - self._last_gpio_request >= THROTTLE_REQUEST_INTERVAL_S):
+                    self._request_gpio_report()
+                    self._last_gpio_request = now
                 # Fall to silent if ALL buses go completely quiet.
                 if CAN_SILENCE_TIMEOUT_S and now - last_real > CAN_SILENCE_TIMEOUT_S:
                     state = "silent"
@@ -433,7 +490,17 @@ class SmartCANWorker(CANWorker):
         # "no sensor data" and blanks both fields rather than showing the
         # -246 °C that extrapolating 0 Ω would imply.
         self.motor_temp_updated.emit(0.0, -1000.0, "no_reading")
+        # Blank the efficiency bar too. 0 % would tell the driver they are off
+        # the throttle — a statement about how they are driving — when the truth
+        # is only that the controller has stopped talking to us.
+        self.throttle_updated.emit(None)
         self.alerts_updated.emit([])
+        # NOTHING BLANKS THE SOLAR GAUGE HERE, deliberately. Solar current comes
+        # from a USB ammeter, not from CAN, so a dead bus tells us nothing about
+        # it — blanking it would erase a perfectly good reading. It has its own
+        # staleness handling in modules/solar_current.py, which is the only
+        # thing that actually knows whether that sensor is still talking.
+        #
         # The controller has stopped talking, so we can no longer say it is on.
         # Brake/lights are GPIO-sourced and unaffected by a dead CAN bus, so
         # they keep whatever the Pi can actually read.
@@ -563,6 +630,86 @@ class SmartCANWorker(CANWorker):
                 else:
                     self._poll_fail_count = 0
 
+    def _request_gpio_report(self) -> None:
+        """Ask the motor controller to start reporting the throttle GPIO.
+
+        The ESC does not broadcast its GPIO inputs. One 8-byte frame to 0x147
+        tells it which inputs to sample, how fast, and which reply bank to use;
+        the replies then arrive on 0x150 and are decoded by the normal read
+        loop like any other frame (see mms_parser's GPIO section).
+
+        WHY THIS REPEATS instead of being sent once on connect: the report
+        configuration lives in the controller's RAM, so it is lost on any ESC
+        power cycle — and the ESC can be power-cycled without the Pi noticing
+        (the Pi runs off its own supply). A one-shot request would mean the
+        throttle trace dies at the first time the car is switched off in the
+        pit lane and never comes back until someone restarts the software.
+
+        RESTRICTED TO ONE CHANNEL, exactly like _poll_bms. A request sent down
+        the wrong wire is never answered, and unanswered transmit retries are
+        what walked can0 to bus-off on this car. THROTTLE_GPIO_CHANNEL is can1,
+        the MMS's wire.
+        """
+        if not self._buses:
+            return
+        target_buses = [
+            (bus, lbl) for bus, lbl in self._buses
+            if THROTTLE_GPIO_CHANNEL is None
+            or getattr(bus, "channel", None) == THROTTLE_GPIO_CHANNEL
+        ]
+        if not target_buses:
+            return
+
+        start_id = (mms_parser.THROTTLE_INPUT_ID if THROTTLE_GPIO_START_ID is None
+                    else THROTTLE_GPIO_START_ID)
+        end_id = start_id if THROTTLE_GPIO_END_ID is None else THROTTLE_GPIO_END_ID
+        try:
+            payload = mms_parser.build_gpio_request(
+                bank=THROTTLE_GPIO_BANK,
+                start_id=start_id,
+                end_id=end_id,
+                period_ms=THROTTLE_GPIO_PERIOD_MS,
+                delay_ms=THROTTLE_GPIO_DELAY_MS,
+                address=THROTTLE_GPIO_ADDRESS,
+            )
+        except ValueError as exc:
+            # A misconfiguration in config.py. Say so once and stop trying,
+            # rather than putting a malformed frame on the traction bus 12
+            # times a minute for the rest of the race.
+            if not self._gpio_fail_count:
+                print(f"⚠️ Throttle GPIO request is misconfigured, not sending: "
+                      f"{exc} — check config.THROTTLE_GPIO_*.")
+            self._gpio_fail_count += 1
+            return
+
+        msg = can.Message(
+            arbitration_id=mms_parser.GPIO_REQUEST_ID,
+            data=payload,
+            is_extended_id=False,
+        )
+        for bus, _ in target_buses:
+            try:
+                bus.send(msg, timeout=0.05)
+            except can.CanError as exc:
+                self._gpio_fail_count += 1
+                # Same throttled reporting as the BMS poll: a failing TX means
+                # frames are not being ACKed, which floods the console if every
+                # attempt is logged.
+                if self._gpio_fail_count % 20 == 1:
+                    print(f"⚠️ Throttle GPIO request TX failed on "
+                          f"{THROTTLE_GPIO_CHANNEL}: {exc} — check the MMS is "
+                          "on this wire, the bitrate matches, and the bus is "
+                          "terminated (2× 120Ω).")
+            else:
+                self._gpio_fail_count = 0
+                if not self._gpio_requested_ok:
+                    self._gpio_requested_ok = True
+                    print(f"🦶 Throttle report armed: GPIO input "
+                          f"{start_id:#x}..{end_id:#x} -> bank "
+                          f"{THROTTLE_GPIO_BANK} (0x"
+                          f"{mms_parser.GPIO_REPORT_IDS[THROTTLE_GPIO_BANK]:X}) "
+                          f"every {THROTTLE_GPIO_PERIOD_MS} ms.")
+
     # ------------------------------------------------------------------ #
     # GPS (gpsd) → vehicle_state → Firebase → pit                         #
     # ------------------------------------------------------------------ #
@@ -621,6 +768,50 @@ class SmartCANWorker(CANWorker):
         # No frame argument: keep the CAN-derived flags and refresh only the
         # GPIO ones. _emit_vehicle_flags emits only when something changed.
         self._emit_vehicle_flags(None)
+
+    def _poll_solar(self) -> None:
+        """Copy the newest solar-current snapshot into vehicle_state + the HUD.
+
+        Placed with the other CAN-independent pollers at the top of the loop, on
+        purpose: the array produces power whenever the sun is up, regardless of
+        whether the motor controller is powered or the CAN bus ever opened. A
+        solar reading that only appeared while CAN was live would go blank in
+        the paddock — which is exactly when the crew is checking the array.
+
+        Costs nothing: SolarCurrentReader.get_reading() takes a lock and copies
+        a dict. All USB I/O happens on the reader's own thread.
+        """
+        now = time.monotonic()
+        if now - self._last_solar_poll < SOLAR_POLL_S:
+            return
+        self._last_solar_poll = now
+
+        reading = self.solar.get_reading()
+        amps = reading["solar_current_A"]
+
+        # Publish the whole snapshot, not just the number. The status is what
+        # lets the pit tell "the array is producing nothing" from "the USB cable
+        # fell out", which are the same missing value and completely different
+        # problems.
+        self.vehicle_state["solar"] = {
+            "solar_current_A": amps,
+            "solar_sensor_status": reading["solar_sensor_status"],
+            "solar_sensor_serial": reading["solar_sensor_serial"],
+        }
+        self.solar_current_updated.emit(amps)
+
+        # Log status CHANGES only — a line per poll would be 5 Hz of noise, but
+        # a cable coming loose mid-race is exactly what you want in the log with
+        # a timestamp on it.
+        status = reading["solar_sensor_status"]
+        if status != self._last_solar_status:
+            self._last_solar_status = status
+            detail = reading["solar_last_error"]
+            # safe_print, not print: this runs inside the CAN loop, and an
+            # encoding error escaping here would propagate out of _run_loop and
+            # take the whole worker down over a status message.
+            safe_print(f"☀️ Solar sensor: {status}"
+                       + (f" — {detail}" if detail else ""))
 
     def _tick_profile(self) -> None:
         """Target speed + corner look-ahead for the driver, from the active profile.

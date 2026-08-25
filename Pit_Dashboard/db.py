@@ -76,6 +76,30 @@ METRIC_COLUMNS = [
     # Active power map as the raw controller value. Numeric so it can be charted
     # as a step trace across a race; the human name is stored beside it below.
     "mms_motor_map_raw",
+    # Throttle pedal position, 0-100 %, from the ESC's GPIO0 reading. The
+    # pit-wall coaching signal: a trace full of spikes is a driver pumping the
+    # pedal, a flat one is the steady input that wins an endurance race.
+    "mms_throttle_percent",
+    # The RAW millivolts the same reading came from. Stored for two reasons, both
+    # of which the PT1000 pair above already demonstrate the value of:
+    #   * It is what the team reads off the pit wall to replace the placeholder
+    #     pedal calibration in efficiency.py (the released/floored voltages).
+    #   * Until that calibration is measured, every percentage above is only
+    #     approximately right — so keeping the raw value means the whole race
+    #     can be RE-DERIVED afterwards once the real span is known, instead of
+    #     being permanently stored at whatever the placeholder implied.
+    "mms_throttle_mv",
+    # Solar charge current, AMPS, from the Yocto-Amp in series between the MPPT
+    # and the pack. Stored in amps because that is what the car publishes — the
+    # sensor's own mA are converted once, on the car, in
+    # modules/solar_current.py, so there is exactly one place that knows the
+    # wire unit and no chance of a second conversion here.
+    #
+    # Independent of bms_current_A and of mms_current_A, and worth having
+    # alongside both: pack current is net (charge minus draw), so solar input is
+    # not recoverable from it. Having both is what makes "how much did the array
+    # actually contribute over the night" answerable.
+    "solar_current_A",
     # Per-lap analytics, all computed ON THE CAR (see lap_tracker.py). The Pi
     # holds each lap's figures for the whole of the FOLLOWING lap, so the pit
     # only has to receive one sample anywhere in a lap to record that lap
@@ -112,6 +136,20 @@ ERROR_COLUMNS = [
 # the two ever run different builds.
 STATE_COLUMNS = [
     "mms_motor_map",
+    # Which efficiency zone the DRIVER was actually shown — "eco" | "normal" |
+    # "power" — as the car classified it. Stored rather than re-derived here for
+    # the same reason mms_motor_map is: after the race, "we radioed them because
+    # they were in the red" has to be answerable from what the HUD displayed,
+    # not from re-running today's thresholds over yesterday's percentages. That
+    # distinction matters precisely because efficiency.py's boundaries are
+    # placeholders and WILL change.
+    "mms_throttle_zone",
+    # Why the solar current is missing, when it is: "online" | "offline" |
+    # "searching" | "no_hub" | "no_library" | "implausible" | "error". A blank
+    # solar trace has several very different causes — night, a cloud, a USB
+    # cable shaken loose, a missing udev rule — and this is the column that
+    # tells them apart after the fact.
+    "solar_sensor_status",
     # How the last lap was triggered: gps | odometer | manual | gps_no_can.
     # "odometer" means the GPS trigger MISSED and the distance backstop fired —
     # a visible signal that finish-line detection needs looking at.
@@ -132,6 +170,8 @@ _COL_TYPES = {
     "mms_error_code": "INTEGER",
     "mms_alerts": "TEXT",
     "mms_motor_map": "TEXT",
+    "mms_throttle_zone": "TEXT",
+    "solar_sensor_status": "TEXT",
     "lap_source": "TEXT",
 }
 
@@ -345,6 +385,10 @@ def flatten_record(rtdb_key: str, record: dict, device_id: str = DEVICE_ID) -> d
     motor = car.get("motor") or {}
     temp = car.get("temp_controller") or {}
     gps = car.get("gps") or {}
+    # The Yocto-Amp's own block. .get with a default because every build older
+    # than this feature simply has no "solar" key, and those rows must land as
+    # NULL rather than raising on ingest.
+    solar = car.get("solar") or {}
 
     return {
         "rtdb_key": rtdb_key,
@@ -374,6 +418,18 @@ def flatten_record(rtdb_key: str, record: dict, device_id: str = DEVICE_ID) -> d
         "mms_motor_temp_C": _num(motor.get("mms_motor_temp_C")),
         "mms_motor_map_raw": _num(motor.get("mms_motor_map_raw")),
         "mms_motor_map": _join(motor.get("mms_motor_map")),
+        # Throttle. _num keeps a missing reading NULL rather than 0: the car
+        # omits mms_throttle_percent entirely when the pedal voltage is
+        # implausible (unplugged sensor), and a stored 0 there would read as a
+        # driver who lifted off.
+        "mms_throttle_percent": _num(motor.get("mms_throttle_percent")),
+        "mms_throttle_mv": _num(motor.get("mms_throttle_mv")),
+        "mms_throttle_zone": _join(motor.get("mms_throttle_zone")),
+        # Solar. _num keeps an absent reading NULL: the car publishes None when
+        # the sensor is offline, and a 0 stored there would be indistinguishable
+        # from a genuine night-time zero.
+        "solar_current_A": _num(solar.get("solar_current_A")),
+        "solar_sensor_status": _join(solar.get("solar_sensor_status")),
         "total_race_energy": _num(motor.get("total_race_energy")),
         "last_lap_energy": _num(motor.get("last_lap_energy")),
         "last_lap_time_s": _num(motor.get("last_lap_time_s")),

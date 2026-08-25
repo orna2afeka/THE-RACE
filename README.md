@@ -24,7 +24,9 @@ giving engineers live battery, motor, temperature, and strategy data.
 | Get CAN working on the Pi | [`docs/PI_CAN_TASK.md`](docs/PI_CAN_TASK.md) |
 | Change a gear ratio, lap length, or alarm threshold | `drivetrain.py`, `track.py`, `limits.py` at the repo root — **both** subsystems read them |
 | Retune when a gauge goes amber or red | `limits.py`, then re-run `python tools/replay_limits.py` to see how often the new number would have fired |
-| Change CAN bitrate / channels / BMS polling | `SolarRace_OS/config.py` |
+| Change CAN bitrate / channels / BMS polling / throttle reporting | `SolarRace_OS/config.py` |
+| Retune the Eco / Normal / Power zones, or calibrate the throttle pedal | `efficiency.py` at the repo root — **both** subsystems read it |
+| Wire up or debug the solar current sensor | [☀ Solar Current Sensor](#-solar-current-sensor-yocto-amp) below |
 
 > **Two things that surprise everyone:**
 > 1. `Pit_Dashboard` never talks to Firebase — only `collector.py` does. The dashboard
@@ -41,7 +43,7 @@ Two subsystems, synchronised through one Firebase node (`live_telemetry`):
 ```
    ┌─────────────────────── CAR (Raspberry Pi) ───────────────────────┐
    │                                                                   │
-   │   can1 @ 1 Mbit/s                                                 │
+   │   can1 @ 500 kbit/s                                               │
    │   └─ MMS  (SiliXcon LYNX motor controller)   IDs 0x600–0x628      │
    │   can0 @ 500 kbit/s                                               │
    │   ├─ BMS  (JBD battery, polled)              IDs 0x100–0x110      │
@@ -91,16 +93,35 @@ Two subsystems, synchronised through one Firebase node (`live_telemetry`):
 
 ## 🔌 CAN Bus Topology
 
-The car uses **two independent CAN channels** on a 2-CH HAT, at different
-bitrates. The motor controller sits alone on the fast wire; the battery and the
-temperature module share the slow one. Message-ID ranges never overlap, so the
-parsers can tell the protocols apart regardless of channel:
+The car uses **two independent CAN channels** on a 2-CH HAT, **both at
+500 kbit/s** since 2026-08-25. The motor controller sits alone on `can1`; the
+battery and the temperature module share `can0`. Message-ID ranges never
+overlap, so the parsers can tell the protocols apart regardless of channel:
 
 | Device | Channel | Bitrate | Protocol | Message IDs | Direction |
 |--------|---------|---------|----------|-------------|-----------|
-| **MMS** (motor) | `can1` | 1 Mbit/s | SiliXcon LYNX | `0x600`–`0x628` (11-bit) | broadcast → Pi |
+| **MMS** (motor) | `can1` | 500 kbit/s | SiliXcon LYNX | `0x600`–`0x628` (11-bit) | broadcast → Pi |
+| **MMS throttle** (GPIO0) | `can1` | 500 kbit/s | siliXcon ESC API | `0x147` out, `0x150` in (11-bit) | **Pi requests → ESC reports** |
 | **BMS** (battery) | `can0` | 500 kbit/s | JBD query/response | `0x100`–`0x110` (11-bit) | Pi polls → BMS replies |
 | **TEMP** (battery temp) | `can0` | 500 kbit/s | J1939 thermistor | `0x1839F380` (29-bit) | broadcast → Pi |
+
+> 🔄 **The MMS moved from 1 Mbit/s to 500 kbit/s on 2026-08-25**, when the
+> engineering team reconfigured both it and the BMS. Both ends of a wire have to
+> be re-flashed together, so a Pi still running the old `can-up.service` holds
+> `can1` at 1 Mbit/s and decodes nothing from it — reinstall the unit and check
+> `ip -details link show can1`. The rates now being equal is **not** a licence to
+> merge the wires: that is a wiring change, and the BMS poll still only goes out
+> on `can0`.
+
+> 🦾 **The throttle is the one signal the car has to ASK for.** Every other
+> frame above is broadcast unprompted; the ESC sends nothing about its GPIO
+> inputs until the Pi transmits a configuration frame to `0x147` naming the
+> input, the sampling period and a reply bank. It then answers on `0x150` in
+> **millivolts, big-endian** — the opposite byte order to every LYNX broadcast
+> frame. The request is re-sent every 5 s because the ESC forgets it on a power
+> cycle. Turn it off with `THROTTLE_GPIO_REQUEST_ENABLED = False` if you would
+> rather arm the report once with siliXcon's own tool; the decoder is unchanged
+> either way. Details: the GPIO section of `SolarRace_OS/modules/mms_parser.py`.
 
 > 📐 **This split was measured on the car**, with a listen-only bitrate sweep
 > plus a live BMS query reply — not assumed. An earlier revision had the MMS on
@@ -110,13 +131,98 @@ parsers can tell the protocols apart regardless of channel:
 
 > ⚠️ **Per-wire bitrate:** every device sharing **one wire** must run at that
 > wire's bitrate — set per channel by `CAN_BITRATES` in `SolarRace_OS/config.py`
-> (**can0 at 500 kbit/s, can1 at 1 Mbit/s**). The two channels are independent
+> (**both channels at 500 kbit/s** today). The two channels are independent
 > controllers and need not agree with each other, which is what lets a device
 > that cannot be reconfigured (the J1939 temp module is often fixed at
 > 250 kbit/s) sit on its own channel instead of dragging the whole car down to
-> its rate. The BMS baud is user-definable — set it to match whichever channel
-> it is wired to. Mixed rates require a **2-channel HAT** (two independent
-> MCP2515s); a single-channel HAT gives you `can0` only.
+> its rate — the reason the map is still per-channel even while the two entries
+> match. The BMS baud is user-definable — set it to match whichever channel it is
+> wired to. Two channels require a **2-channel HAT** (two independent MCP2515s);
+> a single-channel HAT gives you `can0` only.
+
+---
+
+## ☀ Solar Current Sensor (Yocto-Amp)
+
+Measures the DC current the MPPT pushes into the pack — the only *inbound*
+energy number on the car. Hardware: a Yoctopuce **Yocto-Amp** (or **Yocto-Amp-C**,
+the identical board with a USB-C socket), read by
+[`SolarRace_OS/modules/solar_current.py`](SolarRace_OS/modules/solar_current.py).
+
+| Property | Value | Why it matters here |
+|----------|-------|---------------------|
+| Max continuous | **10 A DC** | **Check the MPPT output rating against this before fitting anything.** |
+| Max peak | 17 A DC | Beyond this the reading is meaningless and the shunt is in trouble |
+| Insertion impedance | 5 mΩ | 0.5 W at 10 A — negligible loss, but it is a real heat source |
+| Terminal block | **26–16 AWG**, 5 mm strip, 0.4 Nm | A thicker charge cable will not physically land in it |
+| Isolation | 3 kV r.m.s. USB ↔ sensor | The Pi is NOT exposed to pack potential |
+| Reported unit | **milliamps** | Converted to amps once, on the car. Never store mA |
+| Refresh | 10 Hz | We poll at 4 Hz; the pit sees it at the 0.5 s Firebase rate |
+
+### ⚠️ Before wiring: confirm the current fits
+
+The Yocto-Amp is a **10 A continuous** device. Take the MPPT's rated maximum
+output current — not the array's nominal power, the MPPT's *output spec* — and
+check it is comfortably under 10 A. A 1 kW array into a ~48 V pack is roughly
+20 A, which is **twice this sensor's continuous rating**: it would overheat the
+shunt, and a 5 mΩ resistor cooking inside a sealed box in a race car is a fire
+risk, not a measurement problem. If the number is above ~8 A, stop and fit a
+hall-effect sensor instead. At a sustained 10 A the PCB already runs ~15 °C above
+ambient and Yoctopuce recommend forced airflow.
+
+### Wiring, step by step
+
+1. **Make it safe first.** Open the battery isolator, then isolate the array.
+   A solar panel cannot be switched off — it is live whenever light falls on it,
+   so either open the array isolator or physically cover the panels. Confirm 0 V
+   across the point you are about to cut.
+2. **Pick the point.** Anywhere on the conductor between the **MPPT output** and
+   the **battery**. The MPPT's positive output lead is the conventional choice.
+   Because the sensor is isolated, positive or negative return both work
+   electrically — pick whichever gives a shorter, better-supported cable run.
+3. **Cut that one conductor and land both ends on the terminal block.** The
+   ammeter goes **IN SERIES** — the whole charge current must flow through it.
+   Never wire it across the battery or across anything else: a 5 mΩ shunt in
+   parallel with a pack is a dead short.
+4. **Observe polarity so charging reads positive.** MPPT side → **`+` (measure
+   input positive)**; battery side → **`−` (measure input negative)**. Get this
+   backwards and the car simply reports negative amps all race — which the
+   dashboards deliberately display rather than hide, so you will see it
+   immediately and can swap the two wires.
+5. **Check the wire fits.** The block takes **16 AWG at the thickest**. A solar
+   charge line is often heavier than that. If so, do NOT force strands in: make a
+   short 16 AWG pigtail with a properly crimped joint to the main cable, and
+   remember the pigtail is now the current-limiting element in that path.
+6. **Crimp ferrules on stranded wire, strip 5 mm, torque to 0.4 Nm.** This is a
+   race car: a screw terminal that backs out under vibration becomes a
+   high-resistance hot spot carrying the full charge current.
+7. **Mount the module, not the wires.** Bolt or tie the board to structure so
+   its mass and the USB cable's tugging are never carried by the terminal
+   screws. Leave it in open air — do not bury it in a sealed box.
+8. **Leave the existing fuse in place.** The ammeter protects nothing. The
+   charge line still needs its own fuse, and that fuse should be rated at or
+   below what the Yocto-Amp can survive.
+9. **Restore power** — array last — and verify against a clamp meter before
+   trusting the number.
+
+### How the USB side works
+
+The Yocto-Amp is two electrically separate halves on one board. The shunt sits in
+the charge line at pack potential; the USB half is powered and read by the Pi;
+between them is 3 kV of isolation. **This is why the Pi can safely measure a
+line at pack voltage** — there is no galvanic path from the traction system to
+the Raspberry Pi, so no ground loop and no shared reference.
+
+Plug it into any **USB-A** port on the Pi 5 (the Pi's own USB-C socket is power
+input only — with the Yocto-Amp-C you want a USB-C-to-USB-A cable). It draws
+little enough to run from the port directly. **Strain-relieve and secure the
+connector**: a USB plug shaken loose is the expected failure here, which is why
+`solar_current.py` reconnects on its own and why the pit shows a sensor status
+beside the number — "offline" means the cable, "0.00 A" means the weather.
+
+The device is enumerated by `libusb`, so it needs a udev rule before a non-root
+process can open it. See [`deploy/README.md`](deploy/README.md) § 6 — without it
+the reading is permanently blank and the status reads `no_hub`.
 
 ---
 
@@ -156,6 +262,7 @@ THE RACE/                             # ← repo root
 │   │   ├── temp_controller_parser.py # J1939 battery-temperature decoder (low/high/avg)
 │   │   ├── pt1000.py                 # PT1000 thermistor linearisation
 │   │   ├── gps_reader.py             # GPS position via gpsd (background thread)
+│   │   ├── solar_current.py          # ☀ MPPT→battery current, Yocto-Amp on USB
 │   │   ├── lap_tracker.py            # Lap/sector detection from GPS + wheel distance
 │   │   ├── lap_command.py            # Manual lap triggers / pit commands
 │   │   └── vehicle_inputs.py         # Throttle, brake, and switch inputs
@@ -240,10 +347,13 @@ Almost everything car-side is centralised in **`SolarRace_OS/config.py`**:
 
 | Setting | Purpose |
 |---------|---------|
-| `CAN_BITRATES` | Per-channel bitrate map — **every device on a channel must match its rate** (`can0: 500_000`, `can1: 1_000_000`). For SocketCAN this does not set the rate; `ip link` does (see `deploy/can-up.service`), so keep the two in step. |
+| `CAN_BITRATES` | Per-channel bitrate map — **every device on a channel must match its rate** (`can0: 500_000`, `can1: 500_000`). For SocketCAN this does not set the rate; `ip link` does (see `deploy/can-up.service`), so keep the two in step. |
 | `CAN_BITRATE` | Fallback rate for channels absent from `CAN_BITRATES` — in practice the USB-to-CAN adapters, where python-can really does apply it. |
+| `THROTTLE_GPIO_*` | The throttle report: whether the Pi asks for it at all, which wire and ESC address, which reply bank, which GPIO, how fast, and how often the request is re-armed. **This is the only place the car transmits to the motor controller** — see the note in the file. |
 | `CAN_CANDIDATES` | Connections tried in order: CAN HAT (`socketcan:can0`) first, then a USB-to-CAN adapter. First that opens wins. |
 | `BMS_POLL_IDS` / `BMS_POLL_BYTE` / `BMS_POLL_INTERVAL_S` | Which BMS frames to request, the query byte (`0x5A`), and how often (1 Hz). |
+| `modules/solar_current.py` | Solar sensor tunables live in the module, not here — same as `gps_reader.py`. Poll rate, rescan interval, plausibility ceiling, and `target_serial` (pin this the moment a SECOND Yoctopuce device joins the car). |
+| `efficiency.py` (repo root) | Not in `config.py`, because the **pit reads it too**: the pedal's millivolt calibration and the Eco / Normal / Power boundaries. ⚠️ Every number in it is still a placeholder — nothing has been measured on the car. |
 | `SIM_LOG_PATH` | Recorded log replayed when no CAN bus is found. |
 
 To use a USB adapter instead of the HAT, or change channels, just edit
@@ -296,9 +406,9 @@ The alternates (22 / 24) only apply if the solder pads on the PCB were moved.
 > never appears or behaves erratically. Check your own `config.txt` against this.
 
 The 2-CH HAT carries **two independent MCP2515 controllers** (plus SN65HVD230
-transceivers), which is what makes per-channel bitrates possible — can0 at
-500 kbit/s and can1 at 1 Mbit/s are genuinely separate hardware, not one
-controller time-shared.
+transceivers), which is what makes per-channel bitrates possible — can0 and
+can1 are genuinely separate hardware, not one controller time-shared. Both run
+at 500 kbit/s today, but each could be set independently tomorrow.
 
 Each channel also has a **switchable 120 Ω termination jumper**. A CAN bus needs
 exactly two terminators, one at each physical end. Too few (or too many) causes
@@ -321,30 +431,32 @@ way no amount of software debugging will explain.
 
 Reboot after editing `config.txt`.
 
-### 1 Mbit/s may not be achievable
+### Nothing runs at 1 Mbit/s any more
 
 Waveshare's own FAQ: *"During high-speed communication, the data baud rate may
 not reach the nominal maximum rate ... Users need to ensure stability and select
 a suitable communication speed according to actual measurements."*
 
-This matters here, though note the `BUS-OFF` history on this car had a simpler
-cause: `can0` was being brought up at 1 Mbit/s while the devices actually on it
-(BMS + temp module) ran at 500 kbit/s, so nothing ever ACKed and the controller
-walked itself to `BUS-OFF`. Fixing the channel/bitrate mapping fixed that.
+`can1` used to carry the MMS at 1 Mbit/s, where that caveat bites hardest:
+isolated transceivers add propagation delay and 1 Mbit/s leaves little timing
+margin over any real cable length. Since 2026-08-25 the MMS runs at 500 kbit/s
+like everything else on the car, which removes that whole class of marginal
+failure — so **do not raise a channel back to 1 Mbit/s** without re-flashing
+the device on it and re-measuring.
 
-The vendor caveat still stands for `can1`, which now carries the MMS at
-1 Mbit/s. Isolated transceivers add propagation delay, and 1 Mbit/s leaves
-little timing margin over any real cable length. So if `can1` starts dropping to
-`BUS-OFF` after the wiring and termination check out, **the bitrate itself is
-the suspect** — but the MMS has to be reconfigured to match, since both ends of
-a wire must agree.
+Note the `BUS-OFF` history on this car had a simpler cause than vendor timing
+margin: `can0` was being brought up at 1 Mbit/s while the devices actually on it
+(BMS + temp module) ran at 500 kbit/s, so nothing ever ACKed and the controller
+walked itself to `BUS-OFF`. Fixing the channel/bitrate mapping fixed that. A
+bitrate that does not match the device is still the first suspect whenever a
+channel goes to `BUS-OFF` with the wiring and termination checked out.
 
 **2. Bring each bus up** at *its own* configured bitrate (see
 `config.CAN_BITRATES`; every device on a given wire must agree with that wire):
 ```bash
 sudo ip link set can0 up type can bitrate 500000 listen-only off   # BMS + temp
 sudo ip link set can0 txqueuelen 65536
-sudo ip link set can1 up type can bitrate 1000000 listen-only off  # MMS
+sudo ip link set can1 up type can bitrate 500000 listen-only off   # MMS
 sudo ip link set can1 txqueuelen 65536
 ```
 To make it automatic at boot, install the ready-made unit — do not hand-write one:
@@ -455,6 +567,12 @@ live_telemetry/
     temp_controller:   // J1939 battery-temperature module
       battery_temp_C (= average), battery_temp_avg_C,
       battery_temp_low_C, battery_temp_high_C, temp_module
+    solar:             // live from the Yocto-Amp on USB (solar_current.py)
+      solar_current_A,   // AMPS (the sensor reports mA; converted on the car).
+                         // null — never 0 — when the sensor is not reporting
+      solar_sensor_status,  // online | offline | searching | no_hub |
+                            // no_library | implausible | error
+      solar_sensor_serial
     gps:               // live from gpsd (gps_reader.py)
       lat, lon,        // ABSENT entirely when there is no fix — never 0,0
       fix_mode (2=2D, 3=3D), alt_m, speed_kmh, track_deg,

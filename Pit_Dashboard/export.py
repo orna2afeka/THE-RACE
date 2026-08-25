@@ -51,8 +51,18 @@ METRIC_GROUPS = {
                     # column rather than appearing under its raw name.
                     # mms_estimated_soc_percent stays excluded; see _XLSX_COLS.
                     "mms_vehicle_speed_kmh",
-                    "mms_measured_voltage_V", "mms_current_A", "mms_trip_m"],
+                    "mms_measured_voltage_V", "mms_current_A", "mms_trip_m",
+                    # Throttle: the percentage, the raw mV it was derived from,
+                    # and the zone the driver was shown. All three, because the
+                    # percentage alone cannot be re-derived once the placeholder
+                    # calibration in efficiency.py is replaced by a measured one.
+                    "mms_throttle_percent", "mms_throttle_mv",
+                    "mms_throttle_zone"],
     "Temperature": ["battery_temp_C"],
+    # Its own group: the Yocto-Amp is a separate device on a separate bus from
+    # everything else here, and "give me just the solar data" is a question the
+    # strategy team asks on its own.
+    "Solar (MPPT)": ["solar_current_A", "solar_sensor_status"],
     "Motion / GPS": ["odometer_m", "calculated_lap", "lat", "lon",
                      "target_speed_kmh"],
     "Laps / Energy": ["total_race_energy", "last_lap_energy", "last_lap_time_s",

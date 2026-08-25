@@ -55,6 +55,10 @@ from constants import (
     NORMAL, WARNING, CRITICAL, TIER_COLOURS, classify,
     MOTOR_TEMP, CTRL_TEMP, CELL_TEMP, SOC, POWER,
     PACK_VOLTAGE, BATT_CURRENT, MOTOR_CURRENT, SPEED,
+    # Uncoloured on purpose (no warn, no crit) — it is imported anyway so the
+    # tile declares a limit like every other numeric tile, and so the gauge
+    # scale stays shared with the driver HUD.
+    SOLAR_CURRENT,
     STRATEGIES, STRATEGY_BY_LABEL, DEFAULT_STRATEGY_KEY,
     # speed_kmh() is deliberately NOT imported: road speed comes from the
     # controller's CAN field only (see build_state), and not importing the
@@ -66,6 +70,14 @@ from constants import (
     BMS_PROTECTION_BITS, MMS_ERROR_BITS, decode_error_bits,
 )
 from ui import render_metric, render_sector_display
+# Throttle zone boundaries and pedal calibration, shared with the car so the
+# pit's zone label matches the bar on the driver's HUD.
+#
+# MUST stay below the `from constants import ...` above: constants.py is what
+# puts the repo root on sys.path (see its header), and efficiency.py lives
+# there. Importing it up with `db` and `export` would be an ImportError,
+# exactly the invisible ordering dependency constants' own header warns about.
+import efficiency
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 VELOCITY_PROFILE_PATH = os.path.join(_HERE, "210s.xlsx")
@@ -238,6 +250,15 @@ def read_live_state():
         # voltage (see METRIC_COLUMNS in db.py); `voltage` above is the BMS's
         # known-suspect one, kept for comparison rather than for decisions.
         "pack_voltage": None, "motor_current": None, "regen_energy": None,
+        # Throttle pedal. None (not 0) when the car sent no reading — an
+        # unreported pedal and a released pedal are different facts, and the
+        # whole point of this feature is telling a driver about the pedal.
+        "throttle_pct": None, "throttle_mv": None, "throttle_zone": None,
+        # Solar charge current, amps. None (not 0) when the car sent nothing —
+        # and here the distinction really bites: 0 A is the correct reading for
+        # the whole night stint, so a missing value coalesced to 0 would be
+        # invisible among thousands of legitimate zeros.
+        "solar_current": None, "solar_status": None,
         # car_speed_kmh removed: it was mms_vehicle_speed_kmh under a second
         # name, was never rendered, and is now simply speed_kmh above.
         "target_speed_kmh": None, "soc_ctrl": None,
@@ -281,6 +302,16 @@ def read_live_state():
     state["motor_ohms"] = _val(row, "mms_motor_ohms", None)
     state["motor_map"] = _val(row, "mms_motor_map", None)
     state["motor_map_raw"] = _val(row, "mms_motor_map_raw", None)
+    state["throttle_pct"] = _val(row, "mms_throttle_percent", None)
+    state["throttle_mv"] = _val(row, "mms_throttle_mv", None)
+    state["solar_current"] = _val(row, "solar_current_A", None)
+    state["solar_status"] = _val(row, "solar_sensor_status", None)
+    # Prefer the zone the CAR classified (what the driver's bar actually showed).
+    # Fall back to classifying the percentage here only for rows written before
+    # the column existed, so historical samples still colour rather than reading
+    # blank — efficiency.zone() is the same function the car ran.
+    state["throttle_zone"] = (_val(row, "mms_throttle_zone", None)
+                              or efficiency.zone(state["throttle_pct"]))
     state["last_lap_energy"] = _val(row, "last_lap_energy", None)
     state["total_race_energy"] = _val(row, "total_race_energy", None)
     state["last_lap_time_s"] = _val(row, "last_lap_time_s", None)
@@ -327,6 +358,21 @@ def read_live_state():
 # the dark and light themes.
 HISTORY_CHARTS = [
     ("Speed",     "Speed",           "km/h", "#00FFCC"),
+    # THE THROTTLE TRACE — the pit wall's driver-coaching signal, and the reason
+    # it sits immediately under Speed: the two are read together. Speed says
+    # what the car did, throttle says what the driver asked for, and the gap
+    # between them is where the energy goes. A sawtooth trace at constant speed
+    # is a driver pumping the pedal (expensive); a flat trace is the steady
+    # highway input a 24-hour race is won with.
+    #
+    # Shares the "%" axis with Battery SoC, so adding it to the default view
+    # costs no third axis — see HISTORY_DEFAULT_METRICS and _hist_axis_plan.
+    ("Throttle",  "Throttle",        "%",    "#ff4dd2"),
+    # Solar charge current — what the array put into the pack, over time. The
+    # strategy trace for a solar race: overlay it on Total Race Energy and the
+    # night/day balance of a 24-hour run reads straight off the chart. Amber-gold
+    # because it is the sun, and because no other series here uses it.
+    ("SolarCurrent", "Solar Current", "A",  "#ffd166"),
     ("Power",     "Motor Power",     "W",    "#00B3FF"),
     ("RPM",       "Motor RPM",       "rpm",  "#9b59b6"),
     ("SoC",       "Battery SoC",     "%",    "#f1c40f"),
@@ -372,7 +418,10 @@ HISTORY_WINDOWS = {"1 min": 1, "5 min": 5, "15 min": 15, "1 hour": 60,
 # thirteen overlaid traces is a scribble nobody can read. Exactly two units
 # (km/h + %) so the opening view fills both axes honestly and needs no warning;
 # adding a third unit is what prompts the switch to Normalize.
-HISTORY_DEFAULT_METRICS = ["Speed", "Battery SoC"]
+# Throttle joins them because it is the one the pit wall asked for by name and
+# it needs no extra axis (it is a "%" like SoC). Three traces, two units: the
+# opening view still fills both axes honestly and still needs no Normalize.
+HISTORY_DEFAULT_METRICS = ["Speed", "Throttle", "Battery SoC"]
 
 # Cap points drawn per chart — keeps wide windows ("All" = a whole race) snappy.
 MAX_PLOT_POINTS = 1500
@@ -445,6 +494,13 @@ def read_history_df(limit=100000, start_ts=None):
             # Same single source as the live tile and the driver HUD: the
             # controller's own speed field, never re-derived from RPM.
             "Speed": r["mms_vehicle_speed_kmh"],
+            # NaN, never 0, wherever the pedal was not reported — the trace
+            # draws an honest gap instead of a phantom lift-off.
+            "Throttle": r["mms_throttle_percent"],
+            # NaN, never 0, where the sensor reported nothing. A dropout must
+            # not be averaged in as a genuine zero when the crew asks what the
+            # array averaged over a stint.
+            "SolarCurrent": r["solar_current_A"],
             "Power": r["mms_power_W"],
             "RPM": rpm,
             "SoC": r["bms_soc_percent"],
@@ -1004,6 +1060,35 @@ LIVE_METRIC_GROUPS = [
         dict(label="Power Map", unit="", text=True,
              get=lambda s, c: s["motor_map"]),
     ]),
+    # ── Driver input ─────────────────────────────────────────────────────── #
+    # Its own group rather than an entry under "Motor", because this is the one
+    # thing on the page the DRIVER controls directly. Everything else here is
+    # the car's response; this is the input, and it is what the pit radios about.
+    ("Driver Input", [
+        # Deliberately UNCOLOURED (no `limit`). The efficiency zone is not a
+        # limits tier: red on this page means a fault is developing, and 90 %
+        # throttle on the pit straight is not a fault. The zone travels in the
+        # note instead, where it reads as the coaching cue it is. See the
+        # docstring in efficiency.py for why the two vocabularies stay apart.
+        dict(label="Throttle", unit="%", spec=".0f",
+             get=lambda s, c: s["throttle_pct"],
+             note="pedal position - see zone below"),
+        dict(label="Efficiency Zone", unit="", text=True,
+             get=lambda s, c: (None if s["throttle_zone"] is None else
+                               efficiency.ZONE_LABELS.get(s["throttle_zone"],
+                                                          s["throttle_zone"])),
+             note="what the driver's HUD bar is showing"),
+        # The raw millivolts, which is how the placeholder pedal calibration
+        # gets replaced with a measured one: read this with the pedal released,
+        # then floored, and put the two numbers in efficiency.py. Kept on the
+        # page permanently (not behind a debug flag) for the same reason
+        # "Motor Sensor" is - it is what separates a real reading from a dead
+        # sensor, and a throttle stuck at "-" with a plausible mV here means
+        # the calibration is wrong, not the wiring.
+        dict(label="Throttle Raw", unit="mV", spec=".0f",
+             get=lambda s, c: s["throttle_mv"],
+             note="calibrate efficiency.py from this"),
+    ]),
     ("Controller", [
         dict(label="Controller Temp", unit="\u00b0C", spec=".1f", limit=CTRL_TEMP,
              get=lambda s, c: s["temp"]),
@@ -1031,6 +1116,22 @@ LIVE_METRIC_GROUPS = [
              note="negative = discharge"),
         dict(label="Battery Temp", unit="\u00b0C", spec=".1f", limit=CELL_TEMP,
              get=lambda s, c: s["batt_temp"], note="hottest cell in the pack"),
+        # ---- Solar input ------------------------------------------------- #
+        # In the Battery group because that is where this current GOES; it is
+        # the only inbound number on the page. Uncoloured (limits.SOLAR_CURRENT
+        # sets no thresholds) — see the reasoning there: there is no bad value.
+        #
+        # The sign is shown, not abs()'d: negative means the Yocto-Amp's
+        # terminals are reversed, and that has to be visible.
+        dict(label="Solar Current", unit="A", spec="+.2f", limit=SOLAR_CURRENT,
+             get=lambda s, c: s["solar_current"],
+             note="MPPT into the pack; Yocto-Amp, 10 A max"),
+        # The sensor's own health, as text. This is what separates "the array is
+        # making nothing" from "the USB cable fell out" — the same blank
+        # reading, and a completely different thing to do about it.
+        dict(label="Solar Sensor", unit="", text=True,
+             get=lambda s, c: s["solar_status"],
+             note="online / offline / no_hub / searching"),
         # Also shown despite being useless, for the same reason: it reads 0.00 in
         # all 44,088 recorded samples, so an empty tile here is the evidence that
         # the controller never populates the field.
@@ -1146,7 +1247,10 @@ def _live_metrics_fragment():
     st.caption(
         f"{LIVE_METRIC_COUNT} metrics \u00b7 refreshing every 2 s \u00b7 "
         f"\u2014 means the car has not reported that field. Thresholds and "
-        f"colours come from limits.py, shared with the driver HUD.")
+        f"colours come from limits.py, shared with the driver HUD; the "
+        f"efficiency zones come from efficiency.py, likewise shared \u2014 and "
+        f"both its pedal calibration and its zone boundaries are still "
+        f"placeholders.")
 
 
 @st.fragment(run_every=2)

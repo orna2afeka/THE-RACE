@@ -13,6 +13,24 @@ firebase-admin==6.4.0
 # got a ModuleNotFoundError on first run.
 PySide6>=6.5.0
 
+# Solar charge current, via the Yoctopuce Yocto-Amp / Yocto-Amp-C USB ammeter
+# (modules/solar_current.py). Pure-Python wrapper around libusb — no build step.
+#
+# ⚠️ THE PIP PACKAGE IS NOT ENOUGH ON LINUX. Without a udev rule the device
+# nodes are root-only and the HUD (which deliberately does not run as root)
+# reports status "no_hub". Install the rule once per Pi:
+#
+#   echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="24e0", MODE="0666"' \
+#       | sudo tee /etc/udev/rules.d/51-yoctopuce.rules
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# Verify with:  lsusb | grep 24e0
+#         then: python SolarRace_OS/modules/solar_current.py
+#
+# The import is optional at runtime: with the package missing, main.py still
+# starts and solar current reads "—".
+yoctopuce>=1.10.0
+
 # OPTIONAL — only for the standalone engineering dashboard (`python
 # SolarRace_OS/dashboard.py`). main.py does NOT need it: it runs the
 # driver_dash_v2 HUD, which uses no pyqtgraph. Uncomment if you use that tool.
