@@ -44,6 +44,7 @@ import export
 from weather_service import fetch_zolder_weather
 from strategy_engine import (
     calculate_all_strategies,
+    calculate_soc_charging_strategy,
     create_combined_graph,
     load_velocity_profile,
     get_live_track_status,
@@ -2035,31 +2036,179 @@ def _strategy_fragment():
 
     render_strategy_selector()
 
-    st.markdown("### :material/insights: Strategy Matrix")
-    # From constants.STRATEGIES so the matrix, the remote selector and the
-    # generated profiles can never disagree about what a strategy is.
-    consumption_table = [{'label': s['label'], 'lap_time_min': s['lap_time_min'],
-                          'energy_wh': s['energy_wh']} for s in STRATEGIES]
-    # `not soc` covers both a missing reading and a reported 0: neither is a
-    # usable capacity, so the matrix assumes a full pack rather than telling the
-    # strategist the car is empty. (This already treated 0 that way; None just
-    # joins it now that an unreported SoC stays None instead of becoming 0.)
-    car_battery_wh = 8550 if not soc else (soc / 100.0) * 8550
-    if soc is None or active_lap is None:
-        missing = " or ".join(n for n, v in (("battery SoC", soc),
-                                             ("lap count", active_lap))
-                              if v is None)
-        st.caption(f":orange[Assuming a full pack / lap 0 — no {missing} from the "
-                   f"car yet.] These figures are a placeholder until it reports.")
-    all_strategies = calculate_all_strategies(time_left_min, car_battery_wh,
-                                              active_lap or 0, consumption_table)
-    display_df = pd.DataFrame(all_strategies)
-    graph_data_list = display_df.pop('_graph_data').tolist()
-    st.dataframe(display_df, width="stretch", hide_index=True)
-    fig = create_combined_graph(graph_data_list)
-    st.pyplot(fig)
-    plt.close(fig)   # release the matplotlib figure so they don't pile up
+    st.markdown("### :material/battery_charging_full: Recommended Charging Strategy")
 
+    # Build the consumption table from the real strategy data
+    consumption_table = [
+        {
+            'label': s['label'],
+            'lap_time_min': s['lap_time_min'],
+            'energy_wh': s['energy_wh']
+        }
+        for s in STRATEGIES
+    ]
+
+    # Convert the live SOC to available battery energy
+    car_battery_wh = 8550 if not soc else (soc / 100.0) * 8550
+
+    if soc is None or active_lap is None:
+        missing = " or ".join(
+            n for n, v in (
+                ("battery SoC", soc),
+                ("lap count", active_lap)
+            )
+            if v is None
+        )
+
+        st.caption(
+            f":orange[Assuming a full pack / lap 0 — no {missing} "
+            f"from the car yet.]"
+        )
+
+    # Run the new SOC-dependent charging calculation
+    charging_strategies = calculate_soc_charging_strategy(
+        time_left_min,
+        car_battery_wh,
+        active_lap or 0,
+        consumption_table
+    )
+
+    if charging_strategies:
+
+        # Results are already sorted:
+        # maximum laps first, then minimum charging time
+        best = charging_strategies[0]
+
+        # --------------------------------------------------------------
+        # Main recommendation
+        # --------------------------------------------------------------
+
+        c1, c2, c3, c4 = st.columns(4)
+
+        c1.metric(
+            "Strategy",
+            best["strategy"]
+        )
+
+        c2.metric(
+            "Projected Laps",
+            best["total_laps"]
+        )
+
+        c3.metric(
+            "Charging Stops",
+            best["charging_stops"]
+        )
+
+        c4.metric(
+            "Total Charging Time",
+            f"{best['total_charging_time_min']:.1f} min"
+        )
+
+        # --------------------------------------------------------------
+        # Charging stop plan
+        # --------------------------------------------------------------
+
+        st.markdown("#### :material/pit_stop: Charging Stop Plan")
+
+        if best["stop_plan"]:
+
+            stop_rows = []
+
+            previous_race_time = 0.0
+
+            for stop in best["stop_plan"]:
+
+                drive_time = (
+                    stop["race_time_min"]
+                    - previous_race_time
+                )
+
+                stop_rows.append({
+                    "Stop": stop["stop_number"],
+                    "After Lap": stop["after_lap"],
+                    "Drive Until Stop (min)": round(drive_time, 1),
+                    "Race Time (min)": round(stop["race_time_min"], 1),
+                    "SOC Before (%)": round(stop["soc_before"], 1),
+                    "Charge To (%)": stop["target_soc"],
+                    "Charge For (min)": round(
+                        stop["charging_time_min"], 1
+                    )
+                })
+
+                previous_race_time = (
+                    stop["race_time_min"]
+                    + stop["charging_time_min"]
+                )
+
+            stop_df = pd.DataFrame(stop_rows)
+
+            st.dataframe(
+                stop_df,
+                width="stretch",
+                hide_index=True
+            )
+
+            # Highlight the next stop separately
+            next_stop = best["stop_plan"][0]
+
+            st.info(
+                f"Next recommended stop: after lap "
+                f"**{next_stop['after_lap']}** — "
+                f"charge from **{next_stop['soc_before']:.1f}%** "
+                f"to **{next_stop['target_soc']}%** for approximately "
+                f"**{next_stop['charging_time_min']:.1f} minutes**.",
+                icon=":material/battery_charging_full:"
+            )
+
+        else:
+            st.success(
+                "No charging stop is currently required within the "
+                "remaining race time.",
+                icon=":material/check_circle:"
+            )
+
+    else:
+        st.warning(
+            "No valid charging strategy could be calculated.",
+            icon=":material/warning:"
+        )
+
+
+    # ==============================================================
+    # EXISTING STRATEGY MATRIX
+    # Keep the original calculation below for comparison
+    # ==============================================================
+
+    st.markdown("---")
+    st.markdown("### :material/insights: Existing Strategy Matrix")
+
+    all_strategies = calculate_all_strategies(
+        time_left_min,
+        car_battery_wh,
+        active_lap or 0,
+        consumption_table
+    )
+
+    display_df = pd.DataFrame(all_strategies)
+
+    graph_data_list = display_df.pop(
+        '_graph_data'
+    ).tolist()
+
+    st.dataframe(
+        display_df,
+        width="stretch",
+        hide_index=True
+    )
+
+    fig = create_combined_graph(
+        graph_data_list
+    )
+
+    st.pyplot(fig)
+
+    plt.close(fig)
 
 # ============================================================================
 # DRIVER MESSAGE — send a short instruction to the car HUD (pit's only FB write)
