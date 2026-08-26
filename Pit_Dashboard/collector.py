@@ -57,6 +57,11 @@ STREAM_URL = f"{DB_URL}/{TELEMETRY_PATH}.json"
 # we reconnect.
 STREAM_READ_TIMEOUT = 70.0
 
+# How much we pull off the socket per read. Deliberately large: a reconnect
+# catch-up arrives as one enormous line, and we want a few big reads rather than
+# thousands of tiny ones. See _iter_sse_lines for why that matters so much.
+STREAM_CHUNK_BYTES = 1 << 16  # 64 KiB
+
 
 def _log(msg: str) -> None:
     print(f"[collector] {msg}", flush=True)
@@ -82,6 +87,52 @@ def fresh_token(creds) -> str:
 # --------------------------------------------------------------------------- #
 # SSE parsing + ingest
 # --------------------------------------------------------------------------- #
+def _iter_sse_lines(resp):
+    """Yield SSE lines (str) from a streaming response, in LINEAR time.
+
+    Why not resp.iter_lines()? RTDB delivers a reconnect catch-up as a SINGLE
+    'data:' line holding every missed record — tens of MB with no newline
+    anywhere in it. requests' iter_lines accumulates that with `pending + chunk`
+    at a 512-byte chunk size and re-runs splitlines() over the whole growing
+    buffer on every chunk, which is O(n^2). A 20 MB catch-up became ~40k passes
+    over an ever-growing string, on the order of a terabyte of copying: the
+    collector pegged a core for the better part of an hour with nothing at all
+    reaching the pit wall.
+
+    That made the cost of a dropout quadratic in its length — a two-minute blip
+    was invisible, an eleven-hour one never finished. Exactly backwards from
+    what a race needs, where the long outage is the one you have to survive.
+
+    So: hold unfinished chunks in a list, never recopying what we already have;
+    join only once a chunk actually contains a newline; cut the joined buffer
+    with find(). Every byte is copied a constant number of times. Decoding is
+    per line, so a multi-byte character straddling a chunk boundary is
+    reassembled before it is decoded rather than mangled.
+    """
+    pending = []  # chunks seen so far with no newline in them
+    for chunk in resp.iter_content(chunk_size=STREAM_CHUNK_BYTES):
+        if not chunk:
+            continue  # urllib3 yields b"" as a keep-alive tick
+        if b"\n" not in chunk:
+            pending.append(chunk)
+            continue
+
+        buf = b"".join(pending) + chunk if pending else chunk
+        pending = []
+        start = 0
+        while True:
+            nl = buf.find(b"\n", start)
+            if nl < 0:
+                break
+            yield buf[start:nl].decode("utf-8", "replace")
+            start = nl + 1
+        if start < len(buf):
+            pending.append(buf[start:])
+
+    if pending:  # server closed without a trailing newline
+        yield b"".join(pending).decode("utf-8", "replace")
+
+
 def _store(conn, key, record) -> int:
     """Upsert one (key, record). Returns rows actually inserted (0 or 1)."""
     if not isinstance(record, dict):
@@ -156,9 +207,7 @@ def stream_once(conn, creds, start_after_key) -> str:
         event_type = None
         data_buf = []
 
-        for raw in resp.iter_lines(decode_unicode=True):
-            if raw is None:
-                continue
+        for raw in _iter_sse_lines(resp):
             line = raw.rstrip("\r")
 
             if line == "":
