@@ -79,6 +79,11 @@ from ui import render_metric, render_sector_display
 # there. Importing it up with `db` and `export` would be an ImportError,
 # exactly the invisible ordering dependency constants' own header warns about.
 import efficiency
+# The vector circuit map. MUST stay below `from constants import ...` for the
+# same reason efficiency does: constants.py is what bootstraps the repo root
+# onto sys.path, and track_map lives there. (track_map_view imports constants
+# itself as well, so this is belt and braces rather than a hidden dependency.)
+from track_map_view import render_vector_track_map
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 VELOCITY_PROFILE_PATH = os.path.join(_HERE, "210s.xlsx")
@@ -231,9 +236,66 @@ def _val(row, key, default=0.0):
     return default if v is None else v
 
 
-def read_live_state():
-    """Latest sample from SQLite + freshness. Returns (state_dict, age_seconds).
-    age is None when the store is empty."""
+@st.cache_resource(show_spinner=False)
+def _ensure_schema():
+    """Create / migrate the schema — ONCE per server process.
+
+    init_db is not the cheap idempotent call it looks like. It ends with a
+    one-time correction of historical rows whose motor power was stored as a
+    raw uint16 (see db.init_db), and there is no index on mms_power_W, so that
+    UPDATE is a full SCAN of the whole table inside a write transaction.
+    Measured on a 96 MB store: 84.5 ms, matching zero rows, every time.
+
+    It was running TWICE per full app rerun — here and again in the export
+    panel — which meant every theme toggle and every font-size click paid ~170
+    ms of pointless table scanning before drawing anything. As a migration that
+    cost is fine; as something a button press triggers it is not.
+
+    cache_resource, not cache_data: there is no value to memoise, we are
+    memoising the side effect of having run it.
+
+    The one thing this gives up: if telemetry.db is deleted or swapped out from
+    under a running server, the schema is not recreated and Streamlit has to be
+    restarted. The in-app path is safe — clear_history is a DELETE, not a file
+    drop — so this only bites someone replacing the file by hand mid-session.
+    """
+    conn = db.get_conn()
+    try:
+        db.init_db(conn)
+    finally:
+        conn.close()
+
+
+# How long one live read is reused. Deliberately SHORTER than the 2s fragment
+# tick, so no tile ever shows a sample meaningfully older than an uncached read
+# would have given — but long enough that the four 2s fragments, which Streamlit
+# runs back-to-back on one script thread within a few hundred ms of each other,
+# share ONE connection and ONE query instead of opening four.
+#
+# Not 2.0: a TTL equal to the tick period aliases against it, and a fragment
+# would land on the same cached sample about half the time.
+LIVE_CACHE_S = 1.0
+
+
+@st.cache_data(ttl=LIVE_CACHE_S, show_spinner=False)
+def _live_snapshot():
+    """The newest stored sample, as (state_dict, device_ts).
+
+    Returns device_ts and NOT age, which is the whole point of the split. age is
+    a fact about *now*; device_ts is a fact about the row. Caching an age would
+    freeze the "LIVE - 3s ago" badge at whatever it read when the cache filled,
+    and — much worse — freeze the `fresh` flag derived from it, which is what
+    decides whether the fault banner is marked STALE. A dashboard that cannot
+    notice the car went quiet is the one failure this whole file is written to
+    avoid.
+
+    Before this existed, each of the four 2s fragments called read_live_state
+    independently, so every tick opened three to five fresh SQLite connections
+    (each with its own WAL/synchronous/busy_timeout PRAGMAs) and read the same
+    row three to five times — and because they read at slightly different
+    instants, the top strip and the Live Metrics tab could legitimately display
+    different samples. One cached read fixes both.
+    """
     conn = db.get_conn()
     try:
         row = db.latest_sample(conn)
@@ -284,7 +346,7 @@ def read_live_state():
         "mms_has_error": 0, "mms_error_code": 0, "mms_alerts": "",
     }
     if row is None:
-        return state, None
+        return state, None      # no row, so no device_ts; the wrapper maps it to age=None
 
     state["soc"] = _val(row, "bms_soc_percent", None)
     state["voltage"] = _val(row, "bms_voltage_V", None)
@@ -349,7 +411,57 @@ def read_live_state():
     state["mms_error_code"] = _val(row, "mms_error_code", 0)
     state["mms_alerts"] = _val(row, "mms_alerts", "")
 
-    device_ts = row["device_ts"]
+    return state, row["device_ts"]
+
+
+# -- Pit command acknowledgements ----------------------------------------- #
+# How long after a pit command we keep asking the car whether it applied it.
+#
+# An ack answers exactly one question -- "did the car pick it up?" -- and the car
+# answers within a second or two or it is not listening. Asking again for the
+# remaining twenty-three hours of the race buys nothing and costs a blocking
+# HTTPS GET on the very thread that redraws the live tiles: Streamlit runs a
+# session's fragment reruns sequentially on one script-run thread, so this was
+# never just a slow Strategy tab, it stalled the speed and the fault banner too.
+ACK_POLL_WINDOW_S = 120
+
+# Dedupe within the window. The strategy panel ticks every 10s and the sidebar
+# redraws on every app rerun, so without this a single send still means dozens
+# of round trips.
+ACK_CACHE_S = 5
+
+
+@st.cache_data(ttl=ACK_CACHE_S, show_spinner=False, max_entries=8)
+def _cached_strategy_ack(sent_at):
+    """The car's strategy ack. `sent_at` is in the cache key ONLY so that a NEW
+    send instantly invalidates the previous send's cached answer -- the same
+    trick as _hist_bounds' quantised now_q, used the other way round."""
+    import driver_message
+    return driver_message.read_strategy_ack()
+
+
+@st.cache_data(ttl=ACK_CACHE_S, show_spinner=False, max_entries=8)
+def _cached_lap_ack(sent_at):
+    """The car's cut-lap ack. See _cached_strategy_ack for why sent_at is a key."""
+    import driver_message
+    return driver_message.read_lap_ack()
+
+
+def _ack_polling(sent_at, settled):
+    """Should we still be asking? Only inside the window, and only until the car
+    has actually said something."""
+    return settled is None and (time.time() - float(sent_at or 0)) <= ACK_POLL_WINDOW_S
+
+
+def read_live_state():
+    """Latest sample from SQLite + freshness. Returns (state_dict, age_seconds).
+    age is None when the store is empty.
+
+    A thin wrapper so every existing call site is unchanged: the SQLite read
+    behind it is cached for LIVE_CACHE_S, but the age is recomputed on every
+    single call. See _live_snapshot for why that division matters.
+    """
+    state, device_ts = _live_snapshot()
     age = (time.time() - device_ts) if device_ts else None
     return state, age
 
@@ -654,7 +766,21 @@ def _live_context():
     """Shared live snapshot for the fast (2s) fragments — one SQLite read + track
     calc, reused by the sidebar status, top strip, and Driver tab. Overrides come
     from session_state so the fragments need no args; the velocity profile is
-    @st.cache_data, so recomputing per fragment is cheap."""
+    @st.cache_data, so recomputing per fragment is cheap.
+
+    THIS FUNCTION IS DELIBERATELY NOT CACHED, and must not become so. Two
+    reasons, either one sufficient:
+
+      * It reads session_state (manual_lap, rival_laps, is_racing) which would
+        not be part of any cache key. st.cache_data is process-global, not
+        per-session, so two pit laptops would silently show each other's
+        overrides — and even in one browser a Manual Lap change would not take
+        effect until the TTL expired.
+      * It computes the race countdown from time.time(). Caching it stops the
+        clock for the TTL, which reads as a stuttering timer on the wall.
+
+    The expensive part — the SQLite read — is cached one level down in
+    _live_snapshot, which has neither of those problems."""
     manual_lap_override = int(st.session_state.get("manual_lap", -1))
     comp_laps = int(st.session_state.get("rival_laps", 0))
     elapsed_minutes, time_left_min = _elapsed_and_left()
@@ -1220,9 +1346,11 @@ def _render_live_metric(col, m, state, ctx):
 def _live_metrics_fragment():
     """Live Metrics tab. 2 s, matching the strip above the tabs.
 
-    Same cadence and the same one cached SQLite read (_live_context is
-    @st.cache_data), so this tab costs a little markdown rather than another
-    query per tick.
+    Same cadence and the same one cached SQLite read, so this tab costs a little
+    markdown rather than another query per tick. The cache is on _live_snapshot,
+    NOT on _live_context — this docstring claimed the latter for a long time and
+    neither was cached at all, which is how four fragments ended up each opening
+    their own connection every two seconds without anyone noticing.
     """
     ctx = _live_context()
     state = ctx["state"]
@@ -1267,6 +1395,13 @@ def _driver_fragment():
     render_sector_times(lap, splits, deltas)
     st.markdown("### :material/map: Live GPS Map")
     render_gps_map(c["state"])
+
+    # The satellite map above and this one answer different questions and are
+    # deliberately both here: imagery for "which corner is that", the vector map
+    # for "where are we in the lap, and in which sector". It takes the whole
+    # _live_context dict, so it costs no extra SQLite read on this 2s tick.
+    st.markdown("### :material/route: Circuit Map")
+    render_vector_track_map(c)
 
 
 # Sector boundaries, straight from the definitions the pit already displays.
@@ -2355,6 +2490,10 @@ def render_strategy_selector():
             driver_message.send_strategy(chosen["key"])
             st.session_state.strategy_sent = (chosen["key"],
                                               time.strftime("%H:%M:%S"))
+            # A new send is a new question: restart the polling window and drop
+            # the previous answer, so a stale "confirmed" cannot survive it.
+            st.session_state.strategy_sent_at = time.time()
+            st.session_state.strategy_ack = None
             st.toast(f"Sent {chosen['label']} to the car",
                      icon=":material/check_circle:")
         except Exception as e:
@@ -2363,7 +2502,16 @@ def render_strategy_selector():
 
     sent = st.session_state.get("strategy_sent")
     if sent:
-        ack = driver_message.read_strategy_ack()
+        sent_at = st.session_state.get("strategy_sent_at", 0.0)
+        ack = st.session_state.get("strategy_ack")
+        polling = _ack_polling(sent_at, ack)
+        if polling:
+            ack = _cached_strategy_ack(sent_at)
+            # Once the car has said anything at all, settle it in session_state
+            # so the answer stays on screen without the node being read again.
+            if isinstance(ack, dict) and (ack.get("applied") or ack.get("note")):
+                st.session_state.strategy_ack = ack
+
         if isinstance(ack, dict) and ack.get("applied") \
                 and ack.get("strategy") == sent[0]:
             st.success(f"Car confirmed **{ack.get('strategy')}** · sent {sent[1]}",
@@ -2372,9 +2520,19 @@ def render_strategy_selector():
             # The car rejected it — usually a profile it does not have, which
             # means the generated CSVs have not been deployed to the Pi.
             st.warning(f"Car reported: {ack['note']}", icon=":material/warning:")
-        else:
+        elif polling:
             st.info(f"Sent {sent[0]} at {sent[1]} — awaiting the car's "
                     f"confirmation.", icon=":material/schedule:")
+        else:
+            # Carefully worded: we stopped ASKING, which is not the same as the
+            # command having failed. It may well have landed.
+            st.warning(f"Sent {sent[0]} at {sent[1]} — no confirmation within "
+                       f"{ACK_POLL_WINDOW_S}s. The command may still have "
+                       f"landed; the pit stopped asking.",
+                       icon=":material/schedule:")
+            st.button("Check again", key="strategy_ack_recheck",
+                      on_click=lambda: st.session_state.update(
+                          strategy_sent_at=time.time(), strategy_ack=None))
 
 
 def render_cut_lap_panel():
@@ -2403,6 +2561,8 @@ def render_cut_lap_panel():
         try:
             driver_message.send_lap_cut()
             st.session_state.cut_lap_last = time.strftime("%H:%M:%S")
+            st.session_state.cut_lap_at = time.time()   # restart the ack window
+            st.session_state.cut_lap_ack = None
             st.toast("Cut Lap sent to the car", icon=":material/check_circle:")
         except Exception as e:
             st.toast("Cut Lap failed", icon=":material/error:")
@@ -2412,14 +2572,30 @@ def render_cut_lap_panel():
     if sent:
         # Show the car's acknowledgement when it comes back, so the engineer
         # knows the command actually landed rather than just left the pit.
-        ack = driver_message.read_lap_ack()
+        # Bounded: this panel is drawn from main(), so an unbounded read here
+        # fired a blocking GET on every single full app rerun, forever.
+        sent_at = st.session_state.get("cut_lap_at", 0.0)
+        ack = st.session_state.get("cut_lap_ack")
+        polling = _ack_polling(sent_at, ack)
+        if polling:
+            ack = _cached_lap_ack(sent_at)
+            if isinstance(ack, dict) and ack.get("applied"):
+                st.session_state.cut_lap_ack = ack
+
         if isinstance(ack, dict) and ack.get("applied"):
             st.sidebar.caption(
                 f":material/check_circle: Car confirmed — now on lap "
                 f"**{ack.get('lap')}** · sent {sent}")
-        else:
+        elif polling:
             st.sidebar.caption(f":material/schedule: Cut Lap sent {sent} — "
                                "awaiting the car's confirmation.")
+        else:
+            st.sidebar.caption(f":material/schedule: Cut Lap sent {sent} — no "
+                               f"confirmation within {ACK_POLL_WINDOW_S}s. It "
+                               "may still have landed.")
+            st.sidebar.button("Check again", key="cut_lap_ack_recheck",
+                              on_click=lambda: st.session_state.update(
+                                  cut_lap_at=time.time(), cut_lap_ack=None))
 
 
 def render_driver_message_panel():
@@ -2483,16 +2659,35 @@ def render_driver_message_panel():
 # ============================================================================
 # EXPORT PANEL — filter by date/time + subsystem, then download an Excel workbook
 # ============================================================================
+@st.cache_data(ttl=30, show_spinner=False)
+def _export_bounds():
+    """(lo_ts, hi_ts, total) for the export panel's caption and date defaults.
+
+    Cached because render_export_panel is called from main(), so this ran on
+    every FULL APP RERUN — and a rerun here is a theme toggle, a font-size
+    click, a freeze, or any race-control button. Three queries against a 96 MB
+    store to redraw a sidebar caption nobody asked to refresh.
+
+    30 seconds stale is invisible on a caption, and it cannot disturb a range
+    the engineer has already picked: the date/time widgets below own their
+    values by key (exp_sd/exp_st/exp_ed/exp_et), so once instantiated their
+    `value=` default is ignored.
+
+    This used to call db.init_db too. main() runs it before any of this, so it
+    was pure duplication — and init_db is far from free (see _ensure_schema).
+    """
+    conn = db.get_conn()
+    try:
+        lo, hi = db.time_bounds(conn)
+        return lo, hi, db.count_samples(conn)
+    finally:
+        conn.close()
+
+
 def render_export_panel():
     st.sidebar.markdown("### :material/download: Export Telemetry (Excel)")
 
-    conn = db.get_conn()
-    try:
-        db.init_db(conn)  # make sure the table exists even before first ingest
-        lo, hi = db.time_bounds(conn)
-        total = db.count_samples(conn)
-    finally:
-        conn.close()
+    lo, hi, total = _export_bounds()
 
     if not total or lo is None:
         st.sidebar.caption(":material/warning: No telemetry stored yet — start collector.py.")
@@ -2600,16 +2795,16 @@ def main():
     # Ensure the schema exists / is migrated (adds fault columns to older DBs)
     # before the live fragment starts reading, and load the persisted race
     # clock so a browser refresh keeps a running race (no manual restore).
-    conn = db.get_conn()
-    try:
-        db.init_db(conn)
-        if "race_loaded" not in st.session_state:
+    _ensure_schema()
+    if "race_loaded" not in st.session_state:
+        conn = db.get_conn()
+        try:
             rs = db.load_race_state(conn)
             st.session_state.race_start_time = rs["race_start_time"]
             st.session_state.is_racing = rs["is_racing"]
             st.session_state.race_loaded = True
-    finally:
-        conn.close()
+        finally:
+            conn.close()
 
     # --- Text size (personal readability) --------------------------------- #
     # Two buttons scale the MAIN content only (see apply_font_scale). Living in

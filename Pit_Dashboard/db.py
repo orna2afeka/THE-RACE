@@ -561,13 +561,32 @@ def fetch_lap_track(conn: sqlite3.Connection, lap: int, device_id: str = DEVICE_
 
     Only the two columns sector splits need, so a lap's worth of samples is a
     cheap read even at 1 Hz over a long race.
+
+    MATCHED AS A HALF-OPEN RANGE, NOT WITH A CAST. This used to say
+    `CAST(calculated_lap AS INTEGER) = ?`, and wrapping the column in a function
+    makes the term unusable as an index constraint: SQLite fell back to
+    idx_telemetry_dev_ts with only `device_id = ?` to go on and walked every row
+    the car has ever sent, evaluating the CAST on each one, to return the two
+    hundred belonging to one lap.
+
+    It was not a small difference. read_sector_times calls this TWICE, behind a
+    4-second cache, from the Driver Telemetry tab — the tab the dashboard opens
+    on. Measured against a 96 MB store: 141 ms per call, so 282 ms of the pit
+    wall's single script-run thread every four seconds, for the whole race,
+    growing with the database. As a range on the raw column it plans as
+    SEARCH telemetry USING INDEX idx_telemetry_lap and takes 0.08 ms.
+
+    The range is [lap, lap+1) rather than = lap because calculated_lap is stored
+    REAL (everything numeric goes through _num), so an equality test against an
+    int would depend on float representation. The half-open interval selects
+    exactly the same rows without caring.
     """
     return conn.execute(
         "SELECT device_ts, lap_distance_m FROM telemetry "
-        "WHERE device_id = ? AND CAST(calculated_lap AS INTEGER) = ? "
+        "WHERE device_id = ? AND calculated_lap >= ? AND calculated_lap < ? "
         "  AND device_ts IS NOT NULL AND lap_distance_m IS NOT NULL "
         "ORDER BY device_ts ASC",
-        (device_id, int(lap)),
+        (device_id, float(int(lap)), float(int(lap)) + 1.0),
     ).fetchall()
 
 

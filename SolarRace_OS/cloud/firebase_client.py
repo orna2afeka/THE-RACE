@@ -1,5 +1,6 @@
 # firebase_client.py
 
+import threading
 import time
 import firebase_admin
 from firebase_admin import credentials
@@ -23,6 +24,118 @@ HISTORY_PATH = 'telemetry_history'
 
 # State variable to track the last time we pinged the server
 _last_update_time = 0
+
+
+# ==============================================================================
+# UPLOAD HEALTH — what the driver HUD's PIT badge reads
+# ==============================================================================
+# The HUD's NET badge proves the radio link is up. It cannot prove the pit is
+# receiving anything, and the two come apart exactly when it matters: an expired
+# service-account key, a blocked port, a Firebase outage, a full quota. Every
+# one of those leaves 8.8.8.8 perfectly reachable while the pit wall goes blind.
+#
+# So this records whether the last push actually LANDED, and the HUD shows it
+# next to the link light. NET green + PIT red is the specific, common failure
+# that used to be invisible from the driver's seat.
+#
+# An attempt counts as a success only when BOTH writes went through. The live
+# node feeds the pit's "now"; telemetry_history feeds the pit's SQLite, which is
+# what the strategy screens and the exports are actually built from. A live-only
+# success means the pit's RECORD has a hole in it even though the dial moved,
+# and "the pit can see me" should not be true while that is happening.
+#
+# Read from the HUD's GUI thread, written from the CAN worker thread, hence the
+# lock. Every field is a plain scalar copied out under it — get_upload_status()
+# does no I/O and cannot block the caller.
+
+STATUS_UNKNOWN = "unknown"   # nothing has ever been attempted (Firebase unused)
+STATUS_IDLE = "idle"         # nothing to send lately — quiet bus, no GPS fix
+STATUS_UP = "up"             # a push landed recently
+STATUS_DOWN = "down"         # attempts are being made and they are failing
+
+# How long a success stays "current". Ten throttled intervals: long enough that
+# an ordinary gap between CAN frames never blinks the badge, short enough that a
+# car which stopped uploading stops claiming it is uploading.
+UPLOAD_STALE_AFTER_S = 5.0
+
+# Consecutive failures before the badge goes red. Same asymmetry as the link
+# probe: one failed write on a cellular link is weather, not an outage, and a
+# badge that reacts to weather is a badge the driver stops reading.
+FAILURES_BEFORE_DOWN = 2
+
+_health_lock = threading.Lock()
+_upload_ok_time = 0.0        # time.time() of the last fully successful push
+_upload_attempt_time = 0.0   # time.time() of the last push that actually ran
+_upload_failures = 0         # consecutive failed attempts
+_upload_error = None         # text of the most recent failure
+_upload_ok_count = 0         # proves pushes are really happening
+
+
+def _record_upload(ok, error=None):
+    """Fold one push attempt into the health snapshot. Never raises.
+
+    Only called for attempts that actually ran — a call skipped by the
+    UPDATE_INTERVAL_SECONDS throttle is not evidence of anything and must not
+    be mistaken for either a success or a failure.
+    """
+    global _upload_ok_time, _upload_attempt_time
+    global _upload_failures, _upload_error, _upload_ok_count
+    now = time.time()
+    with _health_lock:
+        _upload_attempt_time = now
+        if ok:
+            _upload_ok_time = now
+            _upload_failures = 0
+            _upload_error = None
+            _upload_ok_count += 1
+        else:
+            _upload_failures += 1
+            _upload_error = str(error) if error is not None else "unknown"
+
+
+def get_upload_status():
+    """Snapshot of whether telemetry is reaching the pit. Never blocks or raises.
+
+    Always a dict:
+
+        upload_status     STATUS_* — the value a status light should show
+        upload_ok         True / False / None, None meaning "not uploading"
+        upload_age_s      seconds since the last landed push, None if never
+        upload_failures   consecutive failures right now
+        upload_error      text of the last failure, or None
+    """
+    now = time.time()
+    with _health_lock:
+        ok_time = _upload_ok_time
+        attempt_time = _upload_attempt_time
+        failures = _upload_failures
+        error = _upload_error
+        count = _upload_ok_count
+
+    if not attempt_time:
+        # Never attempted. This is the standalone-HUD and bench case, and it is
+        # NOT "down" — reporting a failure for a subsystem nobody asked to run
+        # is how a warning light teaches the driver to ignore it.
+        status = STATUS_UNKNOWN
+    elif failures >= FAILURES_BEFORE_DOWN:
+        status = STATUS_DOWN
+    elif ok_time and (now - ok_time) <= UPLOAD_STALE_AFTER_S:
+        status = STATUS_UP
+    else:
+        # Attempts have happened, but nothing landed lately and nothing is
+        # failing either: the car simply has nothing to send (quiet CAN bus, no
+        # GPS fix — see the guard in main.py's GPS publish path).
+        status = STATUS_IDLE
+
+    return {
+        "upload_status": status,
+        "upload_ok": (True if status == STATUS_UP else
+                      False if status == STATUS_DOWN else None),
+        "upload_age_s": (now - ok_time) if ok_time else None,
+        "upload_failures": failures,
+        "upload_error": error,
+        "upload_ok_count": count,
+    }
 
 def initialize_firebase(credential_file_path, database_url):
     """
@@ -71,12 +184,19 @@ def push_telemetry_to_cloud(vehicle_state):
             # Wrapped separately so a history hiccup never affects the live snapshot.
             try:
                 db.reference(HISTORY_PATH).push(payload)
+                _record_upload(True)
             except Exception as hist_err:
                 print(f"[Network Error] Failed to append telemetry history: {hist_err}")
+                # The live snapshot DID land, and the separate try/except above
+                # keeps it that way — but the pit's stored record now has a hole,
+                # so this is not a healthy upload. See the header note on why the
+                # badge reports the AND of both writes.
+                _record_upload(False, f"history: {hist_err}")
 
         except Exception as e:
             # We don't want a network drop to crash the whole car system
             print(f"[Network Error] Failed to update Firebase: {e}")
+            _record_upload(False, e)
 
 
 # Node the pit writes short driver instructions to (category + value). "Latest

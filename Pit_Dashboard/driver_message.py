@@ -20,10 +20,42 @@ from google.auth.transport.requests import Request as GoogleAuthRequest
 from pit_config import DB_URL, SERVICE_ACCOUNT_PATH, OAUTH_SCOPES
 
 _URL = f"{DB_URL}/driver_command.json"
+
+# SENDS get a generous timeout. A send is a deliberate click by an engineer who
+# is watching for the result, and a send that gives up early is a command the
+# pit believes it issued and did not.
 _TIMEOUT = 5  # seconds
+
+# ACK READS get a much tighter one, because they are a different kind of call.
+# An ack is advisory — it upgrades "sent" to "applied" — so a slow one is worth
+# nothing. And critically it happens on the SCRIPT-RUN THREAD, which Streamlit
+# also uses to redraw every live tile on the wall: fragments are not concurrent,
+# they queue. A five-second ack read therefore does not stall the Strategy tab,
+# it stalls the speed, the SoC and the fault banner along with it.
+_ACK_TIMEOUT = 2  # seconds
 
 # Cache the credentials object; it refreshes its own token in place.
 _creds = None
+
+
+class _TimedAuthRequest(GoogleAuthRequest):
+    """google-auth's transport, with a timeout we actually choose.
+
+    Credentials.refresh() calls its transport with no timeout argument, and
+    google.auth.transport.requests.Request defaults to 120 SECONDS. That call
+    runs on the same thread that draws the pit wall, so a hung TLS session to
+    oauth2.googleapis.com froze every tile on the screen for up to two minutes —
+    once an hour as the token expired, and on the send path too.
+
+    Ten seconds is already very generous for an OAuth POST. If it does expire,
+    the send raises, the caller's existing except shows "send failed", and the
+    engineer can press the button again — a visible, retryable failure, which is
+    the correct one to have.
+    """
+
+    def __call__(self, url, method="GET", body=None, headers=None,
+                 timeout=10, **kwargs):
+        return super().__call__(url, method, body, headers, timeout, **kwargs)
 
 
 def _token() -> str:
@@ -34,7 +66,7 @@ def _token() -> str:
             SERVICE_ACCOUNT_PATH, scopes=OAUTH_SCOPES
         )
     if not _creds.valid:
-        _creds.refresh(GoogleAuthRequest())
+        _creds.refresh(_TimedAuthRequest())
     return _creds.token
 
 
@@ -95,7 +127,7 @@ def read_lap_ack():
     """
     try:
         resp = requests.get(_LAP_ACK_URL, params={"access_token": _token()},
-                            timeout=_TIMEOUT)
+                            timeout=_ACK_TIMEOUT)
         resp.raise_for_status()
         return resp.json()
     except Exception:
@@ -133,7 +165,7 @@ def read_strategy_ack():
     """
     try:
         resp = requests.get(_STRATEGY_ACK_URL, params={"access_token": _token()},
-                            timeout=_TIMEOUT)
+                            timeout=_ACK_TIMEOUT)
         resp.raise_for_status()
         return resp.json()
     except Exception:

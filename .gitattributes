@@ -31,3 +31,5 @@
 # speed-profile CSVs are data, not authored source.
 SolarRace_OS/data/**  linguist-generated=true
 profiles/**           linguist-generated=true
+# Circuit centreline baked from OpenStreetMap by tools/build_zolder_track.py.
+zolder_centreline.py  linguist-generated=true

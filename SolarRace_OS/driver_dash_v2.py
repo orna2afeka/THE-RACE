@@ -59,7 +59,29 @@ from PySide6.QtWidgets import (
 )
 
 from can_worker import CANWorker
-from modules import mms_parser, pt1000
+from modules import mms_parser, net_monitor, pt1000
+
+# Upload health for the PIT badge, read straight from the module main.py pushes
+# through — same process, so no wiring is needed and none can be forgotten.
+#
+# SOFT import on purpose. This file is documented to run standalone on a bench
+# laptop, where firebase_admin may not be installed at all, and a missing cloud
+# library must never be the reason the HUD won't start. Absent, the badge stays
+# unlit, which is exactly what it should show when nothing is uploading anyway.
+try:
+    from cloud import firebase_client
+except Exception as _fb_import_error:  # pragma: no cover — bench-only path
+    firebase_client = None
+    print(f"[HUD] cloud.firebase_client unavailable ({_fb_import_error}); "
+          f"the PIT badge will stay unlit.")
+
+# The badge's starting status. Taken FROM firebase_client whenever it imported,
+# so the two cannot drift; the literal is only the bench fallback for when there
+# is no firebase_client to ask. Getting this wrong would not break anything
+# visible — both spellings style as unlit — which is exactly why it would go
+# unnoticed, so it is tied to the source of truth rather than retyped.
+_UPLINK_UNKNOWN = (firebase_client.STATUS_UNKNOWN
+                   if firebase_client is not None else "unknown")
 
 # ── Palette ────────────────────────────────────────────────────────────────── #
 _BG     = "#0e060a"
@@ -809,6 +831,12 @@ class RacingDashboard(QMainWindow):
     _TARGET_H = 40
     _TURN_ALERT_H = 44
 
+    # Root layout margin, in px. Named because _status_budget_px has to
+    # subtract it to work out how much room the status text really has, and a
+    # second copy of the number there would silently start clipping the status
+    # the day anyone retunes the margin here.
+    _ROOT_MARGIN_PX = 5
+
     # The efficiency bar is a PERMANENT readout like the target speed, not an
     # event strip like the turn warning, so it keeps its space. 30 px is enough
     # for a legible zone word at the 800×480 design size while leaving the
@@ -847,15 +875,33 @@ class RacingDashboard(QMainWindow):
         # font sizes without losing the live status/alert coloring.
         self._sc: float = 1.0
         self._status_color: str = _DIM
+        # The FULL status string. The label shows an elided view of it that
+        # changes with the window width, so the label's text is a rendering,
+        # not the value — re-eliding an already-elided string would eat it a
+        # few characters at a time on every resize.
+        self._status_text: str = "● IDLE  —  Press START CAN"
+        # The width we were most recently resized TO, straight off the resize
+        # event. See _status_budget_px for why self.width() will not do.
+        self._window_w: int = 800
         self._alert_color: str = _LIME
         self._pit_color: str = _CYAN   # pit-to-driver message banner color
         # Whether the solar badge is currently lit. Kept as state rather than
         # re-derived from the label text on resize: parsing a rendered string
         # back into a boolean is how a display ends up disagreeing with itself.
         self._solar_charging: bool = False
+        # Internet reachability, for the NET badge. Held as state for the same
+        # reason as _solar_charging, and UNKNOWN rather than offline until the
+        # probe has actually run — see note 3 in modules/net_monitor.py.
+        self._net_status: str = net_monitor.STATUS_UNKNOWN
+        # Whether telemetry is actually LANDING in the pit, for the PIT badge.
+        # Named _uplink_*, NOT _pit_*: _pit_lbl is already the pit-to-driver
+        # message banner, and two different things called _pit_lbl is a bug
+        # waiting to be typed.
+        self._uplink_status: str = _UPLINK_UNKNOWN
 
         self._build_ui()
         self._install_shortcuts()
+        self._start_link_monitors()
         self.setCursor(Qt.BlankCursor)
 
     # ── UI construction ──────────────────────────────────────────────────── #
@@ -864,7 +910,8 @@ class RacingDashboard(QMainWindow):
         self.setCentralWidget(root)
 
         vbox = QVBoxLayout(root)
-        vbox.setContentsMargins(5, 5, 5, 5)
+        m = self._ROOT_MARGIN_PX
+        vbox.setContentsMargins(m, m, m, m)
         vbox.setSpacing(4)
 
         vbox.addWidget(self._build_alert_bar())
@@ -896,12 +943,43 @@ class RacingDashboard(QMainWindow):
         layout.setContentsMargins(10, 0, 10, 0)
         layout.setSpacing(0)
 
-        self._status_lbl = QLabel("● IDLE  —  Press START CAN")
+        self._status_lbl = QLabel(self._status_text)
+        # A QLabel's minimumSizeHint is its WHOLE text, so a long status used
+        # to push the bar's minimum past the panel and grow the window itself
+        # (harmless at fullscreen, visible on a bench laptop). An explicit
+        # minimum of 0 overrides that hint and lets the text elide instead.
+        self._status_lbl.setMinimumWidth(0)
         self._status_lbl.setStyleSheet(
             f"color: {_DIM}; font-size: 11px; font-weight: bold; letter-spacing: 1px;"
         )
         layout.addWidget(self._status_lbl)
         layout.addStretch()
+
+        # INTERNET LINK — immediately left of the MAP badge, in the same shared
+        # bar so it is visible on BOTH screens without paging.
+        #
+        # Here rather than on a screen of its own because the question it
+        # answers is "is the pit hearing me right now", which the driver needs
+        # settled at a glance before they radio, not after they have paged to
+        # find out. It reads as a warning light, so it lives with the other
+        # warning lights.
+        self._net_lbl = QLabel(self._net_badge_text(net_monitor.STATUS_UNKNOWN))
+        self._net_lbl.setAlignment(Qt.AlignCenter)
+        self._apply_net_style(net_monitor.STATUS_UNKNOWN)
+        layout.addWidget(self._net_lbl)
+        # Tighter than the 12 px between the other badges, deliberately: NET and
+        # PIT are one instrument read together, not two neighbours. The pair is
+        # the diagnostic — NET green with PIT red says the radio is fine and the
+        # pit still cannot see you, which neither light says on its own.
+        layout.addSpacing(6)
+
+        # PIT — is telemetry actually LANDING, not merely leaving. Reads
+        # cloud.firebase_client's upload health; see the header note there.
+        self._uplink_lbl = QLabel(self._uplink_badge_text(_UPLINK_UNKNOWN))
+        self._uplink_lbl.setAlignment(Qt.AlignCenter)
+        self._apply_uplink_style(_UPLINK_UNKNOWN)
+        layout.addWidget(self._uplink_lbl)
+        layout.addSpacing(12)
 
         # Active power map — in the shared bar so it is visible on BOTH screens.
         # The driver must be able to confirm which map is live at a glance
@@ -956,6 +1034,113 @@ class RacingDashboard(QMainWindow):
             f"font-weight: bold; letter-spacing: 1px;"
             f"border: 2px solid {colour}; border-radius: 4px; padding: 1px 8px;"
         )
+
+    # ── Internet link badge ───────────────────────────────────────────────── #
+    @staticmethod
+    def _net_badge_text(status: str) -> str:
+        """Glyph + label for a link status.
+
+        The glyph carries the state as well as the colour does. Green-vs-red is
+        the one pair a red-green colour-blind driver cannot separate, and a
+        status light nobody can read is worse than no status light, so a filled
+        dot means up and a hollow one means it is not.
+
+        ● and ○ specifically because _update_page_indicator already draws the
+        page dots with that exact pair, on this Pi, in this font stack — so they
+        are known to render here rather than merely likely to. A tofu box would
+        be its own kind of unreadable, and a status light is a bad place to find
+        out that a glyph was a guess.
+
+        The word NET never changes, so the badge keeps a near-constant width and
+        cannot nudge the MAP badge sideways as the link comes and goes.
+        """
+        return ("● NET" if status == net_monitor.STATUS_ONLINE else "○ NET")
+
+    def _apply_net_style(self, status: str) -> None:
+        """Colour the link badge. Lime up, red down, unlit until we know.
+
+        UNKNOWN takes _OFF, the same unlit slate the MAP and solar badges use
+        before their first reading — booting into a red light that only means
+        "ask me in five seconds" would spend the driver's alarm response on our
+        own startup.
+        """
+        self._net_status = status
+        colour = (_LIME if status == net_monitor.STATUS_ONLINE else
+                  _RED if status == net_monitor.STATUS_OFFLINE else _OFF)
+        self._net_lbl.setText(self._net_badge_text(status))
+        self._net_lbl.setStyleSheet(
+            f"color: {colour}; font-size: {int(13 * self._sc)}px;"
+            f"font-weight: bold; letter-spacing: 1px;"
+            f"border: 2px solid {colour}; border-radius: 4px; padding: 1px 8px;"
+        )
+
+    @staticmethod
+    def _uplink_badge_text(status: str) -> str:
+        """Glyph + label for the upload status. Same dot convention as NET."""
+        up = firebase_client is not None and status == firebase_client.STATUS_UP
+        return ("● PIT" if up else "○ PIT")
+
+    def _apply_uplink_style(self, status: str) -> None:
+        """Colour the uplink badge: lime landing, red failing, unlit otherwise.
+
+        IDLE and UNKNOWN both take the unlit slate, and that is the honest
+        reading of each: a parked car with a quiet bus has nothing to send, and
+        a bench HUD without firebase_admin was never asked to send anything.
+        Neither is a fault, and neither should light a warning.
+
+        Only DOWN — attempts being made and failing — earns red.
+        """
+        self._uplink_status = status
+        if firebase_client is None:
+            colour = _OFF
+        else:
+            colour = (_LIME if status == firebase_client.STATUS_UP else
+                      _RED if status == firebase_client.STATUS_DOWN else _OFF)
+        self._uplink_lbl.setText(self._uplink_badge_text(status))
+        self._uplink_lbl.setStyleSheet(
+            f"color: {colour}; font-size: {int(13 * self._sc)}px;"
+            f"font-weight: bold; letter-spacing: 1px;"
+            f"border: 2px solid {colour}; border-radius: 4px; padding: 1px 8px;"
+        )
+
+    def _start_link_monitors(self) -> None:
+        """Start the probe thread and a 1 Hz timer that reads both link states.
+
+        A POLL, not a Qt signal, and deliberately: net_monitor knows nothing
+        about Qt, so it stays usable from main.py and testable without a
+        QApplication, and firebase_client is written from the CAN worker thread
+        where emitting into the GUI would be the wrong direction entirely.
+        Reading two scalars under a lock once a second costs nothing next to the
+        repaint the HUD is doing anyway.
+
+        ONE timer for both badges: they are read together and they are cheap,
+        and a second QTimer would only add another wakeup to a Pi 4 that is
+        already painting gauges.
+
+        The timer is far faster than either update cadence on purpose — it is
+        the badges' latency to a state CHANGE, and the extra ticks are free
+        because an unchanged status does no work at all (below).
+        """
+        self._net = net_monitor.NetMonitor().start()
+        self._link_timer = QTimer(self)
+        self._link_timer.timeout.connect(self._poll_links)
+        self._link_timer.start(1000)
+
+    def _poll_links(self) -> None:
+        """Copy the link and uplink statuses onto their badges, if they moved."""
+        # Restyle only on a CHANGE. setStyleSheet re-parses the sheet and
+        # forces a repaint every time it is called, even with an identical
+        # string; doing that twice a second forever, for values that change a
+        # handful of times a race, is a repaint the gauges have to share a
+        # frame budget with on a Pi 4.
+        net_status = self._net.get_status()["net_status"]
+        if net_status != self._net_status:
+            self._apply_net_style(net_status)
+
+        if firebase_client is not None:
+            uplink_status = firebase_client.get_upload_status()["upload_status"]
+            if uplink_status != self._uplink_status:
+                self._apply_uplink_style(uplink_status)
 
     def _build_left_panel(self) -> QFrame:
         frame = QFrame()
@@ -1631,6 +1816,12 @@ class RacingDashboard(QMainWindow):
         already handles a stale handle.
         """
         print(f"[HUD] {why} — exiting with code {code}.")
+        # request_stop(), never stop(): a probe already inside connect() cannot
+        # be interrupted, only outlived, and this path has a deadline. The
+        # thread is a daemon and os._exit() below takes it with us.
+        net = getattr(self, "_net", None)
+        if net is not None:
+            net.request_stop()
         worker, self._worker = self._worker, None
         if worker is not None:
             worker.request_stop()                       # returns immediately
@@ -1954,7 +2145,7 @@ class RacingDashboard(QMainWindow):
 
     @Slot(str)
     def _on_status(self, msg: str) -> None:
-        self._status_lbl.setText(msg)
+        self._status_text = msg
         m = msg.upper()
         # Order matters: "NOT CONNECTED" also contains "CONNECTED".
         if "NOT CONNECTED" in m or "ERROR" in m or "DISCONNECT" in m:
@@ -2006,7 +2197,7 @@ class RacingDashboard(QMainWindow):
         blank dashboard. The message now goes to the status bar and the alert
         row, which are already where the driver looks for exactly this.
         """
-        self._status_lbl.setText(f"● CAN ERROR — {msg}")
+        self._status_text = f"● CAN ERROR — {msg}"
         self._status_color = _RED
         self._apply_status_style()
         self._on_alerts([("CAN BUS ERROR", "error")])
@@ -2019,6 +2210,90 @@ class RacingDashboard(QMainWindow):
             f"color: {self._status_color}; font-size: {px}px; "
             "font-weight: bold; letter-spacing: 1px;"
         )
+        self._fit_status_text()
+
+    def _status_font(self) -> QFont:
+        """The font the status label is ACTUALLY rendered in.
+
+        Rebuilt from the same numbers _apply_status_style just put in the
+        stylesheet rather than read back off the widget: a QSS font-size does
+        not reliably reach QWidget.font(), so measuring with widget.font()
+        would size the text against the default font and elide against a width
+        the label never had. Same reasoning as _fit_font, which measures rather
+        than estimates for the same reason — and, like _fit_font, this measures
+        whatever Qt SUBSTITUTES for Consolas on the Pi rather than assuming a
+        font that only exists on Windows.
+        """
+        font = QFont("Consolas")
+        font.setPixelSize(max(9, int(11 * self._sc)))
+        font.setBold(True)
+        font.setLetterSpacing(QFont.AbsoluteSpacing, 1.0)
+        return font
+
+    def _status_budget_px(self) -> float:
+        """How much width the status text may take before it eats the badges.
+
+        The bar carries the CAN status on the left and a row of fixed-size
+        warning badges on the right, and on the 800x480 panel it is
+        over-subscribed: the badges plus a two-bus status string want more than
+        the 790 px there are. Something has to give, and it must be the status
+        text — a clipped bus name costs the driver nothing, a clipped warning
+        light could cost them the car.
+
+        Measured from self._window_w rather than self.width() or the bar's own
+        width, and that is not paranoia — it was a bug. This runs inside
+        resizeEvent, where NEITHER of those is reliably the new size yet: the
+        bar has not necessarily been re-laid-out, and the top-level's own
+        geometry can still be the previous one depending on how the platform
+        delivers the resize. Measured against self.width(), the status text
+        elided to the PREVIOUS window width and only caught up on the next
+        resize — a HUD dragged wider kept a truncated status until something
+        else resized it. self._window_w comes straight off the resize event, so
+        it is the width we are actually being resized TO.
+        """
+        layout = self._alert_bar.layout()
+        left, _, right, _ = layout.getContentsMargins()
+        used = 0.0
+        for i in range(layout.count()):
+            item = layout.itemAt(i)
+            widget = item.widget()
+            if widget is None:          # a stretch (0 px) or an addSpacing gap
+                used += item.sizeHint().width()
+            elif widget is not self._status_lbl:
+                used += widget.sizeHint().width()
+        # The root vbox margin either side, then the bar's own contents
+        # margins, then a couple of pixels so a rounding difference between
+        # our metrics and Qt's cannot clip the last glyph anyway.
+        usable = self._window_w - 2 * self._ROOT_MARGIN_PX - left - right - 2
+        return max(0.0, usable - used)
+
+    def _fit_status_text(self) -> None:
+        """Show as much of the status as fits, ellipsised rather than cut.
+
+        QLabel does not elide, it CLIPS — silently, mid-word, with nothing to
+        say it happened. "● CAN LIVE  |  socketcan:can0 @ 500kbps" became
+        "● CAN LIVE  |  socketc" on the real panel and read as a complete
+        message. An ellipsis is the difference between a shortened string and a
+        wrong one.
+
+        Elided from the RIGHT because the status is written most-significant
+        first: the state ("CAN LIVE", "NOT CONNECTED") leads, and the bus name
+        that gets dropped is the part the driver never acts on.
+        """
+        if not hasattr(self, "_net_lbl"):
+            return                      # called before the bar finished building
+        text = self._status_text
+        metrics = QFontMetricsF(self._status_font())
+        budget = self._status_budget_px()
+        shown = (text if metrics.horizontalAdvance(text) <= budget
+                 else metrics.elidedText(text, Qt.ElideRight, int(budget)))
+        # Only touch the label when the string really changed. setText triggers
+        # a re-layout, this runs inside resizeEvent, and a re-layout can raise
+        # another resize — the same feedback loop that once inflated the whole
+        # HUD a few pixels per event (see the note in resizeEvent). Writing only
+        # on a real change makes the loop terminate after one pass.
+        if shown != self._status_lbl.text():
+            self._status_lbl.setText(shown)
 
     def _apply_alert_style(self) -> None:
         px = max(9, int(11 * self._sc))
@@ -2063,9 +2338,23 @@ class RacingDashboard(QMainWindow):
 
     def resizeEvent(self, event) -> None:  # noqa: ANN001
         super().resizeEvent(event)
+        # Recorded BEFORE the build guard below, so it is current even for the
+        # resizes that arrive while the UI is still being constructed.
+        self._window_w = event.size().width()
         # resize() can fire before the UI is built — ignore until it exists.
         if not hasattr(self, "_left_panel"):
             return
+
+        # Re-elide the status HERE, above the scale short-circuit below, because
+        # it is the one thing in this method keyed to the WINDOW width rather
+        # than to self._sc. That short-circuit returns whenever the scale has
+        # not moved, and the scale is derived from the SCREEN — so it does not
+        # move when only the window is resized, while the status budget very
+        # much does. Below the guard this ran on a scale change and nowhere
+        # else: on the car, where the HUD goes fullscreen once and stays there,
+        # the status would have been elided to the startup width for the rest of
+        # the race no matter what happened to the bar afterwards.
+        self._fit_status_text()
 
         # Scale everything relative to the 800×480 design size. Use the smaller
         # of the width/height ratios so nothing overflows on odd aspect ratios.
@@ -2133,6 +2422,8 @@ class RacingDashboard(QMainWindow):
             warn="REVERSE" in self._map_lbl.text().upper(),
         )
         self._apply_solar_style(self._solar_charging)
+        self._apply_net_style(self._net_status)
+        self._apply_uplink_style(self._uplink_status)
         self._apply_indicator_styles(self._last_flags_shown)
         self._apply_target_style(self._speed_delta())
         # The LIVE severity, not a guess: re-applying "soft" here used to demote
