@@ -43,3 +43,5 @@ collector.err.log
 .Rhistory
 Thumbs.db
 desktop.ini
+
+tools/

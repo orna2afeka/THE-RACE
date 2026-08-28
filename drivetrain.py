@@ -125,7 +125,7 @@ RPM_REPORT_SCALE = 0.5          # controller reports this fraction of true RPM
 # until now, and that coincidence is exactly what hid the RPM error for two days
 # - the speed looked perfect while everything derived from RPM was 2.57x out.
 # Re-measure this if the controller is ever reconfigured again.
-CONTROLLER_SPEED_DIVISOR = 6.5455
+CONTROLLER_SPEED_DIVISOR = 6.5455 / 0.66
 
 # Before that 12:12 reconfiguration the same field needed a different divisor,
 # and this one is not empirical at all - it falls out of the other two. The old
