@@ -42,6 +42,7 @@ import track  # noqa: E402  (path set up immediately above)
 import track_map  # noqa: E402
 from strategy_engine import SECTIONS_INFO  # noqa: E402
 from track_map_view import HAS_PLOTLY, render_vector_track_map  # noqa: E402
+from track_map_view import _SESSION_LAST_FIX  # noqa: E402  (see _reset_last_fix)
 
 st.set_page_config(page_title="Zolder Map — DEMO", layout="wide")
 
@@ -110,6 +111,26 @@ def _stage_at(t):
     return STAGES[0]  # t == CYCLE_SECONDS exactly; falls back to the first stage
 
 
+def _reset_last_fix():
+    """Forget any stored Zolder fix, so a SIMULATED stage is genuinely simulated.
+
+    resolve_car_marker deliberately makes SIGNAL LOST outrank SIMULATED once a
+    real Zolder fix has been seen this session — that ordering is the whole
+    point in production (see track_map_view.py). Left alone here, it means this
+    demo's hollow SIMULATED ring would only ever appear once, in the first few
+    seconds of the very first cycle; every lap after that the "SIMULATED"
+    window would render as SIGNAL LOST instead, because by then a real fix
+    always exists from the previous lap's LIVE stage.
+
+    That is correct behaviour, not a bug — but a demo whose job is to show the
+    ring off should actually show it every cycle. So this demo resets the
+    stored fix at each cycle boundary (auto mode) and whenever SIMULATED is
+    picked directly (manual mode), which the real dashboard has no reason to
+    ever do to a live session.
+    """
+    st.session_state.pop(_SESSION_LAST_FIX, None)
+
+
 if "demo_started_at" not in st.session_state:
     st.session_state.demo_started_at = time.time()
 
@@ -137,6 +158,12 @@ def _live_preview():
         t = elapsed % CYCLE_SECONDS
         lo, hi, stage = _stage_at(t)
         countdown = hi - t
+        # Crossed back to the first stage -> a new lap of the demo cycle
+        # started. See _reset_last_fix for why this has to happen here.
+        stage_idx = STAGES.index((lo, hi, stage))
+        if stage_idx == 0 and st.session_state.get("_demo_prev_stage") not in (0, None):
+            _reset_last_fix()
+        st.session_state["_demo_prev_stage"] = stage_idx
     else:
         stage = {
             "SIMULATED": "SIMULATED — testing far from Zolder",
@@ -145,6 +172,8 @@ def _live_preview():
         }[st.session_state.demo_forced]
         distance = st.session_state.demo_manual_dist
         countdown = None
+        if st.session_state.demo_forced == "SIMULATED":
+            _reset_last_fix()
 
     is_live = stage.startswith("LIVE")
     is_lost = stage.startswith("SIGNAL LOST")

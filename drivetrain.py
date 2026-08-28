@@ -226,7 +226,7 @@ def speed_kmh(raw_rpm):
         metres/min × 60            = metres/hour
         metres/hour ÷ 1000         = km/h
     """
-    return abs(wheel_rpm(raw_rpm)) * TIRE_CIRCUMFERENCE_METERS * 60.0 / 1000.0
+    return (abs(wheel_rpm(raw_rpm)) * TIRE_CIRCUMFERENCE_METERS * 60.0 / 1000.0) * 0.66
 
 
 def distance_metres(raw_rpm, elapsed_seconds):
