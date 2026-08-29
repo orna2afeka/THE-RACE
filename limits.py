@@ -142,6 +142,13 @@ CELL_V_MAX = 4.20      # full charge, per cell — sets the gauge's full scale
 CELL_V_WARN = 3.20     # getting low
 CELL_V_CRIT = 3.00     # standard Li-ion cutoff; below here you are damaging cells
 
+# Per-cell, not derived like PACK_VOLTAGE below. Existed as bare numbers for a
+# while with no Threshold of their own — PACK_VOLTAGE consumed them scaled by
+# CELL_COUNT, but nothing coloured an INDIVIDUAL cell's own reading. The pit's
+# per-cell voltage screen (DS004) is the first thing that needs one directly.
+CELL_VOLTAGE = Threshold(warn=CELL_V_WARN, crit=CELL_V_CRIT,
+                         low_side=True, full_scale=CELL_V_MAX)
+
 PACK_V_FULL = CELL_COUNT * CELL_V_MAX      # 54.6 V
 
 # ⚠️ THE WEAKEST THRESHOLD HERE. Judge the CONTROLLER's measurement only

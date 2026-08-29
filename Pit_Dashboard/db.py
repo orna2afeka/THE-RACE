@@ -28,10 +28,37 @@ from pit_config import SQLITE_PATH, DEVICE_ID
 # Hot columns extracted from each record for charting/filtering. The dashboard
 # can name any of these as an exportable/plottable "metric". Anything not listed
 # is still recoverable from raw_json.
+# How many individual cell-voltage columns to carry. 30, not the currently-
+# wired count, because it is the true UPPER BOUND of what the BMS protocol can
+# address at all: cell voltages arrive 3-per-frame over 10 CAN IDs (0x107..
+# 0x110 — see bms_parser.py), so 30 is the most this wiring could ever report
+# without a protocol change, regardless of how many taps are physically
+# connected today.
+#
+# Deliberately NOT the live "how many are actually wired" count — that number
+# is not even constant across this project's own history (bms_string_count has
+# been seen as both 13 and 28 in stored samples, presumably as the pack was
+# built out), so hard-coding today's figure here would need a second schema
+# migration the next time a cell gets added. bms_string_count is stored as its
+# own column instead (below) and is what a display must gate on, per-row, to
+# tell a real 0.000 V-if-that-ever-happens from "this tap isn't wired yet."
+BMS_CELL_COLUMN_COUNT = 30
+
 METRIC_COLUMNS = [
     "bms_soc_percent",
     "bms_voltage_V",
     "bms_current_A",
+    # How many cell taps the BMS itself reports as configured (ID 0x104). The
+    # authoritative "is this cell real" signal for the bms_cell_NN_V columns
+    # below — see BMS_CELL_COLUMN_COUNT for why that fixed 30 is a wiring limit,
+    # not a live count.
+    "bms_string_count",
+    # Individual cell voltages, 1-indexed to match the BMS's own numbering.
+    # Absent (None) for any cell beyond what was polled/wired for a given
+    # sample, exactly like every other "car never reported this" field here —
+    # never coalesced to 0, so an unwired tap cannot be mistaken for a shorted
+    # cell. See bms_parser.py's cell-voltage decode for the source.
+    *[f"bms_cell_{i:02d}_V" for i in range(1, BMS_CELL_COLUMN_COUNT + 1)],
     "battery_temp_C",
     "mms_rpm",
     "mms_power_W",
@@ -408,6 +435,12 @@ def flatten_record(rtdb_key: str, record: dict, device_id: str = DEVICE_ID) -> d
         "bms_soc_percent": _num(battery.get("bms_soc_percent")),
         "bms_voltage_V": _num(battery.get("bms_voltage_V")),
         "bms_current_A": _num(battery.get("bms_current_A")),
+        "bms_string_count": _num(battery.get("bms_string_count")),
+        # One key per possible cell tap. .get() returns None for anything the
+        # car never reported (fewer cells wired than BMS_CELL_COLUMN_COUNT, or
+        # a build that predates this column existing) — never a fabricated 0.
+        **{f"bms_cell_{i:02d}_V": _num(battery.get(f"bms_cell_{i:02d}_V"))
+           for i in range(1, BMS_CELL_COLUMN_COUNT + 1)},
         "battery_temp_C": _num(temp.get("battery_temp_C")),
         "mms_rpm": _num(motor.get("mms_rpm")),
         "mms_power_W": _signed16(motor.get("mms_power_W")),

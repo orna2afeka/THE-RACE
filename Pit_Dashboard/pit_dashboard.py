@@ -54,7 +54,7 @@ from constants import (
     # The tile code no longer knows what a threshold IS -- it asks limits.
     NORMAL, WARNING, CRITICAL, TIER_COLOURS, classify,
     MOTOR_TEMP, CTRL_TEMP, CELL_TEMP, SOC, POWER,
-    PACK_VOLTAGE, BATT_CURRENT, MOTOR_CURRENT, SPEED,
+    PACK_VOLTAGE, BATT_CURRENT, MOTOR_CURRENT, SPEED, CELL_VOLTAGE,
     # Uncoloured on purpose (no warn, no crit) — it is imported anyway so the
     # tile declares a limit like every other numeric tile, and so the gauge
     # scale stays shared with the driver HUD.
@@ -359,6 +359,13 @@ def _live_snapshot():
     state["soc"] = _val(row, "bms_soc_percent", None)
     state["voltage"] = _val(row, "bms_voltage_V", None)
     state["current"] = _val(row, "bms_current_A", None)
+    # How many cell taps the BMS itself reports configured (0x104). The
+    # authoritative gate for the individual cell tiles below — see
+    # db.BMS_CELL_COLUMN_COUNT for why the column count (30) is a wiring
+    # limit, not a live count, and this is the number that actually is.
+    state["bms_string_count"] = _val(row, "bms_string_count", None)
+    for _i in range(1, db.BMS_CELL_COLUMN_COUNT + 1):
+        state[f"bms_cell_{_i:02d}_V"] = _val(row, f"bms_cell_{_i:02d}_V", None)
     state["pack_voltage"] = _val(row, "mms_measured_voltage_V", None)
     state["motor_current"] = _val(row, "mms_current_A", None)
     state["regen_energy"] = _val(row, "regen_energy", None)
@@ -1374,6 +1381,96 @@ def _assert_no_duplicates():
 
 
 LIVE_METRIC_COUNT = _assert_no_duplicates()
+
+# DS004 of the technical regulations: "Voltage of all battery modules (26
+# sensors)". A FIXED compliance screen, so it always renders exactly this many
+# tiles — Module 1..26 — with a dash for any not yet reporting, rather than a
+# variable-length list that would reshuffle the layout as cells come online.
+DS004_MODULE_COUNT = 26
+
+
+def _cell_value(state, i):
+    """One cell's voltage, or None if it isn't a real reading.
+
+    Gated on bms_string_count, not just on the stored value being present:
+    a CAN ID can be POLLED (so its frame arrives and decodes to a literal
+    0.000 V) without the tap being electrically wired to a real cell — seen on
+    this exact hardware in bench captures. Treating that as a genuine 0.000 V
+    reading would be indistinguishable from a shorted/dead cell; treating it as
+    unreported, like every other missing value on this dashboard, is the
+    honest answer. Falls back to the raw value when bms_string_count itself
+    hasn't been reported yet (an older build, or no sample at all) — there is
+    nothing more authoritative to gate on in that case.
+    """
+    v = state.get(f"bms_cell_{i:02d}_V")
+    if v is None:
+        return None
+    known = state.get("bms_string_count")
+    if known is not None and i > known:
+        return None
+    return v
+
+
+def _render_cell_row(cols_n, indices, state, label_fmt):
+    for row_start in range(0, len(indices), cols_n):
+        chunk = indices[row_start:row_start + cols_n]
+        cols = st.columns(cols_n)
+        for col, i in zip(cols, chunk):
+            v = _cell_value(state, i)
+            render_metric(col, label_fmt(i), fmt(v, ".3f"), "V",
+                         classify(v, CELL_VOLTAGE))
+
+
+def render_cell_voltages(state):
+    """DS003/DS004 tab body — currently DS004 (voltage) only.
+
+    DS003 (temperature of all cells) needs the Orion Thermistor Expansion
+    Module's multiplexed broadcast (CAN ID 0x1838F380 — one hex digit away
+    from 0x1839F380, the aggregate low/high/avg message this dashboard's
+    "Battery Temp" tile already reads). That multiplexed frame has never once
+    been observed on this car's CAN bus: per the module's own datasheet, a
+    thermistor only appears in it once it has been individually loaded/enabled
+    via Orion's Thermistor Utility software. Until a capture shows real
+    0x1838F380 traffic, there is nothing to parse — this section is DS004
+    only until that config step happens on the car.
+    """
+    known = state.get("bms_string_count")
+    if known is not None:
+        st.caption(f"BMS reports **{int(known)} cells** wired and configured.")
+    else:
+        st.caption(":orange[Cell count unknown — the car has not reported "
+                  "bms_string_count yet.]")
+
+    st.markdown(f"##### :material/rule: DS004 — Module Voltages "
+               f"(1–{DS004_MODULE_COUNT})")
+    st.caption("The JBD BMS protocol has no grouping above individual cells "
+              "(BMS_CAN_PROTOCOL.docx: \"Cell 1\" .. \"Cell 30\", no separate "
+              "module concept), so a monitored cell IS a module here. Colour: "
+              f"warn below {CELL_VOLTAGE.warn} V, critical below "
+              f"{CELL_VOLTAGE.crit} V.")
+    _render_cell_row(LIVE_METRICS_PER_ROW, list(range(1, DS004_MODULE_COUNT + 1)),
+                     state, lambda i: f"Module {i}")
+
+    extra = [i for i in range(DS004_MODULE_COUNT + 1, db.BMS_CELL_COLUMN_COUNT + 1)
+            if _cell_value(state, i) is not None]
+    if extra:
+        st.markdown(f"##### Additional Cells ({DS004_MODULE_COUNT + 1}"
+                   f"–{db.BMS_CELL_COLUMN_COUNT})")
+        st.caption("Wired beyond the rulebook's 26 — shown so no data is "
+                  "lost, per the engineering copy of this screen.")
+        _render_cell_row(LIVE_METRICS_PER_ROW, extra, state, lambda i: f"Cell {i}")
+
+
+@st.fragment(run_every=2)
+def _cell_voltage_fragment():
+    """Cell Voltages tab. Same 2s cadence and shared cached read as the other
+    fast tabs — see _live_metrics_fragment's docstring for what is and is not
+    cached."""
+    ctx = _live_context()
+    if not ctx["fresh"]:
+        st.warning(f":material/warning: Not live — every reading below is "
+                  f"from the last sample received, {_age_text(ctx['age'])} ago.")
+    render_cell_voltages(ctx["state"])
 
 
 def _render_live_metric(col, m, state, ctx):
@@ -2786,8 +2883,9 @@ def main():
     # Each fragment below renders directly into its spot and refreshes in place.
     _top_strip_fragment()  # fast (2s)
 
-    tab_driver, tab_live, tab_history, tab_weather, tab_strategy = st.tabs(
+    tab_driver, tab_live, tab_cells, tab_history, tab_weather, tab_strategy = st.tabs(
         [":material/speed: Driver Telemetry", ":material/dashboard: Live Metrics",
+         ":material/battery_full: Cell Voltages",
          ":material/show_chart: History",
          ":material/cloud: Weather", ":material/insights: Strategy"]
     )
@@ -2795,6 +2893,8 @@ def main():
         _driver_fragment()  # fast (2s)
     with tab_live:
         _live_metrics_fragment()  # fast (2s)
+    with tab_cells:
+        _cell_voltage_fragment()  # fast (2s)
     with tab_history:
         # Controls live OUTSIDE the fragments (they are what drives them), so
         # changing one is a full app rerun — which is also what re-registers the

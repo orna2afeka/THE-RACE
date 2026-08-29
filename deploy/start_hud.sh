@@ -12,6 +12,7 @@
 #   3. runs from the REPO ROOT (see the cd note below — this one matters)
 #   5. restarts the HUD if it crashes, with backoff
 #   6. can be told to stay down, via a file that a reboot clears
+#   7. pulls the latest code on every boot, best-effort — see pull_latest()
 # =============================================================================
 set -u
 
@@ -97,6 +98,57 @@ wait_for_network() {
 
 wait_for_display
 wait_for_network
+
+# ── 3b. pull the latest code, best-effort ─────────────────────────────────── #
+# Runs once, here, before the launch loop below — NOT via a self-re-exec of
+# this script. That is deliberate: "${PY}" -u "${APP}" a few lines down reads
+# main.py fresh off disk on every single launch anyway, so whatever this pull
+# just updated takes effect the moment the loop starts. There is no need for
+# this already-running bash process to re-read its OWN (rarely-changing) file
+# to get the benefit — and skipping that avoids re-execing over an already-
+# held flock lock, which is a subtlety not worth taking on for no gain.
+#
+# NEVER discards anything. PI_UPDATE.md's own policy for a human running
+# `git pull` by hand is "if it reports local modifications, stop and report
+# them rather than discarding anything — the Pi is where hand-edits get made
+# during a race weekend." An unattended boot-time pull has to honour that
+# same rule with nobody watching to catch a mistake, so any local change at
+# all — tracked or untracked — skips the pull entirely rather than risking it.
+#
+# --ff-only is the other half of that safety: it refuses to touch the working
+# tree unless the update is a straight fast-forward, so a Pi with its own
+# unpushed commits (or one simply behind a rewritten remote history) fails
+# this cleanly instead of attempting a merge unattended.
+pull_latest() {
+    cd "${REPO}" || { say "auto-update: cannot cd ${REPO} — skipping."; return 0; }
+    if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        say "auto-update: ${REPO} is not a git checkout — skipping."
+        return 0
+    fi
+    if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+        say "auto-update: local changes present — skipping (see: git -C ${REPO} status)."
+        return 0
+    fi
+    local before after
+    before="$(git rev-parse HEAD 2>/dev/null)"
+    say "auto-update: checking for updates (branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null))..."
+    # timeout, not just relying on wait_for_network above: a route existing is
+    # no guarantee the remote is actually reachable, and git itself has no
+    # deadline of its own — this is what keeps a slow/half-up link from
+    # holding the HUD's launch hostage.
+    if ! timeout 20 git pull --ff-only --quiet; then
+        say "auto-update: fetch/merge failed, timed out, or would not fast-forward — starting with the checkout as-is."
+        return 0
+    fi
+    after="$(git rev-parse HEAD 2>/dev/null)"
+    if [ "${before}" = "${after}" ]; then
+        say "auto-update: already up to date (${after:0:8})."
+    else
+        say "auto-update: ${before:0:8} -> ${after:0:8}."
+    fi
+}
+
+pull_latest
 
 if systemctl is-active --quiet gpsd.socket || systemctl is-active --quiet gpsd; then
     say "gpsd is active."
