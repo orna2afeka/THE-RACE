@@ -66,7 +66,8 @@ METRIC_GROUPS = {
     "Motion / GPS": ["odometer_m", "calculated_lap", "lat", "lon",
                      "target_speed_kmh"],
     "Laps / Energy": ["total_race_energy", "last_lap_energy", "last_lap_time_s",
-                      "lap_source", "regen_energy"],
+                      "lap_source", "regen_energy", "last_lap_regen_energy",
+                      "stint_energy", "stint_regen_energy"],
     "Errors / Faults": ["bms_has_error", "bms_error_code", "bms_protections",
                         "mms_has_error", "mms_error_code", "mms_alerts"],
 }
@@ -337,6 +338,14 @@ _XLSX_COLS = {
     "calculated_lap":    ("Lap",                 "0",         "#",    "7F8C9B"),
     "total_race_energy": ("Total Energy (Wh)",   "0.0",       "Wh",   "58D68D"),
     "last_lap_energy":   ("Last Lap Energy (Wh)", "0.0",      "Wh",   "45B39D"),
+    # Regen counterpart of the row above it, and the stint pair below — same
+    # green family as the other energy columns so they read as one group.
+    "last_lap_regen_energy": ("Last Lap Regen Energy (Wh)", "0.0", "Wh", "82C79A"),
+    # Since the last detected charging stop (charge_detector.py on the car),
+    # NOT since the last lap — see LapTracker.mark_stint_start. Rows from
+    # before this feature existed export blank, same as any other None.
+    "stint_energy":      ("Current Stint Energy (Wh)", "0.0", "Wh", "27AE60"),
+    "stint_regen_energy": ("Current Stint Regen Energy (Wh)", "0.0", "Wh", "76D7C4"),
     "last_lap_time_s":   ("Last Lap Time (s)",   "0.000",     "s",    "5DADE2"),
     "lap_source":        ("Lap Trigger",         None,        None,   None),
     "lat":               ("Latitude",            "0.000000",  None,  None),
@@ -378,6 +387,9 @@ def _data_columns(metrics):
         "calculated_lap": "calculated_lap" in m,
         "total_race_energy": "total_race_energy" in m,
         "last_lap_energy": "last_lap_energy" in m,
+        "last_lap_regen_energy": "last_lap_regen_energy" in m,
+        "stint_energy": "stint_energy" in m,
+        "stint_regen_energy": "stint_regen_energy" in m,
         "last_lap_time_s": "last_lap_time_s" in m,
         "lap_source": "lap_source" in m,
         "lat": "lat" in m,

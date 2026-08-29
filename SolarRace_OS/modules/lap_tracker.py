@@ -119,6 +119,15 @@ class LapTracker:
         self._last_power_ts = None       # monotonic; owned by update_energy
         self._last_power_w = None        # previous sample, for the trapezoid
 
+        # Where the CURRENT charging stint's counters started. "Stint" means
+        # since the last real charging stop (see charge_detector.py) — NOT
+        # since the last lap. A fresh tracker has never had a charging stop,
+        # so these start at 0.0 and "current stint" reads the same as "total
+        # race" until mark_stint_start() is first called — exactly the same
+        # convention _lap_start_energy_wh already uses for lap 0.
+        self._stint_start_energy_wh = 0.0
+        self._stint_start_regen_energy_wh = 0.0
+
         # --- laps ---------------------------------------------------------- #
         self.lap_count = 0
         self.lap_source = "none"         # gps | odometer | manual | none
@@ -128,11 +137,13 @@ class LapTracker:
 
         self.last_lap_distance_m = None
         self.last_lap_energy_wh = None
+        self.last_lap_regen_energy_wh = None
         self.last_lap_time_s = None
         self.lap_started_ts = time.time()          # wall clock, for the pit
 
         self._lap_start_odometer_m = 0.0
         self._lap_start_energy_wh = 0.0
+        self._lap_start_regen_energy_wh = 0.0
         self._lap_start_ts = None                  # monotonic
         self._armed = False              # have we seen the line at least once?
 
@@ -362,12 +373,15 @@ class LapTracker:
             self.lap_count += 1
             self.last_lap_distance_m = self.odometer_m - self._lap_start_odometer_m
             self.last_lap_energy_wh = self.total_energy_wh - self._lap_start_energy_wh
+            self.last_lap_regen_energy_wh = (
+                self.regen_energy_wh - self._lap_start_regen_energy_wh)
             self.last_lap_time_s = (
                 (now - self._lap_start_ts) if self._lap_start_ts is not None else None)
             self.lap_source = source
 
         self._lap_start_odometer_m = self.odometer_m
         self._lap_start_energy_wh = self.total_energy_wh
+        self._lap_start_regen_energy_wh = self.regen_energy_wh
         self._lap_start_ts = now
         self.lap_started_ts = time.time()      # wall clock for the pit's stopwatch
         self._armed = True
@@ -394,7 +408,30 @@ class LapTracker:
         self.regen_energy_wh = 0.0
         self.energy_gap_s = 0.0
         self._lap_start_energy_wh = 0.0
+        self._lap_start_regen_energy_wh = 0.0
+        self._stint_start_energy_wh = 0.0
+        self._stint_start_regen_energy_wh = 0.0
         self.last_lap_energy_wh = None
+        self.last_lap_regen_energy_wh = None
+
+    def mark_stint_start(self):
+        """Re-datum 'current stint' to start counting from right now.
+
+        Called by main.py the instant charge_detector.ChargeDetector reports a
+        new charging stop beginning. Deliberately non-destructive — unlike
+        reset_energy(), total_energy_wh and regen_energy_wh are left running
+        for the whole race untouched. This only moves the baseline that
+        snapshot()'s stint_energy/stint_regen_energy are measured FROM.
+
+        Snapshotting at the START of the stop rather than its END is a
+        simplification, not a compromise: total_energy_wh only integrates
+        motor power (update_energy), and motor power is ~0 W while the car is
+        parked being charged, so the two moments are numerically the same
+        baseline. Using the start means the caller only has to watch for one
+        edge (charging beginning), not two.
+        """
+        self._stint_start_energy_wh = self.total_energy_wh
+        self._stint_start_regen_energy_wh = self.regen_energy_wh
 
     # ------------------------------------------------------------------ #
     # Telemetry                                                           #
@@ -432,6 +469,18 @@ class LapTracker:
             "last_lap_energy": (round(self.last_lap_energy_wh, 3)
                                 if self.last_lap_energy_wh is not None else None),
             "regen_energy": round(self.regen_energy_wh, 3) if have_e else None,
+            "last_lap_regen_energy": (round(self.last_lap_regen_energy_wh, 3)
+                                      if self.last_lap_regen_energy_wh is not None
+                                      else None),
+            # Since the last detected charging stop (see mark_stint_start).
+            # Before any stop this race, the baseline is 0 and these read the
+            # same as total_race_energy/regen_energy — there is only one
+            # "stint" so far.
+            "stint_energy": (round(self.total_energy_wh - self._stint_start_energy_wh, 3)
+                             if have_e else None),
+            "stint_regen_energy": (round(self.regen_energy_wh
+                                        - self._stint_start_regen_energy_wh, 3)
+                                   if have_e else None),
             "gps_lap_count": self.gps_lap_count,
             "finish_line_distance_m": (round(self.finish_line_distance_m, 1)
                                        if self.finish_line_distance_m is not None
@@ -451,7 +500,11 @@ class LapTracker:
             "gps_lap_count": self.gps_lap_count,
             "lap_start_odometer_m": self._lap_start_odometer_m,
             "lap_start_energy_wh": self._lap_start_energy_wh,
+            "lap_start_regen_energy_wh": self._lap_start_regen_energy_wh,
+            "stint_start_energy_wh": self._stint_start_energy_wh,
+            "stint_start_regen_energy_wh": self._stint_start_regen_energy_wh,
             "last_lap_energy_wh": self.last_lap_energy_wh,
+            "last_lap_regen_energy_wh": self.last_lap_regen_energy_wh,
             "last_lap_time_s": self.last_lap_time_s,
             "last_lap_distance_m": self.last_lap_distance_m,
             "armed": self._armed,
@@ -473,7 +526,14 @@ class LapTracker:
                 data.get("lap_start_odometer_m", self.odometer_m))
             self._lap_start_energy_wh = float(
                 data.get("lap_start_energy_wh", self.total_energy_wh))
+            self._lap_start_regen_energy_wh = float(
+                data.get("lap_start_regen_energy_wh", self.regen_energy_wh))
+            self._stint_start_energy_wh = float(
+                data.get("stint_start_energy_wh", 0.0))
+            self._stint_start_regen_energy_wh = float(
+                data.get("stint_start_regen_energy_wh", 0.0))
             self.last_lap_energy_wh = data.get("last_lap_energy_wh")
+            self.last_lap_regen_energy_wh = data.get("last_lap_regen_energy_wh")
             self.last_lap_time_s = data.get("last_lap_time_s")
             self.last_lap_distance_m = data.get("last_lap_distance_m")
             self._armed = bool(data.get("armed", False))

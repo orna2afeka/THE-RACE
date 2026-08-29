@@ -333,6 +333,15 @@ def _live_snapshot():
         # Per-lap analytics, all computed on the car. None = not reported yet
         # (no lap completed, or a build older than this feature).
         "last_lap_energy": None, "total_race_energy": None,
+        # last_lap_regen_energy: added alongside last_lap_energy — None on a
+        # build/history that predates it, same as every other "not reported
+        # yet" field here.
+        "last_lap_regen_energy": None,
+        # Since the last detected charging stop (see lap_tracker.mark_stint_start
+        # on the car). None until the car has reported one — a build without
+        # charge_detector.py never sends these, and that must read as "unknown"
+        # rather than a confident 0 Wh stint.
+        "stint_energy": None, "stint_regen_energy": None,
         "last_lap_time_s": None, "lap_distance_m": None, "lap_source": None,
         "lap_started_ts": None,
         "auto_lap": None, "odometer_km": None,
@@ -376,6 +385,9 @@ def _live_snapshot():
                               or efficiency.zone(state["throttle_pct"]))
     state["last_lap_energy"] = _val(row, "last_lap_energy", None)
     state["total_race_energy"] = _val(row, "total_race_energy", None)
+    state["last_lap_regen_energy"] = _val(row, "last_lap_regen_energy", None)
+    state["stint_energy"] = _val(row, "stint_energy", None)
+    state["stint_regen_energy"] = _val(row, "stint_regen_energy", None)
     state["last_lap_time_s"] = _val(row, "last_lap_time_s", None)
     state["lap_distance_m"] = _val(row, "lap_distance_m", None)
     state["lap_source"] = _val(row, "lap_source", None)
@@ -1148,6 +1160,24 @@ def render_gps_map(state):
 #   text    value is already a string; skip formatting and colouring.
 LIVE_METRICS_PER_ROW = 4
 
+
+def _relative_regen(regen_wh, total_wh):
+    """regen / (regen + total), as a PERCENTAGE (0-100, not a 0-1 fraction) —
+    what fraction of gross forward energy at the motor was recovered as regen.
+
+    None whenever either input is missing or the denominator isn't positive,
+    rather than 0 or a divide-by-zero: at the start of a stint/lap/race both
+    are legitimately 0.0, and "0 % recovered" is a claim about a real number,
+    not the honest "nothing to divide yet" this returns instead.
+    """
+    if regen_wh is None or total_wh is None:
+        return None
+    denom = regen_wh + total_wh
+    if denom <= 0:
+        return None
+    return regen_wh / denom * 100.0
+
+
 LIVE_METRIC_GROUPS = [
     ("Motion", [
         dict(label="Speed", unit="km/h", spec=".1f", limit=SPEED,
@@ -1266,14 +1296,42 @@ LIVE_METRIC_GROUPS = [
              note="unimplemented on this controller - always 0"),
     ]),
     ("Energy", [
+        # Whole race, never re-datumed.
         dict(label="Total Race Energy", unit="Wh", spec=".0f",
              get=lambda s, c: s["total_race_energy"],
              note="integrated on the car, net of regen"),
+        dict(label="Total Regen Energy", unit="Wh", spec=".0f",
+             get=lambda s, c: s["regen_energy"],
+             note="recovered under braking, whole race"),
+        dict(label="Total Relative Regen", unit="%", spec=".1f",
+             get=lambda s, c: _relative_regen(s["regen_energy"],
+                                              s["total_race_energy"]),
+             note="regen / (regen + total), whole race"),
+        # Since the last detected charging stop — see
+        # SolarRace_OS/modules/charge_detector.py and
+        # lap_tracker.mark_stint_start(). Reads the same as the Total tiles
+        # above until the car has been through its first charging stop.
+        dict(label="Current Stint Energy", unit="Wh", spec=".1f",
+             get=lambda s, c: s["stint_energy"],
+             note="since the last detected charging stop"),
+        dict(label="Current Stint Regen Energy", unit="Wh", spec=".1f",
+             get=lambda s, c: s["stint_regen_energy"],
+             note="since the last detected charging stop"),
+        dict(label="Current Stint Relative Regen", unit="%", spec=".1f",
+             get=lambda s, c: _relative_regen(s["stint_regen_energy"],
+                                              s["stint_energy"]),
+             note="regen / (regen + total), this stint"),
+        # Held for the whole of the FOLLOWING lap — see snapshot()'s docstring
+        # in lap_tracker.py for why that is what makes this survive a dropped
+        # link instead of needing the two samples either side of a boundary.
         dict(label="Last Lap Energy", unit="Wh", spec=".1f",
              get=lambda s, c: s["last_lap_energy"]),
-        dict(label="Regen Energy", unit="Wh", spec=".0f",
-             get=lambda s, c: s["regen_energy"],
-             note="recovered under braking"),
+        dict(label="Last Lap Regen Energy", unit="Wh", spec=".1f",
+             get=lambda s, c: s["last_lap_regen_energy"]),
+        dict(label="Last Lap Relative Regen", unit="%", spec=".1f",
+             get=lambda s, c: _relative_regen(s["last_lap_regen_energy"],
+                                              s["last_lap_energy"]),
+             note="regen / (regen + total), last lap"),
     ]),
     ("Lap & Distance", [
         dict(label="Lap", unit="", spec=".0f",

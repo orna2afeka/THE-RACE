@@ -102,7 +102,13 @@ REM Stamp matches - but verify the packages are really present, in case someone
 REM uninstalled one. This reads local package metadata only; it never goes to
 REM the network, so it is fast and works offline. It reads the versions FROM the
 REM requirements file, so unlike a hardcoded module list it cannot drift.
-%PYCMD% -c "import re,sys;from importlib.metadata import distributions;have={(d.metadata['Name'] or '').lower().replace('_','-'):d.version for d in distributions()};want=[m for m in (re.match(r'([A-Za-z0-9_.\-]+)==([^\s;#]+)',l.split('#')[0].strip()) for l in open(r'%REQ%',encoding='utf-8')) if m];bad=[m.group(1) for m in want if have.get(m.group(1).lower().replace('_','-'))!=m.group(2)];print('   [i] Need install  : '+', '.join(bad)) if bad else print('   [OK] Packages     : already match %REQ%');sys.exit(1 if bad else 0)"
+REM
+REM A real .py file, not an inline `-c "..."` string: the one-liner this used to
+REM be got mangled by CMD's OWN parser (its `^` escape character and, with
+REM enabledelayedexpansion active above, its `!` token both get eaten even
+REM inside double quotes) the moment the regex or the message text needed either
+REM character - see check_requirements.py's own header for the exact failure.
+%PYCMD% "%~dp0check_requirements.py" "%REQ%"
 if errorlevel 1 goto :install
 goto :deps_done
 

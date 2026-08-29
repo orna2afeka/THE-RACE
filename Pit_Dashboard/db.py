@@ -107,6 +107,16 @@ METRIC_COLUMNS = [
     # Energy is in Wh and is NET of regen, so it can legitimately decrease.
     "total_race_energy",
     "last_lap_energy",
+    # Regen counterpart of the two above. "last_lap_regen_energy" needs no
+    # lap-boundary special case of its own here — it is held for the whole of
+    # the following lap by the SAME mechanism as last_lap_energy (see
+    # lap_tracker.py's snapshot() docstring).
+    "last_lap_regen_energy",
+    # Since the last detected charging stop (charge_detector.py on the car),
+    # NOT since the last lap. Reads the same as total_race_energy/regen_energy
+    # until the first charging stop this race — see LapTracker.mark_stint_start.
+    "stint_energy",
+    "stint_regen_energy",
     "last_lap_time_s",
     "last_lap_distance_m",
     "lap_distance_m",
@@ -432,6 +442,9 @@ def flatten_record(rtdb_key: str, record: dict, device_id: str = DEVICE_ID) -> d
         "solar_sensor_status": _join(solar.get("solar_sensor_status")),
         "total_race_energy": _num(motor.get("total_race_energy")),
         "last_lap_energy": _num(motor.get("last_lap_energy")),
+        "last_lap_regen_energy": _num(motor.get("last_lap_regen_energy")),
+        "stint_energy": _num(motor.get("stint_energy")),
+        "stint_regen_energy": _num(motor.get("stint_regen_energy")),
         "last_lap_time_s": _num(motor.get("last_lap_time_s")),
         "last_lap_distance_m": _num(motor.get("last_lap_distance_m")),
         "lap_distance_m": _num(motor.get("lap_distance_m")),

@@ -64,6 +64,7 @@ from modules import mms_parser
 from modules.temp_controller_parser import parse_temp_controller_message
 from modules.gps_reader import GPSReader
 from modules.lap_tracker import LapTracker
+from modules.charge_detector import ChargeDetector
 from modules.lap_command import LapCommandInbox, StrategyCommandInbox
 from modules.vehicle_inputs import VehicleInputs
 # Solar charge current over USB (Yoctopuce Yocto-Amp). Importing this is safe
@@ -201,6 +202,14 @@ class SmartCANWorker(CANWorker):
         # integral between two triggers, lap time the interval between them.
         self.laps = LapTracker()
         self.lap_inbox = LapCommandInbox()
+        # Detects a real charging stop from bms_current_A + mms_rpm — see
+        # charge_detector.py for why both readings are needed (current alone
+        # can't tell a charger from regen braking). Fed on the same ~2 Hz timer
+        # as the GPS publish below, in _publish_gps; the two latest readings
+        # are cached as they arrive off the bus (see _decode_message).
+        self._charge_detector = ChargeDetector()
+        self._last_bms_current_A = None
+        self._last_mms_rpm = None
         self._last_lap_gps_sample = 0.0
         # Parking brake + lights switches, wired to the Pi's GPIO (the motor
         # controller has no visibility of them). Reports None until the pins
@@ -915,6 +924,14 @@ class SmartCANWorker(CANWorker):
         self._last_gps_publish = now
         self._refresh_gps()
 
+        # A charging stop just began: re-datum "current stint" to start
+        # counting from here. Does NOT touch total_race_energy/regen_energy —
+        # see LapTracker.mark_stint_start().
+        if self._charge_detector.update(self._last_bms_current_A,
+                                        self._last_mms_rpm):
+            self.laps.mark_stint_start()
+            print("🔌 CHARGING DETECTED — stint reset")
+
         # Log GPS state only when the summary changes, so the console shows the
         # moment a fix is acquired or lost without scrolling every second.
         status = self.gps.status()
@@ -967,6 +984,7 @@ class SmartCANWorker(CANWorker):
             # P/V, which is only an estimate and goes wrong at low voltage).
             if "bms_current_A" in bms_data:
                 self.battery_current_updated.emit(float(bms_data["bms_current_A"]))
+                self._last_bms_current_A = float(bms_data["bms_current_A"])
             # Hottest cell — the number that actually matters for battery
             # safety. Prefer the dedicated temp module (below); fall back to the
             # BMS's own NTC probes when it isn't reporting.
@@ -1003,6 +1021,7 @@ class SmartCANWorker(CANWorker):
             # accumulator now owns its own clock inside LapTracker.
             if "mms_rpm" in mms_data:
                 self.laps.update_motion(mms_data["mms_rpm"])
+                self._last_mms_rpm = float(mms_data["mms_rpm"])
             if "mms_power_W" in mms_data:
                 self.laps.update_energy(mms_data["mms_power_W"])
             # The controller broadcasts its own TRIP counter (0x620). Prefer it

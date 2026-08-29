@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Zolder Telemetry Map</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&display=swap" rel="stylesheet">
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            background-color: #06090f;
+            background-image: radial-gradient(#1e293b 1px, transparent 1px);
+            background-size: 24px 24px;
+            color: #ffffff;
+            font-family: 'Rajdhani', sans-serif;
+            overflow: hidden;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .map-container {
+            position: relative;
+            width: 95%;
+            max-width: 1200px;
+            aspect-ratio: 16 / 9;
+        }
+
+        svg {
+            width: 100%;
+            height: 100%;
+            overflow: visible;
+        }
+
+        /* Base track - Thick dark slate to act as a backing for the neon sectors */
+        #track-path {
+            fill: none;
+            stroke: #1e293b;
+            stroke-width: 8;
+            stroke-linecap: round;
+            stroke-linejoin: round;
+        }
+
+        /* The Solar Car Marker */
+        .car-marker {
+            width: 14px;
+            height: 14px;
+            background-color: #00e5ff;
+            border-radius: 50%;
+            position: absolute;
+            top: 0;
+            left: 0;
+            transform: translate(-50%, -50%);
+            box-shadow: 0 0 15px 5px rgba(0, 229, 255, 0.4);
+            z-index: 10;
+        }
+        
+        .car-marker::after {
+            content: '';
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 6px;
+            height: 6px;
+            background-color: #ffffff;
+            border-radius: 50%;
+        }
+
+        /* Telemetry Overlay */
+        .telemetry-overlay {
+            position: absolute;
+            top: 30px;
+            left: 30px;
+            border-left: 3px solid #00e5ff;
+            padding-left: 20px;
+            background: linear-gradient(90deg, rgba(6, 9, 15, 0.9) 0%, rgba(6, 9, 15, 0) 100%);
+            padding-right: 50px;
+        }
+
+        .telemetry-overlay h2 {
+            margin: 0;
+            font-size: 1.1rem;
+            color: #94a3b8;
+            text-transform: uppercase;
+            letter-spacing: 4px;
+            font-weight: 600;
+        }
+
+        .data-row {
+            font-size: 4rem;
+            font-weight: 700;
+            color: #ffffff;
+            font-variant-numeric: tabular-nums;
+            line-height: 1;
+            margin-top: 5px;
+            display: flex;
+            align-items: baseline;
+            gap: 8px;
+            text-shadow: 0 0 20px rgba(255,255,255,0.1);
+        }
+        
+        .data-unit {
+            font-size: 1.5rem;
+            color: #00e5ff;
+            font-weight: 600;
+            letter-spacing: 1px;
+        }
+
+        /* Sleek Legend Box */
+        .legend-box {
+            position: absolute;
+            bottom: 30px;
+            right: 30px;
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 10px 25px;
+            background: rgba(15, 23, 42, 0.85);
+            padding: 15px 25px;
+            border: 1px solid #334155;
+            border-radius: 6px;
+            backdrop-filter: blur(8px);
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+        }
+
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: #cbd5e1;
+            font-size: 0.95rem;
+            font-weight: 600;
+            letter-spacing: 1px;
+        }
+
+        .legend-color {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            box-shadow: 0 0 5px currentColor;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="map-container">
+        <!-- SVG Track -->
+        <svg viewBox="0 0 1000 562.5" id="track-svg">
+            <path id="track-path" d="M 450.9,223.6 L 437.0,214.4 L 409.4,196.7 L 381.2,178.2 L 374.8,173.9 L 372.1,171.7 L 369.5,169.4 L 367.3,167.1 L 364.5,164.1 L 363.0,162.3 L 361.8,160.6 L 361.2,159.8 L 360.7,158.7 L 360.4,157.5 L 360.1,156.0 L 359.9,154.6 L 359.9,152.9 L 360.2,150.4 L 360.7,147.5 L 361.6,144.9 L 362.4,142.4 L 363.7,139.2 L 365.4,135.8 L 368.4,131.4 L 370.9,127.7 L 373.6,124.1 L 381.3,113.8 L 386.0,107.0 L 400.2,87.5 L 403.3,83.0 L 407.0,77.6 L 407.6,76.7 L 408.9,74.1 L 410.0,71.6 L 412.4,64.3 L 412.9,62.2 L 413.3,59.2 L 413.4,57.5 L 413.3,54.8 L 412.9,52.1 L 412.5,50.5 L 411.6,48.0 L 409.7,45.3 L 407.9,43.3 L 405.9,41.6 L 403.3,39.9 L 400.2,38.4 L 397.4,37.1 L 394.6,36.2 L 390.5,35.1 L 383.9,33.9 L 375.6,32.5 L 370.7,31.7 L 365.5,31.1 L 360.9,31.0 L 357.5,31.2 L 354.1,31.6 L 350.4,32.5 L 346.9,33.7 L 343.1,35.4 L 339.8,37.2 L 336.4,39.1 L 333.9,41.0 L 331.1,43.3 L 328.4,45.7 L 325.7,48.8 L 323.5,51.7 L 321.2,54.9 L 320.3,56.2 L 310.4,74.6 L 296.3,100.7 L 293.6,105.6 L 290.3,111.5 L 288.6,114.7 L 287.4,117.9 L 286.6,120.4 L 285.9,123.4 L 285.5,126.6 L 285.4,129.9 L 285.6,132.9 L 286.2,135.4 L 286.9,138.4 L 288.8,143.2 L 290.3,145.7 L 292.1,148.3 L 295.5,152.0 L 300.6,156.0 L 339.8,183.0 L 367.4,201.6 L 431.4,245.8 L 471.5,271.8 L 474.2,274.1 L 475.4,275.6 L 475.9,276.9 L 475.6,278.3 L 475.1,279.6 L 474.5,280.8 L 473.2,283.4 L 472.8,284.5 L 472.7,285.9 L 473.0,287.3 L 473.7,288.5 L 480.9,299.8 L 492.2,317.4 L 497.9,326.8 L 500.7,331.8 L 509.6,349.1 L 520.4,369.8 L 523.2,376.0 L 525.0,380.7 L 526.7,386.6 L 527.9,392.1 L 528.5,398.2 L 528.7,402.8 L 528.8,408.8 L 528.0,414.8 L 526.8,420.7 L 525.0,427.0 L 523.5,431.9 L 516.6,452.9 L 512.6,462.9 L 511.3,465.9 L 511.0,467.5 L 511.0,469.4 L 511.4,470.7 L 512.0,471.4 L 512.9,472.1 L 515.1,473.7 L 518.2,475.5 L 519.1,476.4 L 519.9,477.4 L 520.3,478.4 L 520.5,479.7 L 520.4,480.9 L 519.9,482.8 L 519.1,484.3 L 516.8,488.8 L 516.0,490.4 L 514.8,493.4 L 514.3,495.3 L 514.3,498.1 L 514.3,499.8 L 514.9,502.0 L 515.6,504.1 L 516.6,505.9 L 518.2,507.7 L 524.9,512.7 L 541.4,524.9 L 545.3,527.7 L 548.6,529.1 L 552.4,530.2 L 556.6,530.8 L 560.5,531.0 L 563.3,530.7 L 567.4,530.0 L 572.2,528.4 L 575.9,526.6 L 578.3,524.8 L 581.4,522.2 L 609.3,497.7 L 614.8,492.9 L 620.5,488.4 L 623.1,486.5 L 626.9,484.1 L 630.5,481.9 L 632.3,481.0 L 637.4,478.5 L 649.8,473.5 L 663.9,467.7 L 676.9,462.7 L 690.3,457.5 L 706.5,451.2 L 709.6,449.8 L 711.2,448.8 L 712.5,447.5 L 713.4,446.0 L 714.1,444.8 L 714.4,443.6 L 714.6,443.0 L 714.6,441.7 L 714.5,440.7 L 714.0,439.3 L 713.3,438.0 L 711.7,436.2 L 707.4,433.1 L 700.3,428.5 L 695.0,425.1 L 692.6,423.3 L 690.2,421.0 L 688.6,419.3 L 687.3,417.6 L 685.2,414.7 L 679.3,406.2 L 677.3,404.0 L 675.5,402.5 L 652.0,386.7 L 618.2,363.7 L 580.7,338.3 L 560.9,324.7 L 553.1,319.4 L 545.9,314.7 L 544.2,312.1 L 543.8,310.1 L 544.3,307.8 L 545.1,305.7 L 547.5,302.0 L 549.3,299.2 L 549.8,296.8 L 550.0,294.5 L 549.8,292.3 L 548.9,290.0 L 547.5,287.3 L 546.5,286.0 L 544.6,283.8 L 542.1,282.0 L 472.4,237.7 Z" />
+        </svg>
+
+        <!-- Technical Car Dot -->
+        <div class="car-marker" id="car"></div>
+
+        <!-- Telemetry Overlay -->
+        <div class="telemetry-overlay">
+            <h2>Circuit Zolder Live</h2>
+            <div class="data-row"><span id="lap-dist">0</span><span class="data-unit">M</span></div>
+        </div>
+
+        <div class="legend-box" id="legend"></div>
+    </div>
+
+    <!-- Anime.js CDN -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/animejs/3.2.1/anime.min.js"></script>
+    <script>
+        const TRACK_LENGTH_M = 4000;
+        const path = document.querySelector('#track-path');
+        const car = document.querySelector('#car');
+        const distDisplay = document.querySelector('#lap-dist');
+        const svgElement = document.querySelector('#track-svg');
+        const legendBox = document.querySelector('#legend');
+        const pathLength = path.getTotalLength();
+
+        // High-tech muted neon palette for professional look
+        const sectors = [
+            { id: 1, name: "S1", start: 0, end: 600, color: "#f87171" },
+            { id: 2, name: "S2", start: 600, end: 1000, color: "#fb923c" },
+            { id: 3, name: "S3", start: 1000, end: 1800, color: "#fbbf24" },
+            { id: 4, name: "S4", start: 1800, end: 1910, color: "#34d399" },
+            { id: 5, name: "S5", start: 1910, end: 2400, color: "#2dd4bf" },
+            { id: 6, name: "S6", start: 2400, end: 2500, color: "#38bdf8" },
+            { id: 7, name: "S7", start: 2500, end: 3000, color: "#818cf8" },
+            { id: 8, name: "S8", start: 3000, end: 3430, color: "#a78bfa" },
+            { id: 9, name: "S9", start: 3430, end: 4000, color: "#e879f9" }
+        ];
+
+        // Draw "Neon Tube" Sectors inside the thick base track
+        sectors.forEach(sector => {
+            const newPath = path.cloneNode();
+            newPath.id = 'sector-' + sector.id;
+            
+            const startRatio = sector.start / TRACK_LENGTH_M;
+            const endRatio = sector.end / TRACK_LENGTH_M;
+            
+            const segmentLength = (endRatio - startRatio) * pathLength;
+            const offset = startRatio * pathLength;
+            
+            newPath.style.stroke = sector.color;
+            newPath.style.strokeWidth = "3"; // Thin bright core
+            // -2 ensures a crisp 2px gap between sectors
+            newPath.style.strokeDasharray = `${Math.max(0, segmentLength - 2)} ${pathLength}`;
+            newPath.style.strokeDashoffset = -offset;
+            newPath.style.strokeLinecap = "round";
+            
+            // Insert colored segments above base track but below labels/car
+            svgElement.appendChild(newPath);
+            
+            // Populate sleek legend
+            const item = document.createElement('div');
+            item.className = 'legend-item';
+            item.innerHTML = `<div class="legend-color" style="background:${sector.color}; color:${sector.color}"></div>S${sector.id}`;
+            legendBox.appendChild(item);
+        });
+
+
+        // Helper to get normal vectors for perpendicular lines
+        function getTangentAndNormal(len) {
+            const pt1 = path.getPointAtLength(Math.max(0, len - 0.5));
+            const pt2 = path.getPointAtLength(Math.min(pathLength, len + 0.5));
+            const dx = pt2.x - pt1.x;
+            const dy = pt2.y - pt1.y;
+            const mag = Math.sqrt(dx*dx + dy*dy) || 1;
+            return {
+                pt: path.getPointAtLength(len),
+                nx: -dy / mag,
+                ny: dx / mag
+            };
+        }
+
+        // Sector Boundary ticks for extra technical feel
+        sectors.forEach(s => {
+            if(s.start === 0) return;
+            const ratio = s.start / TRACK_LENGTH_M;
+            const {pt, nx, ny} = getTangentAndNormal(ratio * pathLength);
+            
+            const tick = document.createElementNS("http://www.w3.org/2000/svg", "line");
+            const tickLen = 8;
+            tick.setAttribute("x1", pt.x - nx * tickLen);
+            tick.setAttribute("y1", pt.y - ny * tickLen);
+            tick.setAttribute("x2", pt.x + nx * tickLen);
+            tick.setAttribute("y2", pt.y + ny * tickLen);
+            tick.setAttribute("stroke", "#94a3b8");
+            tick.setAttribute("stroke-width", "1.5");
+            svgElement.appendChild(tick);
+        });
+
+        // Draw Finish Line (thicker)
+        const flInfo = getTangentAndNormal(0);
+        const flTick = document.createElementNS("http://www.w3.org/2000/svg", "line");
+        flTick.setAttribute("x1", flInfo.pt.x - flInfo.nx * 14);
+        flTick.setAttribute("y1", flInfo.pt.y - flInfo.ny * 14);
+        flTick.setAttribute("x2", flInfo.pt.x + flInfo.nx * 14);
+        flTick.setAttribute("y2", flInfo.pt.y + flInfo.ny * 14);
+        flTick.setAttribute("stroke", "#ffffff");
+        flTick.setAttribute("stroke-width", "3");
+        svgElement.appendChild(flTick);
+
+
+        // 2. Turn Landmarks (Clean Broadcast Style with leader lines)
+        const landmarks = [
+            { name: "T1", dist: 600, nx: -1, ny: 0 },
+            { name: "T2", dist: 710, nx: -1, ny: 0.5 },
+            { name: "T4", dist: 1010, nx: 0, ny: 1 },
+            { name: "CHICANE (T5-6)", dist: 1860, nx: 1, ny: 0.5 },
+            { name: "T7", dist: 2400, nx: 1, ny: -0.5 },
+            { name: "T8-9", dist: 2500, nx: 1, ny: -1 },
+            { name: "T10-11", dist: 3000, nx: 0.5, ny: -1 },
+            { name: "T12", dist: 3430, nx: -1, ny: -1 },
+            { name: "CHICANE (T15-16)", dist: 3900, nx: -1, ny: -0.5 }
+        ];
+
+        landmarks.forEach(lm => {
+            const ratio = lm.dist / TRACK_LENGTH_M;
+            const {pt} = getTangentAndNormal(ratio * pathLength);
+            
+            const mag = Math.sqrt(lm.nx*lm.nx + lm.ny*lm.ny);
+            const ux = lm.nx / mag;
+            const uy = lm.ny / mag;
+            
+            const leaderLen = 35; 
+            const endX = pt.x + ux * leaderLen;
+            const endY = pt.y + uy * leaderLen;
+            
+            const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+            line.setAttribute("x1", pt.x);
+            line.setAttribute("y1", pt.y);
+            line.setAttribute("x2", endX);
+            line.setAttribute("y2", endY);
+            line.setAttribute("stroke", "#475569");
+            line.setAttribute("stroke-width", "1.5");
+            svgElement.appendChild(line);
+            
+            const dot = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+            dot.setAttribute("cx", pt.x);
+            dot.setAttribute("cy", pt.y);
+            dot.setAttribute("r", "3");
+            dot.setAttribute("fill", "#00e5ff");
+            svgElement.appendChild(dot);
+            
+            const txt = document.createElementNS("http://www.w3.org/2000/svg", "text");
+            const txtX = endX + (ux * 8);
+            const txtY = endY + (uy * 8) + 4; 
+            txt.setAttribute("x", txtX);
+            txt.setAttribute("y", txtY);
+            txt.setAttribute("fill", "#cbd5e1");
+            txt.setAttribute("font-size", "13px");
+            txt.setAttribute("font-weight", "600");
+            txt.setAttribute("letter-spacing", "1px");
+            
+            if (ux > 0.1) txt.setAttribute("text-anchor", "start");
+            else if (ux < -0.1) txt.setAttribute("text-anchor", "end");
+            else txt.setAttribute("text-anchor", "middle");
+            
+            txt.textContent = lm.name;
+            svgElement.appendChild(txt);
+        });
+
+        // ============================================
+        // Car Animation Logic
+        // ============================================
+        let carState = { progress: 0 };
+        let currentAnimation = null;
+
+        function setCarPosition(progress) {
+            const point = path.getPointAtLength(progress * pathLength);
+            const viewBox = svgElement.viewBox.baseVal;
+            const xPercent = (point.x / viewBox.width) * 100;
+            const yPercent = (point.y / viewBox.height) * 100;
+            car.style.left = `${xPercent}%`;
+            car.style.top = `${yPercent}%`;
+        }
+        
+        setCarPosition(0);
+
+        function updateCarPosition(lapDistanceMeters, trackLengthMeters) {
+            let targetProgress = Math.max(0, Math.min(1, lapDistanceMeters / trackLengthMeters));
+            
+            if (carState.progress > 0.8 && targetProgress < 0.2) {
+                carState.progress = 0;
+                setCarPosition(0);
+            }
+
+            distDisplay.innerText = Math.round(lapDistanceMeters);
+
+            if (currentAnimation) {
+                currentAnimation.pause();
+            }
+
+            currentAnimation = anime({
+                targets: carState,
+                progress: targetProgress,
+                duration: 1000,
+                easing: 'easeOutCubic',
+                update: function() {
+                    setCarPosition(carState.progress);
+                }
+            });
+        }
+
+        window.addEventListener('message', (event) => {
+            const data = event.data;
+            if (data && data.type === 'UPDATE_TELEMETRY') {
+                updateCarPosition(data.lapDistanceMeters || 0, data.trackLengthMeters || 4000);
+            }
+        });
+
+        if (window.self === window.top) {
+            let demoDist = 0;
+            setInterval(() => {
+                demoDist += (Math.random() * 80 + 20); 
+                if (demoDist > 4000) demoDist = 0;
+                updateCarPosition(demoDist, 4000);
+            }, 1000);
+        }
+    </script>
+</body>
+</html>
