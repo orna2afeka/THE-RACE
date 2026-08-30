@@ -11,8 +11,11 @@ laptop). The pit needs nothing from this folder — double-click
 Goal: power on → no password prompt → the fullscreen driver HUD appears by
 itself, and comes back if it ever crashes.
 
-Everything below assumes the user `pi` and the repo at `~/THE-RACE`. Substitute
-your own and keep them consistent.
+Everything below assumes this car's Pi: the user `orna2` and the repo at
+`~/Desktop/THE-RACE-main` (i.e. `/home/orna2/Desktop/THE-RACE-main`).
+Substitute your own and keep them consistent — and if you change them, change
+the `Exec=` line in both `deploy/*.desktop` files too, since XDG autostart
+cannot expand `~` and a stale path there fails silently.
 
 ### 1. System packages
 
@@ -44,8 +47,8 @@ install` into it is blocked. Use a venv — with system site-packages, so it can
 still see the apt-installed gpiozero:
 
 ```bash
-python3 -m venv --system-site-packages ~/THE-RACE/.venv
-~/THE-RACE/.venv/bin/pip install -r ~/THE-RACE/SolarRace_OS/requirements.txt
+python3 -m venv --system-site-packages ~/Desktop/THE-RACE-main/.venv
+~/Desktop/THE-RACE-main/.venv/bin/pip install -r ~/Desktop/THE-RACE-main/SolarRace_OS/requirements.txt
 ```
 
 If `PySide6` has no aarch64 wheel for your Python, install Qt from apt instead —
@@ -58,7 +61,7 @@ sudo apt install -y python3-pyside6.qtcore python3-pyside6.qtgui python3-pyside6
 ### 4. CAN bus at boot
 
 ```bash
-sudo cp ~/THE-RACE/deploy/can-up.service /etc/systemd/system/
+sudo cp ~/Desktop/THE-RACE-main/deploy/can-up.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now can-up.service
 ip -details link show can0        # expect "state UP" and "bitrate 500000"
@@ -138,9 +141,9 @@ screensaver_timeout = -1
 ### 6. Autostart the HUD
 
 ```bash
-chmod +x ~/THE-RACE/deploy/start_hud.sh
+chmod +x ~/Desktop/THE-RACE-main/deploy/start_hud.sh
 mkdir -p ~/.config/autostart
-cp ~/THE-RACE/deploy/solarrace-hud.desktop ~/.config/autostart/
+cp ~/Desktop/THE-RACE-main/deploy/solarrace-hud.desktop ~/.config/autostart/
 nano ~/.config/autostart/solarrace-hud.desktop   # fix the path if not /home/pi
 ```
 
@@ -161,8 +164,8 @@ this step is entirely Pi-side and touches no Python.
 
 ```bash
 sudo apt install -y mpv v4l-utils
-chmod +x ~/THE-RACE/deploy/start_camera.sh
-cp ~/THE-RACE/deploy/solarrace-camera.desktop ~/.config/autostart/
+chmod +x ~/Desktop/THE-RACE-main/deploy/start_camera.sh
+cp ~/Desktop/THE-RACE-main/deploy/solarrace-camera.desktop ~/.config/autostart/
 nano ~/.config/autostart/solarrace-camera.desktop   # fix the path if not /home/pi
 ```
 
@@ -171,7 +174,7 @@ nano ~/.config/autostart/solarrace-camera.desktop   # fix the path if not /home/
 ```bash
 v4l2-ctl --list-devices          # what is attached
 ls -l /dev/v4l/by-id/            # the stable names start_camera.sh prefers
-~/THE-RACE/deploy/start_camera.sh   # run it by hand once, from the desktop
+~/Desktop/THE-RACE-main/deploy/start_camera.sh   # run it by hand once, from the desktop
 tail -f ~/hud-logs/camera.log       # what it decided
 ```
 
@@ -188,7 +191,7 @@ up on the same screen, or swapped, flip it:
 ```bash
 wlr-randr                        # lists the outputs in index order
 # then either edit FS_SCREEN in start_camera.sh, or set it per-boot:
-SOLARRACE_CAM_SCREEN=0 ~/THE-RACE/deploy/start_camera.sh
+SOLARRACE_CAM_SCREEN=0 ~/Desktop/THE-RACE-main/deploy/start_camera.sh
 ```
 
 ⚠️ **Adding a second screen can move the HUD.** The HUD asks to be fullscreen
@@ -215,10 +218,10 @@ from the script and let mpv negotiate, or lower `SOLARRACE_CAM_FPS`.
 
 ```bash
 # by hand first — note the cd, it matters (see below)
-cd ~/THE-RACE && ./.venv/bin/python3 -u SolarRace_OS/main.py
+cd ~/Desktop/THE-RACE-main && ./.venv/bin/python3 -u SolarRace_OS/main.py
 
 # then the wrapper
-~/THE-RACE/deploy/start_hud.sh &
+~/Desktop/THE-RACE-main/deploy/start_hud.sh &
 tail -f ~/hud-logs/hud.log
 
 sudo reboot     # the real test
@@ -249,7 +252,7 @@ touch "$XDG_RUNTIME_DIR/solarrace-hud.stop"     # tell the wrapper to stay down
 pkill -f 'SolarRace_OS/main.py'                 # then stop the HUD
 # ... debug ...
 rm -f "$XDG_RUNTIME_DIR/solarrace-hud.stop"     # hand it back
-~/THE-RACE/deploy/start_hud.sh &
+~/Desktop/THE-RACE-main/deploy/start_hud.sh &
 ```
 
 The stop file lives on tmpfs, so **a power cycle always clears it** — a
@@ -299,7 +302,7 @@ laptop running the dashboard.
 
 
 # 0. Get the code there
-git clone <your repo url> ~/THE-RACE && cd ~/THE-RACE
+git clone <your repo url> ~/Desktop/THE-RACE-main && cd ~/Desktop/THE-RACE-main
 
 # 1. System packages
 sudo apt update
@@ -311,8 +314,8 @@ sudo systemctl enable --now gpsd.socket gpsd
 gpspipe -w -n 5                     # must print JSON
 
 # 3. Python (Bookworm blocks system pip — venv required)
-python3 -m venv --system-site-packages ~/THE-RACE/.venv
-~/THE-RACE/.venv/bin/pip install -r ~/THE-RACE/SolarRace_OS/requirements.txt
+python3 -m venv --system-site-packages ~/Desktop/THE-RACE-main/.venv
+~/Desktop/THE-RACE-main/.venv/bin/pip install -r ~/Desktop/THE-RACE-main/SolarRace_OS/requirements.txt
 
 # 4. CAN bus up at every boot
 sudo cp deploy/can-up.service /etc/systemd/system/
@@ -338,5 +341,5 @@ nano ~/.config/autostart/solarrace-camera.desktop
 wlr-randr                                        # confirm which screen is which
 
 # 7. Test, then reboot
-cd ~/THE-RACE && ./.venv/bin/python3 -u SolarRace_OS/main.py
+cd ~/Desktop/THE-RACE-main && ./.venv/bin/python3 -u SolarRace_OS/main.py
 sudo reboot

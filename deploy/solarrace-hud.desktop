@@ -6,8 +6,19 @@ GenericName=Driver Dashboard
 Comment=Fullscreen driver HUD; restarts itself if it crashes
 # /bin/bash prefix on purpose: a repo cloned on Windows, or a file rewritten by
 # `git pull`, can lose the executable bit, and this still runs either way.
-# Edit the path if your username is not `pi` or the repo is elsewhere.
-Exec=/bin/bash /home/pi/THE-RACE/deploy/start_hud.sh
+# (That is not hypothetical — a pull left every deploy/*.sh non-executable on
+# this Pi, and `deploy/stop_hud.sh` failed with "Permission denied".)
+#
+# ABSOLUTE PATH, and it must match the real checkout. XDG autostart does NOT
+# expand `~`, so this cannot be written as a home-relative path.
+#
+# This pointed at /home/pi/THE-RACE for a long time while the car's actual
+# checkout was /home/orna2/Desktop/THE-RACE-main. Nothing reports that: the
+# desktop entry simply never runs, so the HUD only ever starts when someone
+# launches it by hand — and start_hud.sh's boot-time `git pull` never happens
+# either, which is why the Pi kept coming up on stale code after a reboot.
+# If this repo moves, or is cloned by a different user, fix this line first.
+Exec=/bin/bash /home/orna2/Desktop/THE-RACE-main/deploy/start_hud.sh
 Terminal=false
 StartupNotify=false
 X-GNOME-Autostart-enabled=true

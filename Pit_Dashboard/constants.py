@@ -63,7 +63,8 @@ from limits import (                # noqa: E402  (path set up above)
     # DS003 cell naming: C_A1..C_A13 / C_B1..C_B13, shared with the driver HUD
     # so one sensor can never carry two different names across the two screens.
     CELL_COUNT, cell_temp_label,
-    THERMISTOR_GROUP_NAMES, THERMISTOR_GROUPED_COUNT,
+    THERMISTOR_GROUP_RANGES, THERMISTOR_GROUP_NAMES,
+    THERMISTOR_GROUPED_COUNT, THERMISTOR_ID_MAX,
     SOC, PACK_VOLTAGE, BATT_CURRENT,
     MOTOR_CURRENT, POWER, SPEED,
     CELL_VOLTAGE,

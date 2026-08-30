@@ -188,37 +188,46 @@ CELL_VOLTAGE = Threshold(warn=CELL_V_WARN, crit=CELL_V_CRIT,
 
 
 # DS003 sensor naming. The pack is built as TWO modules of CELL_COUNT cells,
-# so the thermistors read as C_A1..C_A13 then C_B1..C_B13 rather than as one
-# flat 1..30 run — that is how the cells are labelled on the car itself, and a
+# so the thermistors read as C_A1..C_A13 and C_B1..C_B13 rather than as one
+# flat run — that is how the cells are labelled on the car itself, and a
 # temperature is only actionable if you can find the cell it belongs to.
 #
-# Derived from CELL_COUNT so the two cannot drift: change the pack's series
-# count and the grouping follows.
+# THE ID RANGES ARE NOT CONTIGUOUS, and they are measured rather than assumed.
+# The Orion module reports ids 1-13 and 21-33 — 26 in total, matching the 26
+# it declares enabled. Ids 14-20 are simply not loaded on it, and per the
+# datasheet an unloaded thermistor is SKIPPED by the broadcast entirely rather
+# than sent as a fault, so that gap is a wiring fact and not a failure.
 #
-# ⚠️ THE MAPPING IS SEQUENTIAL AND ASSUMED: thermistor 1..13 -> module A,
-# 14..26 -> module B, in the order the Orion module reports them. Nothing on
-# the CAN bus states which physical module a thermistor belongs to (the
-# datasheet's IDs are just a position in the module's own scan order), so this
-# is the one part of the label that is a convention rather than a measurement.
-# If the harness is wired in a different order, fix it HERE — every screen
-# takes its labels from this one function.
-THERMISTOR_GROUP_NAMES = ("A", "B")
-THERMISTOR_GROUPED_COUNT = CELL_COUNT * len(THERMISTOR_GROUP_NAMES)   # 26
+# This started as a sequential 1-13 / 14-26 guess, which labelled seven
+# non-existent sensors as C_B1..C_B7 (they showed as permanent dashes) while
+# the real ids 31-33 fell past the end and were dropped. Both symptoms had the
+# same cause: assuming the layout instead of reading it off the hardware.
+#
+# If the harness changes, change it HERE — every screen, on both the car and
+# the pit, takes its labels from this one function.
+THERMISTOR_GROUP_RANGES = (("A", 1, CELL_COUNT),        # ids 1..13
+                           ("B", 21, 20 + CELL_COUNT))  # ids 21..33
+THERMISTOR_GROUP_NAMES = tuple(name for name, _, _ in THERMISTOR_GROUP_RANGES)
+THERMISTOR_GROUPED_COUNT = sum(hi - lo + 1
+                               for _, lo, hi in THERMISTOR_GROUP_RANGES)   # 26
+# Highest thermistor id the pack actually uses — what a fixed-size display has
+# to span to show every mapped cell (33, not the 26 there are OF them).
+THERMISTOR_ID_MAX = max(hi for _, _, hi in THERMISTOR_GROUP_RANGES)
 
 
 def cell_temp_label(index):
-    """1-indexed thermistor number -> its cell name, e.g. 1 -> 'C_A1',
-    14 -> 'C_B1'.
+    """1-indexed thermistor id -> its cell name, e.g. 1 -> 'C_A1',
+    21 -> 'C_B1', 33 -> 'C_B13'.
 
-    Anything past the grouped pack (27..30 — the Orion module can address more
-    thermistors than this car has cells) falls back to a plain 'C27'. It is
-    NOT forced into a third group: an unmapped sensor should look unmapped
-    rather than borrow a module name it may not belong to.
+    An id outside every mapped range falls back to a plain 'C14'. It is NOT
+    forced into a group: an unmapped sensor must look unmapped rather than
+    borrow a module name it may not belong to — mislabelling which cell is
+    hot is worse than admitting we do not know.
     """
     i = int(index)
-    if 1 <= i <= THERMISTOR_GROUPED_COUNT:
-        group, within = divmod(i - 1, CELL_COUNT)
-        return f"C_{THERMISTOR_GROUP_NAMES[group]}{within + 1}"
+    for name, lo, hi in THERMISTOR_GROUP_RANGES:
+        if lo <= i <= hi:
+            return f"C_{name}{i - lo + 1}"
     return f"C{i}"
 
 

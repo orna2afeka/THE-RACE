@@ -57,7 +57,8 @@ from constants import (
     PACK_VOLTAGE, BATT_CURRENT, MOTOR_CURRENT, SPEED, CELL_VOLTAGE,
     plausible_cell_temp,
     CELL_COUNT, cell_temp_label,
-    THERMISTOR_GROUP_NAMES, THERMISTOR_GROUPED_COUNT,
+    THERMISTOR_GROUP_RANGES, THERMISTOR_GROUP_NAMES,
+    THERMISTOR_GROUPED_COUNT, THERMISTOR_ID_MAX,
     # Uncoloured on purpose (no warn, no crit) — it is imported anyway so the
     # tile declares a limit like every other numeric tile, and so the gauge
     # scale stays shared with the driver HUD.
@@ -1622,28 +1623,30 @@ def render_cell_voltages(state):
     else:
         st.caption(f"Colour: warn above {CELL_TEMP.warn:.0f} °C, critical "
                   f"above {CELL_TEMP.crit:.0f} °C.")
-        for g, group_name in enumerate(THERMISTOR_GROUP_NAMES):
-            first = g * CELL_COUNT + 1
-            indices = list(range(first, first + CELL_COUNT))
+        # Iterate the module's REAL id ranges (1-13 and 21-33), not a
+        # contiguous run — ids 14-20 are not loaded on this module at all.
+        mapped = set()
+        for group_name, lo, hi in THERMISTOR_GROUP_RANGES:
+            indices = list(range(lo, hi + 1))
+            mapped.update(indices)
             st.markdown(f"**Module {group_name}** "
-                       f"({cell_temp_label(indices[0])}–"
-                       f"{cell_temp_label(indices[-1])})")
+                       f"({cell_temp_label(lo)}–{cell_temp_label(hi)}"
+                       f" · sensor ids {lo}-{hi})")
             _render_cell_temp_row(LIVE_METRICS_PER_ROW, indices,
                                   state, cell_temp_label)
 
-        # Anything the Orion module can address beyond the mapped pack. Shown
-        # only when it actually reports, exactly like DS004's "Additional
-        # Cells" below — the house rule is that no data is silently dropped,
-        # but an empty section is clutter on a compliance screen.
-        extra_t = [i for i in range(THERMISTOR_GROUPED_COUNT + 1,
-                                    db.THERMISTOR_CELL_COLUMN_COUNT + 1)
-                   if _cell_temp_value(state, i) is not None]
+        # Anything reporting outside the mapped ranges. Shown only when it
+        # actually reports, exactly like DS004's "Additional Cells" below —
+        # the house rule is that no data is silently dropped, but an empty
+        # section is clutter on a compliance screen.
+        extra_t = [i for i in range(1, db.THERMISTOR_CELL_COLUMN_COUNT + 1)
+                   if i not in mapped and _cell_temp_value(state, i) is not None]
         if extra_t:
-            st.markdown(f"**Unmapped sensors** ({THERMISTOR_GROUPED_COUNT + 1}"
-                       f"–{db.THERMISTOR_CELL_COLUMN_COUNT})")
-            st.caption("Reporting beyond the pack's two 13-cell modules — "
-                      "shown so no reading is lost. If these are real cells, "
-                      "extend the mapping in limits.cell_temp_label.")
+            st.markdown(f"**Unmapped sensors** "
+                       f"(ids {', '.join(str(i) for i in extra_t)})")
+            st.caption("Reporting from ids outside the pack's two 13-cell "
+                      "modules — shown so no reading is lost. If these are "
+                      "real cells, extend THERMISTOR_GROUP_RANGES in limits.py.")
             _render_cell_temp_row(LIVE_METRICS_PER_ROW, extra_t,
                                   state, cell_temp_label)
 

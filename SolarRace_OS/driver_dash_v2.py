@@ -64,7 +64,9 @@ from modules import mms_parser, net_monitor, pt1000
 # DS003's compliance count (30 sensors) — shared with the car-side parser so
 # the HUD grid can never quietly drift from what the parser will actually
 # report. See temp_controller_parser.py's docstring for the protocol.
-from modules.temp_controller_parser import THERMISTOR_COUNT
+# DS003's cell grid is built from limits.THERMISTOR_GROUP_RANGES (the ids the
+# pack actually uses), shared with the pit wall — not from a sensor COUNT,
+# which cannot express the gap at ids 14-20.
 
 # Upload health for the PIT badge, read straight from the module main.py pushes
 # through — same process, so no wiring is needed and none can be forgotten.
@@ -919,10 +921,10 @@ class RacingDashboard(QMainWindow):
     # (26 sensors)". Same NAME and count as the pit dashboard's own
     # DS004_MODULE_COUNT (pit_dashboard.py), but deliberately its own
     # constant rather than imported: this is a fixed regulation count, not a
-    # protocol limit shared by construction (unlike THERMISTOR_COUNT above,
-    # which IS imported because drifting from the parser's own limit would
-    # misfile real data) -- and the pit's copy lives in a different app
-    # entirely, with no shared import path.
+    # protocol limit shared by construction (unlike DS003's id ranges, which
+    # come from limits.py because drifting from the real wiring would
+    # mislabel which cell a temperature belongs to) -- and the pit's copy
+    # lives in a different app entirely, with no shared import path.
     DS004_MODULE_COUNT = 26
 
     # Height the pit-message strip takes WHEN a message is showing. It is hidden
@@ -1702,19 +1704,18 @@ class RacingDashboard(QMainWindow):
         # under it — rather than wrapping arbitrarily mid-module. Labels come
         # from limits.cell_temp_label, shared with the pit wall so a sensor
         # cannot be called C_B1 on one screen and Cell 14 on the other.
+        # Laid out from the module's REAL id ranges (1-13 and 21-33), one row
+        # per pack module. Iterating 1..30 instead — as this did — both drew
+        # seven tiles for ids 14-20 that no thermistor uses, and stopped short
+        # of the real ids 31-33, so module B appeared to be missing its last
+        # three cells while showing seven permanent dashes.
         self._cell_tiles: dict[int, CellTile] = {}
-        for i in range(1, THERMISTOR_COUNT + 1):
-            tile = CellTile(limits.cell_temp_label(i), limits.CELL_TEMP,
-                            decimals=0)
-            self._cell_tiles[i] = tile
-            if i <= limits.THERMISTOR_GROUPED_COUNT:
-                row, col = divmod(i - 1, limits.CELL_COUNT)
-            else:
-                # Sensors past the mapped pack (27-30) get their own trailing
-                # row rather than being folded into module B's.
-                row = len(limits.THERMISTOR_GROUP_NAMES)
-                col = i - limits.THERMISTOR_GROUPED_COUNT - 1
-            grid.addWidget(tile, row, col)
+        for row, (_name, lo, hi) in enumerate(limits.THERMISTOR_GROUP_RANGES):
+            for col, i in enumerate(range(lo, hi + 1)):
+                tile = CellTile(limits.cell_temp_label(i), limits.CELL_TEMP,
+                                decimals=0)
+                self._cell_tiles[i] = tile
+                grid.addWidget(tile, row, col)
         self._ds3_stack.addWidget(grid_page)
 
         return page

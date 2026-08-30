@@ -6,8 +6,10 @@ GenericName=Reverse Camera
 Comment=Fullscreen USB reverse camera on the second screen; restarts if it dies
 # /bin/bash prefix on purpose: a repo cloned on Windows, or a file rewritten by
 # `git pull`, can lose the executable bit, and this still runs either way.
-# Edit the path if your username is not `pi` or the repo is elsewhere.
-Exec=/bin/bash /home/pi/THE-RACE/deploy/start_camera.sh
+# ABSOLUTE PATH, and it must match the real checkout — XDG autostart does not
+# expand `~`. See solarrace-hud.desktop for what a stale path here costs: the
+# entry silently never runs. If this repo moves, fix this line first.
+Exec=/bin/bash /home/orna2/Desktop/THE-RACE-main/deploy/start_camera.sh
 Terminal=false
 StartupNotify=false
 X-GNOME-Autostart-enabled=true

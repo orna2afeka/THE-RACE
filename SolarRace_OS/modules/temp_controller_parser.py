@@ -114,18 +114,20 @@ def parse_temp_controller_message(arb_id, data_bytes):
         result["thermistors_enabled_count"] = enabled_byte & 0x7F
         result["thermistors_enabled_fault"] = bool(enabled_byte & 0x80)
     if len(data_bytes) >= 7:
-        # The module's own statement of which ID range it is scanning, zero
-        # based (datasheet bytes 6-7). Published as 1-BASED to match the cell
-        # numbering everything else uses.
+        # WHICH thermistor is hottest and which is coldest (datasheet bytes
+        # 6-7, zero based; published 1-BASED to match the cell numbering
+        # everything else uses).
         #
-        # This is the ground truth for "are we seeing every thermistor?" —
-        # compare it against the ids actually arriving. It is what tells a
-        # gap in the ids apart from a cap or a decode bug on our side, which
-        # is otherwise guesswork: the round-robin simply skips thermistors
-        # that were never loaded (Note #4), so a missing id looks identical
-        # to one we threw away ourselves.
-        result["thermistor_id_high"] = data_bytes[5] + 1
-        result["thermistor_id_low"] = data_bytes[6] + 1
+        # The datasheet calls these "Highest/Lowest thermistor ID on the
+        # module", which reads like the ID RANGE it scans — that is how they
+        # were first decoded here, and the car promptly reported a "range" of
+        # 31..11: inverted, and contradicting the ids actually arriving
+        # (1-13, 21-33). They pair with the two VALUE bytes immediately
+        # before them: byte 2 is the lowest reading and byte 7 is the id it
+        # came from, byte 3 the highest and byte 6 its id. Named for what
+        # they are, so nothing downstream mistakes them for pack geometry.
+        result["thermistor_hottest_id"] = data_bytes[5] + 1
+        result["thermistor_coldest_id"] = data_bytes[6] + 1
     return result
 
 

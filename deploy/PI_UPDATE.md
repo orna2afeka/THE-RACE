@@ -20,12 +20,17 @@ run, so it just starts working after the restart in step 4.
 
 ## 0. Find the repo, and confirm it is the right one
 
-The repo root has been in more than one place on this Pi (`~/THE-RACE`, and a
-`~/Desktop/THE-RACE-main` that itself contains a `THE-RACE-main` directory).
+The repo root has been in more than one place on this Pi. It currently lives at
+`~/Desktop/THE-RACE-main`; it has also been at `~/THE-RACE`, and inside a
+`~/Desktop/THE-RACE-main` that itself contained a `THE-RACE-main` directory.
+That is not a trivia note — the autostart entry spent a long time pointing at
+the wrong one, which silently disabled both the HUD autostart and its
+boot-time `git pull`.
+
 Every command below assumes `$RACE`. Set it once and check it before going on:
 
 ```bash
-RACE=~/THE-RACE                 # <-- adjust if the checkout lives elsewhere
+RACE=~/Desktop/THE-RACE-main                 # <-- adjust if the checkout lives elsewhere
 ls "$RACE/deploy/can-up.service" "$RACE/SolarRace_OS/main.py"
 ```
 
