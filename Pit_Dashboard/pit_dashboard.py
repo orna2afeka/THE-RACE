@@ -69,7 +69,7 @@ from constants import (
     SECTION_NAMES, SECTION_TURN_LABELS, SECTION_RISK, SECTION_COLORS,
     BMS_PROTECTION_BITS, MMS_ERROR_BITS, decode_error_bits,
 )
-from ui import render_metric, render_sector_display
+from ui import render_metric, render_sector_display, _age_text
 # Throttle zone boundaries and pedal calibration, shared with the car so the
 # pit's zone label matches the bar on the driver's HUD.
 #
@@ -235,6 +235,18 @@ def _val(row, key, default=0.0):
     return default if v is None else v
 
 
+def _val_cf(row, known, key, default=None):
+    """Like _val, but falls back to `known` (db.latest_known()'s dict) when the
+    newest row's column is null. Returns (value, device_ts) — device_ts is
+    None for a live reading straight off `row`, and populated only when the
+    value was carried forward, so callers can show its age."""
+    v = _val(row, key, None)
+    if v is not None:
+        return v, None
+    fallback = known.get(key)
+    return fallback if fallback is not None else (default, None)
+
+
 @st.cache_resource(show_spinner=False)
 def _ensure_schema():
     """Create / migrate the schema — ONCE per server process.
@@ -298,8 +310,24 @@ def _live_snapshot():
     conn = db.get_conn()
     try:
         row = db.latest_sample(conn)
+        known = db.latest_known(conn)
     finally:
         conn.close()
+
+    # Carry-forward-eligible fields fall back to `known` (last real value, any
+    # age) when the newest row is null for them; field_ts records the age of
+    # any value that was actually carried forward, keyed by the STATE dict key
+    # (not the db column), so read_live_state can hand it straight to a tile.
+    # Fault flags, instant-diagnostics (solar_sensor_status, lap_source) and
+    # position are deliberately excluded below and keep using plain _val — see
+    # the plan's carry-forward scope table for why each is excluded.
+    field_ts = {}
+
+    def cf(state_key, column, default=None):
+        val, ts = _val_cf(row, known, column, default)
+        if ts is not None:
+            field_ts[state_key] = ts
+        return val
 
     state = {
         # None, not 0, for EVERY metric the car might not have reported. The
@@ -353,57 +381,71 @@ def _live_snapshot():
         "bms_has_error": 0, "bms_error_code": 0, "bms_protections": "",
         "mms_has_error": 0, "mms_error_code": 0, "mms_alerts": "",
     }
-    if row is None:
-        return state, None      # no row, so no device_ts; the wrapper maps it to age=None
-
-    state["soc"] = _val(row, "bms_soc_percent", None)
-    state["voltage"] = _val(row, "bms_voltage_V", None)
-    state["current"] = _val(row, "bms_current_A", None)
+    # Note: everything below runs even when row is None (empty telemetry table,
+    # e.g. right after a history clear) — _val(None, ...) already returns its
+    # default, and _val_cf falls through to `known` the same way, so this is
+    # correct with no special-casing. `known` is empty in that same situation
+    # too, since clear_history deletes last_known alongside telemetry.
+    state["soc"] = cf("soc", "bms_soc_percent")
+    state["voltage"] = cf("voltage", "bms_voltage_V")
+    state["current"] = cf("current", "bms_current_A")
     # How many cell taps the BMS itself reports configured (0x104). The
     # authoritative gate for the individual cell tiles below — see
     # db.BMS_CELL_COLUMN_COUNT for why the column count (30) is a wiring
     # limit, not a live count, and this is the number that actually is.
-    state["bms_string_count"] = _val(row, "bms_string_count", None)
+    state["bms_string_count"] = cf("bms_string_count", "bms_string_count")
     for _i in range(1, db.BMS_CELL_COLUMN_COUNT + 1):
-        state[f"bms_cell_{_i:02d}_V"] = _val(row, f"bms_cell_{_i:02d}_V", None)
-    state["pack_voltage"] = _val(row, "mms_measured_voltage_V", None)
-    state["motor_current"] = _val(row, "mms_current_A", None)
-    state["regen_energy"] = _val(row, "regen_energy", None)
-    state["target_speed_kmh"] = _val(row, "target_speed_kmh", None)
-    state["soc_ctrl"] = _val(row, "mms_estimated_soc_percent", None)
-    state["trip_m"] = _val(row, "mms_trip_m", None)
-    state["batt_temp"] = _val(row, "battery_temp_C", None)
-    state["rpm"] = _val(row, "mms_rpm", None)
-    state["temp"] = _val(row, "mms_temperature_C", None)
-    state["power_w"] = _val(row, "mms_power_W", None)
-    state["motor_temp"] = _val(row, "mms_motor_temp_C", None)
-    state["motor_ohms"] = _val(row, "mms_motor_ohms", None)
-    state["motor_map"] = _val(row, "mms_motor_map", None)
-    state["motor_map_raw"] = _val(row, "mms_motor_map_raw", None)
-    state["throttle_pct"] = _val(row, "mms_throttle_percent", None)
-    state["throttle_mv"] = _val(row, "mms_throttle_mv", None)
-    state["solar_current"] = _val(row, "solar_current_A", None)
+        _cell_key = f"bms_cell_{_i:02d}_V"
+        state[_cell_key] = cf(_cell_key, _cell_key)
+    state["pack_voltage"] = cf("pack_voltage", "mms_measured_voltage_V")
+    state["motor_current"] = cf("motor_current", "mms_current_A")
+    state["regen_energy"] = cf("regen_energy", "regen_energy")
+    state["target_speed_kmh"] = cf("target_speed_kmh", "target_speed_kmh")
+    state["soc_ctrl"] = cf("soc_ctrl", "mms_estimated_soc_percent")
+    state["trip_m"] = cf("trip_m", "mms_trip_m")
+    state["batt_temp"] = cf("batt_temp", "battery_temp_C")
+    state["rpm"] = cf("rpm", "mms_rpm")
+    state["temp"] = cf("temp", "mms_temperature_C")
+    state["power_w"] = cf("power_w", "mms_power_W")
+    state["motor_temp"] = cf("motor_temp", "mms_motor_temp_C")
+    state["motor_ohms"] = cf("motor_ohms", "mms_motor_ohms")
+    state["motor_map"] = cf("motor_map", "mms_motor_map")
+    state["motor_map_raw"] = cf("motor_map_raw", "mms_motor_map_raw")
+    state["throttle_pct"] = cf("throttle_pct", "mms_throttle_percent")
+    state["throttle_mv"] = cf("throttle_mv", "mms_throttle_mv")
+    state["solar_current"] = cf("solar_current", "solar_current_A")
+    # solar_sensor_status is deliberately NOT carried forward — it explains
+    # *why* solar_current is missing right now (night, cloud, unplugged
+    # sensor); a stale reason attached to a live reading would mislead.
     state["solar_status"] = _val(row, "solar_sensor_status", None)
     # Prefer the zone the CAR classified (what the driver's bar actually showed).
     # Fall back to classifying the percentage here only for rows written before
     # the column existed, so historical samples still colour rather than reading
-    # blank — efficiency.zone() is the same function the car ran.
-    state["throttle_zone"] = (_val(row, "mms_throttle_zone", None)
+    # blank — efficiency.zone() is the same function the car ran. Carrying the
+    # raw column forward first means a stale zone still prefers the car's own
+    # past classification over re-deriving from a (now also carried-forward)
+    # throttle_pct.
+    state["throttle_zone"] = (cf("throttle_zone", "mms_throttle_zone")
                               or efficiency.zone(state["throttle_pct"]))
-    state["last_lap_energy"] = _val(row, "last_lap_energy", None)
-    state["total_race_energy"] = _val(row, "total_race_energy", None)
-    state["last_lap_regen_energy"] = _val(row, "last_lap_regen_energy", None)
-    state["stint_energy"] = _val(row, "stint_energy", None)
-    state["stint_regen_energy"] = _val(row, "stint_regen_energy", None)
-    state["last_lap_time_s"] = _val(row, "last_lap_time_s", None)
-    state["lap_distance_m"] = _val(row, "lap_distance_m", None)
+    state["last_lap_energy"] = cf("last_lap_energy", "last_lap_energy")
+    state["total_race_energy"] = cf("total_race_energy", "total_race_energy")
+    state["last_lap_regen_energy"] = cf("last_lap_regen_energy", "last_lap_regen_energy")
+    state["stint_energy"] = cf("stint_energy", "stint_energy")
+    state["stint_regen_energy"] = cf("stint_regen_energy", "stint_regen_energy")
+    state["last_lap_time_s"] = cf("last_lap_time_s", "last_lap_time_s")
+    state["lap_distance_m"] = cf("lap_distance_m", "lap_distance_m")
+    # lap_source is deliberately NOT carried forward — it's only meaningful
+    # paired with the lap that JUST happened, not as a standing fact.
     state["lap_source"] = _val(row, "lap_source", None)
-    auto_lap = _val(row, "calculated_lap", None)
+    auto_lap = cf("auto_lap", "calculated_lap")
     state["auto_lap"] = None if auto_lap is None else int(auto_lap)
-    odometer_m = _val(row, "odometer_m", None)
+    odometer_m = cf("odometer_km", "odometer_m")
     state["odometer_km"] = None if odometer_m is None else odometer_m / 1000.0
-    # NULL lat/lon = the car sent no fix (no GPS, or still searching). Keep the
-    # Zolder fallback for the map centre, but remember it isn't a real position.
+    # Position is deliberately NOT carried forward — confidently drawing the
+    # car at a stale fix is the highest-confidence WRONG signal this dashboard
+    # could produce. NULL lat/lon = the car sent no fix (no GPS, or still
+    # searching); keep the Zolder fallback for the map centre only, and
+    # remember it isn't a real position.
     state["has_gps"] = _val(row, "lat", None) is not None and \
                        _val(row, "lon", None) is not None
     state["lat"] = _val(row, "lat", 50.9895)
@@ -421,7 +463,11 @@ def _live_snapshot():
     # ⚠️ Rows written BEFORE the decode fix hold the raw uncorrected value
     # (~50x too high). They are wrong here, not merely stale. Run the backfill
     # before trusting historical speed — see tools/backfill_columns.py.
-    state["speed_kmh"] = _val(row, "mms_vehicle_speed_kmh", None)
+    state["speed_kmh"] = cf("speed_kmh", "mms_vehicle_speed_kmh")
+    # Fault flags are deliberately NOT carried forward — a stale "no fault"
+    # could mask a fault that started after the last report, and a stale
+    # "fault active" would never clear. The page-level "Not live" banner
+    # already covers a car that's gone quiet.
     state["bms_has_error"] = _val(row, "bms_has_error", 0)
     state["bms_error_code"] = _val(row, "bms_error_code", 0)
     state["bms_protections"] = _val(row, "bms_protections", "")
@@ -429,7 +475,8 @@ def _live_snapshot():
     state["mms_error_code"] = _val(row, "mms_error_code", 0)
     state["mms_alerts"] = _val(row, "mms_alerts", "")
 
-    return state, row["device_ts"]
+    state["_field_ts"] = field_ts
+    return state, (row["device_ts"] if row is not None else None)
 
 
 # -- Pit command acknowledgements ----------------------------------------- #
@@ -478,9 +525,18 @@ def read_live_state():
     A thin wrapper so every existing call site is unchanged: the SQLite read
     behind it is cached for LIVE_CACHE_S, but the age is recomputed on every
     single call. See _live_snapshot for why that division matters.
+
+    Also stamps state["_field_ages"]: {state_key: age_seconds} for every field
+    that was carried forward from last_known (see _live_snapshot's `field_ts`).
+    Computed fresh here rather than cached alongside field_ts for the same
+    reason `age` itself is — caching an age freezes it for the whole TTL, and
+    a carried-forward critical reading is exactly the case where a frozen "3s
+    old" caption would be actively misleading 40 minutes later.
     """
     state, device_ts = _live_snapshot()
-    age = (time.time() - device_ts) if device_ts else None
+    now = time.time()
+    age = (now - device_ts) if device_ts else None
+    state["_field_ages"] = {k: (now - ts) for k, ts in state.get("_field_ts", {}).items()}
     return state, age
 
 
@@ -743,24 +799,6 @@ def fmt(value, spec=".0f", missing=None):
         return str(value)
 
 
-def _age_text(seconds):
-    """Data age in units a human reads at a glance.
-
-    "Stale · 77585s ago" is a number you have to do arithmetic on before you know
-    whether to worry; "21h 33m ago" is not."""
-    seconds = int(seconds)
-    if seconds < 90:
-        return f"{seconds}s"
-    minutes, sec = divmod(seconds, 60)
-    if minutes < 60:
-        return f"{minutes}m {sec}s"
-    hours, minutes = divmod(minutes, 60)
-    if hours < 24:
-        return f"{hours}h {minutes}m"
-    days, hours = divmod(hours, 24)
-    return f"{days}d {hours}h"
-
-
 # ============================================================================
 # FRAGMENTS
 # Two cadences: live numbers refresh fast (2s); the heavy history / weather /
@@ -928,8 +966,10 @@ def _top_strip_fragment():
             unsafe_allow_html=True)
 
     soc, temp, batt_temp = state["soc"], state["temp"], state["batt_temp"]
+    ages = state.get("_field_ages", {})
     c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
-    render_metric(c1, "Speed", fmt(state["speed_kmh"], ".1f"), "KM/H")
+    render_metric(c1, "Speed", fmt(state["speed_kmh"], ".1f"), "KM/H",
+                  stale_s=ages.get("speed_kmh"))
 
     # Motor PT1000 — the converted °C is the headline, with the raw Ω beside it
     # so the pit can see the measurement the temperature came from (and tell a
@@ -940,16 +980,18 @@ def _top_strip_fragment():
         # No conversion: show the raw Ω if we have one, so a stuck/out-of-range
         # sensor is visible rather than silently absent.
         render_metric(c2, "Motor Temp", "—",
-                      ohms_txt.lstrip(" ·") or "no sensor data")
+                      ohms_txt.lstrip(" ·") or "no sensor data",
+                      stale_s=ages.get("motor_ohms"))
     else:
         motor_cond = classify(motor_temp, MOTOR_TEMP)
         render_metric(c2, "Motor Temp", f"{motor_temp:.1f}",
-                      f"°C{ohms_txt}", motor_cond)
+                      f"°C{ohms_txt}", motor_cond,
+                      stale_s=ages.get("motor_temp"))
 
     # Byte 4 of the same frame — the controller's own temperature. Previously
     # mislabelled "Motor Temp" here, back when the motor had no sensor of its own.
     render_metric(c3, "Controller Temp", fmt(temp), "°C",
-                  classify(temp, CTRL_TEMP))
+                  classify(temp, CTRL_TEMP), stale_s=ages.get("temp"))
     # SoC is inverted — LOW is the dangerous end, which limits.SOC expresses as
     # low_side=True. Unknown stays neutral either way: an absent reading is not
     # evidence of a healthy pack, and not evidence of a flat one either.
@@ -957,14 +999,18 @@ def _top_strip_fragment():
     # This used to be a bare `soc < 20 -> critical` with nothing in between, so
     # the pack went from green straight to red. It now has the amber tier the
     # driver HUD also gained.
-    render_metric(c4, "Battery SoC", fmt(soc), "%", classify(soc, SOC))
+    render_metric(c4, "Battery SoC", fmt(soc), "%", classify(soc, SOC),
+                  stale_s=ages.get("soc"))
     render_metric(c5, "Battery Temp", fmt(batt_temp), "°C",
-                  classify(batt_temp, CELL_TEMP))
+                  classify(batt_temp, CELL_TEMP), stale_s=ages.get("batt_temp"))
     # Power was the one tile with no tier at all. Regen is negative and so never
     # trips a high-side threshold, which is what we want: recovering energy is
     # not a fault.
     render_metric(c6, "Power Out", fmt(state["power_w"]), "W",
-                  classify(state["power_w"], POWER))
+                  classify(state["power_w"], POWER), stale_s=ages.get("power_w"))
+    # Lap Dist is c["current_lap_dist_m"], a synthetic figure (position-derived
+    # modulo, deliberately fabricated to 0.0 when unknown rather than left
+    # null) — not a direct carry-forward field, so no stale_s here.
     render_metric(c7, "Lap Dist", fmt(c["current_lap_dist_m"]), "m")
 
     # ── Second row: per-lap analytics ─────────────────────────────────────── #
@@ -980,11 +1026,12 @@ def _top_strip_fragment():
     # "odometer" means the GPS trigger missed and the distance backstop fired.
     src_note = "" if src in (None, "gps", "manual") else f" · {src}"
     render_metric(l1, "Last Lap Time", format_lap_time(lap_time),
-                  f"m:ss{src_note}")
+                  f"m:ss{src_note}", stale_s=ages.get("last_lap_time_s"))
 
     lap_wh = state["last_lap_energy"]
     render_metric(l2, "Last Lap Energy",
-                  "—" if lap_wh is None else f"{lap_wh:.1f}", "Wh")
+                  "—" if lap_wh is None else f"{lap_wh:.1f}", "Wh",
+                  stale_s=ages.get("last_lap_energy"))
 
     total_wh = state["total_race_energy"]
     # One decimal, matching Last Lap Energy and the Excel export — with a whole
@@ -992,7 +1039,8 @@ def _top_strip_fragment():
     # under regen. Net of regen and motor-side only (excludes controller losses
     # and auxiliaries), so it reads lower than what actually left the pack.
     render_metric(l3, "Total Race Energy",
-                  "—" if total_wh is None else f"{total_wh:.1f}", "Wh net")
+                  "—" if total_wh is None else f"{total_wh:.1f}", "Wh net",
+                  stale_s=ages.get("total_race_energy"))
 
 
 # ── Live GPS map ──────────────────────────────────────────────────────────── #
@@ -1188,9 +1236,9 @@ def _relative_regen(regen_wh, total_wh):
 LIVE_METRIC_GROUPS = [
     ("Motion", [
         dict(label="Speed", unit="km/h", spec=".1f", limit=SPEED,
-             get=lambda s, c: s["speed_kmh"]),
+             field="speed_kmh", get=lambda s, c: s["speed_kmh"]),
         dict(label="Target Speed", unit="km/h", spec=".1f",
-             get=lambda s, c: s["target_speed_kmh"],
+             field="target_speed_kmh", get=lambda s, c: s["target_speed_kmh"],
              note="from the active velocity profile"),
         # Deliberately uncoloured. The HUD colours the equivalent readout against
         # a symmetric +/-5 km/h tolerance, which is a band rather than a
@@ -1203,25 +1251,25 @@ LIVE_METRIC_GROUPS = [
                                else s["speed_kmh"] - s["target_speed_kmh"]),
              note="actual minus target"),
         dict(label="Motor RPM", unit="rpm", spec=".0f",
-             get=lambda s, c: s["rpm"]),
+             field="rpm", get=lambda s, c: s["rpm"]),
     ]),
     ("Motor", [
         dict(label="Motor Power", unit="W", spec=".0f", limit=POWER,
-             get=lambda s, c: s["power_w"],
+             field="power_w", get=lambda s, c: s["power_w"],
              note="negative = regen"),
         dict(label="Motor Temp", unit="\u00b0C", spec=".1f", limit=MOTOR_TEMP,
-             get=lambda s, c: s["motor_temp"]),
+             field="motor_temp", get=lambda s, c: s["motor_temp"]),
         # Its own tile here, where the strip above only appends it to the motor
         # temperature. The raw resistance is what separates a genuinely hot
         # motor from a failing PT1000.
         dict(label="Motor Sensor", unit="\u03a9", spec=".1f",
-             get=lambda s, c: s["motor_ohms"],
+             field="motor_ohms", get=lambda s, c: s["motor_ohms"],
              note="raw PT1000; the temp is derived from this"),
         dict(label="Motor Current", unit="A", spec=".1f", limit=MOTOR_CURRENT,
-             mag=True, get=lambda s, c: s["motor_current"],
+             mag=True, field="motor_current", get=lambda s, c: s["motor_current"],
              note="amber only; high current is normal"),
         dict(label="Power Map", unit="", text=True,
-             get=lambda s, c: s["motor_map"]),
+             field="motor_map", get=lambda s, c: s["motor_map"]),
     ]),
     # ── Driver input ─────────────────────────────────────────────────────── #
     # Its own group rather than an entry under "Motor", because this is the one
@@ -1234,9 +1282,10 @@ LIVE_METRIC_GROUPS = [
         # note instead, where it reads as the coaching cue it is. See the
         # docstring in efficiency.py for why the two vocabularies stay apart.
         dict(label="Throttle", unit="%", spec=".0f",
-             get=lambda s, c: s["throttle_pct"],
+             field="throttle_pct", get=lambda s, c: s["throttle_pct"],
              note="pedal position - see zone below"),
         dict(label="Efficiency Zone", unit="", text=True,
+             field="throttle_zone",
              get=lambda s, c: (None if s["throttle_zone"] is None else
                                efficiency.ZONE_LABELS.get(s["throttle_zone"],
                                                           s["throttle_zone"])),
@@ -1249,18 +1298,18 @@ LIVE_METRIC_GROUPS = [
         # sensor, and a throttle stuck at "-" with a plausible mV here means
         # the calibration is wrong, not the wiring.
         dict(label="Throttle Raw", unit="mV", spec=".0f",
-             get=lambda s, c: s["throttle_mv"],
+             field="throttle_mv", get=lambda s, c: s["throttle_mv"],
              note="calibrate efficiency.py from this"),
     ]),
     ("Controller", [
         dict(label="Controller Temp", unit="\u00b0C", spec=".1f", limit=CTRL_TEMP,
-             get=lambda s, c: s["temp"]),
+             field="temp", get=lambda s, c: s["temp"]),
     ]),
     ("Battery", [
         dict(label="Battery SoC", unit="%", spec=".0f", limit=SOC,
-             get=lambda s, c: s["soc"], note="BMS coulomb count"),
+             field="soc", get=lambda s, c: s["soc"], note="BMS coulomb count"),
         dict(label="Pack Voltage", unit="V", spec=".2f", limit=PACK_VOLTAGE,
-             get=lambda s, c: s["pack_voltage"],
+             field="pack_voltage", get=lambda s, c: s["pack_voltage"],
              note="controller measurement - the one to trust"),
         # Kept beside the controller's figure so the two can be compared at a
         # glance. This decode WAS wrong - it read 2.25x high - and was fixed on
@@ -1272,13 +1321,14 @@ LIVE_METRIC_GROUPS = [
         # but 82 % of the stored history predates the fix, so the History tab's
         # BMS-voltage trace is still 2.25x high over most of its range.
         dict(label="Pack Voltage (BMS)", unit="V", spec=".2f",
-             get=lambda s, c: s["voltage"],
+             field="voltage", get=lambda s, c: s["voltage"],
              note="agrees since 2026-08-20 12:12; older history reads 2.25x high"),
         dict(label="Battery Current", unit="A", spec=".1f", limit=BATT_CURRENT,
-             mag=True, get=lambda s, c: s["current"],
+             mag=True, field="current", get=lambda s, c: s["current"],
              note="negative = discharge"),
         dict(label="Battery Temp", unit="\u00b0C", spec=".1f", limit=CELL_TEMP,
-             get=lambda s, c: s["batt_temp"], note="hottest cell in the pack"),
+             field="batt_temp", get=lambda s, c: s["batt_temp"],
+             note="hottest cell in the pack"),
         # ---- Solar input ------------------------------------------------- #
         # In the Battery group because that is where this current GOES; it is
         # the only inbound number on the page. Uncoloured (limits.SOLAR_CURRENT
@@ -1287,7 +1337,7 @@ LIVE_METRIC_GROUPS = [
         # The sign is shown, not abs()'d: negative means the Yocto-Amp's
         # terminals are reversed, and that has to be visible.
         dict(label="Solar Current", unit="A", spec="+.2f", limit=SOLAR_CURRENT,
-             get=lambda s, c: s["solar_current"],
+             field="solar_current", get=lambda s, c: s["solar_current"],
              note="MPPT into the pack; Yocto-Amp, 10 A max"),
         # The sensor's own health, as text. This is what separates "the array is
         # making nothing" from "the USB cable fell out" — the same blank
@@ -1299,16 +1349,16 @@ LIVE_METRIC_GROUPS = [
         # all 44,088 recorded samples, so an empty tile here is the evidence that
         # the controller never populates the field.
         dict(label="SoC (controller est.)", unit="%", spec=".0f",
-             get=lambda s, c: s["soc_ctrl"],
+             field="soc_ctrl", get=lambda s, c: s["soc_ctrl"],
              note="unimplemented on this controller - always 0"),
     ]),
     ("Energy", [
         # Whole race, never re-datumed.
         dict(label="Total Race Energy", unit="Wh", spec=".0f",
-             get=lambda s, c: s["total_race_energy"],
+             field="total_race_energy", get=lambda s, c: s["total_race_energy"],
              note="integrated on the car, net of regen"),
         dict(label="Total Regen Energy", unit="Wh", spec=".0f",
-             get=lambda s, c: s["regen_energy"],
+             field="regen_energy", get=lambda s, c: s["regen_energy"],
              note="recovered under braking, whole race"),
         dict(label="Total Relative Regen", unit="%", spec=".1f",
              get=lambda s, c: _relative_regen(s["regen_energy"],
@@ -1319,10 +1369,10 @@ LIVE_METRIC_GROUPS = [
         # lap_tracker.mark_stint_start(). Reads the same as the Total tiles
         # above until the car has been through its first charging stop.
         dict(label="Current Stint Energy", unit="Wh", spec=".1f",
-             get=lambda s, c: s["stint_energy"],
+             field="stint_energy", get=lambda s, c: s["stint_energy"],
              note="since the last detected charging stop"),
         dict(label="Current Stint Regen Energy", unit="Wh", spec=".1f",
-             get=lambda s, c: s["stint_regen_energy"],
+             field="stint_regen_energy", get=lambda s, c: s["stint_regen_energy"],
              note="since the last detected charging stop"),
         dict(label="Current Stint Relative Regen", unit="%", spec=".1f",
              get=lambda s, c: _relative_regen(s["stint_regen_energy"],
@@ -1332,8 +1382,9 @@ LIVE_METRIC_GROUPS = [
         # in lap_tracker.py for why that is what makes this survive a dropped
         # link instead of needing the two samples either side of a boundary.
         dict(label="Last Lap Energy", unit="Wh", spec=".1f",
-             get=lambda s, c: s["last_lap_energy"]),
+             field="last_lap_energy", get=lambda s, c: s["last_lap_energy"]),
         dict(label="Last Lap Regen Energy", unit="Wh", spec=".1f",
+             field="last_lap_regen_energy",
              get=lambda s, c: s["last_lap_regen_energy"]),
         dict(label="Last Lap Relative Regen", unit="%", spec=".1f",
              get=lambda s, c: _relative_regen(s["last_lap_regen_energy"],
@@ -1346,12 +1397,13 @@ LIVE_METRIC_GROUPS = [
         dict(label="Lap Distance", unit="m", spec=".0f",
              get=lambda s, c: c["current_lap_dist_m"]),
         dict(label="Last Lap Time", unit="", text=True,
+             field="last_lap_time_s",
              get=lambda s, c: (None if s["last_lap_time_s"] is None
                                else format_lap_time(s["last_lap_time_s"]))),
         dict(label="Odometer", unit="km", spec=".2f",
-             get=lambda s, c: c["odometer_km"]),
+             field="odometer_km", get=lambda s, c: c["odometer_km"]),
         dict(label="Trip", unit="m", spec=".0f",
-             get=lambda s, c: s["trip_m"],
+             field="trip_m", get=lambda s, c: s["trip_m"],
              note="controller trip counter"),
         dict(label="Lap Source", unit="", text=True,
              get=lambda s, c: s["lap_source"],
@@ -1412,13 +1464,15 @@ def _cell_value(state, i):
 
 
 def _render_cell_row(cols_n, indices, state, label_fmt):
+    ages = state.get("_field_ages", {})
     for row_start in range(0, len(indices), cols_n):
         chunk = indices[row_start:row_start + cols_n]
         cols = st.columns(cols_n)
         for col, i in zip(cols, chunk):
             v = _cell_value(state, i)
             render_metric(col, label_fmt(i), fmt(v, ".3f"), "V",
-                         classify(v, CELL_VOLTAGE))
+                         classify(v, CELL_VOLTAGE),
+                         stale_s=ages.get(f"bms_cell_{i:02d}_V"))
 
 
 def render_cell_voltages(state):
@@ -1477,23 +1531,33 @@ def _render_live_metric(col, m, state, ctx):
     """One large tile from a LIVE_METRIC_GROUPS entry."""
     value = m["get"](state, ctx)
     note = m.get("note")
+    # Only set on carry-forward-eligible entries (see the `field=` tags in
+    # LIVE_METRIC_GROUPS) — a stale/never-reported field naturally has nothing
+    # in _field_ages, so stale_s is None and render_metric shows no caption.
+    stale_s = state.get("_field_ages", {}).get(m.get("field"))
 
     if m.get("text"):
         # Strings carry no tier: there is nothing to compare them against.
         render_metric(col, m["label"], value or MISSING_TEXT, m.get("unit", ""),
-                      large=True, note=note)
-        return
+                      large=True, note=note, stale_s=stale_s)
+    else:
+        limit = m.get("limit")
+        condition = NORMAL
+        if limit is not None:
+            # Colour on the magnitude where the threshold is about magnitude,
+            # but still DISPLAY the signed value below - losing the sign would
+            # hide regen entirely.
+            judged = abs(value) if (m.get("mag") and value is not None) else value
+            condition = classify(judged, limit)
+        render_metric(col, m["label"], fmt(value, m.get("spec", ".0f")),
+                      m["unit"], condition, large=True, note=note, stale_s=stale_s)
 
-    limit = m.get("limit")
-    condition = NORMAL
-    if limit is not None:
-        # Colour on the magnitude where the threshold is about magnitude, but
-        # still DISPLAY the signed value below - losing the sign would hide
-        # regen entirely.
-        judged = abs(value) if (m.get("mag") and value is not None) else value
-        condition = classify(judged, limit)
-    render_metric(col, m["label"], fmt(value, m.get("spec", ".0f")),
-                  m["unit"], condition, large=True, note=note)
+    # The one write control on this whole read-only page. Placed here, right
+    # under the Trip tile specifically (`with col:`), rather than in the
+    # sidebar with Cut Lap -- see render_trip_reset_panel's docstring.
+    if m.get("field") == "trip_m":
+        with col:
+            render_trip_reset_panel()
 
 
 @st.fragment(run_every=2)
@@ -1540,6 +1604,16 @@ def _live_metrics_fragment():
 def _driver_fragment():
     """Driver Telemetry tab — track position + live GPS map. Updates in place."""
     c = _live_context()
+    if not c["fresh"]:
+        # Position (lat/lon/has_gps) is deliberately NOT carried forward — see
+        # _live_snapshot — so unlike the Live Metrics / Cell Voltages tabs,
+        # which can show an old-but-labelled number, this tab would otherwise
+        # keep drawing the car at its last real fix with no indication it's
+        # stopped moving. This is the only warning this tab gets.
+        st.warning(f":material/warning: Not live — track position and the GPS "
+                  f"map are from the last sample received, "
+                  f"{_age_text(c['age'])} ago." if c['age'] is not None else
+                  ":material/warning: Not live — no telemetry received yet.")
     st.markdown("### :material/sports_score: Track Position")
     st.markdown(render_sector_display(c["track_status"], c["current_lap_dist_m"],
                                       c["current_sector_id"]), unsafe_allow_html=True)
@@ -2601,6 +2675,69 @@ def render_cut_lap_panel():
             st.sidebar.button("Check again", key="cut_lap_ack_recheck",
                               on_click=lambda: st.session_state.update(
                                   cut_lap_at=time.time(), cut_lap_ack=None))
+
+
+def render_trip_reset_panel():
+    """Ask the CAR to zero its own tracked distance total (state["trip_m"] /
+    lap_tracker.odometer_m). Called from _render_live_metric, `with col:`, so
+    it renders directly under the Trip tile in the Live Metrics grid rather
+    than in the sidebar like Cut Lap -- "under the Trip tile" is literally
+    where this control was asked for. Uses bare st.* calls (not st.sidebar.*)
+    for that reason.
+
+    Distinct from Cut Lap: doesn't touch lap counting or energy. Also does NOT
+    reset the controller's own hardware TRIP register (0x620) -- there is no
+    documented CAN command for that; see lap_tracker.reset_trip()'s docstring.
+    This only re-datums the car's OWN running total, the same way
+    reset_energy (car-side plumbing only, no pit button yet) only re-datums
+    energy.
+
+    Shares /lap_command + /lap_command_ack with Cut Lap/Set Lap/Reset Energy
+    (see driver_message.send_trip_reset(), main.py's _apply_lap_commands), so
+    the ack read below filters on action == "reset_trip" -- otherwise a Cut
+    Lap ack landing on the same node in between could be mistaken for this
+    command's own confirmation.
+    """
+    import driver_message  # lazy import: keep FB-write deps out of app startup
+
+    st.caption("Zeroes the car's own tracked Trip/Odometer total. Does not "
+              "touch lap count or energy.")
+    if st.button(":material/restart_alt: RESET TRIP", width="stretch",
+                key="trip_reset_btn"):
+        try:
+            driver_message.send_trip_reset()
+            st.session_state.trip_reset_last = time.strftime("%H:%M:%S")
+            st.session_state.trip_reset_at = time.time()   # restart the ack window
+            st.session_state.trip_reset_ack = None
+            st.toast("Trip Reset sent to the car", icon=":material/check_circle:")
+        except Exception as e:
+            st.toast("Trip Reset failed", icon=":material/error:")
+            st.error(f"Trip Reset failed: {e}")
+
+    sent = st.session_state.get("trip_reset_last")
+    if sent:
+        sent_at = st.session_state.get("trip_reset_at", 0.0)
+        ack = st.session_state.get("trip_reset_ack")
+        polling = _ack_polling(sent_at, ack)
+        if polling:
+            candidate = _cached_lap_ack(sent_at)
+            if (isinstance(candidate, dict) and candidate.get("applied")
+                    and candidate.get("action") == "reset_trip"):
+                ack = candidate
+                st.session_state.trip_reset_ack = ack
+
+        if isinstance(ack, dict) and ack.get("applied"):
+            st.caption(f":material/check_circle: Car confirmed — trip reset "
+                      f"· sent {sent}")
+        elif polling:
+            st.caption(f":material/schedule: Sent {sent} — awaiting the "
+                      "car's confirmation.")
+        else:
+            st.caption(f":material/schedule: Sent {sent} — no confirmation "
+                      f"within {ACK_POLL_WINDOW_S}s. It may still have landed.")
+            st.button("Check again", key="trip_reset_ack_recheck",
+                      on_click=lambda: st.session_state.update(
+                          trip_reset_at=time.time(), trip_reset_ack=None))
 
 
 def render_driver_message_panel():

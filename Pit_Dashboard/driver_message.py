@@ -118,6 +118,18 @@ def send_lap_cut() -> dict:
     return send_lap_command("cut_lap")
 
 
+def send_trip_reset() -> dict:
+    """Ask the car to zero its OWN tracked distance total (state["trip_m"] /
+    lap_tracker.odometer_m) -- not lap count, not energy, and not the
+    controller's own hardware TRIP register (0x620), for which there is no
+    documented CAN reset command. See lap_tracker.LapTracker.reset_trip().
+
+    Shares /lap_command and /lap_command_ack with send_lap_cut() -- same node,
+    same idempotency gates, same ack shape (with action="reset_trip" so the
+    pit can tell this ack apart from a Cut Lap ack landing in between)."""
+    return send_lap_command("reset_trip")
+
+
 def read_lap_ack():
     """The car's acknowledgement of the last lap command, or None.
 

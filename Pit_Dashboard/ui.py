@@ -9,7 +9,31 @@ from constants import (
     NORMAL,
     WARNING,
     CRITICAL,
+    DATA_STALE_AFTER_S,
 )
+
+
+def _age_text(seconds):
+    """Data age in units a human reads at a glance.
+
+    "Stale · 77585s ago" is a number you have to do arithmetic on before you
+    know whether to worry; "21h 33m ago" is not.
+
+    Lives here (not in pit_dashboard.py, where it originated) so render_metric
+    can use it for a carried-forward field's age caption without an import
+    cycle -- pit_dashboard.py imports FROM ui, not the other way round. Other
+    call sites now import it from here instead of keeping a second copy."""
+    seconds = int(seconds)
+    if seconds < 90:
+        return f"{seconds}s"
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {sec}s"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h {minutes}m"
+    days, hours = divmod(hours, 24)
+    return f"{days}d {hours}h"
 
 # Sharp inline-SVG glyphs for the sector card (raw HTML can't use Streamlit's
 # native :material/…: icons). `currentColor` makes each inherit its span's color,
@@ -24,7 +48,7 @@ _SVG_BOLT = (
 )
 
 def render_metric(col, title, val, unit, condition=NORMAL, large=False,
-                  note=None):
+                  note=None, stale_s=None):
     """One tile. `condition` is a tier from limits.classify().
 
     Until now this function existed twice, byte-identical, here and in
@@ -38,6 +62,17 @@ def render_metric(col, title, val, unit, condition=NORMAL, large=False,
     `note` is a small line under the value, for a reading that needs a caveat
     attached to it wherever it appears -- the BMS pack voltage is known to
     decode about 2.3x high, and a number like that must never be shown bare.
+
+    `stale_s`, when given, is how old a CARRIED-FORWARD value is (seconds) --
+    i.e. the newest sample was null for this field and it fell back to
+    last_known. Only actually shown once it exceeds DATA_STALE_AFTER_S (a
+    value that's merely a couple seconds old from normal carry-forward jitter
+    isn't worth a caption). Deliberately does NOT touch `condition`/the tier
+    colour: a genuinely critical carried-forward reading must stay exactly as
+    alarming as a live one, never muted to grey, which would read as "this
+    isn't urgent" -- precisely backwards for an old critical number. Staleness
+    is presentation, added here as an age caption + a de-emphasized class on
+    the container, not physics -- classify() itself never sees it.
     """
     # An unrecognised tier deliberately falls through to no class rather than
     # raising: a tile with the default colour is a far better failure than a
@@ -45,6 +80,11 @@ def render_metric(col, title, val, unit, condition=NORMAL, large=False,
     color_class = condition if condition in (WARNING, CRITICAL) else ""
     size_class = " large" if large else ""
     unit_px = 22 if large else 16
+    stale = stale_s is not None and stale_s > DATA_STALE_AFTER_S
+    if stale:
+        size_class += " stale-carried"
+        age_caption = f"· {_age_text(stale_s)} ago"
+        note = f"{note} {age_caption}" if note else age_caption
     note_html = (f'<div class="metric-note">{note}</div>' if note else "")
     col.markdown(f"""
     <div class="metric-container{size_class}">

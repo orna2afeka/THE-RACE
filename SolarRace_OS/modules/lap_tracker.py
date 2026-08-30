@@ -414,6 +414,23 @@ class LapTracker:
         self.last_lap_energy_wh = None
         self.last_lap_regen_energy_wh = None
 
+    def reset_trip(self):
+        """Zero our own tracked distance totals without disturbing laps or energy.
+
+        Does NOT reset the controller's own hardware TRIP counter (0x620) --
+        there's no documented CAN command for that; see lap_command.py's
+        reset_trip action and driver_message.send_trip_reset(). This only
+        re-datums OUR running total, the same way reset_energy() only zeroes
+        our own energy totals.
+
+        _last_trip_m = None so the next real TRIP frame re-datums cleanly
+        (self._last_trip_m is None, see update_odometer) instead of computing
+        a bogus multi-hundred-km delta against the pre-reset value."""
+        self.odometer_m = 0.0
+        self._lap_start_odometer_m = 0.0
+        self._last_trip_m = None
+        self.last_lap_distance_m = None
+
     def mark_stint_start(self):
         """Re-datum 'current stint' to start counting from right now.
 

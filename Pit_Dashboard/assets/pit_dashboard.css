@@ -38,6 +38,16 @@
 	font-style: italic;
 }
 
+/* A reading carried forward from last_known because the newest sample was
+   null for this field -- render_metric's stale_s parameter. De-emphasizes
+   the CONTAINER only (dashed border, slight fade). Deliberately does NOT
+   touch .metric-value's colour classes below: a critical carried-forward
+   reading must stay exactly as alarming as a live one. */
+.metric-container.stale-carried {
+	border-style: dashed;
+	opacity: 0.85;
+}
+
 /* Tier colours come from limits.TIER_COLOURS, injected as CSS variables by
    apply_theme() so the pit renders a breach in the same colour the driver sees.
    The literals are FALLBACKS: if injection ever fails the tiles degrade to the

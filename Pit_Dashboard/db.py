@@ -232,6 +232,22 @@ CREATE TABLE IF NOT EXISTS app_state (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+
+-- The last known-non-null value of every metric, per device. Separate from
+-- telemetry on purpose: telemetry keeps real NULLs/gaps for History, Export
+-- and fault-episode detection, while the live view falls back to this table
+-- so a tile never blanks out just because the newest row happens to be NULL
+-- for that one field. Narrow/long (not a wide table mirroring METRIC_COLUMNS)
+-- so a newly-added metric needs no schema migration -- it just starts getting
+-- rows here the first time it's non-null.
+CREATE TABLE IF NOT EXISTS last_known (
+    device_id   TEXT NOT NULL,
+    metric      TEXT NOT NULL,
+    value_num   REAL,
+    value_text  TEXT,
+    device_ts   REAL NOT NULL,
+    PRIMARY KEY (device_id, metric)
+);
 """
 
 
@@ -503,6 +519,39 @@ _INSERT_SQL = (
     f"VALUES ({', '.join(':' + c for c in _COLUMNS)})"
 )
 
+_LAST_KNOWN_SQL = (
+    "INSERT INTO last_known (device_id, metric, value_num, value_text, device_ts) "
+    "VALUES (:device_id, :metric, :value_num, :value_text, :device_ts) "
+    "ON CONFLICT(device_id, metric) DO UPDATE SET "
+    "value_num = excluded.value_num, value_text = excluded.value_text, "
+    "device_ts = excluded.device_ts "
+    "WHERE excluded.device_ts > last_known.device_ts"
+)
+
+
+def _last_known_rows(row: dict):
+    """Expand one flattened telemetry row into its non-null (metric, value)
+    pairs for the last_known upsert. Skipped entirely if the row has no
+    device_ts -- there is nothing to order a carry-forward against."""
+    ts = row.get("device_ts")
+    if ts is None:
+        return []
+    device_id = row["device_id"]
+    out = []
+    for col in EXPORT_COLUMNS:
+        val = row.get(col)
+        if val is None:
+            continue
+        is_text = _COL_TYPES[col] == "TEXT"
+        out.append({
+            "device_id": device_id,
+            "metric": col,
+            "value_num": None if is_text else val,
+            "value_text": val if is_text else None,
+            "device_ts": ts,
+        })
+    return out
+
 
 def upsert_many(conn: sqlite3.Connection, items, ingested_ts: float,
                 device_id: str = DEVICE_ID) -> int:
@@ -527,8 +576,29 @@ def upsert_many(conn: sqlite3.Connection, items, ingested_ts: float,
 
     before = conn.total_changes
     conn.executemany(_INSERT_SQL, rows)
+
+    last_known_rows = [lk for row in rows for lk in _last_known_rows(row)]
+    if last_known_rows:
+        conn.executemany(_LAST_KNOWN_SQL, last_known_rows)
+
     conn.commit()
     return conn.total_changes - before
+
+
+def latest_known(conn: sqlite3.Connection, device_id: str = DEVICE_ID) -> dict:
+    """{metric: (value, device_ts)} for every metric ever reported non-null by
+    this device. At most ~73 rows, a primary-key range scan, so cost is
+    independent of how large telemetry itself has grown."""
+    rows = conn.execute(
+        "SELECT metric, value_num, value_text, device_ts FROM last_known "
+        "WHERE device_id = ?",
+        (device_id,),
+    ).fetchall()
+    out = {}
+    for r in rows:
+        value = r["value_text"] if r["value_text"] is not None else r["value_num"]
+        out[r["metric"]] = (value, r["device_ts"])
+    return out
 
 
 def get_last_key(conn: sqlite3.Connection):
@@ -568,9 +638,12 @@ def clear_history(conn: sqlite3.Connection, device_id: str = DEVICE_ID) -> int:
 
     Records the current stream position first so the collector picks up from the
     live tail afterwards rather than re-downloading the whole RTDB history. The
-    race-clock state in app_state is left untouched."""
+    race-clock state in app_state is left untouched. Also clears last_known for
+    the device, so a fresh race doesn't carry forward values from the last
+    one."""
     save_cursor(conn, get_last_key(conn))
     cur = conn.execute("DELETE FROM telemetry WHERE device_id = ?", (device_id,))
+    conn.execute("DELETE FROM last_known WHERE device_id = ?", (device_id,))
     conn.commit()
     return cur.rowcount
 

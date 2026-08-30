@@ -25,6 +25,15 @@ REACT_MIGRATION_PROMPT.md
 **/*.bak
 
 # ---------------------------------------------------------------------------
+# Car-side runtime state
+# ---------------------------------------------------------------------------
+# main.py writes this on the Pi so a reboot mid-race resumes the running
+# distance/energy totals instead of restarting from zero. Local state, not
+# source: never commit it, same reasoning as telemetry.db above.
+SolarRace_OS/lap_checkpoint.json
+SolarRace_OS/lap_checkpoint.json.tmp
+
+# ---------------------------------------------------------------------------
 # Launcher / runtime bookkeeping
 # ---------------------------------------------------------------------------
 # Hash of the last requirements file run_pit.bat pip-installed.

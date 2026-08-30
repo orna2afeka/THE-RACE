@@ -51,7 +51,7 @@ MAX_COMMAND_AGE_S = 30.0
 # (no RTC, no NTP), so any age comparison would be meaningless.
 _PLAUSIBLE_EPOCH = 1_700_000_000
 
-VALID_ACTIONS = ("cut_lap", "set_lap", "reset_energy")
+VALID_ACTIONS = ("cut_lap", "set_lap", "reset_energy", "reset_trip")
 
 # The strategy selector uses the same machinery on its own node — see
 # CommandInbox below and firebase_client.STRATEGY_COMMAND_PATH.

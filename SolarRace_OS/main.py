@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # dashboard also imports, so both ends of the telemetry link agree.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import time
+import json
 import struct
 import can
 import signal
@@ -137,6 +138,29 @@ GPS_PUBLISH_INTERVAL_S = 0.5
 # purpose — see _sample_lap_gps.
 LAP_GPS_SAMPLE_INTERVAL_S = 0.1
 
+# --- Lap-tracker reboot persistence ----------------------------------------- #
+# LapTracker.state_dict()/.restore() exist so a Pi reboot mid-race doesn't
+# throw away the running distance/energy totals -- but until this, nothing
+# ever called them: every restart genuinely started odometer_m and the energy
+# totals from zero while the motor controller's own hardware TRIP counter
+# (mms_trip_m) kept counting underneath it, unaffected. That mismatch is
+# exactly what showed up as a tiny "Odometer" beside a much larger "Trip" on
+# the pit dashboard.
+#
+# Stored next to main.py (not the repo root, not inside modules/) so it reads
+# as what it is: this Pi's own runtime state, the same way
+# Pit_Dashboard/telemetry.db is that machine's runtime state -- both are
+# gitignored for the same reason.
+LAP_CHECKPOINT_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "lap_checkpoint.json")
+
+# Written on the CAN worker thread inside the read loop (same as _publish_gps
+# below), so a value this small is cheap: it's a stat + a small JSON dump, not
+# something worth measuring against a tick this frequent. 15 s bounds how much
+# gets lost to a crash (as opposed to a clean quit, which saves unconditionally
+# in _teardown) without meaningfully wearing an SD card over a 24 h race.
+LAP_CHECKPOINT_INTERVAL_S = 15.0
+
 # How often the brake/lights switches are read. 5 Hz is instant to a human eye
 # and costs nothing; gpiozero debounces the contacts for us.
 VEHICLE_INPUT_POLL_S = 0.2
@@ -201,6 +225,8 @@ class SmartCANWorker(CANWorker):
         # cannot drift apart — a lap is defined by distance, lap energy is the
         # integral between two triggers, lap time the interval between them.
         self.laps = LapTracker()
+        self._last_checkpoint_save = 0.0
+        self._load_lap_checkpoint()
         self.lap_inbox = LapCommandInbox()
         # Detects a real charging stop from bms_current_A + mms_rpm — see
         # charge_detector.py for why both readings are needed (current alone
@@ -304,6 +330,9 @@ class SmartCANWorker(CANWorker):
         which is the one that actually closes the CAN hardware.
         """
         for name, stop in (
+            # Unconditional (force=True) so a clean quit doesn't lose up to
+            # LAP_CHECKPOINT_INTERVAL_S of distance/energy to the throttle.
+            ("lap checkpoint", lambda: self._save_lap_checkpoint(force=True)),
             ("gps", self.gps.stop),
             ("lap inbox", self.lap_inbox.stop),
             ("strategy inbox", self.strategy_inbox.stop),
@@ -384,6 +413,7 @@ class SmartCANWorker(CANWorker):
             self._poll_solar()
             self._tick_profile()
             self._publish_gps()
+            self._save_lap_checkpoint()
 
             # ---- (Re)open the buses if we have none ---------------------- #
             if not self._buses:
@@ -903,11 +933,72 @@ class SmartCANWorker(CANWorker):
             elif action == "reset_energy":
                 self.laps.reset_energy()
                 print("🏁 PIT RESET ENERGY")
+            elif action == "reset_trip":
+                self.laps.reset_trip()
+                print("🏁 PIT RESET TRIP")
             else:
                 applied = False
             self.vehicle_state["motor"].update(self.laps.snapshot())
             ack_lap_command(cmd.get("id"), action, applied,
                             lap=self.laps.lap_count)
+            if applied:
+                # A pit command is a deliberate, infrequent edit to state that
+                # a reboot must not silently undo -- don't make it wait for the
+                # next throttled tick (up to LAP_CHECKPOINT_INTERVAL_S away).
+                self._save_lap_checkpoint(force=True)
+
+    def _load_lap_checkpoint(self) -> None:
+        """Restore LapTracker's running totals from disk, if a checkpoint exists.
+
+        Called from __init__, before the worker thread starts -- so this needs
+        no locking even though LapTracker is otherwise single-thread-owned by
+        the CAN worker (see lap_tracker.py's docstring): nothing else can be
+        touching self.laps yet.
+
+        Best-effort, matching restore()'s own contract: a missing or corrupt
+        checkpoint must never stop the car's telemetry from starting. restore()
+        already tolerates a malformed dict; this only has to handle the file
+        not existing or not parsing as JSON at all.
+        """
+        try:
+            with open(LAP_CHECKPOINT_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            print(f"⚠️ lap checkpoint unreadable, starting from zero: {exc}")
+            return
+        if self.laps.restore(data):
+            age_s = time.time() - (data.get("saved_at") or time.time())
+            print(f"🔢 resumed from checkpoint: odometer {self.laps.odometer_m:.0f} m, "
+                  f"lap {self.laps.lap_count}, saved {age_s:.0f}s ago")
+
+    def _save_lap_checkpoint(self, force: bool = False) -> None:
+        """Persist LapTracker's running totals, throttled to
+        LAP_CHECKPOINT_INTERVAL_S. `force=True` (used by _teardown, on a clean
+        quit) bypasses the throttle so the very latest state is captured.
+
+        Runs on the CAN worker thread, same as _publish_gps -- LapTracker is
+        single-thread-owned, so reading it via state_dict() here is safe by
+        the same reasoning as every other place that touches self.laps.
+
+        Writes to a temp file and os.replace()s over the real one, so a power
+        cut mid-write (a real risk on a Pi with no UPS) can never leave a
+        torn/corrupt checkpoint behind. restore() already tolerates a missing
+        OR corrupt file either way, but avoiding the corrupt case outright
+        costs nothing.
+        """
+        now = time.time()
+        if not force and now - self._last_checkpoint_save < LAP_CHECKPOINT_INTERVAL_S:
+            return
+        self._last_checkpoint_save = now
+        tmp_path = LAP_CHECKPOINT_PATH + ".tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(self.laps.state_dict(), f)
+            os.replace(tmp_path, LAP_CHECKPOINT_PATH)
+        except Exception as exc:
+            print(f"⚠️ failed to save lap checkpoint: {exc}")
 
     def _publish_gps(self) -> None:
         """Refresh GPS and push telemetry on a timer, independent of CAN.
