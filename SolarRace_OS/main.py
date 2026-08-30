@@ -64,7 +64,7 @@ from modules.mms_parser import parse_mms_message
 from modules import mms_parser
 from modules.temp_controller_parser import (
     parse_temp_controller_message, parse_thermistor_general_message,
-    THERMISTOR_COUNT)
+)
 from modules.gps_reader import GPSReader
 from modules.lap_tracker import LapTracker
 from modules.charge_detector import ChargeDetector

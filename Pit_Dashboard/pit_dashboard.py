@@ -72,7 +72,7 @@ from constants import (
     SECTION_NAMES, SECTION_TURN_LABELS, SECTION_RISK, SECTION_COLORS,
     BMS_PROTECTION_BITS, MMS_ERROR_BITS, decode_error_bits,
 )
-from ui import render_metric, render_sector_display, _age_text
+from ui import render_metric, render_sector_display, _age_text, MISSING_TEXT
 # Throttle zone boundaries and pedal calibration, shared with the car so the
 # pit's zone label matches the bar on the driver's HUD.
 #
@@ -636,7 +636,8 @@ TABLE_TICK_S = 30
 # Shown wherever a reading was never received. The codebase already uses an em
 # dash for this (unknown lap time, unknown target speed, unknown MAP), so a
 # missing number looks the same everywhere instead of masquerading as a real 0.
-MISSING_TEXT = "—"
+# Now defined in ui.py (imported at the top of this file) so render_metric can
+# recognise its own dashes; re-stated here only as documentation of intent.
 
 # How long a history read is reused. Just under the 10s history refresh, so each
 # tick serves from cache instead of re-reading up to 100k rows on the main

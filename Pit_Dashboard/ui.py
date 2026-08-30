@@ -13,6 +13,13 @@ from constants import (
 )
 
 
+# What a tile shows when the car has not reported a value. Defined HERE, not
+# in pit_dashboard.py where it started, for the same reason _age_text moved:
+# render_metric needs it, and pit_dashboard imports FROM ui, never the other
+# way round. pit_dashboard re-imports it from here so there is one definition.
+MISSING_TEXT = "—"
+
+
 def _age_text(seconds):
     """Data age in units a human reads at a glance.
 
@@ -80,7 +87,14 @@ def render_metric(col, title, val, unit, condition=NORMAL, large=False,
     color_class = condition if condition in (WARNING, CRITICAL) else ""
     size_class = " large" if large else ""
     unit_px = 22 if large else 16
-    stale = stale_s is not None and stale_s > DATA_STALE_AFTER_S
+    # An age caption only makes sense next to a VALUE. A tile showing a dash
+    # has nothing whose age could be quoted, and "— °C · 2h 15m ago" reads as
+    # though a reading were being withheld rather than never taken -- which is
+    # exactly what it looked like for the cell temperatures gated out as
+    # broken-sensor values.
+    showing_value = str(val).strip() not in ("", MISSING_TEXT)
+    stale = (stale_s is not None and stale_s > DATA_STALE_AFTER_S
+             and showing_value)
     if stale:
         size_class += " stale-carried"
         age_caption = f"· {_age_text(stale_s)} ago"

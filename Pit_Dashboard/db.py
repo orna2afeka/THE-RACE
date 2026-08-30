@@ -44,16 +44,22 @@ from pit_config import SQLITE_PATH, DEVICE_ID
 # tell a real 0.000 V-if-that-ever-happens from "this tap isn't wired yet."
 BMS_CELL_COLUMN_COUNT = 30
 
-# DS003 of the technical regulations: "Temperature of all battery Cells (30
-# sensors)". This one IS the compliance count itself (unlike
-# BMS_CELL_COLUMN_COUNT above, which is sized to the JBD protocol's own wire
-# limit rather than a fixed regulation number) — the Orion Thermistor
-# Expansion Module supports up to 80 thermistors, this car only needs 30. See
-# modules/temp_controller_parser.THERMISTOR_COUNT on the car side (not
-# imported directly: that module lives under SolarRace_OS/modules, off this
-# app's sys.path — kept in sync by hand, the same way DS004_MODULE_COUNT in
-# pit_dashboard.py is its own independent compliance constant).
-THERMISTOR_CELL_COLUMN_COUNT = 30
+# How many per-thermistor temperature COLUMNS to carry. Sized to the wiring,
+# not to DS003's 30: the Orion module on this car reports 26 thermistors
+# enabled across an id range that runs past 30 (ids 1-13 and 21-onwards, with
+# 14-20 never loaded), so 30 columns silently truncated the last few real
+# sensors into raw_json only.
+#
+# 40 covers that range with headroom while staying far below the module's own
+# 80-thermistor ceiling (temp_controller_parser.THERMISTOR_MAX, which is what
+# the DECODER bounds against). A column that is never populated costs nothing
+# — 38 of this table's columns have never held a value — whereas a reading
+# with nowhere to land is gone from every query and every export.
+#
+# Not imported from the car-side module: that lives under SolarRace_OS/modules,
+# off this app's sys.path. Kept in sync by hand, the same way
+# DS004_MODULE_COUNT in pit_dashboard.py is its own independent constant.
+THERMISTOR_CELL_COLUMN_COUNT = 40
 
 METRIC_COLUMNS = [
     "bms_soc_percent",

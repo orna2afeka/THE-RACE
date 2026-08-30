@@ -62,12 +62,23 @@ _THERM_GENERAL_ID = 0x1838F300
 _THERM_ID_MASK = 0xFFFFFF00
 
 # DS003 of the technical regulations: "Temperature of all battery Cells (30
-# sensors)". Thermistor IDs at or beyond this (module-relative, 1-indexed)
-# are outside the compliance screen's scope and simply ignored — mirrors
-# db.BMS_CELL_COLUMN_COUNT's role for cell voltages, though that one is sized
-# to the JBD protocol's own wire limit rather than a fixed regulation count:
-# the Orion module supports up to 80 thermistors, this car only needs 30.
+# sensors)". This is a DISPLAY/compliance figure — how many tiles the HUD and
+# the pit lay out — NOT a decode limit. See THERMISTOR_MAX below.
 THERMISTOR_COUNT = 30
+
+# The most thermistors one Orion Thermistor Expansion Module can address (its
+# datasheet's own figure), and therefore the only defensible ceiling on what
+# this parser will accept.
+#
+# It used to reject anything above THERMISTOR_COUNT, and that was a real bug
+# rather than a tidy limit: the module reported 26 thermistors enabled while
+# only 23 ever reached the pit, and the three missing ones were simply thrown
+# away here for having ids past 30. A parser silently discarding live sensor
+# readings — with no error, and no way to tell the loss from a sensor that was
+# never wired — is exactly the failure this codebase keeps having to dig out.
+# Decode everything the hardware sends; let the DISPLAY decide what it has
+# room to show.
+THERMISTOR_MAX = 80
 
 
 def parse_temp_controller_message(arb_id, data_bytes):
@@ -102,6 +113,19 @@ def parse_temp_controller_message(arb_id, data_bytes):
         enabled_byte = data_bytes[4]
         result["thermistors_enabled_count"] = enabled_byte & 0x7F
         result["thermistors_enabled_fault"] = bool(enabled_byte & 0x80)
+    if len(data_bytes) >= 7:
+        # The module's own statement of which ID range it is scanning, zero
+        # based (datasheet bytes 6-7). Published as 1-BASED to match the cell
+        # numbering everything else uses.
+        #
+        # This is the ground truth for "are we seeing every thermistor?" —
+        # compare it against the ids actually arriving. It is what tells a
+        # gap in the ids apart from a cap or a decode bug on our side, which
+        # is otherwise guesswork: the round-robin simply skips thermistors
+        # that were never loaded (Note #4), so a missing id looks identical
+        # to one we threw away ourselves.
+        result["thermistor_id_high"] = data_bytes[5] + 1
+        result["thermistor_id_low"] = data_bytes[6] + 1
     return result
 
 
@@ -114,9 +138,11 @@ def parse_thermistor_general_message(arb_id, data_bytes):
     BMS voltages out of bms_parser's 3-cells-per-frame messages.
 
     Returns None for a frame that isn't this broadcast, or whose
-    module-relative ID falls outside THERMISTOR_COUNT (DS003's own scope —
-    a car with a second, differently-numbered module would need widening
-    this, not silently misfiling into slot 1's cell).
+    module-relative ID falls outside what one module can physically address
+    (THERMISTOR_MAX). That bound exists only to reject a corrupt frame — it
+    is deliberately the HARDWARE's limit, not the display's, so a real
+    reading is never dropped here for being past however many tiles a screen
+    happens to lay out.
     """
     if (arb_id & _THERM_ID_MASK) != _THERM_GENERAL_ID:
         return None
@@ -132,7 +158,7 @@ def parse_thermistor_general_message(arb_id, data_bytes):
     fault = bool(module_rel_byte & 0x80)
 
     cell_num = module_rel_id + 1                  # 1-indexed, matches bms_cell_NN_V
-    if not (1 <= cell_num <= THERMISTOR_COUNT):
+    if not (1 <= cell_num <= THERMISTOR_MAX):
         return None
 
     return {
