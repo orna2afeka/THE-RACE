@@ -62,7 +62,9 @@ from modules.mms_parser import parse_mms_message
 # `mms_parser.GPIO_REQUEST_ID` at the point of use says where they came from
 # instead of leaving four more bare names in this file's namespace.
 from modules import mms_parser
-from modules.temp_controller_parser import parse_temp_controller_message
+from modules.temp_controller_parser import (
+    parse_temp_controller_message, parse_thermistor_general_message,
+    THERMISTOR_COUNT)
 from modules.gps_reader import GPSReader
 from modules.lap_tracker import LapTracker
 from modules.charge_detector import ChargeDetector
@@ -271,6 +273,17 @@ class SmartCANWorker(CANWorker):
         # Once the dedicated temp module reports a max cell temp, stop falling
         # back to the BMS's own NTC probes (the module measures more points).
         self._have_module_cell_temp = False
+        # DS003 — individual cell temperatures from the Orion Thermistor
+        # Expansion Module's per-sensor broadcast. _thermistor_configured is
+        # STICKY (see cell_temps_updated's docstring in can_worker.py): once a
+        # real per-sensor frame ever arrives, it stays True for the rest of
+        # the session even through a later bus silence, because a thermistor
+        # slot that was never loaded/enabled on the module has NO frame of
+        # its own that means "not configured" -- see
+        # modules/temp_controller_parser.py's docstring. _cell_temps_C is NOT
+        # sticky: _emit_zeros() clears it like every other reading.
+        self._thermistor_configured = False
+        self._cell_temps_C: dict = {}      # {cell_num (1-indexed): temp_C}
         # The driver HUD's alert bar shows a SINGLE combined list, but MMS
         # (0x600) and BMS (0x102) faults arrive on separate frames. Cache each
         # so a fresh frame from one device doesn't wipe the other's alerts.
@@ -525,6 +538,11 @@ class SmartCANWorker(CANWorker):
         self.motor_current_updated.emit(None)
         self.battery_current_updated.emit(None)
         self.cell_temp_updated.emit(None)
+        # Values blank like every other gauge; _thermistor_configured does
+        # NOT reset -- a module that has already proven it's configured stays
+        # configured through a later dead bus, same as _have_module_cell_temp.
+        self._cell_temps_C = {}
+        self.cell_temps_updated.emit(self._thermistor_configured, {})
         # 0 Ω is below the PT1000's physical floor, so the HUD reads it as
         # "no sensor data" and blanks both fields rather than showing the
         # -246 °C that extrapolating 0 Ω would imply.
@@ -1099,6 +1117,21 @@ class SmartCANWorker(CANWorker):
             if "battery_temp_high_C" in temp_data:
                 self._have_module_cell_temp = True
                 self.cell_temp_updated.emit(float(temp_data["battery_temp_high_C"]))
+
+        # DS003 — the per-sensor round-robin frame. Each one updates exactly
+        # ONE cell's entry in self._cell_temps_C, which is why this dict is
+        # allowed to persist across many frames (see the module's docstring)
+        # rather than being rebuilt from scratch each time: a full 30-sensor
+        # snapshot only exists once the module has cycled through all of them
+        # at least once, same as bms_cell_NN_V accumulating out of the JBD
+        # BMS's 3-cells-per-frame voltage messages.
+        therm_data = parse_thermistor_general_message(msg_id, data_bytes)
+        if therm_data:
+            self._thermistor_configured = True
+            self.vehicle_state["temp_controller"][
+                f"bms_cell_temp_{therm_data['cell_num']:02d}_C"] = therm_data["value_C"]
+            self._cell_temps_C[therm_data["cell_num"]] = therm_data["value_C"]
+            self.cell_temps_updated.emit(True, dict(self._cell_temps_C))
 
         mms_data = parse_mms_message(msg_id, data_bytes)
         if mms_data: 

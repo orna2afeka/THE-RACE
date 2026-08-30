@@ -46,6 +46,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QFrame,
     QGraphicsOpacityEffect,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -60,6 +61,10 @@ from PySide6.QtWidgets import (
 
 from can_worker import CANWorker
 from modules import mms_parser, net_monitor, pt1000
+# DS003's compliance count (30 sensors) — shared with the car-side parser so
+# the HUD grid can never quietly drift from what the parser will actually
+# report. See temp_controller_parser.py's docstring for the protocol.
+from modules.temp_controller_parser import THERMISTOR_COUNT
 
 # Upload health for the PIT badge, read straight from the module main.py pushes
 # through — same process, so no wiring is needed and none can be forgotten.
@@ -638,6 +643,96 @@ class MiniGauge(QWidget):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  CellTile — one compact reading in a DS003-style 30-tile grid
+# ─────────────────────────────────────────────────────────────────────────────
+class CellTile(QWidget):
+    """One reading in a dense grid (DS003's 30 cell temperatures). Same tier
+    logic and 500 ms critical flash as MiniGauge/TachometerWidget
+    (limits.classify decides the colour, never a bespoke comparison here),
+    but painted as a flat bordered box — label above, value below — instead
+    of an arc. An arc needs real space to read; 30 of them on a 480 px panel
+    would be both illegible and would compete for attention with the two
+    readouts (Speed, SOC) the driver actually steers by. A flat tile scales
+    down to a legible number at a fraction of MiniGauge's floor size.
+    """
+
+    def __init__(self, label: str, limit, decimals: int = 0, parent=None):
+        super().__init__(parent)
+        self._label = label
+        self._limit = limit
+        self._decimals = decimals
+        # None until this cell has ever reported — see _NO_DATA. Never
+        # seeded to 0.0, same reasoning as every other reading on this HUD:
+        # "unreported" and "a real zero" must never look identical.
+        self._value: float | None = None
+        self._flash_on = False
+        self._alert = False
+        self._warning = False
+
+        self._flash_timer = QTimer(self)
+        self._flash_timer.setInterval(500)
+        self._flash_timer.timeout.connect(self._toggle_flash)
+
+        # Small floor: 30 of these have to fit a 480 px screen alongside the
+        # header/footer chrome every other screen already carries.
+        self.setMinimumSize(46, 30)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def set_value(self, value: float | None) -> None:
+        self._value = value
+        # classify(), not a local comparison — see MiniGauge.set_value for why
+        # that is what keeps this tile and the pit's identical tile agreeing.
+        tier = limits.classify(value, self._limit)
+        alert = tier == limits.CRITICAL
+        self._warning = tier == limits.WARNING
+        if alert and not self._alert:
+            self._flash_timer.start()
+        elif not alert and self._alert:
+            self._flash_timer.stop()
+            self._flash_on = False
+        self._alert = alert
+        self.update()
+
+    def _toggle_flash(self) -> None:
+        self._flash_on = not self._flash_on
+        self.update()
+
+    def paintEvent(self, _) -> None:  # noqa: ANN001
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+
+        if self._flash_on:
+            p.fillRect(0, 0, w, h, QColor(_FLASH))
+
+        border = C_CRITICAL if self._alert else (
+            C_WARNING if self._warning else C_BORDER)
+        p.setPen(QPen(border, 1.5))
+        p.setBrush(Qt.NoBrush)
+        p.drawRect(QRectF(0.75, 0.75, w - 1.5, h - 1.5))
+
+        unknown = self._value is None
+        value_txt = _NO_DATA if unknown else f"{self._value:.{self._decimals}f}"
+        value_color = (C_NO_DATA if unknown else
+                       C_CRITICAL if self._alert else
+                       C_WARNING if self._warning else C_WHITE)
+
+        lf = _fit_font(self._label, h * 0.26, w - 6.0, bold=False)
+        p.setFont(lf)
+        p.setPen(QPen(C_DIM))
+        p.drawText(QRectF(2.0, h * 0.06, w - 4.0, h * 0.34),
+                  Qt.AlignCenter, self._label)
+
+        vf = _fit_font(value_txt, h * 0.42, w - 6.0)
+        p.setFont(vf)
+        p.setPen(QPen(value_color))
+        p.drawText(QRectF(2.0, h * 0.36, w - 4.0, h * 0.58),
+                  Qt.AlignCenter, value_txt)
+
+        p.end()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  EfficiencyBar — "am I driving economically right now?" in one glance
 # ─────────────────────────────────────────────────────────────────────────────
 class EfficiencyBar(QWidget):
@@ -818,7 +913,7 @@ class RacingDashboard(QMainWindow):
     _NAV_BTN_H = 64
     _NAV_BTN_W = 90
 
-    _SCREEN_NAMES = ("DS001", "DS002")
+    _SCREEN_NAMES = ("DS001", "DS002", "DS003")
 
     # Height the pit-message strip takes WHEN a message is showing. It is hidden
     # the rest of the time — an empty box permanently occupying the screen is
@@ -929,6 +1024,7 @@ class RacingDashboard(QMainWindow):
         self._screens = QStackedWidget()
         self._screens.addWidget(self._build_screen_ds001())
         self._screens.addWidget(self._build_screen_ds002())
+        self._screens.addWidget(self._build_screen_ds003())
         vbox.addWidget(self._screens, stretch=1)
 
         vbox.addWidget(self._build_controls_bar())
@@ -1544,6 +1640,63 @@ class RacingDashboard(QMainWindow):
 
         return page
 
+    def _build_screen_ds003(self) -> QWidget:
+        """DS003 of the technical regulations: "Temperature of all battery
+        Cells (30 sensors)". Reads the Orion Thermistor Expansion Module's
+        per-sensor broadcast (0x1838F3xx) — see
+        modules/temp_controller_parser.py and can_worker.CANWorker's
+        cell_temps_updated signal.
+
+        That module only transmits a thermistor once it has been
+        individually loaded/enabled via Orion's own Thermistor Utility
+        software, so there is no wire signal that means "not configured" —
+        only the absence of a value ever arriving (see the parser's
+        docstring). A page of 30 identical em dashes would read as 30 BROKEN
+        sensors, not one unconfigured module, so this page is a small
+        QStackedWidget of its own: a sign while nothing has ever reported,
+        the real grid once anything has. _on_cell_temps switches between
+        them, driven by the STICKY `configured` flag — see its docstring.
+        """
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        self._ds3_stack = QStackedWidget()
+        outer.addWidget(self._ds3_stack, stretch=1)
+
+        # --- index 0: shown until the module has ever reported a real cell -- #
+        sign = QWidget()
+        sign_box = QVBoxLayout(sign)
+        sign_lbl = QLabel(
+            "DS003 — NOT CONFIGURED YET\n\n"
+            "No per-cell temperature has ever been reported by the "
+            "Thermistor Expansion Module.\n\n"
+            "This screen switches to the real readings automatically, with "
+            "no changes needed here, the moment the module is configured.")
+        sign_lbl.setAlignment(Qt.AlignCenter)
+        sign_lbl.setWordWrap(True)
+        sign_lbl.setStyleSheet(f"color: {_DIM}; font-size: 15px; font-weight: bold;")
+        sign_box.addWidget(sign_lbl)
+        self._ds3_stack.addWidget(sign)
+
+        # --- index 1: the real 30-tile grid ---------------------------------- #
+        grid_page = QWidget()
+        grid = QGridLayout(grid_page)
+        grid.setSpacing(4)
+        grid.setContentsMargins(0, 0, 0, 0)
+        # 6 columns x 5 rows: the widest grid that still leaves each CellTile
+        # comfortably above its own 46 px floor on an 800 px-wide panel.
+        cols = 6
+        self._cell_tiles: dict[int, CellTile] = {}
+        for i in range(1, THERMISTOR_COUNT + 1):
+            tile = CellTile(f"C{i}", limits.CELL_TEMP, decimals=0)
+            self._cell_tiles[i] = tile
+            row, col = divmod(i - 1, cols)
+            grid.addWidget(tile, row, col)
+        self._ds3_stack.addWidget(grid_page)
+
+        return page
+
     # ── Touch pagination ─────────────────────────────────────────────────── #
     def _go_screen(self, index: int) -> None:
         """Switch pages, wrapping around so one button can cycle everything."""
@@ -1723,6 +1876,7 @@ class RacingDashboard(QMainWindow):
         self._worker.motor_current_updated.connect(self._on_motor_current)
         self._worker.battery_current_updated.connect(self._on_battery_current)
         self._worker.cell_temp_updated.connect(self._on_cell_temp)
+        self._worker.cell_temps_updated.connect(self._on_cell_temps)
         self._worker.vehicle_flags_updated.connect(self._on_vehicle_flags)
         self._worker.target_speed_updated.connect(self._on_target_speed)
         self._worker.turn_alert_updated.connect(self._on_turn_alert)
@@ -2090,6 +2244,17 @@ class RacingDashboard(QMainWindow):
     def _on_cell_temp(self, deg_c) -> None:
         self._cell_temp_gauge.set_value(deg_c)
         self._ds2_cell_temp.set_value(deg_c)
+
+    @Slot(object, object)
+    def _on_cell_temps(self, configured: bool, temps: dict) -> None:
+        """DS003 — `configured` is STICKY (see cell_temps_updated's docstring
+        in can_worker.py): once True this page never reverts to the
+        "not configured" sign, even through a later bus silence that clears
+        every individual reading back to None. `temps` is {cell_num: °C} for
+        whichever cells have reported since the module last went quiet."""
+        self._ds3_stack.setCurrentIndex(1 if configured else 0)
+        for cell_num, tile in self._cell_tiles.items():
+            tile.set_value(temps.get(cell_num))
 
     @Slot(object)
     def _on_power(self, watts) -> None:

@@ -44,6 +44,17 @@ from pit_config import SQLITE_PATH, DEVICE_ID
 # tell a real 0.000 V-if-that-ever-happens from "this tap isn't wired yet."
 BMS_CELL_COLUMN_COUNT = 30
 
+# DS003 of the technical regulations: "Temperature of all battery Cells (30
+# sensors)". This one IS the compliance count itself (unlike
+# BMS_CELL_COLUMN_COUNT above, which is sized to the JBD protocol's own wire
+# limit rather than a fixed regulation number) — the Orion Thermistor
+# Expansion Module supports up to 80 thermistors, this car only needs 30. See
+# modules/temp_controller_parser.THERMISTOR_COUNT on the car side (not
+# imported directly: that module lives under SolarRace_OS/modules, off this
+# app's sys.path — kept in sync by hand, the same way DS004_MODULE_COUNT in
+# pit_dashboard.py is its own independent compliance constant).
+THERMISTOR_CELL_COLUMN_COUNT = 30
+
 METRIC_COLUMNS = [
     "bms_soc_percent",
     "bms_voltage_V",
@@ -60,6 +71,15 @@ METRIC_COLUMNS = [
     # cell. See bms_parser.py's cell-voltage decode for the source.
     *[f"bms_cell_{i:02d}_V" for i in range(1, BMS_CELL_COLUMN_COUNT + 1)],
     "battery_temp_C",
+    # DS003 — individual cell temperatures from the Orion Thermistor
+    # Expansion Module's per-sensor round-robin broadcast (0x1838F3xx), NOT
+    # from the BMS's 3 onboard NTC probes battery_temp_C can fall back to.
+    # Absent (None) for any cell not yet loaded/enabled on the module via
+    # Orion's own utility software — see temp_controller_parser.py's
+    # docstring for why there is no wire signal that means "not configured",
+    # only the absence of a value ever arriving. Never coalesced to 0, same
+    # reasoning as bms_cell_NN_V above.
+    *[f"bms_cell_temp_{i:02d}_C" for i in range(1, THERMISTOR_CELL_COLUMN_COUNT + 1)],
     "mms_rpm",
     "mms_power_W",
     "mms_temperature_C",
@@ -458,6 +478,12 @@ def flatten_record(rtdb_key: str, record: dict, device_id: str = DEVICE_ID) -> d
         **{f"bms_cell_{i:02d}_V": _num(battery.get(f"bms_cell_{i:02d}_V"))
            for i in range(1, BMS_CELL_COLUMN_COUNT + 1)},
         "battery_temp_C": _num(temp.get("battery_temp_C")),
+        # DS003. One key per possible thermistor slot; .get() returns None
+        # for anything the module hasn't loaded/enabled (or reported yet) —
+        # never a fabricated 0 (see BMS_CELL_COLUMN_COUNT's cell-voltage
+        # comment above for the same reasoning applied to voltage taps).
+        **{f"bms_cell_temp_{i:02d}_C": _num(temp.get(f"bms_cell_temp_{i:02d}_C"))
+           for i in range(1, THERMISTOR_CELL_COLUMN_COUNT + 1)},
         "mms_rpm": _num(motor.get("mms_rpm")),
         "mms_power_W": _signed16(motor.get("mms_power_W")),
         "mms_temperature_C": _num(motor.get("mms_temperature_C")),

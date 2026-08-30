@@ -127,6 +127,25 @@ class CANWorker(QThread):
     motor_current_updated   = Signal(object)  # Motor phase current (A, q axis)
     battery_current_updated = Signal(object)  # Battery current from the BMS (A)
     cell_temp_updated       = Signal(object)  # Hottest battery cell (°C)
+    # DS003: every individual battery cell's temperature, from the Orion
+    # Thermistor Expansion Module's per-sensor broadcast (0x1838F3xx) — NOT
+    # from the BMS's 3 onboard NTC probes cell_temp_updated can fall back to.
+    # (configured: bool, {cell_num: temp_C}). The bool is STICKY -- True
+    # forever once the module has been configured (Thermistor Utility) and
+    # sent a single real frame, even across a later bus silence -- so the HUD
+    # can tell "never configured" (show a sign) apart from "configured, but
+    # the bus just went quiet" (show dashes, like every other gauge). The
+    # dict is NOT sticky: it's cleared on a silent bus the same as every
+    # other reading, so a dead cell reads as missing rather than frozen on
+    # its last value.
+    #
+    # Signal(object, object), NOT Signal(bool, dict): PySide6 6.11.1 silently
+    # drops the dict's contents across a Signal(bool, dict)-typed emit (and
+    # even a bare Signal(dict) alone) in this environment -- confirmed with a
+    # minimal repro, the payload arrives as an empty {} every time. object is
+    # already this file's own convention for every other signal (see the
+    # module docstring above), and it round-trips a dict correctly.
+    cell_temps_updated      = Signal(object, object)
     # Boolean dashboard indicators: parking_brake / lights_on / ecu_on / reverse
     # (+ the raw status byte they came from). One dict so the HUD repaints the
     # whole indicator row from a single consistent snapshot.

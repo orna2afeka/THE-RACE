@@ -13,6 +13,23 @@ The system links the **car** (a Raspberry Pi reading the vehicle CAN bus) to the
 **pit wall** (a laptop dashboard) through the Google Firebase Realtime Database,
 giving engineers live battery, motor, temperature, and strategy data.
 
+<table>
+<tr>
+<td width="50%">
+
+**Driver HUD** — `SolarRace_OS`, bench-simulated (`tools/hud_sim.py`)
+<img src=".github/screenshots/driver_hud_simulation.png" alt="Driver HUD running in simulation mode">
+
+</td>
+<td width="50%">
+
+**Pit Wall** — `Pit_Dashboard`, sample telemetry
+<img src=".github/screenshots/pit_dashboard_simulation.png" alt="Pit Wall dashboard with sample telemetry">
+
+</td>
+</tr>
+</table>
+
 ### New here? Start with these
 
 | I want to… | Go to |

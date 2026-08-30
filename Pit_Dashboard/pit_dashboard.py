@@ -397,6 +397,12 @@ def _live_snapshot():
     for _i in range(1, db.BMS_CELL_COLUMN_COUNT + 1):
         _cell_key = f"bms_cell_{_i:02d}_V"
         state[_cell_key] = cf(_cell_key, _cell_key)
+    # DS003 — carried forward the same as cell voltage: a real reading, once
+    # any thermistor has ever been configured, is exactly the "continuous
+    # measurement" case this whole mechanism exists for.
+    for _i in range(1, db.THERMISTOR_CELL_COLUMN_COUNT + 1):
+        _cell_temp_key = f"bms_cell_temp_{_i:02d}_C"
+        state[_cell_temp_key] = cf(_cell_temp_key, _cell_temp_key)
     state["pack_voltage"] = cf("pack_voltage", "mms_measured_voltage_V")
     state["motor_current"] = cf("motor_current", "mms_current_A")
     state["regen_energy"] = cf("regen_energy", "regen_energy")
@@ -1475,19 +1481,65 @@ def _render_cell_row(cols_n, indices, state, label_fmt):
                          stale_s=ages.get(f"bms_cell_{i:02d}_V"))
 
 
-def render_cell_voltages(state):
-    """DS003/DS004 tab body — currently DS004 (voltage) only.
+def _cell_temp_value(state, i):
+    """One cell's temperature, or None if that thermistor has never reported.
 
-    DS003 (temperature of all cells) needs the Orion Thermistor Expansion
-    Module's multiplexed broadcast (CAN ID 0x1838F380 — one hex digit away
-    from 0x1839F380, the aggregate low/high/avg message this dashboard's
-    "Battery Temp" tile already reads). That multiplexed frame has never once
-    been observed on this car's CAN bus: per the module's own datasheet, a
-    thermistor only appears in it once it has been individually loaded/enabled
-    via Orion's Thermistor Utility software. Until a capture shows real
-    0x1838F380 traffic, there is nothing to parse — this section is DS004
-    only until that config step happens on the car.
+    No secondary gate like _cell_value's bms_string_count check: per the
+    Orion Thermistor Expansion Module's own datasheet, a thermistor that
+    hasn't been loaded/enabled via the Thermistor Utility is simply never
+    transmitted at all — there is no "polled but unwired" wire state here
+    the way there is for a BMS voltage tap, so an absent value already means
+    exactly "not configured," nothing further to disambiguate."""
+    return state.get(f"bms_cell_temp_{i:02d}_C")
+
+
+def _render_cell_temp_row(cols_n, indices, state, label_fmt):
+    ages = state.get("_field_ages", {})
+    for row_start in range(0, len(indices), cols_n):
+        chunk = indices[row_start:row_start + cols_n]
+        cols = st.columns(cols_n)
+        for col, i in zip(cols, chunk):
+            v = _cell_temp_value(state, i)
+            render_metric(col, label_fmt(i), fmt(v, ".1f"), "°C",
+                         classify(v, CELL_TEMP),
+                         stale_s=ages.get(f"bms_cell_temp_{i:02d}_C"))
+
+
+def render_cell_voltages(state):
+    """DS003/DS004 tab body: per-cell temperature and per-cell voltage.
+
+    DS003 reads the Orion Thermistor Expansion Module's per-sensor broadcast
+    (0x1838F3xx — see SolarRace_OS/modules/temp_controller_parser.py). That
+    module only transmits a thermistor once it has been individually
+    loaded/enabled via Orion's own Thermistor Utility software, so every
+    bms_cell_temp_NN_C column stays permanently None until that config step
+    happens on the car — there is no wire signal that means "not configured
+    yet", only the absence of a value ever arriving (see the parser's
+    docstring). Below, that shows as a "not configured yet" sign; the section
+    switches to the real 30-tile grid automatically the moment the car sends
+    its first genuine reading, with no code change needed here on that day.
     """
+    st.markdown(f"##### :material/thermostat: DS003 — Cell Temperatures "
+               f"(1–{db.THERMISTOR_CELL_COLUMN_COUNT})")
+    configured = any(_cell_temp_value(state, i) is not None
+                     for i in range(1, db.THERMISTOR_CELL_COLUMN_COUNT + 1))
+    if not configured:
+        st.info(":material/info: **Not configured yet.** The Orion "
+               "Thermistor Expansion Module hasn't had any sensors "
+               "loaded/enabled via its own Thermistor Utility software, so "
+               "no per-cell temperature has ever been reported. This will "
+               "switch to real readings automatically — with no dashboard "
+               "changes needed — the first time the car sends one.")
+    else:
+        st.caption(f"Colour: warn above {CELL_TEMP.warn:.0f} °C, critical "
+                  f"above {CELL_TEMP.crit:.0f} °C.")
+        _render_cell_temp_row(
+            LIVE_METRICS_PER_ROW,
+            list(range(1, db.THERMISTOR_CELL_COLUMN_COUNT + 1)),
+            state, lambda i: f"Cell {i}")
+
+    st.divider()
+
     known = state.get("bms_string_count")
     if known is not None:
         st.caption(f"BMS reports **{int(known)} cells** wired and configured.")
