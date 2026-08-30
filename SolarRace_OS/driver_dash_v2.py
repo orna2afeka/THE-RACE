@@ -1697,12 +1697,23 @@ class RacingDashboard(QMainWindow):
         grid.setContentsMargins(0, 0, 0, 0)
         # 6 columns x 5 rows: the widest grid that still leaves each CellTile
         # comfortably above its own 46 px floor on an 800 px-wide panel.
-        cols = 6
+        # One ROW per pack module (13 wide), so the grid mirrors how the cells
+        # are physically grouped and labelled — module A on top, module B
+        # under it — rather than wrapping arbitrarily mid-module. Labels come
+        # from limits.cell_temp_label, shared with the pit wall so a sensor
+        # cannot be called C_B1 on one screen and Cell 14 on the other.
         self._cell_tiles: dict[int, CellTile] = {}
         for i in range(1, THERMISTOR_COUNT + 1):
-            tile = CellTile(f"C{i}", limits.CELL_TEMP, decimals=0)
+            tile = CellTile(limits.cell_temp_label(i), limits.CELL_TEMP,
+                            decimals=0)
             self._cell_tiles[i] = tile
-            row, col = divmod(i - 1, cols)
+            if i <= limits.THERMISTOR_GROUPED_COUNT:
+                row, col = divmod(i - 1, limits.CELL_COUNT)
+            else:
+                # Sensors past the mapped pack (27-30) get their own trailing
+                # row rather than being folded into module B's.
+                row = len(limits.THERMISTOR_GROUP_NAMES)
+                col = i - limits.THERMISTOR_GROUPED_COUNT - 1
             grid.addWidget(tile, row, col)
         self._ds3_stack.addWidget(grid_page)
 
@@ -1726,7 +1737,10 @@ class RacingDashboard(QMainWindow):
         grid = QGridLayout(page)
         grid.setSpacing(4)
         grid.setContentsMargins(0, 0, 0, 0)
-        cols = 6   # same layout as DS003's grid
+        # 6 wide. DS003 next door is laid out 13 wide instead, one row per
+        # pack module, because its labels carry the module (C_A*/C_B*); these
+        # are still flat M1..M26 and have no grouping to mirror.
+        cols = 6
         self._voltage_tiles: dict[int, CellTile] = {}
         for i in range(1, self.DS004_MODULE_COUNT + 1):
             tile = CellTile(f"M{i}", limits.CELL_VOLTAGE, decimals=2)
@@ -2293,7 +2307,10 @@ class RacingDashboard(QMainWindow):
         whichever cells have reported since the module last went quiet."""
         self._ds3_stack.setCurrentIndex(1 if configured else 0)
         for cell_num, tile in self._cell_tiles.items():
-            tile.set_value(temps.get(cell_num))
+            # Gated through the SAME shared helper the pit uses, so a failed
+            # thermistor's nonsense negative reads as "no data" on both
+            # screens rather than as a real sub-zero cell on one of them.
+            tile.set_value(limits.plausible_cell_temp(temps.get(cell_num)))
 
     @Slot(object, object)
     def _on_cell_voltages(self, string_count, voltages: dict) -> None:

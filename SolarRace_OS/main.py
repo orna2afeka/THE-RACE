@@ -101,7 +101,9 @@ from config import (
     BMS_POLL_IDS,
     BMS_POLL_BYTE,
     BMS_POLL_INTERVAL_S,
-    BMS_POLL_CHANNEL,
+    BMS_POLL_CHANNELS,
+    BMS_CELL_OFFSETS,
+    BMS_PRIMARY_CHANNEL,
     THROTTLE_GPIO_REQUEST_ENABLED,
     THROTTLE_GPIO_CHANNEL,
     THROTTLE_GPIO_ADDRESS,
@@ -295,7 +297,13 @@ class SmartCANWorker(CANWorker):
         # (0x600) and BMS (0x102) faults arrive on separate frames. Cache each
         # so a fresh frame from one device doesn't wipe the other's alerts.
         self._mms_alerts: list = []   # (label, severity) from the MMS status word
-        self._bms_alerts: list = []   # (label, severity) from the JBD protections
+        # JBD protections, keyed by CAN channel — one entry per BMS/pack. A
+        # dict, not a list, because the two packs report independently and
+        # pack A clearing its faults must not erase pack B's.
+        self._bms_alerts_by_channel: dict = {}
+        # Each pack's own bms_string_count, so the published figure can be the
+        # SUM across packs (see _remap_bms_frame).
+        self._bms_string_counts: dict = {}
         # Throttle for the "no data" status probe so we don't spawn `ip link`
         # (a subprocess) on every idle loop iteration.
         self._last_link_check = 0.0
@@ -465,6 +473,11 @@ class SmartCANWorker(CANWorker):
             got_any = False
             try:
                 for bus, _ in self._buses:
+                    # The channel travels with the frame from here on. Two BMS
+                    # units answer on identical ids, so this is the ONLY thing
+                    # that says which pack a reading belongs to — dropping it
+                    # here is what let one pack overwrite the other.
+                    channel = getattr(bus, "channel", None)
                     while True:
                         msg = bus.recv(timeout=0.0)
                         if msg is None:
@@ -475,7 +488,7 @@ class SmartCANWorker(CANWorker):
                             state = "live"
                             print("📡 Live CAN traffic detected.")
                             self._set_status(f"● CAN LIVE  |  {self._bus_label}")
-                        self._decode_message(msg)
+                        self._decode_message(msg, channel)
             except can.CanError as exc:
                 print(f"⚠️ CAN read error: {exc} — reopening buses.")
                 self._shutdown_bus()          # forces a reopen next iteration
@@ -656,19 +669,23 @@ class SmartCANWorker(CANWorker):
         wanted ID carrying a single 0x5A byte; the BMS replies on the same
         ID and those replies are decoded by the normal read loop.
 
-        BMS_POLL_CHANNEL restricts the query to the channel the BMS is
-        actually on, confirmed by a live query response (see config.py). If
-        unset, we don't know which channel the BMS sits on, so every query is
-        sent on every open bus; the harmless copy on the wrong bus is simply
-        not answered — except it isn't harmless on a bus with nothing to
-        answer it, since the unacked retries are what push a channel to
-        bus-off.
+        BMS_POLL_CHANNELS lists the channels that actually carry a BMS — one
+        pack per wire on this car. EVERY one of them has to be polled: JBD is
+        master/slave, so a channel left out here is a pack that answers
+        nothing at all, silently. That is precisely what limited the pit to 12
+        cells when only can0 was polled.
+
+        If unset (None), every open bus is polled. The old bus-off worry that
+        once restricted this to a single channel does not apply here — see the
+        note in config.py: any node on a bus acks a valid frame, not just the
+        addressee, and both wires carry other live devices.
         """
         if not self._buses:
             return
         target_buses = [
             (bus, lbl) for bus, lbl in self._buses
-            if BMS_POLL_CHANNEL is None or getattr(bus, "channel", None) == BMS_POLL_CHANNEL
+            if BMS_POLL_CHANNELS is None
+            or getattr(bus, "channel", None) in BMS_POLL_CHANNELS
         ]
         for query_id in BMS_POLL_IDS:
             if not self._running:
@@ -1078,16 +1095,97 @@ class SmartCANWorker(CANWorker):
         # A fresh reopen should be free to search for a USB adapter again.
         self._usb_bus_active = False
 
-    def _decode_message(self, msg) -> None:
+    def _pack_name(self, channel) -> str:
+        """'A', 'B', ... for the pack on `channel`, ordered by its cell offset.
+
+        Derived from BMS_CELL_OFFSETS rather than hard-coded, so the letter a
+        fault is labelled with always matches the cell range that pack owns
+        (C_A*/C_B* on the temperature screen, Modules 1-13/14-26 on DS004)."""
+        offsets = BMS_CELL_OFFSETS or {}
+        if not offsets:
+            return "A"
+        order = sorted(set(offsets.values()))
+        try:
+            return chr(ord("A") + order.index(offsets.get(channel, 0)))
+        except ValueError:
+            return "A"
+
+    def _remap_bms_frame(self, bms_data: dict, channel) -> dict:
+        """Tag one decoded JBD frame with the pack it came from.
+
+        Both BMS units answer on the SAME ids, so the arbitration id says
+        nothing about which pack a reading belongs to — only the channel it
+        arrived on does (see config.BMS_POLL_CHANNELS). Without this, the two
+        packs write into identical keys and the last frame to arrive wins,
+        roughly 2x a second.
+
+        Three different things happen to three kinds of field:
+
+        * CELL VOLTAGES are renumbered into the combined 1..26 space the pit
+          and HUD display, by the channel's BMS_CELL_OFFSETS entry. can0's
+          cell 1 stays cell 1 (module A); can1's cell 1 becomes cell 14
+          (module B).
+        * bms_string_count is SUMMED across packs, because everything
+          downstream reads it as "how many cells does this car have" — and
+          because the pit gates cell tiles on it, leaving it at one pack's 13
+          would hide the other pack's cells even once they arrive.
+        * EVERY OTHER FIELD (voltage, current, SoC, temps, protections) is
+          per-pack. The primary channel keeps the plain names the whole
+          codebase already reads; the secondary's are prefixed `bms2_` so the
+          readings are still published and logged, but cannot overwrite the
+          headline ones. Letting two packs alternate in one SoC field at 2 Hz
+          would show the driver a gauge swinging between them.
+        """
+        offset = (BMS_CELL_OFFSETS or {}).get(channel, 0)
+        is_primary = (BMS_PRIMARY_CHANNEL is None or channel is None
+                      or channel == BMS_PRIMARY_CHANNEL)
+
+        # How many cells this pack actually has, if it has told us yet. JBD
+        # answers in whole 3-cell frames, so a 13-cell pack's last frame can
+        # carry readings for cells 14 and 15 that do not exist. Unclamped,
+        # those land in the NEXT pack's range and quietly overwrite real
+        # readings from the other battery — a wrong number presented as a
+        # measurement, which is the one outcome worth going out of the way to
+        # prevent. Accept everything until the pack states its size.
+        own_count = self._bms_string_counts.get(channel)
+
+        out = {}
+        for key, value in bms_data.items():
+            if key.startswith("bms_cell_") and key.endswith("_V"):
+                n = int(key[len("bms_cell_"):-len("_V")])
+                if own_count is not None and n > own_count:
+                    continue                      # cell this pack does not have
+                if offset:
+                    out[f"bms_cell_{n + offset:02d}_V"] = value
+                else:
+                    out[key] = value
+            elif key == "bms_string_count":
+                # Remember each pack's own count, publish the total.
+                self._bms_string_counts[channel] = value
+                out[key] = sum(self._bms_string_counts.values())
+            elif is_primary:
+                out[key] = value
+            else:
+                out[f"bms2_{key[len('bms_'):]}" if key.startswith("bms_")
+                    else f"bms2_{key}"] = value
+        return out
+
+    def _decode_message(self, msg, channel=None) -> None:
         """
         Intercepts incoming CAN frames, pushes to Firebase,
         and then triggers the UI update signals.
+
+        `channel` is the CAN channel the frame arrived on. It matters for the
+        BMS and ONLY for the BMS: two packs answer on identical ids, so this
+        is the one piece of information that tells them apart. Defaults to
+        None so the base class and any other caller keep working unchanged.
         """
         data_bytes = bytes(msg.data)
         msg_id = msg.arbitration_id
 
         bms_data = parse_jbd_bms_message(msg_id, data_bytes)
         if bms_data:
+            bms_data = self._remap_bms_frame(bms_data, channel)
             self.vehicle_state["battery"].update(bms_data)
             # DS004 — accumulate per-cell voltages the same way DS003
             # accumulates per-cell temperatures (3 cells land per frame,
@@ -1122,9 +1220,20 @@ class SmartCANWorker(CANWorker):
                                           "bms_temp_3_C") if k in bms_data]
             if ntcs and not self._have_module_cell_temp:
                 self.cell_temp_updated.emit(float(max(ntcs)))
-            if "bms_protections" in bms_data:
-                self._bms_alerts = [(f"BMS {label}", "error")
-                                    for label in bms_data["bms_protections"]]
+            # Faults are tracked PER PACK. After _remap_bms_frame the second
+            # pack's key is bms2_protections, so testing only the plain name
+            # would have made every fault on pack B invisible to the driver —
+            # the one class of BMS reading that must never be dropped.
+            # Keyed by channel so one pack clearing its faults cannot wipe the
+            # other's; the pack letter travels in the label so the driver knows
+            # which battery to worry about.
+            prot = bms_data.get("bms_protections")
+            if prot is None:
+                prot = bms_data.get("bms2_protections")
+            if prot is not None:
+                pack = self._pack_name(channel)
+                self._bms_alerts_by_channel[channel] = [
+                    (f"BMS {pack} {label}", "error") for label in prot]
                 self._emit_alerts()
 
         # Battery-temperature controller (J1939) — pit/Firebase only,
@@ -1223,7 +1332,12 @@ class SmartCANWorker(CANWorker):
         never overflows (same cap the base worker used)."""
         mms_errors = [a for a in self._mms_alerts if a[1] == "error"]
         mms_limits = [a for a in self._mms_alerts if a[1] != "error"]
-        combined = mms_errors + self._bms_alerts + mms_limits
+        # Both packs' faults, in a stable channel order so the bar does not
+        # reshuffle between frames.
+        bms_alerts = [a for ch in sorted(self._bms_alerts_by_channel,
+                                         key=lambda c: (c is None, c))
+                      for a in self._bms_alerts_by_channel[ch]]
+        combined = mms_errors + bms_alerts + mms_limits
         self.alerts_updated.emit(combined[:3])
 
     def _decode_battery(self, data: bytes) -> None:

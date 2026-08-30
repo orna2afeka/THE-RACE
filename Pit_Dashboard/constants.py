@@ -56,6 +56,14 @@ from limits import (                # noqa: E402  (path set up above)
     TIER_COLOURS,
     classify,
     MOTOR_TEMP, CTRL_TEMP, CELL_TEMP,
+    # A failed/disconnected thermistor reports a nonsense negative rather than
+    # nothing at all — gate every per-cell temperature through this before
+    # displaying it. See its docstring for why it is one-sided.
+    plausible_cell_temp,
+    # DS003 cell naming: C_A1..C_A13 / C_B1..C_B13, shared with the driver HUD
+    # so one sensor can never carry two different names across the two screens.
+    CELL_COUNT, cell_temp_label,
+    THERMISTOR_GROUP_NAMES, THERMISTOR_GROUPED_COUNT,
     SOC, PACK_VOLTAGE, BATT_CURRENT,
     MOTOR_CURRENT, POWER, SPEED,
     CELL_VOLTAGE,

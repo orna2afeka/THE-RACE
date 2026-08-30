@@ -92,6 +92,29 @@ def export_local(ts):
 RECONNECT_BACKOFF_START = 1.0
 RECONNECT_BACKOFF_MAX = 30.0
 
+# Force a reconnect when no actual TELEMETRY event has arrived for this long,
+# even though the socket is still delivering bytes.
+#
+# This exists because of a real, observed silent stall: the collector sat with
+# an ESTABLISHED connection to RTDB for over an hour, using almost no CPU,
+# logging nothing, and storing nothing — while the car was pushing a sample
+# every half second and Firebase itself had data 0.7 s old. The pit wall showed
+# "Stale" the whole time and there was no error anywhere to explain it.
+#
+# The cause is that STREAM_READ_TIMEOUT (collector.py) measures BYTES, not
+# samples. RTDB sends a `keep-alive` event every ~30-45 s, which resets that
+# read timeout forever, so a stream that has stopped delivering `put` events
+# looks perfectly healthy to the socket layer and is never torn down. Liveness
+# has to be measured in the thing we actually care about — samples — which is
+# what this does.
+#
+# Comfortably longer than the keep-alive interval, so a merely idle-but-healthy
+# stream is not churned. A reconnect is cheap and lossless (startAt resumes
+# from the stored cursor), so erring toward reconnecting is the right trade:
+# the worst case while the car is genuinely parked is one extra HTTPS request
+# every couple of minutes, versus silently missing an entire race stint.
+DATA_SILENCE_TIMEOUT = 120.0
+
 # First-connect backfill cap. On a brand-new machine (empty DB, no cursor) the
 # collector would otherwise stream the ENTIRE telemetry_history node as one
 # initial event. That node grows without bound, so a fresh laptop can stall on a

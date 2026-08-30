@@ -118,14 +118,42 @@ CAN_CANDIDATES = [
 BMS_POLL_BYTE = 0x5A
 BMS_POLL_INTERVAL_S = 1.0          # how often to request a full refresh
 
-# Which channel to send BMS queries on. Confirmed on the car (a 0x5A query on
-# 0x100 got a valid pack-voltage reply) — the BMS is on can0. Restricting the
-# poll to that channel stops _poll_bms() from also transmitting unanswered
-# queries on can1, the MMS's channel — unacked transmit retries are exactly
-# what pushed a channel to bus-off before (see the module docstring above).
-# None means "poll every open bus", for a single-channel car or one where the
-# BMS channel hasn't been confirmed yet.
-BMS_POLL_CHANNEL = "can0"
+# ── TWO BMS units, one per channel ──────────────────────────────────────── #
+# This car carries two JBD BMS units, each monitoring its own 13-cell pack.
+#
+# They answer on the SAME ids (0x100-0x110): JBD's ids are fixed and carry no
+# device address, so two units cannot share a wire without colliding. That is
+# why they are on separate channels — and it is also why THE BUS A REPLY
+# ARRIVED ON IS THE ONLY THING THAT SAYS WHICH PACK IT DESCRIBES. Decode a
+# reply without knowing its channel and the two packs silently overwrite each
+# other; see _remap_bms_frame() in main.py, which is what keeps them apart.
+#
+# Both channels are polled. JBD is master/slave — a BMS says nothing at all
+# until it is asked — so a channel missing from this tuple is a pack that
+# reports NOTHING, with no error to notice: exactly the failure that left the
+# pit showing 12 cells instead of 26.
+#
+# None means "poll every open bus". The bus-off worry that once restricted
+# this to a single channel does not apply to either wire here: CAN acking is
+# done by ANY node on the bus, not just the addressee, and both channels carry
+# other live devices, so the polls are acked whether or not a BMS answers them.
+BMS_POLL_CHANNELS = ("can0", "can1")
+
+# Where each channel's cells land in the combined 1..26 numbering the pit and
+# the HUD display (DS004 "Module 1..26"; limits.cell_temp_label's C_A*/C_B*).
+# can0's pack is A (cells 1-13), can1's is B (cells 14-26).
+#
+# The offset for the SECOND pack must match how many cells the FIRST one has
+# (limits.CELL_COUNT = 13). Getting it wrong does not fail loudly — it files
+# pack B's readings under pack A's cell numbers — so if the pack geometry ever
+# changes, change it here, and check limits.CELL_COUNT with it.
+BMS_CELL_OFFSETS = {"can0": 0, "can1": 13}
+
+# Channel whose pack-level readings (voltage, current, SoC, temps) are the
+# headline ones. The other pack's are kept too, under a bms2_ prefix, rather
+# than being allowed to overwrite these — two packs' SoC alternating in the
+# same field at 2 Hz would read as a wildly flapping gauge.
+BMS_PRIMARY_CHANNEL = "can0"
 
 BMS_POLL_IDS = [
     0x100,  # Basic status: voltage / current / remaining capacity
@@ -153,17 +181,17 @@ BMS_POLL_IDS = [
 #
 #   * Unacked transmits are what drove can0 to BUS-OFF on this car (see the
 #     module docstring at the top of this file). The request therefore goes out
-#     on the MMS's channel ONLY, exactly like BMS_POLL_CHANNEL restricts the
-#     BMS poll to can0, and main.py counts consecutive TX failures rather than
-#     retrying blindly.
+#     on the MMS's channel ONLY (unlike the BMS poll, which now goes to every
+#     channel in BMS_POLL_CHANNELS because there is a pack on each), and
+#     main.py counts consecutive TX failures rather than retrying blindly.
 #   * The frame configures a REPORT. It does not change a power map, a current
 #     limit, or anything the motor acts on.
 THROTTLE_GPIO_REQUEST_ENABLED = True
 
-# Which wire the ESC is on. can1, for the same reason BMS_POLL_CHANNEL is can0:
-# a request sent down the other wire is never answered, and unanswered
-# transmits are the thing that kills a channel. None = send on every open bus,
-# which is only appropriate on a single-channel car.
+# Which wire the ESC is on. can1: a request sent down the other wire is never
+# answered, and unanswered transmits are the thing that kills a channel.
+# None = send on every open bus, which is only appropriate on a
+# single-channel car.
 THROTTLE_GPIO_CHANNEL = "can1"
 
 # The ESC's node address, which travels in byte 0 of the request. 0 is the

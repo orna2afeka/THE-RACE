@@ -130,6 +130,43 @@ CTRL_TEMP = Threshold(warn=70.0, crit=85.0, full_scale=100.0)
 # cooling-off lap that undoes it.
 CELL_TEMP = Threshold(warn=45.0, crit=55.0, full_scale=80.0)
 
+# Below this, a per-cell temperature is a broken sensor, not a cold cell.
+#
+# The Orion Thermistor Expansion Module reports a disconnected/failed
+# thermistor as a nonsense NEGATIVE value while flagging it in the frame's own
+# fault bit (see modules/temp_controller_parser.py, datasheet Note #6). This
+# car's cells 14-20 have been sitting at exactly -41 °C in stored history for
+# that reason, and DS003 was rendering them as though they were measurements.
+#
+# -20 °C is far below anything a working pack reaches on this circuit (the
+# recorded pack has never been near freezing) and far above the -41 sentinel,
+# so it separates the two cleanly without hiding a genuinely cold morning.
+CELL_TEMP_IMPLAUSIBLE_BELOW = -20.0
+
+
+def plausible_cell_temp(deg_c):
+    """The reading, or None if it is not a physically possible cell temperature.
+
+    Same contract and the same reasoning as plausible_pack_voltage below: apply
+    it where the reading ENTERS a display, never inside classify(), which is
+    generic and must not learn any one metric's physics. A broken sensor is not
+    a measurement, so it renders as an em dash like every other unreported
+    value rather than being coloured as though it were real.
+
+    ONE-SIDED ON PURPOSE — this gates only the LOW side. An implausibly HIGH
+    cell temperature must still reach the screen: a thermistor failing high and
+    a pack genuinely overheating look similar from here, and of the two possible
+    mistakes, hiding a real thermal runaway is far worse than showing a
+    suspicious number that turns out to be a dead sensor.
+    """
+    if deg_c is None:
+        return None
+    try:
+        deg_c = float(deg_c)
+    except (TypeError, ValueError):
+        return None
+    return None if deg_c < CELL_TEMP_IMPLAUSIBLE_BELOW else deg_c
+
 
 # ── Battery ─────────────────────────────────────────────────────────────── #
 
@@ -148,6 +185,42 @@ CELL_V_CRIT = 3.00     # standard Li-ion cutoff; below here you are damaging cel
 # per-cell voltage screen (DS004) is the first thing that needs one directly.
 CELL_VOLTAGE = Threshold(warn=CELL_V_WARN, crit=CELL_V_CRIT,
                          low_side=True, full_scale=CELL_V_MAX)
+
+
+# DS003 sensor naming. The pack is built as TWO modules of CELL_COUNT cells,
+# so the thermistors read as C_A1..C_A13 then C_B1..C_B13 rather than as one
+# flat 1..30 run — that is how the cells are labelled on the car itself, and a
+# temperature is only actionable if you can find the cell it belongs to.
+#
+# Derived from CELL_COUNT so the two cannot drift: change the pack's series
+# count and the grouping follows.
+#
+# ⚠️ THE MAPPING IS SEQUENTIAL AND ASSUMED: thermistor 1..13 -> module A,
+# 14..26 -> module B, in the order the Orion module reports them. Nothing on
+# the CAN bus states which physical module a thermistor belongs to (the
+# datasheet's IDs are just a position in the module's own scan order), so this
+# is the one part of the label that is a convention rather than a measurement.
+# If the harness is wired in a different order, fix it HERE — every screen
+# takes its labels from this one function.
+THERMISTOR_GROUP_NAMES = ("A", "B")
+THERMISTOR_GROUPED_COUNT = CELL_COUNT * len(THERMISTOR_GROUP_NAMES)   # 26
+
+
+def cell_temp_label(index):
+    """1-indexed thermistor number -> its cell name, e.g. 1 -> 'C_A1',
+    14 -> 'C_B1'.
+
+    Anything past the grouped pack (27..30 — the Orion module can address more
+    thermistors than this car has cells) falls back to a plain 'C27'. It is
+    NOT forced into a third group: an unmapped sensor should look unmapped
+    rather than borrow a module name it may not belong to.
+    """
+    i = int(index)
+    if 1 <= i <= THERMISTOR_GROUPED_COUNT:
+        group, within = divmod(i - 1, CELL_COUNT)
+        return f"C_{THERMISTOR_GROUP_NAMES[group]}{within + 1}"
+    return f"C{i}"
+
 
 PACK_V_FULL = CELL_COUNT * CELL_V_MAX      # 54.6 V
 

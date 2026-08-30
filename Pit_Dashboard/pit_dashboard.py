@@ -55,6 +55,9 @@ from constants import (
     NORMAL, WARNING, CRITICAL, TIER_COLOURS, classify,
     MOTOR_TEMP, CTRL_TEMP, CELL_TEMP, SOC, POWER,
     PACK_VOLTAGE, BATT_CURRENT, MOTOR_CURRENT, SPEED, CELL_VOLTAGE,
+    plausible_cell_temp,
+    CELL_COUNT, cell_temp_label,
+    THERMISTOR_GROUP_NAMES, THERMISTOR_GROUPED_COUNT,
     # Uncoloured on purpose (no warn, no crit) — it is imported anyway so the
     # tile declares a limit like every other numeric tile, and so the gauge
     # scale stays shared with the driver HUD.
@@ -1474,7 +1477,14 @@ def _render_cell_row(cols_n, indices, state, label_fmt):
     for row_start in range(0, len(indices), cols_n):
         chunk = indices[row_start:row_start + cols_n]
         cols = st.columns(cols_n)
-        for col, i in zip(cols, chunk):
+        # Every column gets an element, trailing unused ones included -- see the
+        # ghost-tile note in _live_metrics_fragment for why an empty slot in a
+        # 2 s fragment keeps showing the previous render's content.
+        for slot, col in enumerate(cols):
+            if slot >= len(chunk):
+                col.empty()
+                continue
+            i = chunk[slot]
             v = _cell_value(state, i)
             render_metric(col, label_fmt(i), fmt(v, ".3f"), "V",
                          classify(v, CELL_VOLTAGE),
@@ -1482,15 +1492,24 @@ def _render_cell_row(cols_n, indices, state, label_fmt):
 
 
 def _cell_temp_value(state, i):
-    """One cell's temperature, or None if that thermistor has never reported.
+    """One cell's temperature, or None if that thermistor has never reported
+    or is reporting a broken-sensor value.
 
-    No secondary gate like _cell_value's bms_string_count check: per the
-    Orion Thermistor Expansion Module's own datasheet, a thermistor that
-    hasn't been loaded/enabled via the Thermistor Utility is simply never
+    No bms_string_count-style gate like _cell_value's: per the Orion
+    Thermistor Expansion Module's own datasheet, a thermistor that hasn't
+    been loaded/enabled via the Thermistor Utility is simply never
     transmitted at all — there is no "polled but unwired" wire state here
     the way there is for a BMS voltage tap, so an absent value already means
-    exactly "not configured," nothing further to disambiguate."""
-    return state.get(f"bms_cell_temp_{i:02d}_C")
+    exactly "not configured," nothing further to disambiguate.
+
+    What DOES need gating is a thermistor the module has enabled but which is
+    failed/disconnected: it reports a nonsense negative (-41 °C on this car's
+    cells 14-20) alongside a per-sensor fault bit. The car now drops those at
+    the source, but the pit must gate them too — every such reading already
+    stored in history, and carried forward through last_known, would
+    otherwise keep rendering as a real measurement forever.
+    """
+    return plausible_cell_temp(state.get(f"bms_cell_temp_{i:02d}_C"))
 
 
 def _render_cell_temp_row(cols_n, indices, state, label_fmt):
@@ -1498,11 +1517,75 @@ def _render_cell_temp_row(cols_n, indices, state, label_fmt):
     for row_start in range(0, len(indices), cols_n):
         chunk = indices[row_start:row_start + cols_n]
         cols = st.columns(cols_n)
-        for col, i in zip(cols, chunk):
+        # Every column gets an element -- see _render_cell_row just above.
+        for slot, col in enumerate(cols):
+            if slot >= len(chunk):
+                col.empty()
+                continue
+            i = chunk[slot]
             v = _cell_temp_value(state, i)
             render_metric(col, label_fmt(i), fmt(v, ".1f"), "°C",
                          classify(v, CELL_TEMP),
                          stale_s=ages.get(f"bms_cell_temp_{i:02d}_C"))
+
+
+def ds004_compliance(state):
+    """(valid_count, required, missing_indices) for the DS004 screen.
+
+    "Valid" means a reading this dashboard would actually show a scrutineer:
+    present, past _cell_value's bms_string_count gate, and non-zero. The
+    zero check matters — an unwired tap on this hardware decodes to a literal
+    0.000 V, and counting that toward compliance is exactly the fabrication
+    this whole screen exists to avoid.
+    """
+    required = DS004_MODULE_COUNT
+    missing = []
+    valid = 0
+    for i in range(1, required + 1):
+        v = _cell_value(state, i)
+        if v is None or float(v) <= 0.0:
+            missing.append(i)
+        else:
+            valid += 1
+    return valid, required, missing
+
+
+def _render_ds004_compliance(state):
+    """The pass/fail banner for DS004's 26-sensor requirement.
+
+    Deliberately reports the SHORTFALL rather than quietly rendering 26 tiles
+    of which half are dashes. The rulebook asks for 26 live module voltages;
+    if the car cannot supply them the crew needs to know that at a glance, on
+    the screen that claims compliance, not by counting dashes.
+    """
+    valid, required, missing = ds004_compliance(state)
+    if valid >= required:
+        st.success(f":material/verified: **DS004 OK — {valid}/{required} "
+                  f"module voltages live.**", icon=":material/check_circle:")
+        return
+
+    def _runs(nums):
+        """Compact 13-26 instead of thirteen separate numbers."""
+        out, start, prev = [], None, None
+        for n in nums + [None]:
+            if start is None:
+                start = prev = n
+            elif n is not None and n == prev + 1:
+                prev = n
+            else:
+                out.append(str(start) if start == prev else f"{start}-{prev}")
+                start = prev = n
+        return ", ".join(out)
+
+    st.error(
+        f":material/error: **DS004 NOT MET — {valid}/{required} module "
+        f"voltages live.** Missing module(s): {_runs(missing)}.\n\n"
+        f"The pit is asking the BMS for every cell frame (0x107-0x110, all "
+        f"ten are polled); these simply are not being answered. That is a "
+        f"BMS configuration / cell-tap wiring matter on the car, not a "
+        f"dashboard one — check the pack's configured series count and the "
+        f"sense harness.",
+        icon=":material/error:")
 
 
 def render_cell_voltages(state):
@@ -1516,11 +1599,16 @@ def render_cell_voltages(state):
     happens on the car — there is no wire signal that means "not configured
     yet", only the absence of a value ever arriving (see the parser's
     docstring). Below, that shows as a "not configured yet" sign; the section
-    switches to the real 30-tile grid automatically the moment the car sends
-    its first genuine reading, with no code change needed here on that day.
+    switches to the real grid automatically the moment the car sends its
+    first genuine reading, with no code change needed here on that day.
+
+    The thermistors are grouped as the pack is actually built — module A then
+    module B, 13 cells each — rather than as one flat 1..30 run, so a hot
+    reading names a cell someone can physically go and find. The naming and
+    the A/B split both come from limits.cell_temp_label, shared with the
+    driver HUD so the two screens cannot label the same sensor differently.
     """
-    st.markdown(f"##### :material/thermostat: DS003 — Cell Temperatures "
-               f"(1–{db.THERMISTOR_CELL_COLUMN_COUNT})")
+    st.markdown("##### :material/thermostat: DS003 — Cell Temperatures")
     configured = any(_cell_temp_value(state, i) is not None
                      for i in range(1, db.THERMISTOR_CELL_COLUMN_COUNT + 1))
     if not configured:
@@ -1533,10 +1621,30 @@ def render_cell_voltages(state):
     else:
         st.caption(f"Colour: warn above {CELL_TEMP.warn:.0f} °C, critical "
                   f"above {CELL_TEMP.crit:.0f} °C.")
-        _render_cell_temp_row(
-            LIVE_METRICS_PER_ROW,
-            list(range(1, db.THERMISTOR_CELL_COLUMN_COUNT + 1)),
-            state, lambda i: f"Cell {i}")
+        for g, group_name in enumerate(THERMISTOR_GROUP_NAMES):
+            first = g * CELL_COUNT + 1
+            indices = list(range(first, first + CELL_COUNT))
+            st.markdown(f"**Module {group_name}** "
+                       f"({cell_temp_label(indices[0])}–"
+                       f"{cell_temp_label(indices[-1])})")
+            _render_cell_temp_row(LIVE_METRICS_PER_ROW, indices,
+                                  state, cell_temp_label)
+
+        # Anything the Orion module can address beyond the mapped pack. Shown
+        # only when it actually reports, exactly like DS004's "Additional
+        # Cells" below — the house rule is that no data is silently dropped,
+        # but an empty section is clutter on a compliance screen.
+        extra_t = [i for i in range(THERMISTOR_GROUPED_COUNT + 1,
+                                    db.THERMISTOR_CELL_COLUMN_COUNT + 1)
+                   if _cell_temp_value(state, i) is not None]
+        if extra_t:
+            st.markdown(f"**Unmapped sensors** ({THERMISTOR_GROUPED_COUNT + 1}"
+                       f"–{db.THERMISTOR_CELL_COLUMN_COUNT})")
+            st.caption("Reporting beyond the pack's two 13-cell modules — "
+                      "shown so no reading is lost. If these are real cells, "
+                      "extend the mapping in limits.cell_temp_label.")
+            _render_cell_temp_row(LIVE_METRICS_PER_ROW, extra_t,
+                                  state, cell_temp_label)
 
     st.divider()
 
@@ -1549,6 +1657,7 @@ def render_cell_voltages(state):
 
     st.markdown(f"##### :material/rule: DS004 — Module Voltages "
                f"(1–{DS004_MODULE_COUNT})")
+    _render_ds004_compliance(state)
     st.caption("The JBD BMS protocol has no grouping above individual cells "
               "(BMS_CAN_PROTOCOL.docx: \"Cell 1\" .. \"Cell 30\", no separate "
               "module concept), so a monitored cell IS a module here. Colour: "
@@ -1604,13 +1713,6 @@ def _render_live_metric(col, m, state, ctx):
         render_metric(col, m["label"], fmt(value, m.get("spec", ".0f")),
                       m["unit"], condition, large=True, note=note, stale_s=stale_s)
 
-    # The one write control on this whole read-only page. Placed here, right
-    # under the Trip tile specifically (`with col:`), rather than in the
-    # sidebar with Cut Lap -- see render_trip_reset_panel's docstring.
-    if m.get("field") == "trip_m":
-        with col:
-            render_trip_reset_panel()
-
 
 @st.fragment(run_every=2)
 def _live_metrics_fragment():
@@ -1640,8 +1742,28 @@ def _live_metrics_fragment():
             # fill it, so tiles line up down the page instead of stretching to
             # different widths per group.
             cols = st.columns(LIVE_METRICS_PER_ROW)
-            for col, m in zip(cols, chunk):
-                _render_live_metric(col, m, state, ctx)
+            # EVERY column gets an element, including the trailing unused ones.
+            # This used to be `zip(cols, chunk)`, which simply left them empty --
+            # and on a fragment that reruns every 2 s, Streamlit matches elements
+            # by position, so an empty slot kept displaying whatever the previous
+            # RENDER had drawn in it. The visible symptom was ghost tiles: the
+            # Energy group's 9th metric sat beside stale copies of the row above
+            # it, and Lap & Distance repeated "Last Lap Time"/"Odometer" under
+            # Trip. Writing an explicit empty placeholder keeps the element tree
+            # the same shape on every rerun, so nothing is left to inherit.
+            for slot, col in enumerate(cols):
+                if slot < len(chunk):
+                    _render_live_metric(col, chunk[slot], state, ctx)
+                else:
+                    col.empty()
+        # The one write control on this whole read-only page, directly under the
+        # group holding the Trip tile. NOT inside the tile loop above: this
+        # panel renders a VARIABLE number of widgets (it grows a caption and a
+        # "Check again" button once a command has been sent), and a grid cell
+        # whose element count changes between reruns is exactly what desynced
+        # the element tree in the first place.
+        if group == "Lap & Distance":
+            render_trip_reset_panel()
 
     st.caption(
         f"{LIVE_METRIC_COUNT} metrics \u00b7 refreshing every 2 s \u00b7 "
@@ -2731,11 +2853,17 @@ def render_cut_lap_panel():
 
 def render_trip_reset_panel():
     """Ask the CAR to zero its own tracked distance total (state["trip_m"] /
-    lap_tracker.odometer_m). Called from _render_live_metric, `with col:`, so
-    it renders directly under the Trip tile in the Live Metrics grid rather
-    than in the sidebar like Cut Lap -- "under the Trip tile" is literally
-    where this control was asked for. Uses bare st.* calls (not st.sidebar.*)
-    for that reason.
+    lap_tracker.odometer_m). Called from _live_metrics_fragment immediately
+    after the "Lap & Distance" group, so it sits directly under the Trip tile
+    on the page rather than in the sidebar like Cut Lap -- "under the Trip
+    tile" is where this control was asked for. Uses bare st.* calls (not
+    st.sidebar.*) for that reason.
+
+    Deliberately rendered BETWEEN groups rather than inside a grid cell: this
+    panel grows extra widgets once a command has been sent (an ack caption,
+    and a "Check again" button), and a column whose element count changes
+    between 2 s reruns is what desynced the fragment's element tree and left
+    ghost tiles in the half-empty rows.
 
     Distinct from Cut Lap: doesn't touch lap counting or energy. Also does NOT
     reset the controller's own hardware TRIP register (0x620) -- there is no

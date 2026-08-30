@@ -48,19 +48,50 @@ from pit_config import (
     RECONNECT_BACKOFF_START,
     RECONNECT_BACKOFF_MAX,
     INITIAL_BACKFILL_LIMIT,
+    DATA_SILENCE_TIMEOUT,
 )
 
 STREAM_URL = f"{DB_URL}/{TELEMETRY_PATH}.json"
 
 # Read timeout for the streaming socket. RTDB sends a keep-alive every ~30-45s;
-# if we see nothing for longer than this, the connection is treated as dead and
-# we reconnect.
+# if we see NO BYTES AT ALL for longer than this, the connection is treated as
+# dead and we reconnect.
+#
+# ⚠️ This alone is NOT enough to detect a stalled feed, because a keep-alive is
+# bytes: a stream that has stopped delivering telemetry but is still being
+# pinged resets this timer forever and never trips. That failure has been
+# observed on this pit wall (see DATA_SILENCE_TIMEOUT in pit_config.py, which
+# is the actual guard against it). Keep both: this one catches a socket that
+# has gone completely silent, that one catches a socket that is chatty but no
+# longer carrying samples.
 STREAM_READ_TIMEOUT = 70.0
 
-# How much we pull off the socket per read. Deliberately large: a reconnect
-# catch-up arrives as one enormous line, and we want a few big reads rather than
-# thousands of tiny ones. See _iter_sse_lines for why that matters so much.
-STREAM_CHUNK_BYTES = 1 << 16  # 64 KiB
+
+class StreamStalled(RuntimeError):
+    """Raised when the socket is healthy but no telemetry has arrived for
+    DATA_SILENCE_TIMEOUT. Subclass of RuntimeError so the supervisor's existing
+    `except Exception` reconnect path handles it with no special casing."""
+
+# How much we pull off the socket per read.
+#
+# This was 64 KiB, and that made the live feed arrive in BURSTS instead of in
+# real time. Measured on the pit wall: exactly 37 samples landed at once every
+# ~20 seconds and nothing in between — 37 samples x ~1.7 KB is almost exactly
+# 64 KiB. The read was waiting to FILL this buffer before yielding anything, so
+# a car pushing twice a second reached the dashboard in one 20-second clump.
+# The tiles sat there ageing past DATA_STALE_AFTER_S (10 s) and flipping to
+# "Stale" between clumps, which is what "the Pi is live but the pit is not"
+# actually looked like.
+#
+# 4 KiB is a couple of samples' worth, so latency is well under a second.
+#
+# The original 64 KiB was chosen to keep a big reconnect catch-up to a few
+# large reads. That reasoning does not apply any more: the O(n^2) blow-up it
+# was guarding against lived in requests' own iter_lines, and _iter_sse_lines
+# below replaced it with a joiner that is O(n) at ANY chunk size. A smaller
+# chunk here costs only more (cheap, constant-work) loop iterations, and the
+# per-byte cost of the catch-up path is unchanged.
+STREAM_CHUNK_BYTES = 4096
 
 
 def _log(msg: str) -> None:
@@ -206,14 +237,28 @@ def stream_once(conn, creds, start_after_key) -> str:
 
         event_type = None
         data_buf = []
+        # Watchdog clock. Deliberately reset ONLY by a real telemetry event
+        # below, never by a keep-alive — see StreamStalled / the note on
+        # STREAM_READ_TIMEOUT for the stall this exists to break out of.
+        last_data_ts = time.time()
 
         for raw in _iter_sse_lines(resp):
             line = raw.rstrip("\r")
 
+            # Checked here rather than only after an event, so a stream that is
+            # delivering nothing but keep-alives still trips it. Keep-alives are
+            # what give this loop control back on an otherwise idle socket.
+            silent_for = time.time() - last_data_ts
+            if silent_for > DATA_SILENCE_TIMEOUT:
+                raise StreamStalled(
+                    f"no telemetry for {silent_for:.0f}s despite a live socket "
+                    f"(limit {DATA_SILENCE_TIMEOUT:.0f}s) — reconnecting")
+
             if line == "":
                 # blank line terminates an event
                 if event_type is not None:
-                    _dispatch(conn, event_type, "\n".join(data_buf))
+                    if _dispatch(conn, event_type, "\n".join(data_buf)):
+                        last_data_ts = time.time()
                 event_type = None
                 data_buf = []
                 continue
@@ -229,33 +274,42 @@ def stream_once(conn, creds, start_after_key) -> str:
         return "closed"
 
 
-def _dispatch(conn, event_type: str, data_str: str):
-    """Apply one fully-parsed SSE event. Returns None (kept simple)."""
+def _dispatch(conn, event_type: str, data_str: str) -> bool:
+    """Apply one fully-parsed SSE event.
+
+    Returns True when this was a REAL telemetry event (as opposed to a
+    keep-alive or an unparseable/ignored one), which is what resets the
+    caller's stall watchdog. A keep-alive must return False — treating it as
+    liveness is precisely the bug StreamStalled exists to catch.
+    """
     if event_type in ("keep-alive",):
-        return None
+        return False
     if event_type == "auth_revoked":
         raise PermissionError("auth_revoked: access token rejected by RTDB")
     if event_type == "cancel":
         raise RuntimeError("cancel: stream cancelled by server (check DB rules)")
 
     if not data_str:
-        return None
+        return False
     try:
         payload = json.loads(data_str)
     except json.JSONDecodeError:
         _log(f"could not parse data for event '{event_type}'")
-        return None
+        return False
 
     if event_type == "put":
         n = _handle_put(conn, payload)
         if n:
             _log(f"+{n} new sample(s)  (total {db.count_samples(conn)})")
-    elif event_type == "patch":
+        # True even when n == 0: a duplicate/boundary key still proves the
+        # stream is delivering telemetry, which is all the watchdog asks.
+        return True
+    if event_type == "patch":
         # records are immutable; a patch shouldn't occur. Log and skip.
         _log(f"ignoring 'patch' at {payload.get('path')}")
-    else:
-        _log(f"ignoring event '{event_type}'")
-    return None
+        return True
+    _log(f"ignoring event '{event_type}'")
+    return False
 
 
 # --------------------------------------------------------------------------- #
