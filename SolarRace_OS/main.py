@@ -284,6 +284,13 @@ class SmartCANWorker(CANWorker):
         # sticky: _emit_zeros() clears it like every other reading.
         self._thermistor_configured = False
         self._cell_temps_C: dict = {}      # {cell_num (1-indexed): temp_C}
+        # DS004 — individual cell voltages, accumulated the same way as
+        # DS003's temperatures (the JBD BMS reports 3 cells per frame across
+        # 10 CAN IDs). No "configured" flag needed: unlike the Thermistor
+        # Expansion Module, the BMS's own cell taps are always present once
+        # it is polled at all -- gate on bms_string_count instead, exactly
+        # like the pit dashboard's DS004 section already does.
+        self._cell_voltages_V: dict = {}   # {cell_num (1-indexed): volts}
         # The driver HUD's alert bar shows a SINGLE combined list, but MMS
         # (0x600) and BMS (0x102) faults arrive on separate frames. Cache each
         # so a fresh frame from one device doesn't wipe the other's alerts.
@@ -543,6 +550,10 @@ class SmartCANWorker(CANWorker):
         # configured through a later dead bus, same as _have_module_cell_temp.
         self._cell_temps_C = {}
         self.cell_temps_updated.emit(self._thermistor_configured, {})
+        # DS004 blanks like every other gauge — no sticky flag to preserve,
+        # since a dead bus means the BMS itself has gone quiet too.
+        self._cell_voltages_V = {}
+        self.cell_voltages_updated.emit(None, {})
         # 0 Ω is below the PT1000's physical floor, so the HUD reads it as
         # "no sensor data" and blanks both fields rather than showing the
         # -246 °C that extrapolating 0 Ω would imply.
@@ -1078,6 +1089,16 @@ class SmartCANWorker(CANWorker):
         bms_data = parse_jbd_bms_message(msg_id, data_bytes)
         if bms_data:
             self.vehicle_state["battery"].update(bms_data)
+            # DS004 — accumulate per-cell voltages the same way DS003
+            # accumulates per-cell temperatures (3 cells land per frame,
+            # across 10 CAN IDs); push a full snapshot + the BMS's own wired
+            # count on every BMS frame, not just the ones carrying a cell.
+            for _k, _v in bms_data.items():
+                if _k.startswith("bms_cell_") and _k.endswith("_V"):
+                    self._cell_voltages_V[int(_k[len("bms_cell_"):-len("_V")])] = _v
+            self.cell_voltages_updated.emit(
+                self.vehicle_state["battery"].get("bms_string_count"),
+                dict(self._cell_voltages_V))
             # Drive the driver HUD's SoC gauge from the REAL BMS (same value the
             # pit shows). The LYNX 0x618 SoC is only the controller's estimate
             # and is suppressed once we have a real reading (see _decode_battery).
@@ -1127,10 +1148,20 @@ class SmartCANWorker(CANWorker):
         # BMS's 3-cells-per-frame voltage messages.
         therm_data = parse_thermistor_general_message(msg_id, data_bytes)
         if therm_data:
+            # Any frame at all -- fault or not -- proves this cell has been
+            # loaded/enabled on the module; that is what "configured" means
+            # (see the parser's docstring). Only the VALUE is untrustworthy
+            # when the fault bit (Note #6) is set -- e.g. an open-circuit
+            # sensor reporting a nonsense -41 C, seen in real captures on
+            # this car's own cells 14-20 -- so that alone is what's skipped.
+            # A persistently faulted cell simply never gets a value (stays
+            # unreported, same as one never loaded at all) rather than
+            # freezing on a number known to be wrong.
             self._thermistor_configured = True
-            self.vehicle_state["temp_controller"][
-                f"bms_cell_temp_{therm_data['cell_num']:02d}_C"] = therm_data["value_C"]
-            self._cell_temps_C[therm_data["cell_num"]] = therm_data["value_C"]
+            if not therm_data["fault"]:
+                key = f"bms_cell_temp_{therm_data['cell_num']:02d}_C"
+                self.vehicle_state["temp_controller"][key] = therm_data["value_C"]
+                self._cell_temps_C[therm_data["cell_num"]] = therm_data["value_C"]
             self.cell_temps_updated.emit(True, dict(self._cell_temps_C))
 
         mms_data = parse_mms_message(msg_id, data_bytes)

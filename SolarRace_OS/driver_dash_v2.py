@@ -913,7 +913,17 @@ class RacingDashboard(QMainWindow):
     _NAV_BTN_H = 64
     _NAV_BTN_W = 90
 
-    _SCREEN_NAMES = ("DS001", "DS002", "DS003")
+    _SCREEN_NAMES = ("DS001", "DS002", "DS003", "DS004")
+
+    # DS004 of the technical regulations: "Voltage of all battery modules
+    # (26 sensors)". Same NAME and count as the pit dashboard's own
+    # DS004_MODULE_COUNT (pit_dashboard.py), but deliberately its own
+    # constant rather than imported: this is a fixed regulation count, not a
+    # protocol limit shared by construction (unlike THERMISTOR_COUNT above,
+    # which IS imported because drifting from the parser's own limit would
+    # misfile real data) -- and the pit's copy lives in a different app
+    # entirely, with no shared import path.
+    DS004_MODULE_COUNT = 26
 
     # Height the pit-message strip takes WHEN a message is showing. It is hidden
     # the rest of the time — an empty box permanently occupying the screen is
@@ -1025,6 +1035,7 @@ class RacingDashboard(QMainWindow):
         self._screens.addWidget(self._build_screen_ds001())
         self._screens.addWidget(self._build_screen_ds002())
         self._screens.addWidget(self._build_screen_ds003())
+        self._screens.addWidget(self._build_screen_ds004())
         vbox.addWidget(self._screens, stretch=1)
 
         vbox.addWidget(self._build_controls_bar())
@@ -1697,6 +1708,33 @@ class RacingDashboard(QMainWindow):
 
         return page
 
+    def _build_screen_ds004(self) -> QWidget:
+        """DS004 of the technical regulations: "Voltage of all battery
+        modules (26 sensors)". Reads the JBD BMS's own per-cell voltage
+        frames (0x107-0x110) — see can_worker.CANWorker.cell_voltages_updated
+        and main.py's accumulation alongside DS003's.
+
+        Unlike DS003, this page has no "not configured" sign: the BMS's own
+        cell taps are already live the moment the BMS is polled at all, so
+        there's nothing to wait on. A cell beyond the BMS's own reported
+        bms_string_count simply reads as unreported (None) — the identical
+        gate the pit dashboard's DS004 section already uses for the same
+        reason (a polled-but-unwired tap can decode to a literal 0.000 V,
+        which must not be shown as a real reading).
+        """
+        page = QWidget()
+        grid = QGridLayout(page)
+        grid.setSpacing(4)
+        grid.setContentsMargins(0, 0, 0, 0)
+        cols = 6   # same layout as DS003's grid
+        self._voltage_tiles: dict[int, CellTile] = {}
+        for i in range(1, self.DS004_MODULE_COUNT + 1):
+            tile = CellTile(f"M{i}", limits.CELL_VOLTAGE, decimals=2)
+            self._voltage_tiles[i] = tile
+            row, col = divmod(i - 1, cols)
+            grid.addWidget(tile, row, col)
+        return page
+
     # ── Touch pagination ─────────────────────────────────────────────────── #
     def _go_screen(self, index: int) -> None:
         """Switch pages, wrapping around so one button can cycle everything."""
@@ -1877,6 +1915,7 @@ class RacingDashboard(QMainWindow):
         self._worker.battery_current_updated.connect(self._on_battery_current)
         self._worker.cell_temp_updated.connect(self._on_cell_temp)
         self._worker.cell_temps_updated.connect(self._on_cell_temps)
+        self._worker.cell_voltages_updated.connect(self._on_cell_voltages)
         self._worker.vehicle_flags_updated.connect(self._on_vehicle_flags)
         self._worker.target_speed_updated.connect(self._on_target_speed)
         self._worker.turn_alert_updated.connect(self._on_turn_alert)
@@ -2255,6 +2294,18 @@ class RacingDashboard(QMainWindow):
         self._ds3_stack.setCurrentIndex(1 if configured else 0)
         for cell_num, tile in self._cell_tiles.items():
             tile.set_value(temps.get(cell_num))
+
+    @Slot(object, object)
+    def _on_cell_voltages(self, string_count, voltages: dict) -> None:
+        """DS004 — gated on bms_string_count, exactly like the pit
+        dashboard's own _cell_value: a tap beyond the wired count reads as
+        unreported even if it decoded to a literal 0.000 V (a real trap on
+        this hardware — see _cell_value's docstring in pit_dashboard.py)."""
+        for cell_num, tile in self._voltage_tiles.items():
+            v = voltages.get(cell_num)
+            if v is not None and string_count is not None and cell_num > string_count:
+                v = None
+            tile.set_value(v)
 
     @Slot(object)
     def _on_power(self, watts) -> None:

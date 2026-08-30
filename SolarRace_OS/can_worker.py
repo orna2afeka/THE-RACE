@@ -146,6 +146,14 @@ class CANWorker(QThread):
     # already this file's own convention for every other signal (see the
     # module docstring above), and it round-trips a dict correctly.
     cell_temps_updated      = Signal(object, object)
+    # DS004: every individual cell VOLTAGE, from the JBD BMS's own
+    # per-cell frames (0x107-0x110) — already flowing continuously once the
+    # BMS is on the bus (unlike DS003's optional thermistor module), so this
+    # carries no "configured" flag of its own. (bms_string_count or None,
+    # {cell_num: volts}). object, object for the same reason as
+    # cell_temps_updated just above -- a plain Signal(dict) silently drops
+    # its payload in this PySide6 version.
+    cell_voltages_updated   = Signal(object, object)
     # Boolean dashboard indicators: parking_brake / lights_on / ecu_on / reverse
     # (+ the raw status byte they came from). One dict so the HUD repaints the
     # whole indicator row from a single consistent snapshot.
