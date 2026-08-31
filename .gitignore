@@ -25,6 +25,21 @@ REACT_MIGRATION_PROMPT.md
 **/*.bak
 
 # ---------------------------------------------------------------------------
+# Firebase credentials
+# ---------------------------------------------------------------------------
+# Real service-account keys for the solar-race-telemetry Firebase project.
+# NEVER commit these -- this repo is public. Get your own copy from the
+# team's shared folder (see README) and drop it in place; both collector.py
+# and main.py load it from these exact paths.
+#
+# This is not a hypothetical: a key WAS committed here for 12 days across 49
+# commits before this line was added, and was purged from history with
+# git-filter-repo. That key must be treated as compromised regardless -- see
+# the README note next to this same warning.
+Pit_Dashboard/serviceAccountKey.json
+SolarRace_OS/cloud/serviceAccountKey.json
+
+# ---------------------------------------------------------------------------
 # Car-side runtime state
 # ---------------------------------------------------------------------------
 # main.py writes this on the Pi so a reboot mid-race resumes the running

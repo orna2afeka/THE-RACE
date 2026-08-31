@@ -612,16 +612,25 @@ once per second; the BMS replies on the same ID and those replies are decoded no
 ## 🔒 Security & Track Notes
 
 1. **Firebase keys** — `serviceAccountKey.json` (Firebase Admin SDK) is required in both
-   `SolarRace_OS/cloud/` and `Pit_Dashboard/` (the two copies are identical). Both are
-   **deliberately committed to this repository**, so that a teammate cloning it gets a
-   working setup with no extra setup step. That is a conscious trade-off, and it means:
-   - **This repository must stay private.** The file contains a live RSA private key with
-     admin access to the `solar-race-telemetry` Realtime Database.
-   - If the repo is ever made public, forked outside the team, or the key otherwise leaks,
-     **rotate it** in the Google Cloud console (IAM → Service Accounts → Keys). Removing
-     the file in a later commit is *not* sufficient — it stays in git history.
-   - `.gitignore` intentionally does **not** list this file, because ignoring an
-     already-tracked file has no effect and would be misleading.
+   `SolarRace_OS/cloud/` and `Pit_Dashboard/` (the two copies are identical). This repo is
+   **public**, so neither copy is committed — both paths are in `.gitignore`.
+   - **Get your own copy from the team's shared folder:**
+     `04 Strategy Data Analysis/software/lee`. Download it and place it at both paths above
+     (or symlink one to the other) before running `collector.py` or `main.py` — both open
+     it by a path relative to their own file, so it must exist at the exact locations the
+     file tree above shows, not just somewhere in the repo.
+   - **A key WAS committed here before this repo went public** — for 12 days, across 49
+     commits, on every branch (`main`, `master`, `charging-strategy-test`,
+     `orna2afeka-patch-1`). It has since been purged from history with `git-filter-repo`,
+     but purging history does **not** undo an exposure that already happened: anyone who
+     cloned or fetched the repo in that window, or any cached copy GitHub kept, may still
+     have it. **That key should be treated as compromised and rotated** in the Google Cloud
+     console (IAM → Service Accounts → Keys) — deleting it from git is hygiene, not a fix,
+     and does not by itself invalidate the old key.
+   - If a *future* key ever leaks the same way, the fix is the same: rotate it in the
+     Google Cloud console. Removing the file in a later commit is never sufficient on its
+     own — it stays reachable from every commit that touched it until history itself is
+     rewritten, and even then anyone with an earlier clone still has it.
 2. **Track adaptation** — the velocity profile, sector layout, and weather coordinates are
    set for **Circuit Zolder (4000 m)**. For another venue, update the track constants in the
    pit dashboard and the coordinates in `weather_service.py` / `fetch_zolder_weather`.
