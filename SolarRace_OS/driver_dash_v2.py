@@ -1861,7 +1861,7 @@ class RacingDashboard(QMainWindow):
         # The methods stay — main.py and closeEvent call them — and the bench
         # keyboard shortcuts below still give full manual control when a laptop
         # is plugged in. See _install_shortcuts().
-        self._ver_lbl = QLabel("Driver HUD ORNA2si | 500 Kbps")
+        self._ver_lbl = QLabel("Driver HUD ORNA2 | 500 Kbps")
         self._ver_lbl.setStyleSheet(f"color: {_DIM}; font-size: 9px;")
         layout.addWidget(self._ver_lbl)
         self._fit_controls_bar()
