@@ -66,7 +66,17 @@ from zolder_centreline import (BUILT_UTC, OSM_ATTRIBUTION,    # noqa: E402
 from strategy_engine import SECTIONS_INFO, TRACK_LANDMARKS    # noqa: E402
 from constants import SECTION_NAMES                           # noqa: E402
 
-OUT_PATH = os.path.join(_REPO, "Pit_Dashboard", "zolder_animation.html")
+# BOTH generated pages live in docs/, and neither is application code.
+#
+# GitHub Pages can publish from a repo's docs/ folder and still serve it at the
+# SITE ROOT, so docs/index.html is reachable at the bare project address --
+# family get a link with no path on it -- while the repo root stays free of
+# loose .html. The presentation page rides along in the same folder because it
+# is the same kind of thing: a web page about the car, not part of the pit app
+# it used to sit inside.
+_SITE = os.path.join(_REPO, "docs")
+OUT_PATH = os.path.join(_SITE, "zolder_animation.html")
+SPECTATOR_PATH = os.path.join(_SITE, "index.html")
 PROFILE_PATH = os.path.join(_REPO, "profiles", "base_210s.csv")
 
 BOUNDARIES = [SECTIONS_INFO[s]["range"][0] for s in sorted(SECTIONS_INFO)]
@@ -338,42 +348,35 @@ def build_data():
 
 
 # --------------------------------------------------------------------------- #
-# The page. Data goes in as one JSON blob at __DATA__; nothing else is
-# substituted, so the CSS and JS below are exactly what ships.
+# The pages. TWO come out of this generator, sharing one map renderer:
+#
+#   Pit_Dashboard/zolder_animation.html   the formal/presentation piece. Drives
+#                                         itself round the 210 s profile. Shown
+#                                         to sponsors and the team; never live.
+#   index.html                            the SPECTATOR page, at the repo root
+#                                         so GitHub Pages serves it as the site
+#                                         root. Live from Firebase, or honestly
+#                                         says it is not.
+#
+# They share MAP_JS and BASE_CSS. The map is the expensive, fiddly part — the
+# projection, the sector splits, the callout placement — and having it exist
+# twice is how the two would end up disagreeing about where Turn 12 is.
 # --------------------------------------------------------------------------- #
-TEMPLATE = r"""<!DOCTYPE html>
-<!--
-  GENERATED FILE - DO NOT EDIT BY HAND.
-  Written by tools/build_zolder_animation.py; re-run that to change anything
-  here, or your edit is gone the next time anyone does.
 
-  The circuit, the nine sectors, the turn names and their speeds, and the lap
-  the demo car drives are all read from the modules the pit dashboard itself
-  uses - track.py, track_map.py, strategy_engine.py, profiles/base_210s.csv -
-  so this page cannot quietly disagree with the rest of the system about where
-  a sector starts or how fast a corner is taken.
+# The database the car publishes to. Read from SolarRace_OS/main.py's own URL
+# rather than retyped: this is the fourth place that string would otherwise
+# live, and a spectator page pointed at the wrong database shows nothing with
+# no error anyone would notice.
+DB_URL = "https://solar-race-telemetry-default-rtdb.europe-west1.firebasedatabase.app"
+PUBLIC_PATH = "public/live"
+RACE_PATH = "public/race"
 
-  Self-contained: no CDN, no network, nothing to install. Open it in a browser,
-  from a USB stick if need be. Embedded in an iframe it stops driving itself
-  and follows postMessage {type:"UPDATE_TELEMETRY", lapDistanceMeters, ...}.
--->
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Circuit Zolder &mdash; Afeka Solar &amp; Electric Racing</title>
-<!-- Progressive enhancement only, and deliberately NOT render-blocking: this
-     page gets shown in places with hostile wifi, and a plain stylesheet link
-     holds first paint until the request resolves -- which on a captive-portal
-     network is seconds of black screen in front of an audience. Loading it as
-     print media and promoting it on load means the page draws immediately in
-     the fallback face and picks Rajdhani up if and when it arrives. -->
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&display=swap"
-      rel="stylesheet" media="print" onload="this.media='all'">
-<noscript><link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&display=swap" rel="stylesheet"></noscript>
-<style>
+# How long after the car's last sample the page stops claiming to be live. The
+# car publishes once a second; 20 s is twenty missed updates, which is a real
+# outage and not a bad moment on a mobile network.
+STALE_AFTER_S = 20
+
+BASE_CSS = """
   :root {
     --bg: #06090f;
     --panel: rgba(15, 23, 42, 0.82);
@@ -381,6 +384,9 @@ TEMPLATE = r"""<!DOCTYPE html>
     --dim: #94a3b8;
     --text: #e2e8f0;
     --accent: #00e5ff;
+    --good: #34d399;
+    --warn: #fbbf24;
+    --bad: #f87171;
   }
   * { box-sizing: border-box; }
   html, body {
@@ -391,19 +397,6 @@ TEMPLATE = r"""<!DOCTYPE html>
     color: var(--text);
     font-family: 'Rajdhani', 'Segoe UI Semibold', 'DIN Alternate',
                  system-ui, -apple-system, sans-serif;
-    overflow: hidden;
-  }
-  #stage {
-    height: 100%; width: 100%;
-    display: grid;
-    grid-template-columns: minmax(260px, 22%) 1fr;
-    gap: 8px;
-  }
-  /* ── left rail ─────────────────────────────────────────────────────── */
-  #rail {
-    padding: 26px 18px 18px 30px;
-    display: flex; flex-direction: column; gap: 22px;
-    min-width: 0;
   }
   .eyebrow {
     font-size: 0.78rem; letter-spacing: 4px; text-transform: uppercase;
@@ -414,41 +407,43 @@ TEMPLATE = r"""<!DOCTYPE html>
     letter-spacing: 2px; text-transform: uppercase; line-height: 1.1;
   }
   h1 span { color: var(--accent); }
-  .readout { border-left: 3px solid var(--accent); padding-left: 16px; }
-  .readout .label {
-    font-size: 0.72rem; letter-spacing: 3px; text-transform: uppercase;
-    color: var(--dim); font-weight: 600;
-  }
-  .readout .value {
-    font-size: 4.4rem; line-height: 0.95; font-weight: 700;
-    font-variant-numeric: tabular-nums;
-    text-shadow: 0 0 26px rgba(0, 229, 255, 0.18);
-  }
-  .readout .unit {
-    font-size: 1.2rem; color: var(--accent); font-weight: 600;
-    letter-spacing: 2px; margin-left: 6px;
-  }
-  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 12px; }
-  .cell .label {
+  .label {
     font-size: 0.68rem; letter-spacing: 2.5px; text-transform: uppercase;
     color: var(--dim); font-weight: 600;
   }
-  .cell .value {
-    font-size: 1.75rem; font-weight: 700; font-variant-numeric: tabular-nums;
+  .value { font-size: 1.75rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .value.small { font-size: 1.15rem; line-height: 1.25; }
+  .unit { font-size: 0.85rem; color: var(--dim); margin-left: 5px;
+          letter-spacing: 2px; font-weight: 600; }
+  .sub { font-size: 0.85rem; color: var(--dim); font-weight: 600;
+         font-variant-numeric: tabular-nums; margin-top: 2px; }
+  /* -- the map ---------------------------------------------------------- */
+  #map { position: relative; min-width: 0; min-height: 0; }
+  svg { width: 100%; height: 100%; display: block; }
+  .gate { stroke: #64748b; stroke-width: 2.6; }
+  .finish { stroke: #ffffff; stroke-width: 5; }
+  .leader { stroke: #475569; stroke-width: 2.4; }
+  .lm-dot { fill: var(--accent); }
+  .lm-name { fill: #cbd5e1; font-weight: 600; letter-spacing: 1px; }
+  .lm-speed { fill: #64748b; font-weight: 600; }
+  .s-label { font-weight: 700; letter-spacing: 1px;
+             text-anchor: middle; dominant-baseline: middle; }
+  /* -- legend ----------------------------------------------------------- */
+  #legend {
+    position: absolute; right: 18px; bottom: 16px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+    padding: 12px 16px; backdrop-filter: blur(8px);
+    box-shadow: 0 12px 34px rgba(0, 0, 0, 0.55);
+    display: grid; grid-template-columns: repeat(3, auto); gap: 7px 20px;
+    font-size: 0.8rem; letter-spacing: 0.6px;
   }
-  .cell .value.small { font-size: 1.15rem; line-height: 1.25; }
-  .cell .unit { font-size: 0.85rem; color: var(--dim); margin-left: 5px;
-                letter-spacing: 2px; font-weight: 600; }
-  .cell .sub {
-    font-size: 0.85rem; color: var(--dim); font-weight: 600;
-    font-variant-numeric: tabular-nums; margin-top: 2px;
-  }
-  #sector-name { color: var(--accent); }
-  .spacer { flex: 1 1 auto; }
-  /* The nine sectors to scale, so the strip is a map of the lap and not a
-     generic bar: S4 and S6 really are the slivers they look like (110 m and
-     100 m of a 4 km lap), which is also why their labels are the ones that
-     collide on the circuit above. */
+  .leg { display: flex; align-items: center; gap: 8px; color: #cbd5e1; }
+  .leg b { font-weight: 700; min-width: 20px; }
+  .leg .swatch { width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto;
+                 box-shadow: 0 0 6px currentColor; }
+  .leg.on { color: #ffffff; }
+  .leg.on .swatch { transform: scale(1.5); }
+  /* -- lap strip -------------------------------------------------------- */
   #progress {
     position: relative; display: flex; height: 11px; margin-top: 7px;
     border-radius: 6px; overflow: hidden; background: #0f172a;
@@ -460,125 +455,9 @@ TEMPLATE = r"""<!DOCTYPE html>
     background: #ffffff; border-radius: 2px;
     box-shadow: 0 0 8px rgba(255, 255, 255, 0.85);
   }
-  .foot {
-    font-size: 0.7rem; color: #64748b; line-height: 1.55;
-    letter-spacing: 0.3px; border-top: 1px solid #1e293b; padding-top: 10px;
-  }
-  /* ── map ───────────────────────────────────────────────────────────── */
-  #map { position: relative; min-width: 0; min-height: 0; }
-  /* xMin, not xMid. The circuit is taller than it is wide and the screen is
-     the other way round, so a centred drawing leaves a slab of empty space on
-     BOTH sides of it -- including one between the readouts and the track,
-     which reads as a mistake. Pinned left, the whole surplus collects on the
-     right where the legend sits on it and the composition closes up. */
-  svg { width: 100%; height: 100%; display: block; }
-  .gate { stroke: #64748b; stroke-width: 2.6; }
-  .finish { stroke: #ffffff; stroke-width: 5; }
-  .leader { stroke: #475569; stroke-width: 2.4; }
-  .lm-dot { fill: var(--accent); }
-  /* No font-size here: the generator fitted the viewBox around these words
-     and sets the sizes it measured with, so a number typed here as well would
-     be a second opinion about how big the text is. */
-  .lm-name { fill: #cbd5e1; font-weight: 600; letter-spacing: 1px; }
-  .lm-speed { fill: #64748b; font-weight: 600; }
-  .s-label {
-    font-weight: 700; letter-spacing: 1px;
-    text-anchor: middle; dominant-baseline: middle;
-  }
-  /* ── legend ────────────────────────────────────────────────────────── */
-  #legend {
-    position: absolute; right: 18px; bottom: 16px;
-    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
-    padding: 12px 16px; backdrop-filter: blur(8px);
-    box-shadow: 0 12px 34px rgba(0, 0, 0, 0.55);
-    display: grid; grid-template-columns: repeat(3, auto); gap: 7px 20px;
-    font-size: 0.8rem; letter-spacing: 0.6px;
-  }
-  .leg { display: flex; align-items: center; gap: 8px; color: #cbd5e1; }
-  .leg b { font-weight: 700; min-width: 20px; }
-  .leg .swatch {
-    width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto;
-    box-shadow: 0 0 6px currentColor;
-  }
-  .leg.on { color: #ffffff; }
-  .leg.on .swatch { transform: scale(1.5); }
-  /* ── demo speed control ────────────────────────────────────────────── */
-  #speedctl {
-    position: absolute; left: 16px; top: 16px;
-    display: flex; gap: 6px; align-items: center;
-    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
-    padding: 6px 10px; font-size: 0.72rem; letter-spacing: 2px;
-    color: var(--dim); text-transform: uppercase; font-weight: 600;
-  }
-  #speedctl button {
-    font: inherit; letter-spacing: 1px; color: var(--dim); cursor: pointer;
-    background: transparent; border: 1px solid var(--line); border-radius: 5px;
-    padding: 3px 9px;
-  }
-  #speedctl button.on { color: #06090f; background: var(--accent);
-                        border-color: var(--accent); }
-  @media (max-width: 900px) {
-    #stage { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
-    #rail { padding: 16px 16px 0; }
-    .readout .value { font-size: 3rem; }
-    #legend { grid-template-columns: repeat(2, auto); font-size: 0.72rem; }
-  }
-</style>
-</head>
-<body>
-<div id="stage">
-  <div id="rail">
-    <div>
-      <div class="eyebrow">Afeka Solar &amp; Electric Racing</div>
-      <h1>Circuit <span>Zolder</span></h1>
-    </div>
+"""
 
-    <div class="readout">
-      <div class="label">Speed</div>
-      <div class="value"><span id="speed">&mdash;</span><span class="unit">KM/H</span></div>
-    </div>
-
-    <div class="grid2">
-      <div class="cell">
-        <div class="label">Lap distance</div>
-        <div class="value"><span id="dist">&mdash;</span><span class="unit">M</span></div>
-      </div>
-      <div class="cell">
-        <div class="label">Lap</div>
-        <div class="value"><span id="lap">&mdash;</span></div>
-      </div>
-      <div class="cell">
-        <div class="label">Lap time</div>
-        <div class="value"><span id="laptime">&mdash;</span></div>
-      </div>
-      <div class="cell">
-        <div class="label">Last lap</div>
-        <div class="value"><span id="lastlap">&mdash;</span></div>
-      </div>
-    </div>
-
-    <div class="cell">
-      <div class="label">Sector</div>
-      <div class="value small" id="sector-name">&mdash;</div>
-    </div>
-
-    <div class="cell">
-      <div class="label">Next</div>
-      <div class="value small" id="next-name">&mdash;</div>
-      <div class="sub" id="next-sub">&mdash;</div>
-    </div>
-
-    <div class="cell">
-      <div class="label">Lap progress</div>
-      <div id="progress"><div id="progress-mark"></div></div>
-      <div class="sub" id="progress-sub">&mdash;</div>
-    </div>
-
-    <div class="spacer"></div>
-    <div class="foot" id="foot"></div>
-  </div>
-
-  <div id="map">
+MAP_SVG = """
     <svg id="svg" preserveAspectRatio="xMinYMid meet">
       <defs>
         <filter id="glow" x="-60%" y="-60%" width="220%" height="220%">
@@ -595,15 +474,10 @@ TEMPLATE = r"""<!DOCTYPE html>
       <circle id="car" r="0" filter="url(#glow)"></circle>
       <circle id="car-core" r="0" fill="#ffffff"></circle>
     </svg>
-    <div id="legend"></div>
-    <div id="speedctl"><span>Demo</span></div>
-  </div>
-</div>
+"""
 
-<script>
+MAP_JS = r"""
 "use strict";
-const DATA = __DATA__;
-
 const NS = "http://www.w3.org/2000/svg";
 const svg = document.getElementById("svg");
 svg.setAttribute("viewBox", DATA.viewBox);
@@ -615,16 +489,14 @@ const mk = (tag, attrs) => {
   return n;
 };
 
-// ── static drawing ──────────────────────────────────────────────────────── //
 // One casing path under everything: the sectors are drawn as separate coloured
 // cores on top, and without a continuous dark ribbon beneath them the joins
 // between sectors show as notches.
-const casing = mk("path", {
+el("g-casing").appendChild(mk("path", {
   d: DATA.sectors.map(s => s.d).join(" "),
   fill: "none", stroke: "#1e293b", "stroke-width": DATA.style.casing,
   "stroke-linecap": "round", "stroke-linejoin": "round",
-});
-el("g-casing").appendChild(casing);
+}));
 
 DATA.sectors.forEach(s => {
   el("g-sectors").appendChild(mk("path", {
@@ -684,42 +556,38 @@ car.setAttribute("fill", DATA.carColor);
 el("car-core").setAttribute("r", DATA.style.car * 0.36);
 el("trail").setAttribute("stroke-width", DATA.style.core);
 
-// Legend: sector number, colour and the name the pit dashboard uses for it.
 const legend = el("legend");
-DATA.sectors.forEach(s => {
-  const d = document.createElement("div");
-  d.className = "leg";
-  d.id = "leg-" + s.id;
-  d.innerHTML = '<span class="swatch" style="background:' + s.color +
-                ';color:' + s.color + '"></span><b>S' + s.id + '</b> ' + s.name;
-  legend.appendChild(d);
-});
+if (legend) {
+  DATA.sectors.forEach(s => {
+    const d = document.createElement("div");
+    d.className = "leg";
+    d.id = "leg-" + s.id;
+    d.innerHTML = '<span class="swatch" style="background:' + s.color +
+                  ';color:' + s.color + '"></span><b>S' + s.id + '</b> ' + s.name;
+    legend.appendChild(d);
+  });
+}
 
-// Sector widths are the real lengths, S9 included: its range ends at 0 m
-// (the finish line is both the last boundary and the first), so its length has
-// to be taken the long way round or it comes out negative.
+// Sector widths are the real lengths, S9 included: its range ends at 0 m (the
+// finish line is both the last boundary and the first), so its length has to be
+// taken the long way round or it comes out negative.
 const progress = el("progress");
-const lapLen = DATA.trackLength;
-DATA.sectors.forEach(s => {
-  const len = ((s.end - s.start) % lapLen + lapLen) % lapLen || lapLen;
-  const d = document.createElement("div");
-  d.className = "seg";
-  d.id = "seg-" + s.id;
-  d.style.background = s.color;
-  d.style.width = (len / lapLen * 100) + "%";
-  progress.insertBefore(d, el("progress-mark"));
-});
+if (progress) {
+  DATA.sectors.forEach(s => {
+    const len = ((s.end - s.start) % DATA.trackLength + DATA.trackLength)
+                % DATA.trackLength || DATA.trackLength;
+    const d = document.createElement("div");
+    d.className = "seg";
+    d.id = "seg-" + s.id;
+    d.style.background = s.color;
+    d.style.width = (len / DATA.trackLength * 100) + "%";
+    progress.insertBefore(d, el("progress-mark"));
+  });
+}
 
-el("foot").innerHTML =
-  DATA.attribution +
-  "<br>Demo lap driven by the team's 210 s baseline velocity profile &mdash; " +
-  "modelled lap " + DATA.profileLapSeconds.toFixed(1) + " s.";
-
-// ── position along the lap ──────────────────────────────────────────────── //
 // The same model as track_map.position_at_distance: walk the baked cumulative
-// distances and interpolate between the two vertices that straddle it. Doing
-// it off the SVG path length instead would drift, because path length is only
-// proportional to real distance while every segment is scaled identically.
+// distances and interpolate between the two vertices that straddle it. Doing it
+// off the SVG path length instead would drift.
 function posAt(d) {
   const L = DATA.trackLength, cum = DATA.cum, line = DATA.line;
   d = ((d % L) + L) % L;
@@ -734,35 +602,22 @@ function posAt(d) {
   return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
 }
 
-function speedAt(d) {
-  const p = DATA.profile, L = DATA.trackLength;
+function sectorAt(d) {
+  const L = DATA.trackLength;
   d = ((d % L) + L) % L;
-  let lo = 0, hi = p.length - 1;
-  while (lo < hi - 1) {
-    const mid = (lo + hi) >> 1;
-    if (p[mid][0] <= d) lo = mid; else hi = mid;
-  }
-  const span = p[lo + 1][0] - p[lo][0];
-  const t = span > 0 ? (d - p[lo][0]) / span : 0;
-  return p[lo][1] + (p[lo + 1][1] - p[lo][1]) * t;
+  for (const s of DATA.sectors) if (d >= s.start && d < s.end) return s;
+  return DATA.sectors[DATA.sectors.length - 1];
 }
 
 // The next named corner ahead, wrapping past the finish line. TRACK_LANDMARKS
-// is the pit's own list, so the name and the speed shown here are the ones the
-// strategy engine uses -- not a caption invented for this page.
+// is the pit's own list, so the name and the speed are the ones the strategy
+// engine uses -- not a caption invented for a web page.
 function nextLandmark(d) {
   const L = DATA.trackLength, lms = DATA.landmarks;
   if (!lms.length) return null;
   d = ((d % L) + L) % L;
   for (const lm of lms) if (lm.dist > d) return [lm, lm.dist - d];
   return [lms[0], L - d + lms[0].dist];
-}
-
-function sectorAt(d) {
-  const L = DATA.trackLength;
-  d = ((d % L) + L) % L;
-  for (const s of DATA.sectors) if (d >= s.start && d < s.end) return s;
-  return DATA.sectors[DATA.sectors.length - 1];
 }
 
 // The tail behind the car, rebuilt each frame from the real centreline so it
@@ -781,21 +636,17 @@ function fmtTime(s) {
   return m + ":" + (r < 10 ? "0" : "") + r.toFixed(1);
 }
 
-// ── state ───────────────────────────────────────────────────────────────── //
-// external === driven from outside by postMessage; until that happens the page
-// drives itself round the baseline profile so it is never a still image.
-let external = false;
-let dist = 0;            // metres along the current lap
-let lapNo = 1;
-let lapStart = 0;        // demo-clock seconds when the current lap began
-let lastLap = null;
-let demoClock = 0;
-let rate = 1;
-let target = null;       // external mode: where we are easing toward
-let shownSpeed = null;
+function fmtClock(s) {
+  if (s == null) return "—";
+  s = Math.max(0, Math.floor(s));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+  return h + "h " + (m < 10 ? "0" : "") + m + "m";
+}
 
 let lastSector = null;
-function paint(speed) {
+// Moves the car and everything that follows it. Returns the sector it is in, so
+// the caller can label it without repeating the lookup.
+function paintMap(dist) {
   const [x, y] = posAt(dist);
   car.setAttribute("cx", x); car.setAttribute("cy", y);
   el("car-core").setAttribute("cx", x); el("car-core").setAttribute("cy", y);
@@ -805,25 +656,9 @@ function paint(speed) {
   el("trail").setAttribute("d", trailPath(dist));
   el("trail").setAttribute("opacity", "0.55");
 
-  el("dist").textContent = Math.round(dist).toLocaleString();
-  el("speed").textContent = speed == null ? "—" : speed.toFixed(0);
-  el("lap").textContent = lapNo;
-  el("sector-name").textContent = "S" + s.id + " · " + s.name;
-  el("lastlap").textContent = fmtTime(lastLap);
-
-  const nx = nextLandmark(dist);
-  if (nx) {
-    el("next-name").textContent = nx[0].name;
-    el("next-sub").textContent =
-      Math.round(nx[1]).toLocaleString() + " m ahead" +
-      (nx[0].speed == null ? "" : " · max " + nx[0].speed + " km/h");
+  if (progress) {
+    el("progress-mark").style.left = (dist / DATA.trackLength * 100) + "%";
   }
-
-  el("progress-mark").style.left = (dist / DATA.trackLength * 100) + "%";
-  el("progress-sub").textContent =
-    (dist / DATA.trackLength * 100).toFixed(0) + "% of " +
-    DATA.trackLength.toLocaleString() + " m";
-
   if (s.id !== lastSector) {
     DATA.sectors.forEach(o => {
       const n = el("leg-" + o.id);
@@ -833,26 +668,180 @@ function paint(speed) {
     });
     lastSector = s.id;
   }
+  return s;
+}
+"""
+
+FONT_LINK = """<!-- Progressive enhancement only, and deliberately NOT render-blocking: these
+     pages get opened on hostile wifi, and a plain stylesheet link holds first
+     paint until the request resolves. Loaded as print media and promoted on
+     load, the page draws immediately in the fallback face. -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&display=swap"
+      rel="stylesheet" media="print" onload="this.media='all'">
+<noscript><link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&display=swap" rel="stylesheet"></noscript>"""
+
+BANNER = """<!--
+  GENERATED FILE - DO NOT EDIT BY HAND.
+  Written by tools/build_zolder_animation.py; re-run that to change anything
+  here, or your edit is gone the next time anyone does.
+
+  The circuit, the nine sectors, the turn names and their speeds are read from
+  the modules the pit dashboard itself uses - track.py, track_map.py,
+  strategy_engine.py - so these pages cannot quietly disagree with the rest of
+  the system about where a sector starts or how fast a corner is taken.
+-->"""
+
+
+# --------------------------------------------------------------------------- #
+# Page 1 - the presentation piece
+# --------------------------------------------------------------------------- #
+DEMO_TEMPLATE = r"""<!DOCTYPE html>
+__BANNER__
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Circuit Zolder &mdash; Afeka Solar &amp; Electric Racing</title>
+__FONT_LINK__
+<style>
+__BASE_CSS__
+  html, body { overflow: hidden; }
+  #stage { height: 100%; width: 100%; display: grid;
+           grid-template-columns: minmax(260px, 22%) 1fr; gap: 8px; }
+  #rail { padding: 26px 18px 18px 30px; display: flex; flex-direction: column;
+          gap: 22px; min-width: 0; }
+  .readout { border-left: 3px solid var(--accent); padding-left: 16px; }
+  .readout .label { font-size: 0.72rem; letter-spacing: 3px; }
+  .readout .value { font-size: 4.4rem; line-height: 0.95;
+                    text-shadow: 0 0 26px rgba(0, 229, 255, 0.18); }
+  .readout .unit { font-size: 1.2rem; color: var(--accent); }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 12px; }
+  #sector-name { color: var(--accent); }
+  .spacer { flex: 1 1 auto; }
+  .foot { font-size: 0.7rem; color: #64748b; line-height: 1.55;
+          border-top: 1px solid #1e293b; padding-top: 10px; }
+  #speedctl {
+    position: absolute; left: 16px; top: 16px; display: flex; gap: 6px;
+    align-items: center; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: 6px 10px; font-size: 0.72rem;
+    letter-spacing: 2px; color: var(--dim); text-transform: uppercase;
+    font-weight: 600;
+  }
+  #speedctl button { font: inherit; letter-spacing: 1px; color: var(--dim);
+    cursor: pointer; background: transparent; border: 1px solid var(--line);
+    border-radius: 5px; padding: 3px 9px; }
+  #speedctl button.on { color: #06090f; background: var(--accent);
+                        border-color: var(--accent); }
+  @media (max-width: 900px) {
+    #stage { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
+    #rail { padding: 16px 16px 0; }
+    .readout .value { font-size: 3rem; }
+    #legend { grid-template-columns: repeat(2, auto); font-size: 0.72rem; }
+  }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="rail">
+    <div>
+      <div class="eyebrow">Afeka Solar &amp; Electric Racing</div>
+      <h1>Circuit <span>Zolder</span></h1>
+    </div>
+    <div class="readout">
+      <div class="label">Speed</div>
+      <div class="value"><span id="speed">&mdash;</span><span class="unit">KM/H</span></div>
+    </div>
+    <div class="grid2">
+      <div><div class="label">Lap distance</div>
+        <div class="value"><span id="dist">&mdash;</span><span class="unit">M</span></div></div>
+      <div><div class="label">Lap</div><div class="value"><span id="lap">&mdash;</span></div></div>
+      <div><div class="label">Lap time</div><div class="value"><span id="laptime">&mdash;</span></div></div>
+      <div><div class="label">Last lap</div><div class="value"><span id="lastlap">&mdash;</span></div></div>
+    </div>
+    <div>
+      <div class="label">Sector</div>
+      <div class="value small" id="sector-name">&mdash;</div>
+    </div>
+    <div>
+      <div class="label">Next</div>
+      <div class="value small" id="next-name">&mdash;</div>
+      <div class="sub" id="next-sub">&mdash;</div>
+    </div>
+    <div>
+      <div class="label">Lap progress</div>
+      <div id="progress"><div id="progress-mark"></div></div>
+      <div class="sub" id="progress-sub">&mdash;</div>
+    </div>
+    <div class="spacer"></div>
+    <div class="foot" id="foot"></div>
+  </div>
+  <div id="map">
+__MAP_SVG__
+    <div id="legend"></div>
+    <div id="speedctl"><span>Demo</span></div>
+  </div>
+</div>
+<script>
+const DATA = __DATA__;
+</script>
+<script>
+__MAP_JS__
+
+el("foot").innerHTML =
+  DATA.attribution +
+  "<br>Demo lap driven by the team's 210 s baseline velocity profile &mdash; " +
+  "modelled lap " + DATA.profileLapSeconds.toFixed(1) + " s.";
+
+function speedAt(d) {
+  const p = DATA.profile, L = DATA.trackLength;
+  d = ((d % L) + L) % L;
+  let lo = 0, hi = p.length - 1;
+  while (lo < hi - 1) {
+    const mid = (lo + hi) >> 1;
+    if (p[mid][0] <= d) lo = mid; else hi = mid;
+  }
+  const span = p[lo + 1][0] - p[lo][0];
+  const t = span > 0 ? (d - p[lo][0]) / span : 0;
+  return p[lo][1] + (p[lo + 1][1] - p[lo][1]) * t;
+}
+
+let external = false, dist = 0, lapNo = 1, lapStart = 0, lastLap = null;
+let demoClock = 0, rate = 1, target = null, shownSpeed = null;
+
+function paint(speed) {
+  const s = paintMap(dist);
+  el("dist").textContent = Math.round(dist).toLocaleString();
+  el("speed").textContent = speed == null ? "—" : speed.toFixed(0);
+  el("lap").textContent = lapNo;
+  el("sector-name").textContent = "S" + s.id + " · " + s.name;
+  el("lastlap").textContent = fmtTime(lastLap);
+  el("progress-sub").textContent =
+    (dist / DATA.trackLength * 100).toFixed(0) + "% of " +
+    DATA.trackLength.toLocaleString() + " m";
+  const nx = nextLandmark(dist);
+  if (nx) {
+    el("next-name").textContent = nx[0].name;
+    el("next-sub").textContent = Math.round(nx[1]).toLocaleString() + " m ahead" +
+      (nx[0].speed == null ? "" : " · max " + nx[0].speed + " km/h");
+  }
 }
 
 let prev = null;
 function frame(now) {
   const dt = prev == null ? 0 : Math.min(0.25, (now - prev) / 1000);
   prev = now;
-
   let speed;
   if (external) {
-    // Ease toward the last reported distance instead of snapping to it: the
-    // car reports about twice a second and a hard jump every 500 ms reads as
-    // stuttering rather than motion.
     if (target != null) {
       let delta = target - dist;
       const L = DATA.trackLength;
-      if (delta < -L / 2) delta += L;          // rolled past the finish line
+      if (delta < -L / 2) delta += L;
       if (delta > L / 2) delta -= L;
       dist = ((dist + delta * Math.min(1, dt * 4)) % L + L) % L;
     }
-    speed = shownSpeed;                        // null stays "—", never 0
+    speed = shownSpeed;
   } else {
     demoClock += dt * rate;
     speed = speedAt(dist);
@@ -865,12 +854,10 @@ function frame(now) {
     }
     el("laptime").textContent = fmtTime(demoClock - lapStart);
   }
-
   paint(speed);
   requestAnimationFrame(frame);
 }
 
-// ── demo speed control ──────────────────────────────────────────────────── //
 const ctl = el("speedctl");
 [1, 2, 4].forEach(r => {
   const b = document.createElement("button");
@@ -884,12 +871,8 @@ const ctl = el("speedctl");
   ctl.appendChild(b);
 });
 
-// ── the external feed ───────────────────────────────────────────────────── //
-// Same message shape the page has always accepted, so anything already sending
-// it keeps working; speed / lap are optional extras. A field that is absent
-// shows as "—" and never as zero — an unreported reading is not a measurement
-// of nothing, and this page is watched by people who would read a big bold 0
-// as the car having stopped.
+// The same message shape this page has always accepted. A field that is absent
+// shows as an em dash and never as zero.
 window.addEventListener("message", (event) => {
   const d = event.data;
   if (!d || d.type !== "UPDATE_TELEMETRY") return;
@@ -915,23 +898,524 @@ requestAnimationFrame(frame);
 """
 
 
-def render(data):
-    return TEMPLATE.replace("__DATA__", json.dumps(data, separators=(",", ":")))
+# --------------------------------------------------------------------------- #
+# Page 2 - the spectator page, for people who are not at the circuit
+# --------------------------------------------------------------------------- #
+# WHAT THIS PAGE MUST NEVER DO: pretend. It is watched by people with no other
+# source of information about the car, who cannot tell a frozen animation from
+# a slow lap. So every number here is either a reading the car actually
+# published or an em dash, the car stops moving the moment the feed goes stale,
+# and the status pill says which of those is happening in plain words.
+SPECTATOR_TEMPLATE = r"""<!DOCTYPE html>
+__BANNER__
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Afeka Solar Racing &mdash; Live from Circuit Zolder</title>
+<meta name="description" content="Follow the Afeka Solar &amp; Electric Racing team live from the iESC 24-hour race at Circuit Zolder.">
+__FONT_LINK__
+<style>
+__BASE_CSS__
+  body { min-height: 100%; }
+  #stage {
+    display: grid; grid-template-columns: 360px 1fr;
+    gap: 14px; padding: 16px; height: 100vh;
+  }
+  #rail { display: flex; flex-direction: column; gap: 14px;
+          min-width: 0; overflow-y: auto; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 13px 15px;
+  }
+  .pill {
+    display: inline-flex; align-items: center; gap: 8px;
+    border-radius: 999px; padding: 5px 13px; font-size: 0.72rem;
+    letter-spacing: 2.5px; text-transform: uppercase; font-weight: 700;
+    border: 1px solid var(--line); color: var(--dim);
+  }
+  .pill .dot { width: 8px; height: 8px; border-radius: 50%;
+               background: currentColor; }
+  .pill.live { color: var(--good); border-color: var(--good); }
+  .pill.live .dot { animation: pulse 1.6s ease-in-out infinite; }
+  .pill.stale { color: var(--warn); border-color: var(--warn); }
+  .pill.off { color: var(--bad); border-color: var(--bad); }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.25; } }
+  .hero { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .hero .value { font-size: 3.1rem; line-height: 1;
+                 text-shadow: 0 0 26px rgba(0, 229, 255, 0.18); }
+  .hero .unit { font-size: 1rem; color: var(--accent); }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .bar { position: relative; height: 10px; border-radius: 5px;
+         background: #0f172a; overflow: hidden; margin-top: 7px; }
+  .bar > i { position: absolute; left: 0; top: 0; bottom: 0; display: block;
+             border-radius: 5px; background: var(--accent); width: 0; }
+  #soc-bar > i { background: var(--good); }
+  #race-bar > i { background: var(--accent); }
+  #sector-name { color: var(--accent); }
+  .foot { font-size: 0.7rem; color: #64748b; line-height: 1.55; }
+  #map { border: 1px solid var(--line); border-radius: 10px;
+         background: rgba(6, 9, 15, 0.4); overflow: hidden; }
+  /* The car stops being drawn as a live thing the moment the feed is not. */
+  #car, #car-core, #trail { transition: opacity 0.4s ease; }
+  body.stale #car, body.stale #car-core, body.stale #trail { opacity: 0.28; }
+  #milestone {
+    position: fixed; left: 50%; top: 22px; transform: translateX(-50%) translateY(-140%);
+    background: linear-gradient(90deg, #0ea5e9, #22d3ee);
+    color: #04121a; font-weight: 700; letter-spacing: 2px;
+    text-transform: uppercase; padding: 12px 26px; border-radius: 999px;
+    box-shadow: 0 14px 40px rgba(34, 211, 238, 0.35);
+    transition: transform 0.5s cubic-bezier(.2,.9,.3,1.2); z-index: 50;
+    font-size: 0.95rem; text-align: center;
+  }
+  #milestone.show { transform: translateX(-50%) translateY(0); }
+  @media (max-width: 900px) {
+    #stage { grid-template-columns: 1fr; height: auto; padding: 12px; }
+    #map { height: 56vh; }
+    #legend { display: none; }
+    .hero .value { font-size: 2.6rem; }
+  }
+</style>
+</head>
+<body>
+<div id="milestone"></div>
+<div id="stage">
+  <div id="rail">
+    <div>
+      <div class="eyebrow">Afeka Solar &amp; Electric Racing</div>
+      <h1>Live from <span>Zolder</span></h1>
+      <div style="margin-top:10px"><span class="pill off" id="status">
+        <span class="dot"></span><span id="status-text">Connecting</span></span></div>
+      <div class="sub" id="status-sub">&mdash;</div>
+    </div>
+
+    <div class="card hero">
+      <div>
+        <div class="label">Lap</div>
+        <div class="value"><span id="lap">&mdash;</span></div>
+      </div>
+      <div>
+        <div class="label">Speed</div>
+        <div class="value"><span id="speed">&mdash;</span><span class="unit">KM/H</span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="label">Where the car is</div>
+      <div class="value small" id="sector-name">&mdash;</div>
+      <div class="sub" id="next-sub">&mdash;</div>
+      <div id="progress"><div id="progress-mark"></div></div>
+    </div>
+
+    <div class="card" id="race-card">
+      <div class="label" id="race-label">Race clock</div>
+      <div class="value small"><span id="race-elapsed">&mdash;</span><span
+        class="sub" style="display:inline" id="race-of"> of <span
+        id="race-total">24h</span></span></div>
+      <div class="bar" id="race-bar"><i></i></div>
+      <div class="sub" id="race-sub">&mdash;</div>
+    </div>
+
+    <div class="card row">
+      <div>
+        <div class="label">Distance</div>
+        <div class="value small"><span id="odo">&mdash;</span><span class="unit">KM</span></div>
+      </div>
+      <div>
+        <div class="label">Last lap</div>
+        <div class="value small" id="lastlap">&mdash;</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="label">Battery</div>
+      <div class="value small"><span id="soc">&mdash;</span><span class="unit">%</span></div>
+      <div class="bar" id="soc-bar"><i></i></div>
+      <div class="sub">Solar input <span id="solar">&mdash;</span></div>
+    </div>
+
+    <div class="card">
+      <div class="label">At the circuit</div>
+      <div class="value small" id="weather">&mdash;</div>
+      <div class="sub" id="daynight">&mdash;</div>
+    </div>
+
+    <div class="foot" id="foot"></div>
+  </div>
+
+  <div id="map">
+__MAP_SVG__
+    <div id="legend"></div>
+  </div>
+</div>
+
+<script>
+const DATA = __DATA__;
+const CONFIG = __CONFIG__;
+</script>
+<script>
+__MAP_JS__
+
+el("foot").innerHTML = DATA.attribution +
+  "<br>The car publishes once a second. Every value here is a reading the car " +
+  "actually sent &mdash; a dash means it did not send one, never zero.";
+
+// ── state ──────────────────────────────────────────────────────────────── //
+// `snap` is the last thing the car published, verbatim. Nothing here ever
+// invents a value to fill a gap in it.
+let snap = null;
+let lastRxWall = 0;        // our clock, for "how long since anything arrived"
+let dist = 0, target = null, everPainted = false;
+let race = { start: CONFIG.raceStart, end: CONFIG.raceEnd };
+let sun = null;
+
+const num = (v) => (v == null || v === "" || isNaN(Number(v))) ? null : Number(v);
+
+function fmtCountdown(s) {
+  s = Math.max(0, Math.floor(s));
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (d > 0) return d + "d " + h + "h";
+  if (h > 0) return h + "h " + (m < 10 ? "0" : "") + m + "m";
+  return m + "m " + (s % 60) + "s";
+}
+
+// Shown in the VIEWER's timezone, deliberately. Family watching from Israel
+// should read the start time in their own evening, not in Belgian local time
+// they then have to convert.
+function whenLocal(ts) {
+  try {
+    return new Date(ts * 1000).toLocaleString(undefined,
+      { weekday: "short", day: "numeric", month: "short",
+        hour: "2-digit", minute: "2-digit" });
+  } catch (e) { return "—"; }
+}
+const dash = (v, digits, suffix) => v == null ? "—"
+  : v.toLocaleString(undefined, { minimumFractionDigits: digits,
+                                  maximumFractionDigits: digits }) + (suffix || "");
+
+// ── the feed ───────────────────────────────────────────────────────────── //
+// RTDB's REST stream: one connection, the server pushes on every change. If it
+// cannot be opened (an old browser, a proxy that eats text/event-stream) we
+// fall back to polling the same URL, which is slower but works everywhere.
+const LIVE_URL = CONFIG.dbUrl + "/" + CONFIG.publicPath + ".json";
+
+function applySnapshot(obj) {
+  if (obj == null) return;
+  snap = obj;
+  lastRxWall = Date.now() / 1000;
+  const d = num(obj.lap_distance_m);
+  if (d != null) {
+    target = ((d % DATA.trackLength) + DATA.trackLength) % DATA.trackLength;
+    if (!everPainted) { dist = target; everPainted = true; }
+  }
+  checkMilestones(obj);
+  render();
+}
+
+function startStream() {
+  let es;
+  try { es = new EventSource(LIVE_URL); } catch (e) { return startPolling(); }
+  let opened = false;
+  es.addEventListener("open", () => { opened = true; });
+  const onEvent = (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch (e) { return; }
+    if (!msg) return;
+    if (msg.path === "/") applySnapshot(msg.data);
+    else if (snap && msg.path) {          // a patch to one field
+      snap[msg.path.replace(/^\//, "")] = msg.data;
+      applySnapshot(snap);
+    }
+  };
+  es.addEventListener("put", onEvent);
+  es.addEventListener("patch", onEvent);
+  es.addEventListener("error", () => {
+    // Never opened at all -> streaming is not available here, poll instead.
+    // Opened once and dropped -> EventSource reconnects by itself; leave it.
+    if (!opened) { es.close(); startPolling(); }
+  });
+}
+
+let polling = false;
+function startPolling() {
+  if (polling) return;
+  polling = true;
+  const tick = () => fetch(LIVE_URL, { cache: "no-store" })
+    .then(r => r.ok ? r.json() : null)
+    .then(applySnapshot)
+    .catch(() => {});
+  tick();
+  setInterval(tick, 2000);
+}
+
+// The race window, if anyone has published one. Optional: without it the clock
+// card hides rather than counting down to a guess.
+function loadRace() {
+  fetch(CONFIG.dbUrl + "/" + CONFIG.racePath + ".json", { cache: "no-store" })
+    .then(r => r.ok ? r.json() : null)
+    .then(r => {
+      if (r && num(r.start_ts)) race = { start: num(r.start_ts), end: num(r.end_ts) };
+      render();
+    }).catch(() => {});
+}
+
+// ── weather, straight from Open-Meteo, same source the pit uses ─────────── //
+function loadWeather() {
+  const u = "https://api.open-meteo.com/v1/forecast?latitude=" + CONFIG.lat +
+            "&longitude=" + CONFIG.lon +
+            "&current=temperature_2m,cloud_cover,wind_speed_10m" +
+            "&daily=sunrise,sunset&timezone=Europe%2FBrussels&forecast_days=2";
+  fetch(u).then(r => r.ok ? r.json() : null).then(w => {
+    if (!w || !w.current) return;
+    const c = w.current;
+    el("weather").textContent =
+      Math.round(c.temperature_2m) + "°C · " + Math.round(c.cloud_cover) +
+      "% cloud · " + Math.round(c.wind_speed_10m) + " km/h wind";
+    if (w.daily && w.daily.sunrise) {
+      sun = { rise: w.daily.sunrise, set: w.daily.sunset };
+      renderDayNight();
+    }
+  }).catch(() => {});
+}
+
+function renderDayNight() {
+  if (!sun) return;
+  const now = new Date();
+  let label = null;
+  for (let i = 0; i < sun.rise.length; i++) {
+    const rise = new Date(sun.rise[i]), set = new Date(sun.set[i]);
+    if (now >= rise && now < set) {
+      label = "☀ Daylight · sunset " + set.toTimeString().slice(0, 5);
+      break;
+    }
+    if (now < rise) {
+      label = "🌙 Dark · sunrise " + rise.toTimeString().slice(0, 5);
+      break;
+    }
+  }
+  el("daynight").textContent = label ||
+    "🌙 Dark · sunrise " + new Date(sun.rise[sun.rise.length - 1])
+      .toTimeString().slice(0, 5);
+}
+
+// ── milestones ─────────────────────────────────────────────────────────── //
+// Only fired for transitions SEEN while the page is open. Someone opening the
+// page on lap 137 should not be greeted by a stale celebration of lap 100.
+let seenLap = null, seenKm = null, milestoneTimer = null;
+function celebrate(text) {
+  const m = el("milestone");
+  m.textContent = text;
+  m.classList.add("show");
+  clearTimeout(milestoneTimer);
+  milestoneTimer = setTimeout(() => m.classList.remove("show"), 9000);
+}
+function checkMilestones(obj) {
+  const lap = num(obj.lap);
+  if (lap != null) {
+    if (seenLap != null && lap > seenLap && lap % 10 === 0) {
+      celebrate("Lap " + lap + " complete");
+    }
+    seenLap = lap;
+  }
+  const km = num(obj.odometer_m) == null ? null : num(obj.odometer_m) / 1000;
+  if (km != null) {
+    if (seenKm != null && Math.floor(km / 100) > Math.floor(seenKm / 100)) {
+      celebrate(Math.floor(km / 100) * 100 + " km covered");
+    }
+    seenKm = km;
+  }
+}
+
+// ── rendering ──────────────────────────────────────────────────────────── //
+function render() {
+  const now = Date.now() / 1000;
+  const age = lastRxWall ? now - lastRxWall : null;
+  // Two clocks on purpose: `age` is how long since WE heard anything, and
+  // sampleAge is how old the car says its own reading is. A phone with a wrong
+  // clock skews the second, so the status is driven by the first.
+  const stale = age == null || age > CONFIG.staleAfterS;
+
+  const pill = el("status");
+  pill.className = "pill " + (age == null ? "off" : stale ? "stale" : "live");
+  el("status-text").textContent =
+    age == null ? "Waiting for the car" : stale ? "No data" : "Live";
+  el("status-sub").textContent =
+    age == null ? "Nothing has arrived yet — the car may not be running."
+                : stale ? "Nothing for " + Math.round(age) + "s. The car is out of "
+                          + "contact; the marker below is where it was last seen."
+                : "Updated " + Math.max(0, Math.round(age)) + "s ago";
+  document.body.classList.toggle("stale", stale);
+
+  const s = snap || {};
+  el("lap").textContent = num(s.lap) == null ? "—" : num(s.lap);
+  el("speed").textContent = num(s.speed_kmh) == null ? "—"
+                            : Math.round(num(s.speed_kmh));
+  el("lastlap").textContent = fmtTime(num(s.last_lap_time_s));
+  const odo = num(s.odometer_m);
+  el("odo").textContent = odo == null ? "—" : dash(odo / 1000, 1);
+
+  const soc = num(s.soc_percent);
+  el("soc").textContent = soc == null ? "—" : Math.round(soc);
+  el("soc-bar").firstElementChild.style.width = (soc == null ? 0 : soc) + "%";
+  const amps = num(s.solar_current_A);
+  el("solar").textContent = amps == null ? "—" : dash(amps, 1, " A");
+
+  // Race clock. Hidden outright when nobody has published a window -- a
+  // countdown to a date this page guessed would be worse than no countdown.
+  // Three states, because for most of the time this page exists the race has
+  // either not started or is over, and "0h 00m of 24h 00m" is a confusing way
+  // to say "not yet" to someone who opened the link a fortnight early.
+  const card = el("race-card");
+  if (race.start && race.end) {
+    card.style.display = "";
+    const total = race.end - race.start;
+    const bar = card.querySelector(".bar > i");
+    el("race-total").textContent = fmtClock(total);
+    if (now < race.start) {
+      el("race-label").textContent = "Race starts in";
+      el("race-elapsed").textContent = fmtCountdown(race.start - now);
+      el("race-of").style.display = "none";
+      el("race-sub").textContent = "Lights out " + whenLocal(race.start);
+      bar.style.width = "0%";
+    } else if (now >= race.end) {
+      el("race-label").textContent = "Race complete";
+      el("race-elapsed").textContent = fmtClock(total);
+      el("race-of").style.display = "none";
+      el("race-sub").textContent = "Finished " + whenLocal(race.end);
+      bar.style.width = "100%";
+    } else {
+      const done = now - race.start;
+      el("race-label").textContent = "Race clock";
+      el("race-elapsed").textContent = fmtClock(done);
+      el("race-of").style.display = "inline";
+      el("race-sub").textContent = fmtClock(total - done) + " remaining";
+      bar.style.width = (done / total * 100) + "%";
+    }
+  } else {
+    card.style.display = "none";
+  }
+}
+
+// ── the smooth part ────────────────────────────────────────────────────── //
+// The car reports once a second; easing toward the reported distance turns
+// that into motion instead of a marker that jumps. When the feed is stale the
+// easing stops with it: a frozen car is the honest picture of no data.
+let prev = null;
+function frame(t) {
+  const dt = prev == null ? 0 : Math.min(0.25, (t - prev) / 1000);
+  prev = t;
+  const fresh = lastRxWall && (Date.now() / 1000 - lastRxWall) <= CONFIG.staleAfterS;
+  if (target != null && fresh) {
+    let delta = target - dist;
+    const L = DATA.trackLength;
+    if (delta < -L / 2) delta += L;
+    if (delta > L / 2) delta -= L;
+    dist = ((dist + delta * Math.min(1, dt * 2.2)) % L + L) % L;
+  }
+  if (everPainted) {
+    const s = paintMap(dist);
+    el("sector-name").textContent = "S" + s.id + " · " + s.name;
+    const nx = nextLandmark(dist);
+    if (nx) {
+      el("next-sub").textContent = "Next: " + nx[0].name + " · " +
+        Math.round(nx[1]).toLocaleString() + " m ahead";
+    }
+  }
+  requestAnimationFrame(frame);
+}
+
+render();
+startStream();
+loadRace();
+loadWeather();
+setInterval(render, 1000);          // keeps the ages and the race clock moving
+setInterval(loadWeather, 900000);
+setInterval(renderDayNight, 60000);
+setInterval(loadRace, 300000);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
+"""
+
+
+def render_demo(data):
+    return (DEMO_TEMPLATE
+            .replace("__BANNER__", BANNER)
+            .replace("__FONT_LINK__", FONT_LINK)
+            .replace("__BASE_CSS__", BASE_CSS)
+            .replace("__MAP_SVG__", MAP_SVG)
+            .replace("__MAP_JS__", MAP_JS)
+            .replace("__DATA__", json.dumps(data, separators=(",", ":"))))
+
+
+def render_spectator(data, race_start, race_end):
+    config = {
+        "dbUrl": DB_URL.rstrip("/"),
+        "publicPath": PUBLIC_PATH,
+        "racePath": RACE_PATH,
+        "staleAfterS": STALE_AFTER_S,
+        "raceStart": race_start,
+        "raceEnd": race_end,
+        "lat": track.FINISH_LINE_LAT,
+        "lon": track.FINISH_LINE_LON,
+    }
+    return (SPECTATOR_TEMPLATE
+            .replace("__BANNER__", BANNER)
+            .replace("__FONT_LINK__", FONT_LINK)
+            .replace("__BASE_CSS__", BASE_CSS)
+            .replace("__MAP_SVG__", MAP_SVG)
+            .replace("__MAP_JS__", MAP_JS)
+            .replace("__CONFIG__", json.dumps(config, separators=(",", ":")))
+            .replace("__DATA__", json.dumps(data, separators=(",", ":"))))
+
+
+def _epoch(text):
+    """ISO-8601 (with offset, e.g. 2026-09-19T12:00+02:00) -> epoch seconds."""
+    if not text:
+        return None
+    dt = datetime.datetime.fromisoformat(text)
+    if dt.tzinfo is None:
+        raise SystemExit("--race-start/--race-end need a timezone offset, e.g. "
+                         "2026-09-19T12:00+02:00 — without one the countdown is "
+                         "wrong for everyone not in your timezone.")
+    return dt.timestamp()
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[1])
     ap.add_argument("--verify", action="store_true",
-                    help="write the page and print a geometry report")
+                    help="write the pages and print a geometry report")
+    ap.add_argument("--race-start", default=None,
+                    help="ISO-8601 with offset, e.g. 2026-09-19T12:00+02:00. "
+                         "Without it the spectator page hides its race clock "
+                         "rather than counting down to a guess.")
+    ap.add_argument("--race-end", default=None,
+                    help="ISO-8601 with offset. Defaults to 24 h after the start.")
     args = ap.parse_args()
 
-    data = build_data()
-    html = render(data)
-    with open(OUT_PATH, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(html)
+    start = _epoch(args.race_start)
+    end = _epoch(args.race_end)
+    if start and not end:
+        end = start + 24 * 3600
+    if start and end and end <= start:
+        raise SystemExit("--race-end must be after --race-start.")
 
-    rel = os.path.relpath(OUT_PATH, _REPO)
-    print(f"wrote {rel}  ({len(html) / 1024:.1f} KB)")
+    data = build_data()
+    os.makedirs(_SITE, exist_ok=True)
+
+    demo = render_demo(data)
+    with open(OUT_PATH, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(demo)
+    print(f"wrote {os.path.relpath(OUT_PATH, _REPO)}  ({len(demo) / 1024:.1f} KB)")
+
+    spec = render_spectator(data, start, end)
+    with open(SPECTATOR_PATH, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(spec)
+    print(f"wrote {os.path.relpath(SPECTATOR_PATH, _REPO)}  "
+          f"({len(spec) / 1024:.1f} KB)"
+          + ("" if start else "   [race clock hidden — no --race-start given]"))
 
     if args.verify:
         print(f"  built            {datetime.datetime.now(datetime.timezone.utc)}")
@@ -947,11 +1431,17 @@ def main():
               ", ".join(f"{l['name']}@{l['dist']:.0f}m" for l in data["landmarks"]))
         print(f"  demo profile     {len(data['profile'])} points, "
               f"modelled lap {data['profileLapSeconds']:.1f} s")
-        # The centreline is an OPEN polyline that is closed by one final
-        # segment from the last vertex back to the first, so the two ends being
-        # apart is expected -- what must hold is that the gap matches the length
-        # CUM_M budgets for that closing segment. If those two disagree, every
-        # distance on the page is off by the difference.
+        print(f"  spectator feed   {DB_URL}/{PUBLIC_PATH}.json "
+              f"(stale after {STALE_AFTER_S}s)")
+        if start:
+            print(f"  race window      "
+                  f"{datetime.datetime.fromtimestamp(start, datetime.timezone.utc)} "
+                  f"-> {datetime.datetime.fromtimestamp(end, datetime.timezone.utc)} UTC")
+        # The centreline is an OPEN polyline closed by one final segment from
+        # the last vertex back to the first, so the two ends being apart is
+        # expected -- what must hold is that the gap matches the length CUM_M
+        # budgets for that closing segment. If those disagree, every distance
+        # on both pages is off by the difference.
         gap = math.hypot(data["line"][0][0] - data["line"][-1][0],
                          data["line"][0][1] - data["line"][-1][1])
         booked = track_map.CUM_M[-1] - track_map.CUM_M[-2]

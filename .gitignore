@@ -60,8 +60,13 @@ SolarRace_OS/lap_checkpoint.json.tmp
 # Hash of the last requirements file run_pit.bat pip-installed.
 .deps_stamp
 **/.deps_stamp
+# docs/ is private by default -- the task briefs in it are working notes, not
+# something the public repo needs. The two GENERATED web pages are the
+# exception: GitHub Pages publishes this folder at the site root, so if they
+# are not committed the spectator page simply does not exist for anyone but
+# whoever last ran the build script.
 docs/*
-!docs/REACT_MIGRATION_PLAN.md
+!docs/*.html
 # collector stdout/stderr when launched detached by run_pit.bat
 collector.out.log
 collector.err.log

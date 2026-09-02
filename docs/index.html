@@ -1,0 +1,738 @@
+<!DOCTYPE html>
+<!--
+  GENERATED FILE - DO NOT EDIT BY HAND.
+  Written by tools/build_zolder_animation.py; re-run that to change anything
+  here, or your edit is gone the next time anyone does.
+
+  The circuit, the nine sectors, the turn names and their speeds are read from
+  the modules the pit dashboard itself uses - track.py, track_map.py,
+  strategy_engine.py - so these pages cannot quietly disagree with the rest of
+  the system about where a sector starts or how fast a corner is taken.
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Afeka Solar Racing &mdash; Live from Circuit Zolder</title>
+<meta name="description" content="Follow the Afeka Solar &amp; Electric Racing team live from the iESC 24-hour race at Circuit Zolder.">
+<!-- Progressive enhancement only, and deliberately NOT render-blocking: these
+     pages get opened on hostile wifi, and a plain stylesheet link holds first
+     paint until the request resolves. Loaded as print media and promoted on
+     load, the page draws immediately in the fallback face. -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&display=swap"
+      rel="stylesheet" media="print" onload="this.media='all'">
+<noscript><link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&display=swap" rel="stylesheet"></noscript>
+<style>
+
+  :root {
+    --bg: #06090f;
+    --panel: rgba(15, 23, 42, 0.82);
+    --line: #334155;
+    --dim: #94a3b8;
+    --text: #e2e8f0;
+    --accent: #00e5ff;
+    --good: #34d399;
+    --warn: #fbbf24;
+    --bad: #f87171;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%; width: 100%;
+    background-color: var(--bg);
+    background-image: radial-gradient(#16202f 1px, transparent 1px);
+    background-size: 26px 26px;
+    color: var(--text);
+    font-family: 'Rajdhani', 'Segoe UI Semibold', 'DIN Alternate',
+                 system-ui, -apple-system, sans-serif;
+  }
+  .eyebrow {
+    font-size: 0.78rem; letter-spacing: 4px; text-transform: uppercase;
+    color: var(--dim); font-weight: 600;
+  }
+  h1 {
+    margin: 4px 0 0; font-size: 1.5rem; font-weight: 700;
+    letter-spacing: 2px; text-transform: uppercase; line-height: 1.1;
+  }
+  h1 span { color: var(--accent); }
+  .label {
+    font-size: 0.68rem; letter-spacing: 2.5px; text-transform: uppercase;
+    color: var(--dim); font-weight: 600;
+  }
+  .value { font-size: 1.75rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .value.small { font-size: 1.15rem; line-height: 1.25; }
+  .unit { font-size: 0.85rem; color: var(--dim); margin-left: 5px;
+          letter-spacing: 2px; font-weight: 600; }
+  .sub { font-size: 0.85rem; color: var(--dim); font-weight: 600;
+         font-variant-numeric: tabular-nums; margin-top: 2px; }
+  /* -- the map ---------------------------------------------------------- */
+  #map { position: relative; min-width: 0; min-height: 0; }
+  svg { width: 100%; height: 100%; display: block; }
+  .gate { stroke: #64748b; stroke-width: 2.6; }
+  .finish { stroke: #ffffff; stroke-width: 5; }
+  .leader { stroke: #475569; stroke-width: 2.4; }
+  .lm-dot { fill: var(--accent); }
+  .lm-name { fill: #cbd5e1; font-weight: 600; letter-spacing: 1px; }
+  .lm-speed { fill: #64748b; font-weight: 600; }
+  .s-label { font-weight: 700; letter-spacing: 1px;
+             text-anchor: middle; dominant-baseline: middle; }
+  /* -- legend ----------------------------------------------------------- */
+  #legend {
+    position: absolute; right: 18px; bottom: 16px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+    padding: 12px 16px; backdrop-filter: blur(8px);
+    box-shadow: 0 12px 34px rgba(0, 0, 0, 0.55);
+    display: grid; grid-template-columns: repeat(3, auto); gap: 7px 20px;
+    font-size: 0.8rem; letter-spacing: 0.6px;
+  }
+  .leg { display: flex; align-items: center; gap: 8px; color: #cbd5e1; }
+  .leg b { font-weight: 700; min-width: 20px; }
+  .leg .swatch { width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto;
+                 box-shadow: 0 0 6px currentColor; }
+  .leg.on { color: #ffffff; }
+  .leg.on .swatch { transform: scale(1.5); }
+  /* -- lap strip -------------------------------------------------------- */
+  #progress {
+    position: relative; display: flex; height: 11px; margin-top: 7px;
+    border-radius: 6px; overflow: hidden; background: #0f172a;
+  }
+  #progress .seg { height: 100%; opacity: 0.42; }
+  #progress .seg.on { opacity: 1; }
+  #progress-mark {
+    position: absolute; top: -3px; width: 3px; height: 17px; left: 0;
+    background: #ffffff; border-radius: 2px;
+    box-shadow: 0 0 8px rgba(255, 255, 255, 0.85);
+  }
+
+  body { min-height: 100%; }
+  #stage {
+    display: grid; grid-template-columns: 360px 1fr;
+    gap: 14px; padding: 16px; height: 100vh;
+  }
+  #rail { display: flex; flex-direction: column; gap: 14px;
+          min-width: 0; overflow-y: auto; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 13px 15px;
+  }
+  .pill {
+    display: inline-flex; align-items: center; gap: 8px;
+    border-radius: 999px; padding: 5px 13px; font-size: 0.72rem;
+    letter-spacing: 2.5px; text-transform: uppercase; font-weight: 700;
+    border: 1px solid var(--line); color: var(--dim);
+  }
+  .pill .dot { width: 8px; height: 8px; border-radius: 50%;
+               background: currentColor; }
+  .pill.live { color: var(--good); border-color: var(--good); }
+  .pill.live .dot { animation: pulse 1.6s ease-in-out infinite; }
+  .pill.stale { color: var(--warn); border-color: var(--warn); }
+  .pill.off { color: var(--bad); border-color: var(--bad); }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.25; } }
+  .hero { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .hero .value { font-size: 3.1rem; line-height: 1;
+                 text-shadow: 0 0 26px rgba(0, 229, 255, 0.18); }
+  .hero .unit { font-size: 1rem; color: var(--accent); }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .bar { position: relative; height: 10px; border-radius: 5px;
+         background: #0f172a; overflow: hidden; margin-top: 7px; }
+  .bar > i { position: absolute; left: 0; top: 0; bottom: 0; display: block;
+             border-radius: 5px; background: var(--accent); width: 0; }
+  #soc-bar > i { background: var(--good); }
+  #race-bar > i { background: var(--accent); }
+  #sector-name { color: var(--accent); }
+  .foot { font-size: 0.7rem; color: #64748b; line-height: 1.55; }
+  #map { border: 1px solid var(--line); border-radius: 10px;
+         background: rgba(6, 9, 15, 0.4); overflow: hidden; }
+  /* The car stops being drawn as a live thing the moment the feed is not. */
+  #car, #car-core, #trail { transition: opacity 0.4s ease; }
+  body.stale #car, body.stale #car-core, body.stale #trail { opacity: 0.28; }
+  #milestone {
+    position: fixed; left: 50%; top: 22px; transform: translateX(-50%) translateY(-140%);
+    background: linear-gradient(90deg, #0ea5e9, #22d3ee);
+    color: #04121a; font-weight: 700; letter-spacing: 2px;
+    text-transform: uppercase; padding: 12px 26px; border-radius: 999px;
+    box-shadow: 0 14px 40px rgba(34, 211, 238, 0.35);
+    transition: transform 0.5s cubic-bezier(.2,.9,.3,1.2); z-index: 50;
+    font-size: 0.95rem; text-align: center;
+  }
+  #milestone.show { transform: translateX(-50%) translateY(0); }
+  @media (max-width: 900px) {
+    #stage { grid-template-columns: 1fr; height: auto; padding: 12px; }
+    #map { height: 56vh; }
+    #legend { display: none; }
+    .hero .value { font-size: 2.6rem; }
+  }
+</style>
+</head>
+<body>
+<div id="milestone"></div>
+<div id="stage">
+  <div id="rail">
+    <div>
+      <div class="eyebrow">Afeka Solar &amp; Electric Racing</div>
+      <h1>Live from <span>Zolder</span></h1>
+      <div style="margin-top:10px"><span class="pill off" id="status">
+        <span class="dot"></span><span id="status-text">Connecting</span></span></div>
+      <div class="sub" id="status-sub">&mdash;</div>
+    </div>
+
+    <div class="card hero">
+      <div>
+        <div class="label">Lap</div>
+        <div class="value"><span id="lap">&mdash;</span></div>
+      </div>
+      <div>
+        <div class="label">Speed</div>
+        <div class="value"><span id="speed">&mdash;</span><span class="unit">KM/H</span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="label">Where the car is</div>
+      <div class="value small" id="sector-name">&mdash;</div>
+      <div class="sub" id="next-sub">&mdash;</div>
+      <div id="progress"><div id="progress-mark"></div></div>
+    </div>
+
+    <div class="card" id="race-card">
+      <div class="label" id="race-label">Race clock</div>
+      <div class="value small"><span id="race-elapsed">&mdash;</span><span
+        class="sub" style="display:inline" id="race-of"> of <span
+        id="race-total">24h</span></span></div>
+      <div class="bar" id="race-bar"><i></i></div>
+      <div class="sub" id="race-sub">&mdash;</div>
+    </div>
+
+    <div class="card row">
+      <div>
+        <div class="label">Distance</div>
+        <div class="value small"><span id="odo">&mdash;</span><span class="unit">KM</span></div>
+      </div>
+      <div>
+        <div class="label">Last lap</div>
+        <div class="value small" id="lastlap">&mdash;</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="label">Battery</div>
+      <div class="value small"><span id="soc">&mdash;</span><span class="unit">%</span></div>
+      <div class="bar" id="soc-bar"><i></i></div>
+      <div class="sub">Solar input <span id="solar">&mdash;</span></div>
+    </div>
+
+    <div class="card">
+      <div class="label">At the circuit</div>
+      <div class="value small" id="weather">&mdash;</div>
+      <div class="sub" id="daynight">&mdash;</div>
+    </div>
+
+    <div class="foot" id="foot"></div>
+  </div>
+
+  <div id="map">
+
+    <svg id="svg" preserveAspectRatio="xMinYMid meet">
+      <defs>
+        <filter id="glow" x="-60%" y="-60%" width="220%" height="220%">
+          <feGaussianBlur stdDeviation="9" result="b"/>
+          <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+        </filter>
+      </defs>
+      <g id="g-casing"></g>
+      <g id="g-sectors"></g>
+      <g id="g-gates"></g>
+      <g id="g-landmarks"></g>
+      <g id="g-slabels"></g>
+      <path id="trail" fill="none" stroke-linecap="round"></path>
+      <circle id="car" r="0" filter="url(#glow)"></circle>
+      <circle id="car-core" r="0" fill="#ffffff"></circle>
+    </svg>
+
+    <div id="legend"></div>
+  </div>
+</div>
+
+<script>
+const DATA = {"viewBox":"0 0 1617 1614","trackLength":4000.0,"line":[[724.5,942.5],[687.8,966.6],[615.1,1013.5],[540.6,1062.1],[523.5,1073.5],[516.6,1079.5],[509.6,1085.5],[503.9,1091.5],[496.4,1099.4],[492.6,1104.3],[489.2,1108.7],[487.7,1110.7],[486.5,1113.7],[485.6,1116.9],[484.7,1120.7],[484.4,1124.5],[484.3,1129.0],[485.0,1135.7],[486.5,1143.3],[488.8,1150.2],[491.0,1156.6],[494.4,1165.3],[498.8,1174.0],[506.6,1185.6],[513.3,1195.5],[520.5,1205.0],[540.7,1232.2],[553.1,1250.1],[590.5,1301.7],[598.8,1313.6],[608.6,1327.7],[610.3,1330.1],[613.6,1336.9],[616.5,1343.5],[622.7,1362.9],[624.3,1368.4],[625.3,1376.4],[625.6,1380.9],[625.3,1388.0],[624.2,1395.0],[623.2,1399.3],[620.7,1405.8],[615.7,1413.1],[611.0,1418.4],[605.7,1422.9],[598.9,1427.3],[590.8,1431.2],[583.2,1434.7],[575.8,1437.1],[565.2,1439.8],[547.6,1443.2],[525.7,1446.9],[512.9,1449.0],[499.2,1450.4],[487.0,1450.8],[478.1,1450.1],[468.9,1449.1],[459.2,1446.7],[449.9,1443.7],[439.9,1439.2],[431.1,1434.5],[422.4,1429.4],[415.5,1424.4],[408.2,1418.4],[401.2,1411.8],[393.9,1403.7],[388.1,1396.2],[382.2,1387.7],[379.7,1384.2],[353.8,1335.7],[316.3,1266.8],[309.3,1253.9],[300.7,1238.3],[296.0,1229.8],[292.8,1221.4],[290.7,1214.9],[289.0,1206.8],[287.8,1198.5],[287.5,1189.6],[288.1,1181.8],[289.7,1175.2],[291.5,1167.4],[296.7,1154.7],[300.6,1148.0],[305.3,1141.2],[314.4,1131.2],[327.7,1120.9],[431.4,1049.5],[504.1,1000.5],[673.0,883.9],[778.8,815.2],[786.0,809.0],[789.1,805.1],[790.4,801.7],[789.7,798.0],[788.3,794.7],[786.7,791.4],[783.4,784.5],[782.3,781.6],[782.1,777.9],[782.9,774.4],[784.7,771.1],[803.8,741.1],[833.4,694.8],[848.5,670.0],[855.9,656.8],[879.5,611.1],[907.9,556.6],[915.3,540.1],[920.2,527.6],[924.6,512.1],[927.7,497.5],[929.2,481.6],[929.8,469.4],[930.1,453.5],[928.1,437.6],[924.8,422.1],[920.1,405.5],[916.2,392.6],[897.8,337.1],[887.4,310.7],[883.9,302.9],[883.3,298.6],[883.3,293.6],[884.2,290.1],[885.8,288.3],[888.0,286.4],[894.1,282.3],[902.2,277.5],[904.6,275.2],[906.7,272.5],[907.5,269.8],[908.1,266.5],[907.8,263.1],[906.7,258.2],[904.6,254.2],[898.3,242.3],[896.3,238.1],[893.3,230.3],[891.9,225.1],[891.7,217.8],[891.9,213.3],[893.3,207.5],[895.2,202.1],[898.0,197.3],[902.1,192.6],[919.7,179.3],[963.3,147.1],[973.7,139.8],[982.3,135.9],[992.4,133.2],[1003.5,131.5],[1013.7,131.0],[1021.0,131.7],[1031.9,133.6],[1044.8,137.9],[1054.3,142.7],[1060.7,147.3],[1068.9,154.1],[1142.5,218.8],[1157.0,231.4],[1172.0,243.5],[1178.9,248.3],[1188.9,254.8],[1198.6,260.5],[1203.3,263.1],[1216.8,269.6],[1249.6,282.8],[1286.7,298.0],[1321.0,311.3],[1356.4,325.0],[1399.2,341.7],[1407.4,345.2],[1411.6,348.0],[1414.9,351.4],[1417.5,355.4],[1419.2,358.6],[1420.1,361.7],[1420.5,363.3],[1420.7,366.6],[1420.4,369.3],[1418.8,373.1],[1417.1,376.5],[1413.0,381.2],[1401.5,389.4],[1382.8,401.6],[1368.7,410.5],[1362.5,415.4],[1356.1,421.2],[1351.9,425.8],[1348.4,430.3],[1343.0,438.0],[1327.3,460.4],[1322.1,466.1],[1317.3,470.2],[1255.3,511.8],[1166.1,572.5],[1067.2,639.7],[1014.8,675.5],[994.3,689.4],[975.2,701.9],[970.8,708.8],[969.7,714.0],[971.1,720.1],[973.2,725.7],[979.5,735.5],[984.1,742.9],[985.6,749.1],[986.0,755.4],[985.6,761.1],[983.1,767.1],[979.4,774.2],[976.8,777.7],[971.9,783.5],[965.2,788.3],[781.3,905.2]],"cum":[0.0,43.82,130.38,219.29,239.77,248.96,258.25,266.44,277.37,283.53,289.11,291.58,294.81,298.18,302.03,305.83,310.32,317.08,324.81,332.12,338.93,348.17,358.01,371.99,383.85,395.79,429.67,451.43,515.2,529.67,546.83,549.72,557.31,564.51,584.91,590.63,598.65,603.14,610.26,617.36,621.77,628.68,637.56,644.63,651.58,659.7,668.72,677.01,684.87,695.81,713.67,735.94,748.88,762.67,774.86,783.77,792.96,803.0,812.77,823.74,833.67,843.79,852.28,861.72,871.35,882.25,891.73,902.08,906.4,961.36,1039.77,1054.39,1072.23,1081.9,1090.89,1097.78,1106.03,1114.41,1123.3,1131.15,1137.87,1145.92,1159.69,1167.37,1175.63,1189.13,1205.96,1331.84,1419.51,1624.67,1750.78,1760.27,1765.27,1768.85,1772.6,1776.21,1779.9,1787.53,1790.62,1794.37,1797.97,1801.69,1837.17,1892.17,1921.19,1936.34,1987.69,2049.18,2067.24,2080.66,2096.81,2111.68,2127.66,2139.9,2155.75,2171.78,2187.63,2204.84,2218.36,2276.75,2305.12,2313.72,2318.09,2323.01,2326.64,2329.06,2332.02,2339.31,2348.78,2352.09,2355.48,2358.31,2361.63,2365.03,2370.07,2374.58,2388.04,2392.73,2401.12,2406.43,2413.8,2418.25,2424.26,2429.94,2435.49,2441.72,2463.78,2517.98,2530.71,2540.14,2550.57,2561.82,2571.99,2579.38,2590.43,2603.97,2614.64,2622.52,2633.15,2731.13,2750.4,2769.62,2778.02,2789.94,2801.2,2806.5,2821.55,2856.86,2896.93,2933.7,2971.65,3017.55,3026.49,3031.56,3036.27,3041.1,3044.64,3047.87,3049.59,3052.83,3055.54,3059.69,3063.47,3069.72,3083.83,3106.17,3122.83,3130.66,3139.35,3145.55,3151.27,3160.67,3188.01,3195.75,3202.05,3276.72,3384.53,3504.08,3567.5,3592.31,3615.08,3623.2,3628.51,3634.84,3640.75,3652.41,3661.17,3667.49,3673.78,3679.5,3685.99,3694.04,3698.44,3705.98,3714.25,3932.02,4000.0],"sectors":[{"id":1,"name":"Start / Turn 1","start":0.0,"end":600.0,"color":"#f87171","d":"M 724.5,942.5 L 687.8,966.6 L 615.1,1013.5 L 540.6,1062.1 L 523.5,1073.5 L 516.6,1079.5 L 509.6,1085.5 L 503.9,1091.5 L 496.4,1099.4 L 492.6,1104.3 L 489.2,1108.7 L 487.7,1110.7 L 486.5,1113.7 L 485.6,1116.9 L 484.7,1120.7 L 484.4,1124.5 L 484.3,1129.0 L 485.0,1135.7 L 486.5,1143.3 L 488.8,1150.2 L 491.0,1156.6 L 494.4,1165.3 L 498.8,1174.0 L 506.6,1185.6 L 513.3,1195.5 L 520.5,1205.0 L 540.7,1232.2 L 553.1,1250.1 L 590.5,1301.7 L 598.8,1313.6 L 608.6,1327.7 L 610.3,1330.1 L 613.6,1336.9 L 616.5,1343.5 L 622.7,1362.9 L 624.3,1368.4 L 625.3,1376.4 L 625.4,1377.7"},{"id":2,"name":"Turns 2 & 3","start":600.0,"end":1000.0,"color":"#fb923c","d":"M 625.4,1377.7 L 625.6,1380.9 L 625.3,1388.0 L 624.2,1395.0 L 623.2,1399.3 L 620.7,1405.8 L 615.7,1413.1 L 611.0,1418.4 L 605.7,1422.9 L 598.9,1427.3 L 590.8,1431.2 L 583.2,1434.7 L 575.8,1437.1 L 565.2,1439.8 L 547.6,1443.2 L 525.7,1446.9 L 512.9,1449.0 L 499.2,1450.4 L 487.0,1450.8 L 478.1,1450.1 L 468.9,1449.1 L 459.2,1446.7 L 449.9,1443.7 L 439.9,1439.2 L 431.1,1434.5 L 422.4,1429.4 L 415.5,1424.4 L 408.2,1418.4 L 401.2,1411.8 L 393.9,1403.7 L 388.1,1396.2 L 382.2,1387.7 L 379.7,1384.2 L 353.8,1335.7 L 335.3,1301.7"},{"id":3,"name":"Uphill Straight","start":1000.0,"end":1800.0,"color":"#fbbf24","d":"M 335.3,1301.7 L 316.3,1266.8 L 309.3,1253.9 L 300.7,1238.3 L 296.0,1229.8 L 292.8,1221.4 L 290.7,1214.9 L 289.0,1206.8 L 287.8,1198.5 L 287.5,1189.6 L 288.1,1181.8 L 289.7,1175.2 L 291.5,1167.4 L 296.7,1154.7 L 300.6,1148.0 L 305.3,1141.2 L 314.4,1131.2 L 327.7,1120.9 L 431.4,1049.5 L 504.1,1000.5 L 673.0,883.9 L 778.8,815.2 L 786.0,809.0 L 789.1,805.1 L 790.4,801.7 L 789.7,798.0 L 788.3,794.7 L 786.7,791.4 L 783.4,784.5 L 782.3,781.6 L 782.1,777.9 L 782.9,774.4 L 783.9,772.6"},{"id":4,"name":"Chicane","start":1800.0,"end":1910.0,"color":"#34d399","d":"M 783.9,772.6 L 784.7,771.1 L 803.8,741.1 L 833.4,694.8 L 842.7,679.6"},{"id":5,"name":"Middle Straight","start":1910.0,"end":2400.0,"color":"#2dd4bf","d":"M 842.7,679.6 L 848.5,670.0 L 855.9,656.8 L 879.5,611.1 L 907.9,556.6 L 915.3,540.1 L 920.2,527.6 L 924.6,512.1 L 927.7,497.5 L 929.2,481.6 L 929.8,469.4 L 930.1,453.5 L 928.1,437.6 L 924.8,422.1 L 920.1,405.5 L 916.2,392.6 L 897.8,337.1 L 887.4,310.7 L 883.9,302.9 L 883.3,298.6 L 883.3,293.6 L 884.2,290.1 L 885.8,288.3 L 888.0,286.4 L 894.1,282.3 L 902.2,277.5 L 904.6,275.2 L 906.7,272.5 L 907.5,269.8 L 908.1,266.5 L 907.8,263.1 L 906.7,258.2 L 904.6,254.2 L 898.3,242.3 L 896.3,238.1 L 893.7,231.3"},{"id":6,"name":"Hairpins","start":2400.0,"end":2500.0,"color":"#38bdf8","d":"M 893.7,231.3 L 893.3,230.3 L 891.9,225.1 L 891.7,217.8 L 891.9,213.3 L 893.3,207.5 L 895.2,202.1 L 898.0,197.3 L 902.1,192.6 L 919.7,179.3 L 948.9,157.8"},{"id":7,"name":"Back Straight","start":2500.0,"end":3000.0,"color":"#818cf8","d":"M 948.9,157.8 L 963.3,147.1 L 973.7,139.8 L 982.3,135.9 L 992.4,133.2 L 1003.5,131.5 L 1013.7,131.0 L 1021.0,131.7 L 1031.9,133.6 L 1044.8,137.9 L 1054.3,142.7 L 1060.7,147.3 L 1068.9,154.1 L 1142.5,218.8 L 1157.0,231.4 L 1172.0,243.5 L 1178.9,248.3 L 1188.9,254.8 L 1198.6,260.5 L 1203.3,263.1 L 1216.8,269.6 L 1249.6,282.8 L 1286.7,298.0 L 1321.0,311.3 L 1356.4,325.0 L 1382.8,335.3"},{"id":8,"name":"Slow Corner","start":3000.0,"end":3430.0,"color":"#a78bfa","d":"M 1382.8,335.3 L 1399.2,341.7 L 1407.4,345.2 L 1411.6,348.0 L 1414.9,351.4 L 1417.5,355.4 L 1419.2,358.6 L 1420.1,361.7 L 1420.5,363.3 L 1420.7,366.6 L 1420.4,369.3 L 1418.8,373.1 L 1417.1,376.5 L 1413.0,381.2 L 1401.5,389.4 L 1382.8,401.6 L 1368.7,410.5 L 1362.5,415.4 L 1356.1,421.2 L 1351.9,425.8 L 1348.4,430.3 L 1343.0,438.0 L 1327.3,460.4 L 1322.1,466.1 L 1317.3,470.2 L 1255.3,511.8 L 1166.1,572.5 L 1128.5,598.1"},{"id":9,"name":"Final Chicane","start":3430.0,"end":0.0,"color":"#e879f9","d":"M 1128.5,598.1 L 1067.2,639.7 L 1014.8,675.5 L 994.3,689.4 L 975.2,701.9 L 970.8,708.8 L 969.7,714.0 L 971.1,720.1 L 973.2,725.7 L 979.5,735.5 L 984.1,742.9 L 985.6,749.1 L 986.0,755.4 L 985.6,761.1 L 983.1,767.1 L 979.4,774.2 L 976.8,777.7 L 971.9,783.5 L 965.2,788.3 L 781.3,905.2 L 724.5,942.5"}],"gates":[{"dist":0,"x1":715.2,"y1":928.3,"x2":733.8,"y2":956.7},{"dist":600,"x1":608.5,"y1":1378.9,"x2":642.4,"y2":1376.6},{"dist":1000,"x1":350.2,"y1":1293.6,"x2":320.4,"y2":1309.9},{"dist":1800,"x1":799.2,"y1":780.0,"x2":768.6,"y2":765.2},{"dist":1910,"x1":857.2,"y1":688.4,"x2":828.2,"y2":670.7},{"dist":2400,"x1":909.8,"y1":225.9,"x2":877.6,"y2":236.8},{"dist":2500,"x1":958.9,"y1":171.5,"x2":938.8,"y2":144.1},{"dist":3000,"x1":1376.6,"y1":351.1,"x2":1389.0,"y2":319.4},{"dist":3430,"x1":1118.9,"y1":584.0,"x2":1138.0,"y2":612.1}],"sectorLabels":[{"text":"S1","x":749.7,"y":981.0,"color":"#f87171"},{"text":"S2","x":671.3,"y":1374.6,"color":"#fb923c"},{"text":"S3","x":294.9,"y":1323.7,"color":"#fbbf24"},{"text":"S4","x":742.5,"y":752.6,"color":"#34d399"},{"text":"S5","x":803.4,"y":655.6,"color":"#2dd4bf"},{"text":"S6","x":937.2,"y":216.6,"color":"#38bdf8"},{"text":"S7","x":921.6,"y":120.8,"color":"#818cf8"},{"text":"S8","x":1399.6,"y":292.4,"color":"#a78bfa"},{"text":"S9","x":1154.3,"y":636.1,"color":"#e879f9"}],"finish":{"x1":711.3,"y1":922.4,"x2":737.7,"y2":962.6},"landmarks":[{"name":"Turn 1","speed":75,"dist":600.0,"x1":625.4,"y1":1377.7,"x2":703.2,"y2":1372.4,"anchor":"start","dy":-1},{"name":"Turn 2","speed":80,"dist":710.0,"x1":551.2,"y1":1442.5,"x2":565.9,"y2":1519.1,"anchor":"start","dy":1},{"name":"Start of Uphill","speed":110,"dist":1010.0,"x1":330.5,"y1":1292.9,"x2":262.0,"y2":1330.2,"anchor":"end","dy":1},{"name":"Chicane (Turns 5,6)","speed":60,"dist":1860.0,"x1":816.1,"y1":721.9,"x2":750.4,"y2":679.9,"anchor":"end","dy":-1},{"name":"Turn 7","speed":78,"dist":2400.0,"x1":893.7,"y1":231.3,"x2":819.8,"y2":256.3,"anchor":"end","dy":1},{"name":"Turns 8,9","speed":45,"dist":2500.0,"x1":948.9,"y1":157.8,"x2":902.6,"y2":95.0,"anchor":"end","dy":-1},{"name":"Turns 10,11","speed":78,"dist":3000.0,"x1":1382.8,"y1":335.3,"x2":1411.2,"y2":262.6,"anchor":"start","dy":-1},{"name":"Turn 12","speed":40,"dist":3430.0,"x1":1128.5,"y1":598.1,"x2":1172.3,"y2":662.6,"anchor":"start","dy":1},{"name":"Chicane 15,16","speed":54,"dist":3900.0,"x1":808.4,"y1":888.0,"x2":850.2,"y2":953.8,"anchor":"start","dy":1}],"profile":[[0.0,90.67],[40.0,90.55],[80.0,90.46],[120.0,90.65],[160.0,91.51],[200.0,92.33],[240.0,93.11],[280.0,93.86],[320.0,95.13],[360.0,96.78],[400.0,95.92],[440.0,94.54],[480.0,92.68],[520.0,91.55],[560.0,90.52],[600.0,90.0],[640.0,90.0],[680.0,87.73],[720.0,44.16],[760.0,45.72],[800.0,51.13],[840.0,55.65],[880.0,60.17],[920.0,62.27],[960.0,64.11],[1000.0,65.04],[1040.0,60.68],[1080.0,54.25],[1120.0,48.11],[1160.0,42.09],[1200.0,90.0],[1240.0,90.0],[1280.0,90.0],[1320.0,90.0],[1360.0,90.0],[1400.0,90.0],[1440.0,90.0],[1480.0,90.0],[1520.0,90.0],[1560.0,90.0],[1600.0,88.26],[1640.0,82.17],[1680.0,75.6],[1720.0,68.4],[1760.0,60.35],[1800.0,51.04],[1840.0,39.6],[1880.0,35.46],[1920.0,45.12],[1960.0,48.74],[2000.0,54.71],[2040.0,58.38],[2080.0,61.22],[2120.0,65.19],[2160.0,68.86],[2200.0,71.76],[2240.0,74.08],[2280.0,75.26],[2320.0,76.34],[2360.0,74.89],[2400.0,32.99],[2440.0,32.4],[2480.0,39.6],[2520.0,79.72],[2560.0,80.66],[2600.0,82.1],[2640.0,83.71],[2680.0,83.42],[2720.0,83.15],[2760.0,83.6],[2800.0,86.39],[2840.0,88.98],[2880.0,90.77],[2920.0,91.61],[2960.0,91.05],[3000.0,68.31],[3040.0,60.24],[3080.0,50.91],[3120.0,39.44],[3160.0,36.0],[3200.0,43.8],[3240.0,52.42],[3280.0,59.81],[3320.0,66.38],[3360.0,72.36],[3400.0,77.88],[3440.0,79.72],[3480.0,80.66],[3520.0,82.1],[3560.0,83.71],[3600.0,83.42],[3640.0,83.15],[3680.0,83.6],[3720.0,86.39],[3760.0,88.98],[3800.0,90.77],[3840.0,91.61],[3880.0,91.05],[3920.0,90.18],[3960.0,90.36],[4000.0,90.57],[4010.0,90.62]],"profileLapSeconds":210.0,"carColor":"#00e5ff","attribution":"Circuit centreline \u00a9 OpenStreetMap contributors, ODbL 1.0 \u00b7 OSM relation 6006460, fetched 2026-08-27","style":{"casing":17.0,"core":11.0,"car":13.0,"trail":170.0,"lmFont":25.0,"lmSpeedFont":21.0,"sFont":30.0}};
+const CONFIG = {"dbUrl":"https://solar-race-telemetry-default-rtdb.europe-west1.firebasedatabase.app","publicPath":"public/live","racePath":"public/race","staleAfterS":20,"raceStart":null,"raceEnd":null,"lat":50.989021980390824,"lon":5.255727395757176};
+</script>
+<script>
+
+"use strict";
+const NS = "http://www.w3.org/2000/svg";
+const svg = document.getElementById("svg");
+svg.setAttribute("viewBox", DATA.viewBox);
+
+const el = (id) => document.getElementById(id);
+const mk = (tag, attrs) => {
+  const n = document.createElementNS(NS, tag);
+  for (const k in attrs) n.setAttribute(k, attrs[k]);
+  return n;
+};
+
+// One casing path under everything: the sectors are drawn as separate coloured
+// cores on top, and without a continuous dark ribbon beneath them the joins
+// between sectors show as notches.
+el("g-casing").appendChild(mk("path", {
+  d: DATA.sectors.map(s => s.d).join(" "),
+  fill: "none", stroke: "#1e293b", "stroke-width": DATA.style.casing,
+  "stroke-linecap": "round", "stroke-linejoin": "round",
+}));
+
+DATA.sectors.forEach(s => {
+  el("g-sectors").appendChild(mk("path", {
+    d: s.d, fill: "none", stroke: s.color, "stroke-width": DATA.style.core,
+    "stroke-linecap": "round", "stroke-linejoin": "round",
+  }));
+});
+
+DATA.gates.forEach(g => {
+  if (g.dist === 0) return;                 // the finish line is drawn below
+  el("g-gates").appendChild(mk("line", {
+    x1: g.x1, y1: g.y1, x2: g.x2, y2: g.y2, class: "gate",
+  }));
+});
+el("g-gates").appendChild(mk("line", {
+  x1: DATA.finish.x1, y1: DATA.finish.y1,
+  x2: DATA.finish.x2, y2: DATA.finish.y2, class: "finish",
+}));
+
+DATA.landmarks.forEach(lm => {
+  const g = el("g-landmarks");
+  g.appendChild(mk("line", {
+    x1: lm.x1, y1: lm.y1, x2: lm.x2, y2: lm.y2, class: "leader",
+  }));
+  g.appendChild(mk("circle", { cx: lm.x1, cy: lm.y1, r: 5, class: "lm-dot" }));
+
+  const pad = lm.anchor === "start" ? 12 : lm.anchor === "end" ? -12 : 0;
+  const name = mk("text", {
+    x: lm.x2 + pad, y: lm.y2 + (lm.dy > 0 ? 24 : -6),
+    "text-anchor": lm.anchor, class: "lm-name",
+    "font-size": DATA.style.lmFont,
+  });
+  name.textContent = lm.name;
+  g.appendChild(name);
+
+  if (lm.speed != null) {
+    const sp = mk("text", {
+      x: lm.x2 + pad, y: lm.y2 + (lm.dy > 0 ? 48 : 18),
+      "text-anchor": lm.anchor, class: "lm-speed",
+      "font-size": DATA.style.lmSpeedFont,
+    });
+    sp.textContent = lm.speed + " km/h";
+    g.appendChild(sp);
+  }
+});
+
+DATA.sectorLabels.forEach(s => {
+  const t = mk("text", { x: s.x, y: s.y, class: "s-label", fill: s.color,
+                         "font-size": DATA.style.sFont });
+  t.textContent = s.text;
+  el("g-slabels").appendChild(t);
+});
+
+const car = el("car");
+car.setAttribute("r", DATA.style.car);
+car.setAttribute("fill", DATA.carColor);
+el("car-core").setAttribute("r", DATA.style.car * 0.36);
+el("trail").setAttribute("stroke-width", DATA.style.core);
+
+const legend = el("legend");
+if (legend) {
+  DATA.sectors.forEach(s => {
+    const d = document.createElement("div");
+    d.className = "leg";
+    d.id = "leg-" + s.id;
+    d.innerHTML = '<span class="swatch" style="background:' + s.color +
+                  ';color:' + s.color + '"></span><b>S' + s.id + '</b> ' + s.name;
+    legend.appendChild(d);
+  });
+}
+
+// Sector widths are the real lengths, S9 included: its range ends at 0 m (the
+// finish line is both the last boundary and the first), so its length has to be
+// taken the long way round or it comes out negative.
+const progress = el("progress");
+if (progress) {
+  DATA.sectors.forEach(s => {
+    const len = ((s.end - s.start) % DATA.trackLength + DATA.trackLength)
+                % DATA.trackLength || DATA.trackLength;
+    const d = document.createElement("div");
+    d.className = "seg";
+    d.id = "seg-" + s.id;
+    d.style.background = s.color;
+    d.style.width = (len / DATA.trackLength * 100) + "%";
+    progress.insertBefore(d, el("progress-mark"));
+  });
+}
+
+// The same model as track_map.position_at_distance: walk the baked cumulative
+// distances and interpolate between the two vertices that straddle it. Doing it
+// off the SVG path length instead would drift.
+function posAt(d) {
+  const L = DATA.trackLength, cum = DATA.cum, line = DATA.line;
+  d = ((d % L) + L) % L;
+  let lo = 0, hi = cum.length - 1;
+  while (lo < hi - 1) {
+    const mid = (lo + hi) >> 1;
+    if (cum[mid] <= d) lo = mid; else hi = mid;
+  }
+  const span = cum[lo + 1] - cum[lo];
+  const t = span > 0 ? (d - cum[lo]) / span : 0;
+  const a = line[lo], b = line[(lo + 1) % line.length];
+  return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+}
+
+function sectorAt(d) {
+  const L = DATA.trackLength;
+  d = ((d % L) + L) % L;
+  for (const s of DATA.sectors) if (d >= s.start && d < s.end) return s;
+  return DATA.sectors[DATA.sectors.length - 1];
+}
+
+// The next named corner ahead, wrapping past the finish line. TRACK_LANDMARKS
+// is the pit's own list, so the name and the speed are the ones the strategy
+// engine uses -- not a caption invented for a web page.
+function nextLandmark(d) {
+  const L = DATA.trackLength, lms = DATA.landmarks;
+  if (!lms.length) return null;
+  d = ((d % L) + L) % L;
+  for (const lm of lms) if (lm.dist > d) return [lm, lm.dist - d];
+  return [lms[0], L - d + lms[0].dist];
+}
+
+// The tail behind the car, rebuilt each frame from the real centreline so it
+// hugs the corners instead of cutting across them.
+function trailPath(d) {
+  const step = DATA.style.trail / 7;
+  const pts = [];
+  for (let k = 7; k >= 0; k--) pts.push(posAt(d - step * k));
+  return "M " + pts.map(p => p[0].toFixed(1) + "," + p[1].toFixed(1)).join(" L ");
+}
+
+function fmtTime(s) {
+  if (s == null) return "—";
+  const m = Math.floor(s / 60);
+  const r = s - m * 60;
+  return m + ":" + (r < 10 ? "0" : "") + r.toFixed(1);
+}
+
+function fmtClock(s) {
+  if (s == null) return "—";
+  s = Math.max(0, Math.floor(s));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+  return h + "h " + (m < 10 ? "0" : "") + m + "m";
+}
+
+let lastSector = null;
+// Moves the car and everything that follows it. Returns the sector it is in, so
+// the caller can label it without repeating the lookup.
+function paintMap(dist) {
+  const [x, y] = posAt(dist);
+  car.setAttribute("cx", x); car.setAttribute("cy", y);
+  el("car-core").setAttribute("cx", x); el("car-core").setAttribute("cy", y);
+
+  const s = sectorAt(dist);
+  el("trail").setAttribute("stroke", s.color);
+  el("trail").setAttribute("d", trailPath(dist));
+  el("trail").setAttribute("opacity", "0.55");
+
+  if (progress) {
+    el("progress-mark").style.left = (dist / DATA.trackLength * 100) + "%";
+  }
+  if (s.id !== lastSector) {
+    DATA.sectors.forEach(o => {
+      const n = el("leg-" + o.id);
+      if (n) n.classList.toggle("on", o.id === s.id);
+      const g = el("seg-" + o.id);
+      if (g) g.classList.toggle("on", o.id === s.id);
+    });
+    lastSector = s.id;
+  }
+  return s;
+}
+
+
+el("foot").innerHTML = DATA.attribution +
+  "<br>The car publishes once a second. Every value here is a reading the car " +
+  "actually sent &mdash; a dash means it did not send one, never zero.";
+
+// ── state ──────────────────────────────────────────────────────────────── //
+// `snap` is the last thing the car published, verbatim. Nothing here ever
+// invents a value to fill a gap in it.
+let snap = null;
+let lastRxWall = 0;        // our clock, for "how long since anything arrived"
+let dist = 0, target = null, everPainted = false;
+let race = { start: CONFIG.raceStart, end: CONFIG.raceEnd };
+let sun = null;
+
+const num = (v) => (v == null || v === "" || isNaN(Number(v))) ? null : Number(v);
+
+function fmtCountdown(s) {
+  s = Math.max(0, Math.floor(s));
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (d > 0) return d + "d " + h + "h";
+  if (h > 0) return h + "h " + (m < 10 ? "0" : "") + m + "m";
+  return m + "m " + (s % 60) + "s";
+}
+
+// Shown in the VIEWER's timezone, deliberately. Family watching from Israel
+// should read the start time in their own evening, not in Belgian local time
+// they then have to convert.
+function whenLocal(ts) {
+  try {
+    return new Date(ts * 1000).toLocaleString(undefined,
+      { weekday: "short", day: "numeric", month: "short",
+        hour: "2-digit", minute: "2-digit" });
+  } catch (e) { return "—"; }
+}
+const dash = (v, digits, suffix) => v == null ? "—"
+  : v.toLocaleString(undefined, { minimumFractionDigits: digits,
+                                  maximumFractionDigits: digits }) + (suffix || "");
+
+// ── the feed ───────────────────────────────────────────────────────────── //
+// RTDB's REST stream: one connection, the server pushes on every change. If it
+// cannot be opened (an old browser, a proxy that eats text/event-stream) we
+// fall back to polling the same URL, which is slower but works everywhere.
+const LIVE_URL = CONFIG.dbUrl + "/" + CONFIG.publicPath + ".json";
+
+function applySnapshot(obj) {
+  if (obj == null) return;
+  snap = obj;
+  lastRxWall = Date.now() / 1000;
+  const d = num(obj.lap_distance_m);
+  if (d != null) {
+    target = ((d % DATA.trackLength) + DATA.trackLength) % DATA.trackLength;
+    if (!everPainted) { dist = target; everPainted = true; }
+  }
+  checkMilestones(obj);
+  render();
+}
+
+function startStream() {
+  let es;
+  try { es = new EventSource(LIVE_URL); } catch (e) { return startPolling(); }
+  let opened = false;
+  es.addEventListener("open", () => { opened = true; });
+  const onEvent = (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch (e) { return; }
+    if (!msg) return;
+    if (msg.path === "/") applySnapshot(msg.data);
+    else if (snap && msg.path) {          // a patch to one field
+      snap[msg.path.replace(/^\//, "")] = msg.data;
+      applySnapshot(snap);
+    }
+  };
+  es.addEventListener("put", onEvent);
+  es.addEventListener("patch", onEvent);
+  es.addEventListener("error", () => {
+    // Never opened at all -> streaming is not available here, poll instead.
+    // Opened once and dropped -> EventSource reconnects by itself; leave it.
+    if (!opened) { es.close(); startPolling(); }
+  });
+}
+
+let polling = false;
+function startPolling() {
+  if (polling) return;
+  polling = true;
+  const tick = () => fetch(LIVE_URL, { cache: "no-store" })
+    .then(r => r.ok ? r.json() : null)
+    .then(applySnapshot)
+    .catch(() => {});
+  tick();
+  setInterval(tick, 2000);
+}
+
+// The race window, if anyone has published one. Optional: without it the clock
+// card hides rather than counting down to a guess.
+function loadRace() {
+  fetch(CONFIG.dbUrl + "/" + CONFIG.racePath + ".json", { cache: "no-store" })
+    .then(r => r.ok ? r.json() : null)
+    .then(r => {
+      if (r && num(r.start_ts)) race = { start: num(r.start_ts), end: num(r.end_ts) };
+      render();
+    }).catch(() => {});
+}
+
+// ── weather, straight from Open-Meteo, same source the pit uses ─────────── //
+function loadWeather() {
+  const u = "https://api.open-meteo.com/v1/forecast?latitude=" + CONFIG.lat +
+            "&longitude=" + CONFIG.lon +
+            "&current=temperature_2m,cloud_cover,wind_speed_10m" +
+            "&daily=sunrise,sunset&timezone=Europe%2FBrussels&forecast_days=2";
+  fetch(u).then(r => r.ok ? r.json() : null).then(w => {
+    if (!w || !w.current) return;
+    const c = w.current;
+    el("weather").textContent =
+      Math.round(c.temperature_2m) + "°C · " + Math.round(c.cloud_cover) +
+      "% cloud · " + Math.round(c.wind_speed_10m) + " km/h wind";
+    if (w.daily && w.daily.sunrise) {
+      sun = { rise: w.daily.sunrise, set: w.daily.sunset };
+      renderDayNight();
+    }
+  }).catch(() => {});
+}
+
+function renderDayNight() {
+  if (!sun) return;
+  const now = new Date();
+  let label = null;
+  for (let i = 0; i < sun.rise.length; i++) {
+    const rise = new Date(sun.rise[i]), set = new Date(sun.set[i]);
+    if (now >= rise && now < set) {
+      label = "☀ Daylight · sunset " + set.toTimeString().slice(0, 5);
+      break;
+    }
+    if (now < rise) {
+      label = "🌙 Dark · sunrise " + rise.toTimeString().slice(0, 5);
+      break;
+    }
+  }
+  el("daynight").textContent = label ||
+    "🌙 Dark · sunrise " + new Date(sun.rise[sun.rise.length - 1])
+      .toTimeString().slice(0, 5);
+}
+
+// ── milestones ─────────────────────────────────────────────────────────── //
+// Only fired for transitions SEEN while the page is open. Someone opening the
+// page on lap 137 should not be greeted by a stale celebration of lap 100.
+let seenLap = null, seenKm = null, milestoneTimer = null;
+function celebrate(text) {
+  const m = el("milestone");
+  m.textContent = text;
+  m.classList.add("show");
+  clearTimeout(milestoneTimer);
+  milestoneTimer = setTimeout(() => m.classList.remove("show"), 9000);
+}
+function checkMilestones(obj) {
+  const lap = num(obj.lap);
+  if (lap != null) {
+    if (seenLap != null && lap > seenLap && lap % 10 === 0) {
+      celebrate("Lap " + lap + " complete");
+    }
+    seenLap = lap;
+  }
+  const km = num(obj.odometer_m) == null ? null : num(obj.odometer_m) / 1000;
+  if (km != null) {
+    if (seenKm != null && Math.floor(km / 100) > Math.floor(seenKm / 100)) {
+      celebrate(Math.floor(km / 100) * 100 + " km covered");
+    }
+    seenKm = km;
+  }
+}
+
+// ── rendering ──────────────────────────────────────────────────────────── //
+function render() {
+  const now = Date.now() / 1000;
+  const age = lastRxWall ? now - lastRxWall : null;
+  // Two clocks on purpose: `age` is how long since WE heard anything, and
+  // sampleAge is how old the car says its own reading is. A phone with a wrong
+  // clock skews the second, so the status is driven by the first.
+  const stale = age == null || age > CONFIG.staleAfterS;
+
+  const pill = el("status");
+  pill.className = "pill " + (age == null ? "off" : stale ? "stale" : "live");
+  el("status-text").textContent =
+    age == null ? "Waiting for the car" : stale ? "No data" : "Live";
+  el("status-sub").textContent =
+    age == null ? "Nothing has arrived yet — the car may not be running."
+                : stale ? "Nothing for " + Math.round(age) + "s. The car is out of "
+                          + "contact; the marker below is where it was last seen."
+                : "Updated " + Math.max(0, Math.round(age)) + "s ago";
+  document.body.classList.toggle("stale", stale);
+
+  const s = snap || {};
+  el("lap").textContent = num(s.lap) == null ? "—" : num(s.lap);
+  el("speed").textContent = num(s.speed_kmh) == null ? "—"
+                            : Math.round(num(s.speed_kmh));
+  el("lastlap").textContent = fmtTime(num(s.last_lap_time_s));
+  const odo = num(s.odometer_m);
+  el("odo").textContent = odo == null ? "—" : dash(odo / 1000, 1);
+
+  const soc = num(s.soc_percent);
+  el("soc").textContent = soc == null ? "—" : Math.round(soc);
+  el("soc-bar").firstElementChild.style.width = (soc == null ? 0 : soc) + "%";
+  const amps = num(s.solar_current_A);
+  el("solar").textContent = amps == null ? "—" : dash(amps, 1, " A");
+
+  // Race clock. Hidden outright when nobody has published a window -- a
+  // countdown to a date this page guessed would be worse than no countdown.
+  // Three states, because for most of the time this page exists the race has
+  // either not started or is over, and "0h 00m of 24h 00m" is a confusing way
+  // to say "not yet" to someone who opened the link a fortnight early.
+  const card = el("race-card");
+  if (race.start && race.end) {
+    card.style.display = "";
+    const total = race.end - race.start;
+    const bar = card.querySelector(".bar > i");
+    el("race-total").textContent = fmtClock(total);
+    if (now < race.start) {
+      el("race-label").textContent = "Race starts in";
+      el("race-elapsed").textContent = fmtCountdown(race.start - now);
+      el("race-of").style.display = "none";
+      el("race-sub").textContent = "Lights out " + whenLocal(race.start);
+      bar.style.width = "0%";
+    } else if (now >= race.end) {
+      el("race-label").textContent = "Race complete";
+      el("race-elapsed").textContent = fmtClock(total);
+      el("race-of").style.display = "none";
+      el("race-sub").textContent = "Finished " + whenLocal(race.end);
+      bar.style.width = "100%";
+    } else {
+      const done = now - race.start;
+      el("race-label").textContent = "Race clock";
+      el("race-elapsed").textContent = fmtClock(done);
+      el("race-of").style.display = "inline";
+      el("race-sub").textContent = fmtClock(total - done) + " remaining";
+      bar.style.width = (done / total * 100) + "%";
+    }
+  } else {
+    card.style.display = "none";
+  }
+}
+
+// ── the smooth part ────────────────────────────────────────────────────── //
+// The car reports once a second; easing toward the reported distance turns
+// that into motion instead of a marker that jumps. When the feed is stale the
+// easing stops with it: a frozen car is the honest picture of no data.
+let prev = null;
+function frame(t) {
+  const dt = prev == null ? 0 : Math.min(0.25, (t - prev) / 1000);
+  prev = t;
+  const fresh = lastRxWall && (Date.now() / 1000 - lastRxWall) <= CONFIG.staleAfterS;
+  if (target != null && fresh) {
+    let delta = target - dist;
+    const L = DATA.trackLength;
+    if (delta < -L / 2) delta += L;
+    if (delta > L / 2) delta -= L;
+    dist = ((dist + delta * Math.min(1, dt * 2.2)) % L + L) % L;
+  }
+  if (everPainted) {
+    const s = paintMap(dist);
+    el("sector-name").textContent = "S" + s.id + " · " + s.name;
+    const nx = nextLandmark(dist);
+    if (nx) {
+      el("next-sub").textContent = "Next: " + nx[0].name + " · " +
+        Math.round(nx[1]).toLocaleString() + " m ahead";
+    }
+  }
+  requestAnimationFrame(frame);
+}
+
+render();
+startStream();
+loadRace();
+loadWeather();
+setInterval(render, 1000);          // keeps the ages and the race clock moving
+setInterval(loadWeather, 900000);
+setInterval(renderDayNight, 60000);
+setInterval(loadRace, 300000);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

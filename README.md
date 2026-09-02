@@ -304,7 +304,6 @@ THE RACE/                             # ← repo root
 │   ├── .streamlit/config.toml        # Streamlit server/theme settings
 │   ├── 210s.xlsx                     # Baseline 210 s Zolder velocity profile
 │   ├── requirements_pit.txt          # Pit dependencies
-│   ├── zolder_animation.html         # GENERATED presentation circuit map (see tools/, self-contained)
 │   ├── serviceAccountKey.json        # 🔒 Firebase admin key — SEE SECURITY NOTE BELOW
 │   └── telemetry.db                  # Local SQLite store (gitignored; created by collector.py)
 │
@@ -328,8 +327,13 @@ THE RACE/                             # ← repo root
 │   ├── start_camera.sh               # Reverse camera on screen 2 (mpv, no Python)
 │   └── start_hud.sh / stop_hud.sh    # HUD start/stop scripts
 │
-└── docs/                             # Standalone task briefs (no code depends on these)
-    └── PI_CAN_TASK.md                # Step-by-step: MMS + BMS on two CAN channels
+└── docs/                             # Task briefs + the published web pages
+    ├── PI_CAN_TASK.md                # Step-by-step: MMS + BMS on two CAN channels
+    ├── index.html                    # GENERATED spectator page — live from Firebase, for people at home
+    └── zolder_animation.html         # GENERATED presentation circuit map (self-contained, demo lap)
+    #  Both .html files are built by tools/build_zolder_animation.py — never
+    #  hand-edit them. GitHub Pages publishes this folder AT THE SITE ROOT, so
+    #  index.html is what the bare project address serves.
 ```
 
 ### Shared modules — the one layout rule

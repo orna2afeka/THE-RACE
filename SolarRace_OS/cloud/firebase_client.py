@@ -193,10 +193,98 @@ def push_telemetry_to_cloud(vehicle_state):
                 # badge reports the AND of both writes.
                 _record_upload(False, f"history: {hist_err}")
 
+            # The spectator feed rides along AFTER both pit writes, so it can
+            # never delay or displace them, and its own failure is caught
+            # inside push_public_snapshot rather than here.
+            push_public_snapshot(vehicle_state)
+
         except Exception as e:
             # We don't want a network drop to crash the whole car system
             print(f"[Network Error] Failed to update Firebase: {e}")
             _record_upload(False, e)
+
+
+# ==============================================================================
+# THE PUBLIC NODE — the only thing the outside world can read
+# ==============================================================================
+# Everything else in this database is readable only with the service-account
+# key. This one node is world-readable, because it feeds the spectator page
+# that people at home watch the race on, and that page is a plain static file
+# with no credentials of any kind — it cannot be given a key without giving the
+# key to everyone who opens it.
+#
+# So the snapshot below is a WHITELIST, not a copy of vehicle_state. Three
+# reasons it is written out field by field rather than filtered from the live
+# payload:
+#
+#   1. A field is public because it is listed here. Nobody makes something
+#      public by accident, and adding a metric to the car does not silently
+#      publish it.
+#   2. NO POSITION. lat/lon are deliberately absent: the page places the car
+#      from lap_distance_m along the baked centreline, which puts it in the
+#      right corner without broadcasting where the car actually is. The
+#      spectator map is a schematic and does not need better.
+#   3. Size. This is read by every viewer's browser every time it changes, and
+#      RTDB egress is metered. The full payload is a few hundred fields of
+#      cell voltages and thermistors; this is eight numbers.
+PUBLIC_PATH = 'public/live'
+
+# Slower than the 0.5 s pit feed on purpose. The pit is making decisions off
+# its data; a spectator watching a car go round a 4 km lap cannot see the
+# difference between one update a second and two, and every viewer pays for
+# every update in bandwidth.
+PUBLIC_UPDATE_INTERVAL_SECONDS = 1.0
+
+_last_public_update = 0
+
+
+def _public_snapshot(vehicle_state):
+    """The whitelist, resolved against one vehicle_state. Never raises.
+
+    Missing readings stay MISSING — the keys come out None and firebase-admin
+    drops them from the node, so the page renders "—" rather than a confident
+    zero. A spectator page showing 0% state of charge because the BMS went
+    quiet would read as a dead car to exactly the audience least able to tell
+    the difference.
+    """
+    motor = vehicle_state.get("motor") or {}
+    battery = vehicle_state.get("battery") or {}
+    solar = vehicle_state.get("solar") or {}
+    return {
+        # Server-independent: the page compares this against its own clock to
+        # decide whether the feed is live, so it must be the moment the car
+        # sampled, not the moment anything received it.
+        "ts": time.time(),
+        "lap": motor.get("calculated_lap"),
+        "lap_distance_m": motor.get("lap_distance_m"),
+        "odometer_m": motor.get("odometer_m"),
+        "speed_kmh": motor.get("mms_vehicle_speed_kmh"),
+        "last_lap_time_s": motor.get("last_lap_time_s"),
+        "soc_percent": battery.get("bms_soc_percent"),
+        "solar_current_A": solar.get("solar_current_A"),
+    }
+
+
+def push_public_snapshot(vehicle_state):
+    """Best-effort write of the spectator snapshot. NEVER affects the pit feed.
+
+    Called from push_telemetry_to_cloud after the pit's own writes have gone
+    out, inside its own try/except, and deliberately NOT folded into
+    _record_upload(): the PIT badge on the driver's HUD answers one question —
+    "can the pit see me" — and a spectator page failing to update is not an
+    answer to it. Turning the badge red because a family page went stale would
+    train the driver to ignore the one light that tells them the pit wall has
+    gone blind.
+    """
+    global _last_public_update
+    now = time.time()
+    if (now - _last_public_update) < PUBLIC_UPDATE_INTERVAL_SECONDS:
+        return
+    _last_public_update = now
+    try:
+        db.reference(PUBLIC_PATH).set(_public_snapshot(vehicle_state))
+    except Exception as exc:
+        print(f"[Network Error] Failed to update the public snapshot: {exc}")
 
 
 # Node the pit writes short driver instructions to (category + value). "Latest

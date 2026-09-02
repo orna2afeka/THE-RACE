@@ -4,33 +4,27 @@
   Written by tools/build_zolder_animation.py; re-run that to change anything
   here, or your edit is gone the next time anyone does.
 
-  The circuit, the nine sectors, the turn names and their speeds, and the lap
-  the demo car drives are all read from the modules the pit dashboard itself
-  uses - track.py, track_map.py, strategy_engine.py, profiles/base_210s.csv -
-  so this page cannot quietly disagree with the rest of the system about where
-  a sector starts or how fast a corner is taken.
-
-  Self-contained: no CDN, no network, nothing to install. Open it in a browser,
-  from a USB stick if need be. Embedded in an iframe it stops driving itself
-  and follows postMessage {type:"UPDATE_TELEMETRY", lapDistanceMeters, ...}.
+  The circuit, the nine sectors, the turn names and their speeds are read from
+  the modules the pit dashboard itself uses - track.py, track_map.py,
+  strategy_engine.py - so these pages cannot quietly disagree with the rest of
+  the system about where a sector starts or how fast a corner is taken.
 -->
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Circuit Zolder &mdash; Afeka Solar &amp; Electric Racing</title>
-<!-- Progressive enhancement only, and deliberately NOT render-blocking: this
-     page gets shown in places with hostile wifi, and a plain stylesheet link
-     holds first paint until the request resolves -- which on a captive-portal
-     network is seconds of black screen in front of an audience. Loading it as
-     print media and promoting it on load means the page draws immediately in
-     the fallback face and picks Rajdhani up if and when it arrives. -->
+<!-- Progressive enhancement only, and deliberately NOT render-blocking: these
+     pages get opened on hostile wifi, and a plain stylesheet link holds first
+     paint until the request resolves. Loaded as print media and promoted on
+     load, the page draws immediately in the fallback face. -->
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&display=swap"
       rel="stylesheet" media="print" onload="this.media='all'">
 <noscript><link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&display=swap" rel="stylesheet"></noscript>
 <style>
+
   :root {
     --bg: #06090f;
     --panel: rgba(15, 23, 42, 0.82);
@@ -38,6 +32,9 @@
     --dim: #94a3b8;
     --text: #e2e8f0;
     --accent: #00e5ff;
+    --good: #34d399;
+    --warn: #fbbf24;
+    --bad: #f87171;
   }
   * { box-sizing: border-box; }
   html, body {
@@ -48,19 +45,6 @@
     color: var(--text);
     font-family: 'Rajdhani', 'Segoe UI Semibold', 'DIN Alternate',
                  system-ui, -apple-system, sans-serif;
-    overflow: hidden;
-  }
-  #stage {
-    height: 100%; width: 100%;
-    display: grid;
-    grid-template-columns: minmax(260px, 22%) 1fr;
-    gap: 8px;
-  }
-  /* ── left rail ─────────────────────────────────────────────────────── */
-  #rail {
-    padding: 26px 18px 18px 30px;
-    display: flex; flex-direction: column; gap: 22px;
-    min-width: 0;
   }
   .eyebrow {
     font-size: 0.78rem; letter-spacing: 4px; text-transform: uppercase;
@@ -71,41 +55,43 @@
     letter-spacing: 2px; text-transform: uppercase; line-height: 1.1;
   }
   h1 span { color: var(--accent); }
-  .readout { border-left: 3px solid var(--accent); padding-left: 16px; }
-  .readout .label {
-    font-size: 0.72rem; letter-spacing: 3px; text-transform: uppercase;
-    color: var(--dim); font-weight: 600;
-  }
-  .readout .value {
-    font-size: 4.4rem; line-height: 0.95; font-weight: 700;
-    font-variant-numeric: tabular-nums;
-    text-shadow: 0 0 26px rgba(0, 229, 255, 0.18);
-  }
-  .readout .unit {
-    font-size: 1.2rem; color: var(--accent); font-weight: 600;
-    letter-spacing: 2px; margin-left: 6px;
-  }
-  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 12px; }
-  .cell .label {
+  .label {
     font-size: 0.68rem; letter-spacing: 2.5px; text-transform: uppercase;
     color: var(--dim); font-weight: 600;
   }
-  .cell .value {
-    font-size: 1.75rem; font-weight: 700; font-variant-numeric: tabular-nums;
+  .value { font-size: 1.75rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .value.small { font-size: 1.15rem; line-height: 1.25; }
+  .unit { font-size: 0.85rem; color: var(--dim); margin-left: 5px;
+          letter-spacing: 2px; font-weight: 600; }
+  .sub { font-size: 0.85rem; color: var(--dim); font-weight: 600;
+         font-variant-numeric: tabular-nums; margin-top: 2px; }
+  /* -- the map ---------------------------------------------------------- */
+  #map { position: relative; min-width: 0; min-height: 0; }
+  svg { width: 100%; height: 100%; display: block; }
+  .gate { stroke: #64748b; stroke-width: 2.6; }
+  .finish { stroke: #ffffff; stroke-width: 5; }
+  .leader { stroke: #475569; stroke-width: 2.4; }
+  .lm-dot { fill: var(--accent); }
+  .lm-name { fill: #cbd5e1; font-weight: 600; letter-spacing: 1px; }
+  .lm-speed { fill: #64748b; font-weight: 600; }
+  .s-label { font-weight: 700; letter-spacing: 1px;
+             text-anchor: middle; dominant-baseline: middle; }
+  /* -- legend ----------------------------------------------------------- */
+  #legend {
+    position: absolute; right: 18px; bottom: 16px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+    padding: 12px 16px; backdrop-filter: blur(8px);
+    box-shadow: 0 12px 34px rgba(0, 0, 0, 0.55);
+    display: grid; grid-template-columns: repeat(3, auto); gap: 7px 20px;
+    font-size: 0.8rem; letter-spacing: 0.6px;
   }
-  .cell .value.small { font-size: 1.15rem; line-height: 1.25; }
-  .cell .unit { font-size: 0.85rem; color: var(--dim); margin-left: 5px;
-                letter-spacing: 2px; font-weight: 600; }
-  .cell .sub {
-    font-size: 0.85rem; color: var(--dim); font-weight: 600;
-    font-variant-numeric: tabular-nums; margin-top: 2px;
-  }
-  #sector-name { color: var(--accent); }
-  .spacer { flex: 1 1 auto; }
-  /* The nine sectors to scale, so the strip is a map of the lap and not a
-     generic bar: S4 and S6 really are the slivers they look like (110 m and
-     100 m of a 4 km lap), which is also why their labels are the ones that
-     collide on the circuit above. */
+  .leg { display: flex; align-items: center; gap: 8px; color: #cbd5e1; }
+  .leg b { font-weight: 700; min-width: 20px; }
+  .leg .swatch { width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto;
+                 box-shadow: 0 0 6px currentColor; }
+  .leg.on { color: #ffffff; }
+  .leg.on .swatch { transform: scale(1.5); }
+  /* -- lap strip -------------------------------------------------------- */
   #progress {
     position: relative; display: flex; height: 11px; margin-top: 7px;
     border-radius: 6px; overflow: hidden; background: #0f172a;
@@ -117,61 +103,32 @@
     background: #ffffff; border-radius: 2px;
     box-shadow: 0 0 8px rgba(255, 255, 255, 0.85);
   }
-  .foot {
-    font-size: 0.7rem; color: #64748b; line-height: 1.55;
-    letter-spacing: 0.3px; border-top: 1px solid #1e293b; padding-top: 10px;
-  }
-  /* ── map ───────────────────────────────────────────────────────────── */
-  #map { position: relative; min-width: 0; min-height: 0; }
-  /* xMin, not xMid. The circuit is taller than it is wide and the screen is
-     the other way round, so a centred drawing leaves a slab of empty space on
-     BOTH sides of it -- including one between the readouts and the track,
-     which reads as a mistake. Pinned left, the whole surplus collects on the
-     right where the legend sits on it and the composition closes up. */
-  svg { width: 100%; height: 100%; display: block; }
-  .gate { stroke: #64748b; stroke-width: 2.6; }
-  .finish { stroke: #ffffff; stroke-width: 5; }
-  .leader { stroke: #475569; stroke-width: 2.4; }
-  .lm-dot { fill: var(--accent); }
-  /* No font-size here: the generator fitted the viewBox around these words
-     and sets the sizes it measured with, so a number typed here as well would
-     be a second opinion about how big the text is. */
-  .lm-name { fill: #cbd5e1; font-weight: 600; letter-spacing: 1px; }
-  .lm-speed { fill: #64748b; font-weight: 600; }
-  .s-label {
-    font-weight: 700; letter-spacing: 1px;
-    text-anchor: middle; dominant-baseline: middle;
-  }
-  /* ── legend ────────────────────────────────────────────────────────── */
-  #legend {
-    position: absolute; right: 18px; bottom: 16px;
-    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
-    padding: 12px 16px; backdrop-filter: blur(8px);
-    box-shadow: 0 12px 34px rgba(0, 0, 0, 0.55);
-    display: grid; grid-template-columns: repeat(3, auto); gap: 7px 20px;
-    font-size: 0.8rem; letter-spacing: 0.6px;
-  }
-  .leg { display: flex; align-items: center; gap: 8px; color: #cbd5e1; }
-  .leg b { font-weight: 700; min-width: 20px; }
-  .leg .swatch {
-    width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto;
-    box-shadow: 0 0 6px currentColor;
-  }
-  .leg.on { color: #ffffff; }
-  .leg.on .swatch { transform: scale(1.5); }
-  /* ── demo speed control ────────────────────────────────────────────── */
+
+  html, body { overflow: hidden; }
+  #stage { height: 100%; width: 100%; display: grid;
+           grid-template-columns: minmax(260px, 22%) 1fr; gap: 8px; }
+  #rail { padding: 26px 18px 18px 30px; display: flex; flex-direction: column;
+          gap: 22px; min-width: 0; }
+  .readout { border-left: 3px solid var(--accent); padding-left: 16px; }
+  .readout .label { font-size: 0.72rem; letter-spacing: 3px; }
+  .readout .value { font-size: 4.4rem; line-height: 0.95;
+                    text-shadow: 0 0 26px rgba(0, 229, 255, 0.18); }
+  .readout .unit { font-size: 1.2rem; color: var(--accent); }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 12px; }
+  #sector-name { color: var(--accent); }
+  .spacer { flex: 1 1 auto; }
+  .foot { font-size: 0.7rem; color: #64748b; line-height: 1.55;
+          border-top: 1px solid #1e293b; padding-top: 10px; }
   #speedctl {
-    position: absolute; left: 16px; top: 16px;
-    display: flex; gap: 6px; align-items: center;
-    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
-    padding: 6px 10px; font-size: 0.72rem; letter-spacing: 2px;
-    color: var(--dim); text-transform: uppercase; font-weight: 600;
+    position: absolute; left: 16px; top: 16px; display: flex; gap: 6px;
+    align-items: center; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: 6px 10px; font-size: 0.72rem;
+    letter-spacing: 2px; color: var(--dim); text-transform: uppercase;
+    font-weight: 600;
   }
-  #speedctl button {
-    font: inherit; letter-spacing: 1px; color: var(--dim); cursor: pointer;
-    background: transparent; border: 1px solid var(--line); border-radius: 5px;
-    padding: 3px 9px;
-  }
+  #speedctl button { font: inherit; letter-spacing: 1px; color: var(--dim);
+    cursor: pointer; background: transparent; border: 1px solid var(--line);
+    border-radius: 5px; padding: 3px 9px; }
   #speedctl button.on { color: #06090f; background: var(--accent);
                         border-color: var(--accent); }
   @media (max-width: 900px) {
@@ -189,53 +146,36 @@
       <div class="eyebrow">Afeka Solar &amp; Electric Racing</div>
       <h1>Circuit <span>Zolder</span></h1>
     </div>
-
     <div class="readout">
       <div class="label">Speed</div>
       <div class="value"><span id="speed">&mdash;</span><span class="unit">KM/H</span></div>
     </div>
-
     <div class="grid2">
-      <div class="cell">
-        <div class="label">Lap distance</div>
-        <div class="value"><span id="dist">&mdash;</span><span class="unit">M</span></div>
-      </div>
-      <div class="cell">
-        <div class="label">Lap</div>
-        <div class="value"><span id="lap">&mdash;</span></div>
-      </div>
-      <div class="cell">
-        <div class="label">Lap time</div>
-        <div class="value"><span id="laptime">&mdash;</span></div>
-      </div>
-      <div class="cell">
-        <div class="label">Last lap</div>
-        <div class="value"><span id="lastlap">&mdash;</span></div>
-      </div>
+      <div><div class="label">Lap distance</div>
+        <div class="value"><span id="dist">&mdash;</span><span class="unit">M</span></div></div>
+      <div><div class="label">Lap</div><div class="value"><span id="lap">&mdash;</span></div></div>
+      <div><div class="label">Lap time</div><div class="value"><span id="laptime">&mdash;</span></div></div>
+      <div><div class="label">Last lap</div><div class="value"><span id="lastlap">&mdash;</span></div></div>
     </div>
-
-    <div class="cell">
+    <div>
       <div class="label">Sector</div>
       <div class="value small" id="sector-name">&mdash;</div>
     </div>
-
-    <div class="cell">
+    <div>
       <div class="label">Next</div>
       <div class="value small" id="next-name">&mdash;</div>
       <div class="sub" id="next-sub">&mdash;</div>
     </div>
-
-    <div class="cell">
+    <div>
       <div class="label">Lap progress</div>
       <div id="progress"><div id="progress-mark"></div></div>
       <div class="sub" id="progress-sub">&mdash;</div>
     </div>
-
     <div class="spacer"></div>
     <div class="foot" id="foot"></div>
   </div>
-
   <div id="map">
+
     <svg id="svg" preserveAspectRatio="xMinYMid meet">
       <defs>
         <filter id="glow" x="-60%" y="-60%" width="220%" height="220%">
@@ -252,15 +192,17 @@
       <circle id="car" r="0" filter="url(#glow)"></circle>
       <circle id="car-core" r="0" fill="#ffffff"></circle>
     </svg>
+
     <div id="legend"></div>
     <div id="speedctl"><span>Demo</span></div>
   </div>
 </div>
-
 <script>
-"use strict";
 const DATA = {"viewBox":"0 0 1617 1614","trackLength":4000.0,"line":[[724.5,942.5],[687.8,966.6],[615.1,1013.5],[540.6,1062.1],[523.5,1073.5],[516.6,1079.5],[509.6,1085.5],[503.9,1091.5],[496.4,1099.4],[492.6,1104.3],[489.2,1108.7],[487.7,1110.7],[486.5,1113.7],[485.6,1116.9],[484.7,1120.7],[484.4,1124.5],[484.3,1129.0],[485.0,1135.7],[486.5,1143.3],[488.8,1150.2],[491.0,1156.6],[494.4,1165.3],[498.8,1174.0],[506.6,1185.6],[513.3,1195.5],[520.5,1205.0],[540.7,1232.2],[553.1,1250.1],[590.5,1301.7],[598.8,1313.6],[608.6,1327.7],[610.3,1330.1],[613.6,1336.9],[616.5,1343.5],[622.7,1362.9],[624.3,1368.4],[625.3,1376.4],[625.6,1380.9],[625.3,1388.0],[624.2,1395.0],[623.2,1399.3],[620.7,1405.8],[615.7,1413.1],[611.0,1418.4],[605.7,1422.9],[598.9,1427.3],[590.8,1431.2],[583.2,1434.7],[575.8,1437.1],[565.2,1439.8],[547.6,1443.2],[525.7,1446.9],[512.9,1449.0],[499.2,1450.4],[487.0,1450.8],[478.1,1450.1],[468.9,1449.1],[459.2,1446.7],[449.9,1443.7],[439.9,1439.2],[431.1,1434.5],[422.4,1429.4],[415.5,1424.4],[408.2,1418.4],[401.2,1411.8],[393.9,1403.7],[388.1,1396.2],[382.2,1387.7],[379.7,1384.2],[353.8,1335.7],[316.3,1266.8],[309.3,1253.9],[300.7,1238.3],[296.0,1229.8],[292.8,1221.4],[290.7,1214.9],[289.0,1206.8],[287.8,1198.5],[287.5,1189.6],[288.1,1181.8],[289.7,1175.2],[291.5,1167.4],[296.7,1154.7],[300.6,1148.0],[305.3,1141.2],[314.4,1131.2],[327.7,1120.9],[431.4,1049.5],[504.1,1000.5],[673.0,883.9],[778.8,815.2],[786.0,809.0],[789.1,805.1],[790.4,801.7],[789.7,798.0],[788.3,794.7],[786.7,791.4],[783.4,784.5],[782.3,781.6],[782.1,777.9],[782.9,774.4],[784.7,771.1],[803.8,741.1],[833.4,694.8],[848.5,670.0],[855.9,656.8],[879.5,611.1],[907.9,556.6],[915.3,540.1],[920.2,527.6],[924.6,512.1],[927.7,497.5],[929.2,481.6],[929.8,469.4],[930.1,453.5],[928.1,437.6],[924.8,422.1],[920.1,405.5],[916.2,392.6],[897.8,337.1],[887.4,310.7],[883.9,302.9],[883.3,298.6],[883.3,293.6],[884.2,290.1],[885.8,288.3],[888.0,286.4],[894.1,282.3],[902.2,277.5],[904.6,275.2],[906.7,272.5],[907.5,269.8],[908.1,266.5],[907.8,263.1],[906.7,258.2],[904.6,254.2],[898.3,242.3],[896.3,238.1],[893.3,230.3],[891.9,225.1],[891.7,217.8],[891.9,213.3],[893.3,207.5],[895.2,202.1],[898.0,197.3],[902.1,192.6],[919.7,179.3],[963.3,147.1],[973.7,139.8],[982.3,135.9],[992.4,133.2],[1003.5,131.5],[1013.7,131.0],[1021.0,131.7],[1031.9,133.6],[1044.8,137.9],[1054.3,142.7],[1060.7,147.3],[1068.9,154.1],[1142.5,218.8],[1157.0,231.4],[1172.0,243.5],[1178.9,248.3],[1188.9,254.8],[1198.6,260.5],[1203.3,263.1],[1216.8,269.6],[1249.6,282.8],[1286.7,298.0],[1321.0,311.3],[1356.4,325.0],[1399.2,341.7],[1407.4,345.2],[1411.6,348.0],[1414.9,351.4],[1417.5,355.4],[1419.2,358.6],[1420.1,361.7],[1420.5,363.3],[1420.7,366.6],[1420.4,369.3],[1418.8,373.1],[1417.1,376.5],[1413.0,381.2],[1401.5,389.4],[1382.8,401.6],[1368.7,410.5],[1362.5,415.4],[1356.1,421.2],[1351.9,425.8],[1348.4,430.3],[1343.0,438.0],[1327.3,460.4],[1322.1,466.1],[1317.3,470.2],[1255.3,511.8],[1166.1,572.5],[1067.2,639.7],[1014.8,675.5],[994.3,689.4],[975.2,701.9],[970.8,708.8],[969.7,714.0],[971.1,720.1],[973.2,725.7],[979.5,735.5],[984.1,742.9],[985.6,749.1],[986.0,755.4],[985.6,761.1],[983.1,767.1],[979.4,774.2],[976.8,777.7],[971.9,783.5],[965.2,788.3],[781.3,905.2]],"cum":[0.0,43.82,130.38,219.29,239.77,248.96,258.25,266.44,277.37,283.53,289.11,291.58,294.81,298.18,302.03,305.83,310.32,317.08,324.81,332.12,338.93,348.17,358.01,371.99,383.85,395.79,429.67,451.43,515.2,529.67,546.83,549.72,557.31,564.51,584.91,590.63,598.65,603.14,610.26,617.36,621.77,628.68,637.56,644.63,651.58,659.7,668.72,677.01,684.87,695.81,713.67,735.94,748.88,762.67,774.86,783.77,792.96,803.0,812.77,823.74,833.67,843.79,852.28,861.72,871.35,882.25,891.73,902.08,906.4,961.36,1039.77,1054.39,1072.23,1081.9,1090.89,1097.78,1106.03,1114.41,1123.3,1131.15,1137.87,1145.92,1159.69,1167.37,1175.63,1189.13,1205.96,1331.84,1419.51,1624.67,1750.78,1760.27,1765.27,1768.85,1772.6,1776.21,1779.9,1787.53,1790.62,1794.37,1797.97,1801.69,1837.17,1892.17,1921.19,1936.34,1987.69,2049.18,2067.24,2080.66,2096.81,2111.68,2127.66,2139.9,2155.75,2171.78,2187.63,2204.84,2218.36,2276.75,2305.12,2313.72,2318.09,2323.01,2326.64,2329.06,2332.02,2339.31,2348.78,2352.09,2355.48,2358.31,2361.63,2365.03,2370.07,2374.58,2388.04,2392.73,2401.12,2406.43,2413.8,2418.25,2424.26,2429.94,2435.49,2441.72,2463.78,2517.98,2530.71,2540.14,2550.57,2561.82,2571.99,2579.38,2590.43,2603.97,2614.64,2622.52,2633.15,2731.13,2750.4,2769.62,2778.02,2789.94,2801.2,2806.5,2821.55,2856.86,2896.93,2933.7,2971.65,3017.55,3026.49,3031.56,3036.27,3041.1,3044.64,3047.87,3049.59,3052.83,3055.54,3059.69,3063.47,3069.72,3083.83,3106.17,3122.83,3130.66,3139.35,3145.55,3151.27,3160.67,3188.01,3195.75,3202.05,3276.72,3384.53,3504.08,3567.5,3592.31,3615.08,3623.2,3628.51,3634.84,3640.75,3652.41,3661.17,3667.49,3673.78,3679.5,3685.99,3694.04,3698.44,3705.98,3714.25,3932.02,4000.0],"sectors":[{"id":1,"name":"Start / Turn 1","start":0.0,"end":600.0,"color":"#f87171","d":"M 724.5,942.5 L 687.8,966.6 L 615.1,1013.5 L 540.6,1062.1 L 523.5,1073.5 L 516.6,1079.5 L 509.6,1085.5 L 503.9,1091.5 L 496.4,1099.4 L 492.6,1104.3 L 489.2,1108.7 L 487.7,1110.7 L 486.5,1113.7 L 485.6,1116.9 L 484.7,1120.7 L 484.4,1124.5 L 484.3,1129.0 L 485.0,1135.7 L 486.5,1143.3 L 488.8,1150.2 L 491.0,1156.6 L 494.4,1165.3 L 498.8,1174.0 L 506.6,1185.6 L 513.3,1195.5 L 520.5,1205.0 L 540.7,1232.2 L 553.1,1250.1 L 590.5,1301.7 L 598.8,1313.6 L 608.6,1327.7 L 610.3,1330.1 L 613.6,1336.9 L 616.5,1343.5 L 622.7,1362.9 L 624.3,1368.4 L 625.3,1376.4 L 625.4,1377.7"},{"id":2,"name":"Turns 2 & 3","start":600.0,"end":1000.0,"color":"#fb923c","d":"M 625.4,1377.7 L 625.6,1380.9 L 625.3,1388.0 L 624.2,1395.0 L 623.2,1399.3 L 620.7,1405.8 L 615.7,1413.1 L 611.0,1418.4 L 605.7,1422.9 L 598.9,1427.3 L 590.8,1431.2 L 583.2,1434.7 L 575.8,1437.1 L 565.2,1439.8 L 547.6,1443.2 L 525.7,1446.9 L 512.9,1449.0 L 499.2,1450.4 L 487.0,1450.8 L 478.1,1450.1 L 468.9,1449.1 L 459.2,1446.7 L 449.9,1443.7 L 439.9,1439.2 L 431.1,1434.5 L 422.4,1429.4 L 415.5,1424.4 L 408.2,1418.4 L 401.2,1411.8 L 393.9,1403.7 L 388.1,1396.2 L 382.2,1387.7 L 379.7,1384.2 L 353.8,1335.7 L 335.3,1301.7"},{"id":3,"name":"Uphill Straight","start":1000.0,"end":1800.0,"color":"#fbbf24","d":"M 335.3,1301.7 L 316.3,1266.8 L 309.3,1253.9 L 300.7,1238.3 L 296.0,1229.8 L 292.8,1221.4 L 290.7,1214.9 L 289.0,1206.8 L 287.8,1198.5 L 287.5,1189.6 L 288.1,1181.8 L 289.7,1175.2 L 291.5,1167.4 L 296.7,1154.7 L 300.6,1148.0 L 305.3,1141.2 L 314.4,1131.2 L 327.7,1120.9 L 431.4,1049.5 L 504.1,1000.5 L 673.0,883.9 L 778.8,815.2 L 786.0,809.0 L 789.1,805.1 L 790.4,801.7 L 789.7,798.0 L 788.3,794.7 L 786.7,791.4 L 783.4,784.5 L 782.3,781.6 L 782.1,777.9 L 782.9,774.4 L 783.9,772.6"},{"id":4,"name":"Chicane","start":1800.0,"end":1910.0,"color":"#34d399","d":"M 783.9,772.6 L 784.7,771.1 L 803.8,741.1 L 833.4,694.8 L 842.7,679.6"},{"id":5,"name":"Middle Straight","start":1910.0,"end":2400.0,"color":"#2dd4bf","d":"M 842.7,679.6 L 848.5,670.0 L 855.9,656.8 L 879.5,611.1 L 907.9,556.6 L 915.3,540.1 L 920.2,527.6 L 924.6,512.1 L 927.7,497.5 L 929.2,481.6 L 929.8,469.4 L 930.1,453.5 L 928.1,437.6 L 924.8,422.1 L 920.1,405.5 L 916.2,392.6 L 897.8,337.1 L 887.4,310.7 L 883.9,302.9 L 883.3,298.6 L 883.3,293.6 L 884.2,290.1 L 885.8,288.3 L 888.0,286.4 L 894.1,282.3 L 902.2,277.5 L 904.6,275.2 L 906.7,272.5 L 907.5,269.8 L 908.1,266.5 L 907.8,263.1 L 906.7,258.2 L 904.6,254.2 L 898.3,242.3 L 896.3,238.1 L 893.7,231.3"},{"id":6,"name":"Hairpins","start":2400.0,"end":2500.0,"color":"#38bdf8","d":"M 893.7,231.3 L 893.3,230.3 L 891.9,225.1 L 891.7,217.8 L 891.9,213.3 L 893.3,207.5 L 895.2,202.1 L 898.0,197.3 L 902.1,192.6 L 919.7,179.3 L 948.9,157.8"},{"id":7,"name":"Back Straight","start":2500.0,"end":3000.0,"color":"#818cf8","d":"M 948.9,157.8 L 963.3,147.1 L 973.7,139.8 L 982.3,135.9 L 992.4,133.2 L 1003.5,131.5 L 1013.7,131.0 L 1021.0,131.7 L 1031.9,133.6 L 1044.8,137.9 L 1054.3,142.7 L 1060.7,147.3 L 1068.9,154.1 L 1142.5,218.8 L 1157.0,231.4 L 1172.0,243.5 L 1178.9,248.3 L 1188.9,254.8 L 1198.6,260.5 L 1203.3,263.1 L 1216.8,269.6 L 1249.6,282.8 L 1286.7,298.0 L 1321.0,311.3 L 1356.4,325.0 L 1382.8,335.3"},{"id":8,"name":"Slow Corner","start":3000.0,"end":3430.0,"color":"#a78bfa","d":"M 1382.8,335.3 L 1399.2,341.7 L 1407.4,345.2 L 1411.6,348.0 L 1414.9,351.4 L 1417.5,355.4 L 1419.2,358.6 L 1420.1,361.7 L 1420.5,363.3 L 1420.7,366.6 L 1420.4,369.3 L 1418.8,373.1 L 1417.1,376.5 L 1413.0,381.2 L 1401.5,389.4 L 1382.8,401.6 L 1368.7,410.5 L 1362.5,415.4 L 1356.1,421.2 L 1351.9,425.8 L 1348.4,430.3 L 1343.0,438.0 L 1327.3,460.4 L 1322.1,466.1 L 1317.3,470.2 L 1255.3,511.8 L 1166.1,572.5 L 1128.5,598.1"},{"id":9,"name":"Final Chicane","start":3430.0,"end":0.0,"color":"#e879f9","d":"M 1128.5,598.1 L 1067.2,639.7 L 1014.8,675.5 L 994.3,689.4 L 975.2,701.9 L 970.8,708.8 L 969.7,714.0 L 971.1,720.1 L 973.2,725.7 L 979.5,735.5 L 984.1,742.9 L 985.6,749.1 L 986.0,755.4 L 985.6,761.1 L 983.1,767.1 L 979.4,774.2 L 976.8,777.7 L 971.9,783.5 L 965.2,788.3 L 781.3,905.2 L 724.5,942.5"}],"gates":[{"dist":0,"x1":715.2,"y1":928.3,"x2":733.8,"y2":956.7},{"dist":600,"x1":608.5,"y1":1378.9,"x2":642.4,"y2":1376.6},{"dist":1000,"x1":350.2,"y1":1293.6,"x2":320.4,"y2":1309.9},{"dist":1800,"x1":799.2,"y1":780.0,"x2":768.6,"y2":765.2},{"dist":1910,"x1":857.2,"y1":688.4,"x2":828.2,"y2":670.7},{"dist":2400,"x1":909.8,"y1":225.9,"x2":877.6,"y2":236.8},{"dist":2500,"x1":958.9,"y1":171.5,"x2":938.8,"y2":144.1},{"dist":3000,"x1":1376.6,"y1":351.1,"x2":1389.0,"y2":319.4},{"dist":3430,"x1":1118.9,"y1":584.0,"x2":1138.0,"y2":612.1}],"sectorLabels":[{"text":"S1","x":749.7,"y":981.0,"color":"#f87171"},{"text":"S2","x":671.3,"y":1374.6,"color":"#fb923c"},{"text":"S3","x":294.9,"y":1323.7,"color":"#fbbf24"},{"text":"S4","x":742.5,"y":752.6,"color":"#34d399"},{"text":"S5","x":803.4,"y":655.6,"color":"#2dd4bf"},{"text":"S6","x":937.2,"y":216.6,"color":"#38bdf8"},{"text":"S7","x":921.6,"y":120.8,"color":"#818cf8"},{"text":"S8","x":1399.6,"y":292.4,"color":"#a78bfa"},{"text":"S9","x":1154.3,"y":636.1,"color":"#e879f9"}],"finish":{"x1":711.3,"y1":922.4,"x2":737.7,"y2":962.6},"landmarks":[{"name":"Turn 1","speed":75,"dist":600.0,"x1":625.4,"y1":1377.7,"x2":703.2,"y2":1372.4,"anchor":"start","dy":-1},{"name":"Turn 2","speed":80,"dist":710.0,"x1":551.2,"y1":1442.5,"x2":565.9,"y2":1519.1,"anchor":"start","dy":1},{"name":"Start of Uphill","speed":110,"dist":1010.0,"x1":330.5,"y1":1292.9,"x2":262.0,"y2":1330.2,"anchor":"end","dy":1},{"name":"Chicane (Turns 5,6)","speed":60,"dist":1860.0,"x1":816.1,"y1":721.9,"x2":750.4,"y2":679.9,"anchor":"end","dy":-1},{"name":"Turn 7","speed":78,"dist":2400.0,"x1":893.7,"y1":231.3,"x2":819.8,"y2":256.3,"anchor":"end","dy":1},{"name":"Turns 8,9","speed":45,"dist":2500.0,"x1":948.9,"y1":157.8,"x2":902.6,"y2":95.0,"anchor":"end","dy":-1},{"name":"Turns 10,11","speed":78,"dist":3000.0,"x1":1382.8,"y1":335.3,"x2":1411.2,"y2":262.6,"anchor":"start","dy":-1},{"name":"Turn 12","speed":40,"dist":3430.0,"x1":1128.5,"y1":598.1,"x2":1172.3,"y2":662.6,"anchor":"start","dy":1},{"name":"Chicane 15,16","speed":54,"dist":3900.0,"x1":808.4,"y1":888.0,"x2":850.2,"y2":953.8,"anchor":"start","dy":1}],"profile":[[0.0,90.67],[40.0,90.55],[80.0,90.46],[120.0,90.65],[160.0,91.51],[200.0,92.33],[240.0,93.11],[280.0,93.86],[320.0,95.13],[360.0,96.78],[400.0,95.92],[440.0,94.54],[480.0,92.68],[520.0,91.55],[560.0,90.52],[600.0,90.0],[640.0,90.0],[680.0,87.73],[720.0,44.16],[760.0,45.72],[800.0,51.13],[840.0,55.65],[880.0,60.17],[920.0,62.27],[960.0,64.11],[1000.0,65.04],[1040.0,60.68],[1080.0,54.25],[1120.0,48.11],[1160.0,42.09],[1200.0,90.0],[1240.0,90.0],[1280.0,90.0],[1320.0,90.0],[1360.0,90.0],[1400.0,90.0],[1440.0,90.0],[1480.0,90.0],[1520.0,90.0],[1560.0,90.0],[1600.0,88.26],[1640.0,82.17],[1680.0,75.6],[1720.0,68.4],[1760.0,60.35],[1800.0,51.04],[1840.0,39.6],[1880.0,35.46],[1920.0,45.12],[1960.0,48.74],[2000.0,54.71],[2040.0,58.38],[2080.0,61.22],[2120.0,65.19],[2160.0,68.86],[2200.0,71.76],[2240.0,74.08],[2280.0,75.26],[2320.0,76.34],[2360.0,74.89],[2400.0,32.99],[2440.0,32.4],[2480.0,39.6],[2520.0,79.72],[2560.0,80.66],[2600.0,82.1],[2640.0,83.71],[2680.0,83.42],[2720.0,83.15],[2760.0,83.6],[2800.0,86.39],[2840.0,88.98],[2880.0,90.77],[2920.0,91.61],[2960.0,91.05],[3000.0,68.31],[3040.0,60.24],[3080.0,50.91],[3120.0,39.44],[3160.0,36.0],[3200.0,43.8],[3240.0,52.42],[3280.0,59.81],[3320.0,66.38],[3360.0,72.36],[3400.0,77.88],[3440.0,79.72],[3480.0,80.66],[3520.0,82.1],[3560.0,83.71],[3600.0,83.42],[3640.0,83.15],[3680.0,83.6],[3720.0,86.39],[3760.0,88.98],[3800.0,90.77],[3840.0,91.61],[3880.0,91.05],[3920.0,90.18],[3960.0,90.36],[4000.0,90.57],[4010.0,90.62]],"profileLapSeconds":210.0,"carColor":"#00e5ff","attribution":"Circuit centreline \u00a9 OpenStreetMap contributors, ODbL 1.0 \u00b7 OSM relation 6006460, fetched 2026-08-27","style":{"casing":17.0,"core":11.0,"car":13.0,"trail":170.0,"lmFont":25.0,"lmSpeedFont":21.0,"sFont":30.0}};
+</script>
+<script>
 
+"use strict";
 const NS = "http://www.w3.org/2000/svg";
 const svg = document.getElementById("svg");
 svg.setAttribute("viewBox", DATA.viewBox);
@@ -272,16 +214,14 @@ const mk = (tag, attrs) => {
   return n;
 };
 
-// ── static drawing ──────────────────────────────────────────────────────── //
 // One casing path under everything: the sectors are drawn as separate coloured
 // cores on top, and without a continuous dark ribbon beneath them the joins
 // between sectors show as notches.
-const casing = mk("path", {
+el("g-casing").appendChild(mk("path", {
   d: DATA.sectors.map(s => s.d).join(" "),
   fill: "none", stroke: "#1e293b", "stroke-width": DATA.style.casing,
   "stroke-linecap": "round", "stroke-linejoin": "round",
-});
-el("g-casing").appendChild(casing);
+}));
 
 DATA.sectors.forEach(s => {
   el("g-sectors").appendChild(mk("path", {
@@ -341,42 +281,38 @@ car.setAttribute("fill", DATA.carColor);
 el("car-core").setAttribute("r", DATA.style.car * 0.36);
 el("trail").setAttribute("stroke-width", DATA.style.core);
 
-// Legend: sector number, colour and the name the pit dashboard uses for it.
 const legend = el("legend");
-DATA.sectors.forEach(s => {
-  const d = document.createElement("div");
-  d.className = "leg";
-  d.id = "leg-" + s.id;
-  d.innerHTML = '<span class="swatch" style="background:' + s.color +
-                ';color:' + s.color + '"></span><b>S' + s.id + '</b> ' + s.name;
-  legend.appendChild(d);
-});
+if (legend) {
+  DATA.sectors.forEach(s => {
+    const d = document.createElement("div");
+    d.className = "leg";
+    d.id = "leg-" + s.id;
+    d.innerHTML = '<span class="swatch" style="background:' + s.color +
+                  ';color:' + s.color + '"></span><b>S' + s.id + '</b> ' + s.name;
+    legend.appendChild(d);
+  });
+}
 
-// Sector widths are the real lengths, S9 included: its range ends at 0 m
-// (the finish line is both the last boundary and the first), so its length has
-// to be taken the long way round or it comes out negative.
+// Sector widths are the real lengths, S9 included: its range ends at 0 m (the
+// finish line is both the last boundary and the first), so its length has to be
+// taken the long way round or it comes out negative.
 const progress = el("progress");
-const lapLen = DATA.trackLength;
-DATA.sectors.forEach(s => {
-  const len = ((s.end - s.start) % lapLen + lapLen) % lapLen || lapLen;
-  const d = document.createElement("div");
-  d.className = "seg";
-  d.id = "seg-" + s.id;
-  d.style.background = s.color;
-  d.style.width = (len / lapLen * 100) + "%";
-  progress.insertBefore(d, el("progress-mark"));
-});
+if (progress) {
+  DATA.sectors.forEach(s => {
+    const len = ((s.end - s.start) % DATA.trackLength + DATA.trackLength)
+                % DATA.trackLength || DATA.trackLength;
+    const d = document.createElement("div");
+    d.className = "seg";
+    d.id = "seg-" + s.id;
+    d.style.background = s.color;
+    d.style.width = (len / DATA.trackLength * 100) + "%";
+    progress.insertBefore(d, el("progress-mark"));
+  });
+}
 
-el("foot").innerHTML =
-  DATA.attribution +
-  "<br>Demo lap driven by the team's 210 s baseline velocity profile &mdash; " +
-  "modelled lap " + DATA.profileLapSeconds.toFixed(1) + " s.";
-
-// ── position along the lap ──────────────────────────────────────────────── //
 // The same model as track_map.position_at_distance: walk the baked cumulative
-// distances and interpolate between the two vertices that straddle it. Doing
-// it off the SVG path length instead would drift, because path length is only
-// proportional to real distance while every segment is scaled identically.
+// distances and interpolate between the two vertices that straddle it. Doing it
+// off the SVG path length instead would drift.
 function posAt(d) {
   const L = DATA.trackLength, cum = DATA.cum, line = DATA.line;
   d = ((d % L) + L) % L;
@@ -391,35 +327,22 @@ function posAt(d) {
   return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
 }
 
-function speedAt(d) {
-  const p = DATA.profile, L = DATA.trackLength;
+function sectorAt(d) {
+  const L = DATA.trackLength;
   d = ((d % L) + L) % L;
-  let lo = 0, hi = p.length - 1;
-  while (lo < hi - 1) {
-    const mid = (lo + hi) >> 1;
-    if (p[mid][0] <= d) lo = mid; else hi = mid;
-  }
-  const span = p[lo + 1][0] - p[lo][0];
-  const t = span > 0 ? (d - p[lo][0]) / span : 0;
-  return p[lo][1] + (p[lo + 1][1] - p[lo][1]) * t;
+  for (const s of DATA.sectors) if (d >= s.start && d < s.end) return s;
+  return DATA.sectors[DATA.sectors.length - 1];
 }
 
 // The next named corner ahead, wrapping past the finish line. TRACK_LANDMARKS
-// is the pit's own list, so the name and the speed shown here are the ones the
-// strategy engine uses -- not a caption invented for this page.
+// is the pit's own list, so the name and the speed are the ones the strategy
+// engine uses -- not a caption invented for a web page.
 function nextLandmark(d) {
   const L = DATA.trackLength, lms = DATA.landmarks;
   if (!lms.length) return null;
   d = ((d % L) + L) % L;
   for (const lm of lms) if (lm.dist > d) return [lm, lm.dist - d];
   return [lms[0], L - d + lms[0].dist];
-}
-
-function sectorAt(d) {
-  const L = DATA.trackLength;
-  d = ((d % L) + L) % L;
-  for (const s of DATA.sectors) if (d >= s.start && d < s.end) return s;
-  return DATA.sectors[DATA.sectors.length - 1];
 }
 
 // The tail behind the car, rebuilt each frame from the real centreline so it
@@ -438,21 +361,17 @@ function fmtTime(s) {
   return m + ":" + (r < 10 ? "0" : "") + r.toFixed(1);
 }
 
-// ── state ───────────────────────────────────────────────────────────────── //
-// external === driven from outside by postMessage; until that happens the page
-// drives itself round the baseline profile so it is never a still image.
-let external = false;
-let dist = 0;            // metres along the current lap
-let lapNo = 1;
-let lapStart = 0;        // demo-clock seconds when the current lap began
-let lastLap = null;
-let demoClock = 0;
-let rate = 1;
-let target = null;       // external mode: where we are easing toward
-let shownSpeed = null;
+function fmtClock(s) {
+  if (s == null) return "—";
+  s = Math.max(0, Math.floor(s));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+  return h + "h " + (m < 10 ? "0" : "") + m + "m";
+}
 
 let lastSector = null;
-function paint(speed) {
+// Moves the car and everything that follows it. Returns the sector it is in, so
+// the caller can label it without repeating the lookup.
+function paintMap(dist) {
   const [x, y] = posAt(dist);
   car.setAttribute("cx", x); car.setAttribute("cy", y);
   el("car-core").setAttribute("cx", x); el("car-core").setAttribute("cy", y);
@@ -462,25 +381,9 @@ function paint(speed) {
   el("trail").setAttribute("d", trailPath(dist));
   el("trail").setAttribute("opacity", "0.55");
 
-  el("dist").textContent = Math.round(dist).toLocaleString();
-  el("speed").textContent = speed == null ? "—" : speed.toFixed(0);
-  el("lap").textContent = lapNo;
-  el("sector-name").textContent = "S" + s.id + " · " + s.name;
-  el("lastlap").textContent = fmtTime(lastLap);
-
-  const nx = nextLandmark(dist);
-  if (nx) {
-    el("next-name").textContent = nx[0].name;
-    el("next-sub").textContent =
-      Math.round(nx[1]).toLocaleString() + " m ahead" +
-      (nx[0].speed == null ? "" : " · max " + nx[0].speed + " km/h");
+  if (progress) {
+    el("progress-mark").style.left = (dist / DATA.trackLength * 100) + "%";
   }
-
-  el("progress-mark").style.left = (dist / DATA.trackLength * 100) + "%";
-  el("progress-sub").textContent =
-    (dist / DATA.trackLength * 100).toFixed(0) + "% of " +
-    DATA.trackLength.toLocaleString() + " m";
-
   if (s.id !== lastSector) {
     DATA.sectors.forEach(o => {
       const n = el("leg-" + o.id);
@@ -490,26 +393,63 @@ function paint(speed) {
     });
     lastSector = s.id;
   }
+  return s;
+}
+
+
+el("foot").innerHTML =
+  DATA.attribution +
+  "<br>Demo lap driven by the team's 210 s baseline velocity profile &mdash; " +
+  "modelled lap " + DATA.profileLapSeconds.toFixed(1) + " s.";
+
+function speedAt(d) {
+  const p = DATA.profile, L = DATA.trackLength;
+  d = ((d % L) + L) % L;
+  let lo = 0, hi = p.length - 1;
+  while (lo < hi - 1) {
+    const mid = (lo + hi) >> 1;
+    if (p[mid][0] <= d) lo = mid; else hi = mid;
+  }
+  const span = p[lo + 1][0] - p[lo][0];
+  const t = span > 0 ? (d - p[lo][0]) / span : 0;
+  return p[lo][1] + (p[lo + 1][1] - p[lo][1]) * t;
+}
+
+let external = false, dist = 0, lapNo = 1, lapStart = 0, lastLap = null;
+let demoClock = 0, rate = 1, target = null, shownSpeed = null;
+
+function paint(speed) {
+  const s = paintMap(dist);
+  el("dist").textContent = Math.round(dist).toLocaleString();
+  el("speed").textContent = speed == null ? "—" : speed.toFixed(0);
+  el("lap").textContent = lapNo;
+  el("sector-name").textContent = "S" + s.id + " · " + s.name;
+  el("lastlap").textContent = fmtTime(lastLap);
+  el("progress-sub").textContent =
+    (dist / DATA.trackLength * 100).toFixed(0) + "% of " +
+    DATA.trackLength.toLocaleString() + " m";
+  const nx = nextLandmark(dist);
+  if (nx) {
+    el("next-name").textContent = nx[0].name;
+    el("next-sub").textContent = Math.round(nx[1]).toLocaleString() + " m ahead" +
+      (nx[0].speed == null ? "" : " · max " + nx[0].speed + " km/h");
+  }
 }
 
 let prev = null;
 function frame(now) {
   const dt = prev == null ? 0 : Math.min(0.25, (now - prev) / 1000);
   prev = now;
-
   let speed;
   if (external) {
-    // Ease toward the last reported distance instead of snapping to it: the
-    // car reports about twice a second and a hard jump every 500 ms reads as
-    // stuttering rather than motion.
     if (target != null) {
       let delta = target - dist;
       const L = DATA.trackLength;
-      if (delta < -L / 2) delta += L;          // rolled past the finish line
+      if (delta < -L / 2) delta += L;
       if (delta > L / 2) delta -= L;
       dist = ((dist + delta * Math.min(1, dt * 4)) % L + L) % L;
     }
-    speed = shownSpeed;                        // null stays "—", never 0
+    speed = shownSpeed;
   } else {
     demoClock += dt * rate;
     speed = speedAt(dist);
@@ -522,12 +462,10 @@ function frame(now) {
     }
     el("laptime").textContent = fmtTime(demoClock - lapStart);
   }
-
   paint(speed);
   requestAnimationFrame(frame);
 }
 
-// ── demo speed control ──────────────────────────────────────────────────── //
 const ctl = el("speedctl");
 [1, 2, 4].forEach(r => {
   const b = document.createElement("button");
@@ -541,12 +479,8 @@ const ctl = el("speedctl");
   ctl.appendChild(b);
 });
 
-// ── the external feed ───────────────────────────────────────────────────── //
-// Same message shape the page has always accepted, so anything already sending
-// it keeps working; speed / lap are optional extras. A field that is absent
-// shows as "—" and never as zero — an unreported reading is not a measurement
-// of nothing, and this page is watched by people who would read a big bold 0
-// as the car having stopped.
+// The same message shape this page has always accepted. A field that is absent
+// shows as an em dash and never as zero.
 window.addEventListener("message", (event) => {
   const d = event.data;
   if (!d || d.type !== "UPDATE_TELEMETRY") return;
