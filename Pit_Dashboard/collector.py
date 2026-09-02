@@ -274,6 +274,51 @@ def stream_once(conn, creds, start_after_key) -> str:
         return "closed"
 
 
+# Running row-change total for the log line, seeded once at startup. It is only
+# ever printed; nothing branches on it.
+_stored_total = 0
+
+# How often the writer collapses the WAL. The collector is the ONLY writer, so
+# it is the only process that can do this safely.
+WAL_CHECKPOINT_EVERY_S = 60.0
+_last_checkpoint = 0.0
+
+
+def _maybe_checkpoint(conn) -> None:
+    """Collapse the write-ahead log back into the database, at most once a
+    minute. Never raises.
+
+    Why this has to exist: a PASSIVE checkpoint (all SQLite does on its own)
+    can copy pages back but cannot RESET the WAL while any reader holds an open
+    snapshot, and the dashboard opens short read connections continuously. The
+    result was a 151 MB WAL beside a 290 MB database, and every page lookup in
+    both processes paying to search it.
+
+    THE busy_timeout CLAMP IS NOT OPTIONAL. get_conn sets busy_timeout=30000,
+    and wal_checkpoint(TRUNCATE) blocks waiting for readers -- so without the
+    clamp a single checkpoint during a busy dashboard moment could stall
+    ingest for thirty seconds. Clamped, the worst case is a 500 ms pause once a
+    minute, which the RTDB stream socket buffers straight through. If it comes
+    back busy, nothing happened and we try again next minute.
+    """
+    global _last_checkpoint
+    now = time.time()
+    if now - _last_checkpoint < WAL_CHECKPOINT_EVERY_S:
+        return
+    _last_checkpoint = now
+    try:
+        conn.execute("PRAGMA busy_timeout=500")
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except Exception as exc:
+        # A checkpoint is maintenance. It must never be able to kill ingest.
+        _log(f"wal checkpoint skipped: {exc}")
+    finally:
+        try:
+            conn.execute("PRAGMA busy_timeout=30000")
+        except Exception:
+            pass
+
+
 def _dispatch(conn, event_type: str, data_str: str) -> bool:
     """Apply one fully-parsed SSE event.
 
@@ -300,7 +345,18 @@ def _dispatch(conn, event_type: str, data_str: str) -> bool:
     if event_type == "put":
         n = _handle_put(conn, payload)
         if n:
-            _log(f"+{n} new sample(s)  (total {db.count_samples(conn)})")
+            # The running total is COUNTED IN MEMORY, not re-queried. This line
+            # used to call db.count_samples(conn) -- a full scan of
+            # idx_telemetry_dev_ts over every row ever stored -- once per
+            # ingested sample, purely to decorate a log message. The cost grew
+            # with the table, so it was worst late in a race, which is exactly
+            # when the laptop needs to be responsive. Seeded from the one
+            # legitimate count at startup in run().
+            global _stored_total
+            _stored_total += n
+            _log(f"+{n} row change(s)  (total {_stored_total})")
+        # After the commit inside _handle_put, never before it.
+        _maybe_checkpoint(conn)
         # True even when n == 0: a duplicate/boundary key still proves the
         # stream is delivering telemetry, which is all the watchdog asks.
         return True
@@ -320,7 +376,9 @@ def run():
     _log(f"stream: {STREAM_URL}")
     conn = db.get_conn()
     db.init_db(conn)
-    _log(f"resuming with {db.count_samples(conn)} sample(s) already stored")
+    global _stored_total
+    _stored_total = db.count_samples(conn)
+    _log(f"resuming with {_stored_total} sample(s) already stored")
 
     creds = load_credentials()
     backoff = RECONNECT_BACKOFF_START

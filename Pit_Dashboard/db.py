@@ -287,6 +287,12 @@ def get_conn(path: str = SQLITE_PATH) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA busy_timeout=30000;")
+    # Cap the write-ahead log at 32 MB when it is next reset. A no-op on its
+    # own -- it takes effect only when a checkpoint actually succeeds, which is
+    # what collector._maybe_checkpoint is for. Without both halves the WAL grows
+    # for the life of the file: this store had reached 151 MB beside a 290 MB
+    # database, and every page lookup in every query paid to search it.
+    conn.execute("PRAGMA journal_size_limit=33554432;")
     return conn
 
 
@@ -823,17 +829,133 @@ def fetch_samples(conn: sqlite3.Connection, start_ts: float = None,
     return conn.execute(sql, params).fetchall()
 
 
+# Names a caller is allowed to ask fetch_series for. The list is interpolated
+# into SQL rather than bound as parameters (column names cannot be bound), so it
+# is checked against the real schema first. Every caller passes a module
+# constant, so in practice this catches a typo rather than an attack -- but it
+# means the f-string below is obviously safe to whoever reads it next.
+_COLUMN_SET = frozenset(_COLUMNS)
+
+
+def count_range(conn: sqlite3.Connection, start_ts: float = None,
+                end_ts: float = None, device_id: str = DEVICE_ID) -> int:
+    """How many samples fall in [start_ts, end_ts].
+
+    Index-only against idx_telemetry_dev_ts, so it stays milliseconds even when
+    the range is the whole race. fetch_series needs it to work out a stride, and
+    the History caption needs it to say honestly how many samples a thinned
+    chart was built from.
+    """
+    clauses = ["device_id = ?"]
+    params = [device_id]
+    if start_ts is not None:
+        clauses.append("device_ts >= ?")
+        params.append(start_ts)
+    if end_ts is not None:
+        clauses.append("device_ts <= ?")
+        params.append(end_ts)
+    row = conn.execute(
+        f"SELECT COUNT(*) AS n FROM telemetry WHERE {' AND '.join(clauses)}",
+        params).fetchone()
+    return int(row["n"]) if row else 0
+
+
+def fetch_series(conn: sqlite3.Connection, columns, start_ts: float = None,
+                 end_ts: float = None, limit: int = None,
+                 stride_target: int = None, device_id: str = DEVICE_ID):
+    """Rows for CHARTING: only the columns asked for, optionally thinned in SQL.
+
+    Returns (rows, total, step) -- the rows ascending by car time, how many
+    samples the range actually holds, and the stride that was applied (1 when
+    every row in range was returned).
+
+    WHY THIS EXISTS ALONGSIDE fetch_samples
+    fetch_samples is `SELECT *`, and it has to stay that way: the CSV/Excel
+    export resolves its column list at runtime and genuinely wants all 118 of
+    them. The chart wants 16. The other 102 include raw_json, which is ~1.6 kB
+    per row and 61% of the database file -- read off disk, boxed into Python and
+    thrown away, once per row, on a path that runs every 10 seconds. Measured on
+    the real store: 100k rows took 25.7 s as `SELECT *` and 1.6 s as the sixteen
+    columns the chart reads.
+
+    WHY THE STRIDE IS IN SQL
+    The chart draws at most OVERLAY_MAX_POINTS (900) points and thins to that in
+    pandas -- after transferring every row. Doing it here means a 24-hour window
+    never materialises 100k rows to draw 900 of them.
+
+    It is a STRIDE, not a time-bucket average, and that is deliberate: every
+    point drawn stays a value the car actually measured at a moment it actually
+    measured it. Bucketing would need a different aggregate per metric (max for
+    temperatures, min for voltage sag, mean for speed) and would put numbers on
+    screen that were never sampled -- in a dashboard whose whole convention is
+    that a missing reading shows as an em dash rather than a plausible zero,
+    that is the wrong trade.
+
+    `(rn - 1) % step = 0` counts from the NEWEST row, so rn = 1 always
+    survives: the live end of every trace is exact no matter the stride.
+    """
+    bad = [c for c in columns if c not in _COLUMN_SET]
+    if bad:
+        raise ValueError(f"fetch_series: unknown column(s) {bad}")
+    cols = ", ".join(columns)
+
+    clauses = ["device_id = ?"]
+    params = [device_id]
+    if start_ts is not None:
+        clauses.append("device_ts >= ?")
+        params.append(start_ts)
+    if end_ts is not None:
+        clauses.append("device_ts <= ?")
+        params.append(end_ts)
+    where = " AND ".join(clauses)
+
+    total = count_range(conn, start_ts, end_ts, device_id)
+    # `limit` keeps its fetch_samples meaning: the newest N rows in range.
+    considered = min(total, limit) if limit is not None else total
+
+    step = 1
+    if stride_target and considered > stride_target:
+        step = -(-considered // stride_target)      # ceil, no float rounding
+
+    if step > 1:
+        inner_limit = limit if limit is not None else considered
+        sql = (f"SELECT {cols} FROM ("
+               f"SELECT {cols}, ROW_NUMBER() OVER (ORDER BY device_ts DESC) "
+               f"AS _rn FROM telemetry WHERE {where} "
+               f"ORDER BY device_ts DESC LIMIT ?) "
+               f"WHERE (_rn - 1) % ? = 0 ORDER BY device_ts ASC")
+        rows = conn.execute(sql, [*params, inner_limit, step]).fetchall()
+    elif limit is not None:
+        sql = (f"SELECT {cols} FROM (SELECT {cols} FROM telemetry WHERE {where} "
+               f"ORDER BY device_ts DESC LIMIT ?) ORDER BY device_ts ASC")
+        rows = conn.execute(sql, [*params, limit]).fetchall()
+    else:
+        sql = f"SELECT {cols} FROM telemetry WHERE {where} ORDER BY device_ts ASC"
+        rows = conn.execute(sql, params).fetchall()
+
+    return rows, total, step
+
+
 def fetch_faults(conn: sqlite3.Connection, limit: int = 2000,
-                 device_id: str = DEVICE_ID):
+                 device_id: str = DEVICE_ID, columns=None):
     """Rows with a BMS or MMS fault flag set, ascending by car time.
     With `limit`, returns the most recent `limit` fault rows (still ascending).
     Backed by the partial fault index, so it stays cheap on a large table."""
     where = "device_id = ? AND (bms_has_error = 1 OR mms_has_error = 1)"
+    # Defaults to SELECT * so the CSV export keeps every column; the dashboard's
+    # fault timeline passes the seven it actually reads.
+    if columns is None:
+        cols = "*"
+    else:
+        bad = [c for c in columns if c not in _COLUMN_SET]
+        if bad:
+            raise ValueError(f"fetch_faults: unknown column(s) {bad}")
+        cols = ", ".join(columns)
     if limit is not None:
-        sql = (f"SELECT * FROM (SELECT * FROM telemetry WHERE {where} "
+        sql = (f"SELECT {cols} FROM (SELECT {cols} FROM telemetry WHERE {where} "
                f"ORDER BY device_ts DESC LIMIT ?) ORDER BY device_ts ASC")
         return conn.execute(sql, (device_id, limit)).fetchall()
-    sql = f"SELECT * FROM telemetry WHERE {where} ORDER BY device_ts ASC"
+    sql = f"SELECT {cols} FROM telemetry WHERE {where} ORDER BY device_ts ASC"
     return conn.execute(sql, (device_id,)).fetchall()
 
 

@@ -494,7 +494,12 @@ def _live_snapshot():
 # HTTPS GET on the very thread that redraws the live tiles: Streamlit runs a
 # session's fragment reruns sequentially on one script-run thread, so this was
 # never just a slow Strategy tab, it stalled the speed and the fault banner too.
-ACK_POLL_WINDOW_S = 120
+#
+# Cut from 120s to 30s. The reasoning above already says the car answers within
+# a second or two, so the remaining ninety seconds were pure blocking I/O on the
+# render thread for an answer that had either arrived or was never coming. The
+# "Check again" button covers the rare case where it is worth asking later.
+ACK_POLL_WINDOW_S = 30
 
 # Dedupe within the window. The strategy panel ticks every 10s and the sidebar
 # redraws on every app rerun, so without this a single send still means dozens
@@ -636,10 +641,42 @@ TABLE_TICK_S = 30
 # Now defined in ui.py (imported at the top of this file) so render_metric can
 # recognise its own dashes; re-stated here only as documentation of intent.
 
-# How long a history read is reused. Just under the 10s history refresh, so each
-# tick serves from cache instead of re-reading up to 100k rows on the main
-# thread — that read is what made long sessions stall and look disconnected.
-HISTORY_CACHE_S = 8
+# Two DIFFERENT numbers that used to be one constant — and conflating them meant
+# the cache they were supposed to serve never hit once.
+#
+# The BUCKET is the step _hist_bounds quantises start_ts to, and start_ts is part
+# of read_history_df's cache key. The TTL is how long an entry lives. A TTL
+# SHORTER than the tick consuming it is always expired by the time that tick
+# arrives; a bucket on a different clock from the tick changes the key between
+# ticks as well. Both were true of a single 8s constant against a 10s chart, so
+# every tick paid the full read in full — while the comment here claimed it was
+# being saved. Measured on the real store, that read was 26s on a 24h window.
+#
+# Bucket == the tick, so the key changes exactly once per tick and everything
+# within one tick shares an entry. TTL > the tick, so the entry outlives the tick
+# that created it and the 30s tables fragment lands on a live one.
+HISTORY_BUCKET_S = CHART_TICK_S
+HISTORY_CACHE_S = CHART_TICK_S + 5
+
+# How many rows the chart asks SQLite for before pandas thins to
+# OVERLAY_MAX_POINTS. Deliberately ~9x the 900 actually drawn, not 900 itself:
+# at this target every window up to an hour comes back unstrided and identical
+# to before, only 3h+ is touched, and the stats cards still read a frame dense
+# enough that their min/avg/max are indistinguishable from exact.
+HISTORY_SQL_TARGET = 8000
+
+# Exactly the columns the loop in read_history_df reads. The table has 118; the
+# other 102 include raw_json, which is ~1.6 kB per row and 61% of the database
+# file, and which this path fetched off disk, boxed into Python and threw away
+# once per row, every tick. Sixteen columns instead of all of them measured 17x
+# faster on 100k rows (26.9s -> 1.5s).
+_HIST_COLUMNS = [
+    "device_ts", "mms_vehicle_speed_kmh", "mms_throttle_percent",
+    "solar_current_A", "mms_power_W", "mms_rpm", "bms_soc_percent",
+    "mms_measured_voltage_V", "bms_current_A", "battery_temp_C",
+    "mms_motor_temp_C", "mms_temperature_C", "mms_motor_ohms",
+    "odometer_m", "calculated_lap", "total_race_energy",
+]
 
 
 def _downsample(df, n=MAX_PLOT_POINTS):
@@ -654,25 +691,34 @@ def _downsample(df, n=MAX_PLOT_POINTS):
     return thinned
 
 
-@st.cache_data(ttl=HISTORY_CACHE_S, show_spinner=False)
-def read_history_df(limit=100000, start_ts=None):
+@st.cache_data(ttl=HISTORY_CACHE_S, show_spinner=False, max_entries=4)
+def read_history_df(limit=100000, start_ts=None, stride_target=HISTORY_SQL_TARGET):
     """Samples as a DataFrame for charting (oldest -> newest), one column per
     chartable metric. `start_ts` limits to samples at/after that unix time.
 
-    Cached for 8s — just under the 10s history refresh. Without it, every tick
-    re-read and re-boxed up to 100k rows on the main thread; on the "All" window
-    late in a race that is long enough to stall the websocket and make the page
-    look frozen. `start_ts` is part of the cache key, so changing the time
+    Returns (df, total, step): the frame, how many samples the range really
+    holds, and the stride SQLite applied to get there (1 = every row in range).
+    The caller needs those two to caption the chart honestly — a thinned chart
+    that says nothing about being thinned is a chart that misreports the data.
+
+    Reads only _HIST_COLUMNS and lets SQLite do the thinning (see
+    db.fetch_series). Both matter: this runs every CHART_TICK_S seconds on the
+    single thread that also redraws every live tile, so whatever it costs, the
+    speed and SoC tiles are frozen for exactly that long.
+
+    `start_ts` and `stride_target` are part of the cache key, so changing the
     window still refetches immediately.
     """
     conn = db.get_conn()
     try:
-        rows = db.fetch_samples(conn, start_ts=start_ts, limit=limit)
+        rows, total, step = db.fetch_series(
+            conn, _HIST_COLUMNS, start_ts=start_ts, limit=limit,
+            stride_target=stride_target)
     finally:
         conn.close()
     cols = ["Time"] + [c for c, *_ in HISTORY_CHARTS]
     if not rows:
-        return pd.DataFrame(columns=cols)
+        return pd.DataFrame(columns=cols), 0, 1
 
     # A reading the car never sent stays None -> pandas NaN, NOT 0. The old
     # `or 0` coalescing turned every telemetry dropout into a confident lie: the
@@ -715,7 +761,7 @@ def read_history_df(limit=100000, start_ts=None):
             "Lap": r["calculated_lap"],
             "Energy": r["total_race_energy"],
         })
-    return pd.DataFrame(recs)
+    return pd.DataFrame(recs), total, step
 
 
 def _bms_fault_detail(protections, code):
@@ -731,7 +777,16 @@ def _mms_fault_detail(alerts, code):
             or f"error 0x{int(code or 0):X}")
 
 
-@st.cache_data(ttl=30, show_spinner=False)
+# The only columns the episode collapse below reads. Same reasoning as
+# _HIST_COLUMNS: this was pulling all 118, raw_json included, for 3000 rows.
+_FAULT_COLUMNS = ["device_ts", "bms_has_error", "bms_protections",
+                  "bms_error_code", "mms_has_error", "mms_alerts",
+                  "mms_error_code"]
+
+
+# ttl 45 against a 30s fragment. It was 30 against 30, which never hits: the
+# entry expires at the same moment the tick that wants it arrives.
+@st.cache_data(ttl=45, show_spinner=False)
 def read_fault_episodes(limit_rows=3000, gap_s=3.0):
     """Collapse the per-sample fault rows into discrete episodes.
 
@@ -744,7 +799,8 @@ def read_fault_episodes(limit_rows=3000, gap_s=3.0):
     persists for 200 samples shows as a single readable row, not 200."""
     conn = db.get_conn()
     try:
-        rows = db.fetch_faults(conn, limit=limit_rows)
+        rows = db.fetch_faults(conn, limit=limit_rows,
+                               columns=_FAULT_COLUMNS)
     finally:
         conn.close()
 
@@ -1934,7 +1990,10 @@ def render_sector_times(current_lap, splits, deltas):
                 unsafe_allow_html=True)
 
 
-@st.cache_data(ttl=10, show_spinner=False)
+# ttl 25 against the 30s tables fragment (was 10, which never hit). Not 45:
+# this is also read on a full app rerun, and a lap change lagging by three
+# quarters of a minute would be its own bug.
+@st.cache_data(ttl=25, show_spinner=False)
 def read_lap_df():
     """One row per completed lap, INDEXED BY LAP NUMBER.
 
@@ -2089,20 +2148,28 @@ def _hist_bounds():
     window_min = HISTORY_WINDOWS.get(st.session_state.get("hist_window") or "15 min")
     if not window_min:
         return None, None
-    # Quantise to whole HISTORY_CACHE_S steps: start_ts is part of
+    # Quantise to whole HISTORY_BUCKET_S steps: start_ts is part of
     # read_history_df's cache key, so a raw time.time() would mint a brand-new
-    # key every tick and the cache would never hit once.
-    now_q = int(time.time() // HISTORY_CACHE_S) * HISTORY_CACHE_S
+    # key every tick and the cache would never hit once. The bucket is the CHART
+    # TICK, not the cache TTL — see the constants. Only the left edge of the
+    # window moves in steps; end_ts stays None, so every read still runs through
+    # to the newest row and the live end of the chart is never stale.
+    now_q = int(time.time() // HISTORY_BUCKET_S) * HISTORY_BUCKET_S
     return now_q - window_min * 60, None
 
 
 def _hist_frame():
-    """(DataFrame, start_ts, end_ts) for the current range, full resolution."""
+    """(DataFrame, start_ts, end_ts, total, step) for the current range.
+
+    `total` and `step` describe what SQLite did: how many samples the range
+    holds and the stride taken through them. Charts may draw a thinned frame,
+    but nothing downstream is allowed to *claim* it is the whole range.
+    """
     start_ts, end_ts = _hist_bounds()
-    df = read_history_df(start_ts=start_ts)
+    df, total, step = read_history_df(start_ts=start_ts)
     if end_ts is not None and not df.empty:
         df = df[df["Time"] <= datetime.fromtimestamp(end_ts)]
-    return df, start_ts, end_ts
+    return df, start_ts, end_ts, total, step
 
 
 def _hist_selected_charts():
@@ -2112,7 +2179,8 @@ def _hist_selected_charts():
     return [c for c in HISTORY_CHARTS if c[1] in labels]
 
 
-@st.cache_data(ttl=4, show_spinner=False)
+# ttl 6 against the 5s status fragment (was 4, i.e. always expired on arrival).
+@st.cache_data(ttl=6, show_spinner=False)
 def _hist_new_since(ts):
     """How many samples landed after `ts` — the "new data buffered" counter."""
     conn = db.get_conn()
@@ -2438,12 +2506,28 @@ def _render_hist_stats(df, charts):
                          unsafe_allow_html=True)
 
 
-def _render_hist_export(df, charts):
+def _hist_full_frame(start_ts, end_ts):
+    """Every sample in the range, unthinned. For the EXPORT only.
+
+    The chart's frame may have been strided in SQL, so writing the file from it
+    would silently drop rows from an export that promises "uses all". This is
+    the same read with the stride switched off, and it only ever runs from a
+    download click — never on a refresh tick.
+    """
+    df, _total, _step = read_history_df(start_ts=start_ts, stride_target=None)
+    if end_ts is not None and not df.empty:
+        df = df[df["Time"] <= datetime.fromtimestamp(end_ts)]
+    return df
+
+
+def _render_hist_export(df, charts, start_ts=None, end_ts=None, total=None):
     """CSV for exactly the range the caption above names.
 
-    Built from the same DataFrame the chart and the stats used, so the picture,
-    the numbers and the file cannot disagree. `data=` takes a callable, which
-    Streamlit runs on click — so nothing is generated on the refresh tick."""
+    `df` is only used for the file name and the row count shown on the button;
+    the bytes come from _hist_full_frame so the file holds every sample in the
+    range even when the chart above it was drawn from a stride. `data=` takes a
+    callable, which Streamlit runs on click — so neither the read nor the CSV is
+    generated on the refresh tick."""
     t0, t1 = df["Time"].iloc[0], df["Time"].iloc[-1]
     stem = (f"history_{'-'.join(c[1].lower().replace(' ', '') for c in charts[:3])}"
             f"{f'-plus{len(charts) - 3}' if len(charts) > 3 else ''}"
@@ -2455,7 +2539,9 @@ def _render_hist_export(df, charts):
                   placeholder="Session name for the report header (optional)",
                   label_visibility="collapsed")
     session = st.session_state.get("hist_session", "")
-    rows = len(df)
+    # What the FILE will contain (every sample in range), not what the chart
+    # was drawn from -- the button promises a row count and then writes it.
+    rows = len(df) if total is None else total
     for col, style, label, tip in (
         (c2, "data", "CSV (data)", "Clean table — opens straight into Excel or Sheets."),
         (c3, "report", "CSV (report)", "Same table behind a documented header block."),
@@ -2464,8 +2550,9 @@ def _render_hist_export(df, charts):
             f":material/table_view: {label} · {rows:,}",
             # A closure, not bytes: Streamlit only calls it if the user actually
             # clicks. Must stay pure pandas/csv — st.* calls inside are ignored.
-            data=lambda s=style: export.history_csv_bytes(df, charts, style=s,
-                                                          session=session),
+            data=lambda s=style: export.history_csv_bytes(
+                _hist_full_frame(start_ts, end_ts), charts, style=s,
+                session=session),
             file_name=f"{stem}{'_report' if style == 'report' else ''}.csv",
             mime="text/csv", key=f"hist_csv_{style}", help=tip,
             on_click="ignore", width="stretch")
@@ -2531,7 +2618,7 @@ def _render_history_chart():
     if not charts:
         st.info("Pick one or more metrics above.", icon=":material/info:")
         return
-    df, start_ts, end_ts = _hist_frame()
+    df, start_ts, end_ts, hist_total, hist_step = _hist_frame()
     if df.empty:
         # Frozen-and-empty needs different advice from live-and-empty. Telling
         # someone to "start collector.py" when they have simply frozen a span
@@ -2566,10 +2653,21 @@ def _render_history_chart():
     # disagreed the moment one of them rounded differently, which made both
     # untrustworthy. min/max rather than the first and last rows, so an
     # out-of-order timestamp in the store cannot invert it.
+    # `hist_total` is what the RANGE holds, which is not what the chart drew:
+    # SQLite may have strided (db.fetch_series) and pandas may have thinned again
+    # (_downsample). Both are legitimate; quietly reporting the drawn count as
+    # the sample count would not be.
     note = (f"Range **{_hist_span_text(df['Time'].min(), df['Time'].max())}** · "
-            f"{len(df):,} samples")
-    if drawn != len(df):
-        note += f" · chart drawing {drawn:,} of them (exports use all)"
+            f"{hist_total:,} samples")
+    if drawn != hist_total:
+        note += f" · chart drawing {drawn:,} of them"
+        # Name the SQL stride explicitly when there is one. "1 in 13" tells an
+        # engineer looking at a 24h trace that a one-sample spike could be
+        # between the points -- which is exactly what they need to know before
+        # concluding the trace is clean.
+        if hist_step > 1:
+            note += f" (1 in {hist_step})"
+        note += " (exports use all)"
     if frozen:
         note += " · zooming does not change this range — drag a new box to re-scope"
     # A filter that is not announced is a silent edit to the numbers. The controls
@@ -2624,7 +2722,25 @@ def _render_history_chart():
                 col.line_chart(plot_df[key], color=color, height=200)
 
     _render_hist_stats(df, charts)
-    _render_hist_export(df, charts)
+    _render_hist_export(df, charts, start_ts, end_ts, hist_total)
+
+
+def _hist_recent_rows(n=200):
+    """The newest `n` samples in the selected range, never strided.
+
+    Deliberately separate from the chart's frame: see the note at the call site.
+
+    NOT cached, on purpose: it reads the selected window from session_state,
+    which st.cache_data cannot see, so a cached copy would keep serving the old
+    window's rows after someone changed it. read_history_df underneath is
+    cached on start_ts, so this is a dictionary lookup in the common case.
+    """
+    start_ts, end_ts = _hist_bounds()
+    df, _total, _step = read_history_df(start_ts=start_ts, limit=n,
+                                        stride_target=None)
+    if end_ts is not None and not df.empty:
+        df = df[df["Time"] <= datetime.fromtimestamp(end_ts)]
+    return df.tail(n)
 
 
 @st.fragment(run_every=TABLE_TICK_S)
@@ -2636,11 +2752,15 @@ def _history_tables_fragment():
     (An st.expander still executes its body — it tidies the page, it does not
     defer the work. The saving here comes from the slower tick plus caching.)"""
     with st.expander(":material/history: Recent Samples"):
-        df, _s, _e = _hist_frame()
+        # Its own read, NOT the chart's frame. That frame may have been strided
+        # in SQL on a wide window, and "the last 200 rows of a 1-in-13 sample"
+        # is not what a table called Recent Samples is claiming to be. 200 rows
+        # unstrided is cheap at any window width.
+        df = _hist_recent_rows()
         if df.empty:
             st.caption("Nothing in this range.")
         else:
-            st.dataframe(df.tail(200).round(2), width="stretch", hide_index=True)
+            st.dataframe(df.round(2), width="stretch", hide_index=True)
 
     # Per-lap charts are keyed to lap number, not the selected time window, so
     # completed laps stay visible even when the window holds no samples.
@@ -3211,18 +3331,40 @@ def main():
     # Each fragment below renders directly into its spot and refreshes in place.
     _top_strip_fragment()  # fast (2s)
 
+    # LAZY TABS, and this is the single most important line on the page.
+    #
+    # By default st.tabs executes EVERY tab body on every run, and Streamlit
+    # serialises all of a session's fragment reruns onto one script thread. So
+    # the History chart's 10s tick ran while you were looking at Driver
+    # Telemetry, and for however long it took, none of the 2s fragments could
+    # run at all. That is why the whole page moved at 7-10s while the car was
+    # publishing every 0.6s: the tiles were not slow, they were queued behind a
+    # chart on a tab nobody was looking at.
+    #
+    # on_change="rerun" + the .open property (streamlit >= 1.58) makes only the
+    # visible tab's body execute. A fragment that stops being rendered stops
+    # ticking, cleanly -- the runtime drops it on the same rerun that hides it.
+    #
+    # The cost is that switching tabs is now a server round trip rather than a
+    # client-side toggle. main() is cheap (schema is cache_resource, bounds are
+    # ttl-cached), so that is ~100-200ms, and it buys the live tiles a thread
+    # that is idle the rest of the time.
     tab_driver, tab_live, tab_cells, tab_history, tab_weather, tab_strategy = st.tabs(
         [":material/speed: Driver Telemetry", ":material/dashboard: Live Metrics",
          ":material/battery_full: Cell Voltages",
          ":material/show_chart: History",
-         ":material/cloud: Weather", ":material/insights: Strategy"]
+         ":material/cloud: Weather", ":material/insights: Strategy"],
+        key="active_tab", on_change="rerun",
     )
     with tab_driver:
-        _driver_fragment()  # fast (2s)
+        if tab_driver.open:
+            _driver_fragment()  # fast (2s)
     with tab_live:
-        _live_metrics_fragment()  # fast (2s)
+        if tab_live.open:
+            _live_metrics_fragment()  # fast (2s)
     with tab_cells:
-        _cell_voltage_fragment()  # fast (2s)
+        if tab_cells.open:
+            _cell_voltage_fragment()  # fast (2s)
     with tab_history:
         # Controls live OUTSIDE the fragments (they are what drives them), so
         # changing one is a full app rerun — which is also what re-registers the
@@ -3262,16 +3404,27 @@ def main():
         st.pills("Metrics", HISTORY_LABELS, selection_mode="multi",
                  key="hist_metrics", label_visibility="collapsed")
 
-        _history_status_fragment()   # 5s — badge only, ticks even while frozen
-        # run_every is applied HERE rather than as a decorator so a freeze can
-        # stop the tick outright: a frozen chart is never redrawn, so nothing can
-        # shift under the cursor while it is being read. Fragment identity is
-        # module + function name + position (not run_every), so swapping the
-        # interval like this keeps the very same fragment.
-        st.fragment(run_every=None if _hist_frozen_range() else CHART_TICK_S)(
-            _render_history_chart)()
-        st.markdown("---")
-        _history_tables_fragment()   # 30s
+        # EVERYTHING ABOVE THIS LINE STAYS OUTSIDE THE GUARD, and it has to.
+        # Streamlit garbage-collects the state of any widget that was not
+        # rendered during a run, so gating the window / metrics / filter
+        # controls would silently reset the engineer's chosen range and traces
+        # every time they glanced at another tab. Rendering a few widgets into
+        # a closed tab costs a handful of deltas; re-picking your metrics after
+        # every tab switch costs the crew's patience mid-race.
+        #
+        # What IS gated is the expensive part: the reads and the Plotly figure.
+        if tab_history.open:
+            _history_status_fragment()   # 5s — badge only, ticks even while frozen
+            # run_every is applied HERE rather than as a decorator so a freeze
+            # can stop the tick outright: a frozen chart is never redrawn, so
+            # nothing can shift under the cursor while it is being read.
+            # Fragment identity is module + function name + position (not
+            # run_every), so swapping the interval like this keeps the very
+            # same fragment.
+            st.fragment(run_every=None if _hist_frozen_range() else CHART_TICK_S)(
+                _render_history_chart)()
+            st.markdown("---")
+            _history_tables_fragment()   # 30s
         # Reset control — guarded behind a popover + confirm so it can't be hit by
         # accident mid-race. The collector keeps its stream position, so only past
         # data is cleared.
@@ -3289,9 +3442,15 @@ def main():
                 st.rerun()
         st.markdown("---")
     with tab_weather:
-        _weather_fragment()  # slow (10s)
+        if tab_weather.open:
+            _weather_fragment()  # slow (10s)
     with tab_strategy:
-        _strategy_fragment()  # slow (10s)
+        # Known and accepted side effect of gating this one: the strategy
+        # SELECTBOX is inside the fragment, so leaving the tab resets the
+        # picker to the default. It is a picker, not committed state -- what
+        # the car is actually running is shown separately by the ack.
+        if tab_strategy.open:
+            _strategy_fragment()  # slow (10s)
 
 
 if __name__ == "__main__":
