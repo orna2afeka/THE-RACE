@@ -82,11 +82,6 @@ from ui import render_metric, render_sector_display, _age_text, MISSING_TEXT
 # there. Importing it up with `db` and `export` would be an ImportError,
 # exactly the invisible ordering dependency constants' own header warns about.
 import efficiency
-# The vector circuit map. MUST stay below `from constants import ...` for the
-# same reason efficiency does: constants.py is what bootstraps the repo root
-# onto sys.path, and track_map lives there. (track_map_view imports constants
-# itself as well, so this is belt and braces rather than a hidden dependency.)
-from track_map_view import render_vector_track_map
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 VELOCITY_PROFILE_PATH = os.path.join(_HERE, "210s.xlsx")
@@ -471,8 +466,9 @@ def _live_snapshot():
     # months. Missing speed renders as an em dash — see fmt().
     #
     # ⚠️ Rows written BEFORE the decode fix hold the raw uncorrected value
-    # (~50x too high). They are wrong here, not merely stale. Run the backfill
-    # before trusting historical speed — see tools/backfill_columns.py.
+    # (~50x too high). They are wrong here, not merely stale. The live database
+    # has been repaired and the one-off script that did it is gone; a pre-fix
+    # .bak opened in this dashboard still shows those bad values.
     state["speed_kmh"] = cf("speed_kmh", "mms_vehicle_speed_kmh")
     # Fault flags are deliberately NOT carried forward — a stale "no fault"
     # could mask a fault that started after the last report, and a stale
@@ -706,8 +702,9 @@ def read_history_df(limit=100000, start_ts=None):
             # fallback to bms_voltage_V: the two disagree by ~2.25x, so filling
             # gaps from the other source would draw a trace that steps between
             # 50 V and 113 V and looks like a real electrical event. A gap is
-            # honest. Rows predating this column read empty until
-            # tools/backfill_columns.py recovers them from raw_json.
+            # honest. Rows predating this column read empty; the raw_json each
+            # row carries still holds the value, which is how the one-off
+            # backfill recovered them before it was retired.
             "Voltage": r["mms_measured_voltage_V"],
             "Current": r["bms_current_A"],
             "BattTemp": r["battery_temp_C"],
@@ -1802,12 +1799,22 @@ def _driver_fragment():
     st.markdown("### :material/map: Live GPS Map")
     render_gps_map(c["state"])
 
-    # The satellite map above and this one answer different questions and are
-    # deliberately both here: imagery for "which corner is that", the vector map
-    # for "where are we in the lap, and in which sector". It takes the whole
-    # _live_context dict, so it costs no extra SQLite read on this 2s tick.
-    st.markdown("### :material/route: Circuit Map")
-    render_vector_track_map(c)
+    # There is ONE map on this tab, deliberately. The Plotly vector circuit map
+    # used to sit here as well, on the theory that imagery answers "which corner
+    # is that" and a plan view answers "where are we in the lap". In practice the
+    # second map earned none of the space: the sector strip at the top of this
+    # tab already gives sector and lap distance as text, and the satellite map's
+    # own caption already states plainly whether the dot is a real fix or the
+    # default Zolder centre. Two maps of the same car, one of them ugly, reads
+    # worse than one map that is good.
+    #
+    # track_map_view.py and its demo app have since been deleted outright, so
+    # this is not a chart that is merely switched off — restoring it means
+    # recovering the module from git history. What went with it is the HELD vs
+    # SIMULATED distinction ("last Zolder fix, 12s old" / "placed from lap
+    # distance, 3,000 km away"). If that ever needs to be visible again, put it
+    # in the GPS map's caption above; it was one sentence carried by a whole
+    # second chart.
 
 
 # Sector boundaries, straight from the definitions the pit already displays.

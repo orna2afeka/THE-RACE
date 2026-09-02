@@ -1,4 +1,347 @@
-<!DOCTYPE html>
+"""
+build_zolder_animation.py — bake the presentation circuit animation
+====================================================================
+Generates Pit_Dashboard/zolder_animation.html: a single self-contained page
+that draws Circuit Zolder and drives a car round it. This is the FORMAL piece —
+the one shown to sponsors, faculty and the team — not part of the race
+dashboard and never on the critical path of a session.
+
+    python tools/build_zolder_animation.py            # write the page
+    python tools/build_zolder_animation.py --verify   # write it and report
+
+WHY THIS IS GENERATED AND NOT HAND-WRITTEN
+The hand-written version of this page carried its own copies of the track
+length, the nine sectors, the turn landmarks and the centreline. Four facts the
+repo already owns, retyped into a file nobody would think to update — so the
+day a sector boundary moves, the demo keeps confidently showing the old one to
+an audience. Everything below is read from the same modules the pit dashboard
+reads:
+
+    track.py                 lap length, finish line
+    track_map.py             centreline geometry, sector splits, gate ticks
+    zolder_centreline.py     OSM provenance and attribution, label sides
+    strategy_engine.py       SECTIONS_INFO (the nine sectors), TRACK_LANDMARKS
+    Pit_Dashboard/constants  SECTION_NAMES (what each sector is called)
+    profiles/base_210s.csv   the 210 s baseline lap the demo car actually drives
+
+A dev-time tool may reach into Pit_Dashboard/ like this; tools/build_zolder_
+track.py already does, and for the same reason.
+
+WHAT THE OUTPUT DEPENDS ON AT RUNTIME: NOTHING
+No CDN, no fonts that must load, no network. The previous version pulled
+anime.js from cdnjs and Rajdhani from Google Fonts — on the isolated pit LAN,
+or a venue with captive-portal wifi, the font silently falls back (fine) and
+anime.js does not load at all (not fine: the car never moves, which is the
+entire demo). Motion here is a plain requestAnimationFrame integrator, so the
+page works from a USB stick on a laptop in flight mode.
+
+THE CAR IS DRAWN INSIDE THE SVG
+The hand-written version positioned the car as an HTML <div> at a percentage of
+the container. That only lands on the track while the container's aspect ratio
+exactly matches the viewBox's: any other shape letterboxes the SVG and the dot
+drifts off into the grass. Inside the SVG it is in track coordinates and cannot
+come apart from the track no matter what the page does around it.
+"""
+
+import argparse
+import csv
+import datetime
+import json
+import math
+import os
+import sys
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO = os.path.dirname(_HERE)
+if _REPO not in sys.path:
+    sys.path.insert(0, _REPO)
+_PIT = os.path.join(_REPO, "Pit_Dashboard")
+if _PIT not in sys.path:
+    sys.path.insert(0, _PIT)
+
+import track                                                  # noqa: E402
+import track_map                                              # noqa: E402
+from zolder_centreline import (BUILT_UTC, OSM_ATTRIBUTION,    # noqa: E402
+                               OSM_RELATION_ID, OSM_TIMESTAMP)
+from strategy_engine import SECTIONS_INFO, TRACK_LANDMARKS    # noqa: E402
+from constants import SECTION_NAMES                           # noqa: E402
+
+OUT_PATH = os.path.join(_REPO, "Pit_Dashboard", "zolder_animation.html")
+PROFILE_PATH = os.path.join(_REPO, "profiles", "base_210s.csv")
+
+BOUNDARIES = [SECTIONS_INFO[s]["range"][0] for s in sorted(SECTIONS_INFO)]
+SECTOR_IDS = sorted(SECTIONS_INFO)
+
+# ── The palette ───────────────────────────────────────────────────────────── #
+# Nine distinct hues, one per sector, deliberately NOT the pit dashboard's
+# three-colour risk palette (SECTION_COLORS in constants.py). Those three
+# colours mean "this corner is dangerous" and they belong on the wall the
+# engineers read during a session. This page is a different job: nobody is
+# making a call off it, and what it needs to do is let a viewer follow the car
+# from one named sector to the next, which three repeated colours cannot do —
+# S7 and S8 would be the same green.
+SECTOR_PALETTE = {
+    1: "#f87171", 2: "#fb923c", 3: "#fbbf24", 4: "#34d399", 5: "#2dd4bf",
+    6: "#38bdf8", 7: "#818cf8", 8: "#a78bfa", 9: "#e879f9",
+}
+
+CAR_COLOR = "#00e5ff"
+
+# ── Geometry, in metres, because the SVG user unit IS one metre ───────────── #
+# Everything below is track_map's local-metre frame with y flipped (SVG counts
+# y downward), shifted so the drawing starts at 0,0. Font sizes and stroke
+# widths are therefore also in metres: the 12 m track ribbon really is twelve
+# metres wide, and a 26 m label is about two car lengths tall. Picking these in
+# ground units instead of pixels is what keeps them in proportion when the page
+# is shown on a phone and on a projector.
+# The drawing is fitted to its own CONTENT, not to the tarmac: the callouts
+# stick out much further than the track does, and a fixed margin big enough for
+# the longest of them ("Chicane (Turns 5,6)", which runs 260 m wide at this
+# scale) wastes that much space on all four sides. So the bounds below are
+# measured from the labels themselves and this is only the breathing room added
+# once they are all accounted for.
+PAD_M = 40.0
+# Rough advance width of one character as a fraction of font size, for working
+# out how far a callout actually reaches. It only has to be close: a little
+# generous costs a few metres of margin, a little tight clips a label.
+CHAR_W = 0.56
+TRACK_CASING_M = 17.0
+TRACK_CORE_M = 11.0
+GATE_HALF_M = 17.0
+FINISH_HALF_M = 24.0
+SECTOR_LABEL_OFFSET_M = 46.0
+LANDMARK_LEADER_M = 78.0
+CAR_RADIUS_M = 13.0
+TRAIL_M = 170.0       # how much track the car's tail covers
+# In metres, like everything else here, and known to PYTHON rather than only to
+# the stylesheet because the viewBox is fitted around the text: the bounds
+# maths cannot ask the browser how wide a word came out.
+LANDMARK_FONT_M = 25.0
+LANDMARK_SPEED_FONT_M = 21.0
+SECTOR_FONT_M = 30.0
+LABEL_PAD_M = 12.0
+
+
+def _svg_xy(x, y, ox, oy):
+    """One local-metre point in SVG user units (y flipped, origin at 0,0)."""
+    return (round(x - ox, 1), round(oy - y, 1))
+
+
+def _clearance(px, py):
+    """How far a point is from the nearest bit of tarmac, in metres.
+
+    Used to decide which side of the track a turn callout goes on. The obvious
+    rule — push it away from the middle of the circuit — is wrong at Zolder,
+    because the lap doubles back on itself twice: at Turn 7 and at the final
+    chicane the "outside" of the local corner is the INSIDE of the circuit as a
+    whole, and a centroid test puts the label straight across the other half of
+    the lap. Maximising clearance instead asks the question that actually
+    matters, which is "where is there room for this text".
+    """
+    return min(math.hypot(px - cx, py - cy)
+               for cx, cy in track_map.CENTRELINE_XY)
+
+
+def _read_profile():
+    """The 210 s baseline lap: [(distance_m, speed_kmh), ...], ~40 m apart.
+
+    This is what makes the demo lap worth watching. A car advanced at a
+    constant speed goes round in a bland circle; driven by the real profile it
+    brakes for the chicane, crawls through the hairpins and pulls away up the
+    hill, so the sector colours and the speed readout tell the same story a
+    real lap does. The file is the team's own baseline strategy, not a shape
+    invented for the animation.
+    """
+    rows = []
+    with open(PROFILE_PATH, encoding="utf-8-sig") as fh:
+        for row in csv.DictReader(fh):
+            rows.append((float(row["d(m)"]), float(row["V(km/h)"])))
+    rows.sort()
+    # Every 4th sample: 10 m spacing is finer than anything visible here, and
+    # the full file would quadruple the page for no difference on screen.
+    thinned = rows[::4]
+    if thinned[-1][0] < rows[-1][0]:
+        thinned.append(rows[-1])
+    return thinned
+
+
+def _profile_lap_seconds():
+    """Modelled lap time from the profile's own Time(s) column."""
+    last = None
+    with open(PROFILE_PATH, encoding="utf-8-sig") as fh:
+        for row in csv.DictReader(fh):
+            last = float(row["Time(s)"])
+    return last
+
+
+def _centroid(points):
+    return (sum(p[0] for p in points) / len(points),
+            sum(p[1] for p in points) / len(points))
+
+
+def build_data():
+    """Everything the page needs, in SVG user units. Pure apart from reading
+    the profile CSV, so --verify can report on it without writing anything."""
+    centre_local = _centroid(track_map.CENTRELINE_XY)
+
+    # -- pass 1: everything in local metres, and how far it all reaches ------ #
+    # Bounds start as the tarmac and grow to contain each callout, so the
+    # finished viewBox is exactly the drawing and no more.
+    x0, x1, y0, y1 = track_map.BOUNDS_XY
+    lo_x, hi_x, lo_y, hi_y = x0, x1, y0, y1
+
+    def grow(px, py):
+        nonlocal lo_x, hi_x, lo_y, hi_y
+        lo_x, hi_x = min(lo_x, px), max(hi_x, px)
+        lo_y, hi_y = min(lo_y, py), max(hi_y, py)
+
+    landmarks_local = []
+    for lm in TRACK_LANDMARKS:
+        dist = float(lm["dist_m"]) % track.TRACK_LENGTH_METERS
+        if dist == 0.0:
+            continue          # the finish line already has its own white gate
+        px, py = track_map.position_at_distance(dist)
+        tx, ty = track_map.tangent_at(dist)
+        nx, ny = -ty, tx
+
+        # Which side: whichever end has more room around it. Near-ties (a
+        # straight, with equal space both ways) fall back to pointing away from
+        # the middle of the circuit, which keeps the callouts fanned outwards.
+        cands = []
+        for sign in (1.0, -1.0):
+            ex = px + LANDMARK_LEADER_M * sign * nx
+            ey = py + LANDMARK_LEADER_M * sign * ny
+            cands.append((_clearance(ex, ey), sign, ex, ey))
+        cands.sort(reverse=True)
+        if abs(cands[0][0] - cands[1][0]) < 15.0:
+            outward = ((px - centre_local[0]) * nx + (py - centre_local[1]) * ny)
+            sign = 1.0 if outward >= 0 else -1.0
+            ex = px + LANDMARK_LEADER_M * sign * nx
+            ey = py + LANDMARK_LEADER_M * sign * ny
+        else:
+            _, sign, ex, ey = cands[0]
+
+        speed = lm.get("max_speed")
+        text = str(lm["name"])
+        # How far the text itself reaches past the end of its leader line, so
+        # the bounds below account for the words and not just the line.
+        speed_reach = (len("%s km/h" % speed) * LANDMARK_SPEED_FONT_M * CHAR_W
+                       if speed is not None else 0.0)
+        reach = max(len(text) * LANDMARK_FONT_M * CHAR_W, speed_reach)
+        landmarks_local.append({
+            "name": text, "speed": speed, "dist": dist,
+            "px": px, "py": py, "ex": ex, "ey": ey,
+            "right": ex > px + 1.0, "left": ex < px - 1.0,
+        })
+        grow(px, py)
+        if ex > px + 1.0:
+            grow(ex + reach + LABEL_PAD_M, ey)
+        elif ex < px - 1.0:
+            grow(ex - reach - LABEL_PAD_M, ey)
+        else:
+            grow(ex - reach / 2, ey)
+            grow(ex + reach / 2, ey)
+        # Two lines of text hang below or above the end of the leader.
+        grow(ex, ey + LANDMARK_FONT_M * 2.2)
+        grow(ex, ey - LANDMARK_FONT_M * 2.2)
+
+    ticks = track_map.boundary_ticks(BOUNDARIES, GATE_HALF_M)
+    slabels_local = []
+    for (dist, _a, _b, normal), sector_id, side in zip(ticks, SECTOR_IDS,
+                                                       track_map.LABEL_SIDE):
+        px, py = track_map.position_at_distance(dist)
+        lx = px + SECTOR_LABEL_OFFSET_M * side * normal[0]
+        ly = py + SECTOR_LABEL_OFFSET_M * side * normal[1]
+        slabels_local.append((sector_id, lx, ly))
+        grow(lx, ly)
+
+    lo_x -= PAD_M
+    hi_x += PAD_M
+    lo_y -= PAD_M
+    hi_y += PAD_M
+
+    # -- pass 2: into SVG user units (one unit = one metre, y flipped) ------- #
+    ox, oy = lo_x, hi_y
+    width, height = hi_x - lo_x, hi_y - lo_y
+
+    line = [_svg_xy(x, y, ox, oy) for x, y in track_map.CENTRELINE_XY]
+    cum = [round(c, 2) for c in track_map.CUM_M]
+
+    sectors = []
+    for sector_id, (seg_start, seg_end, xs, ys) in zip(
+            SECTOR_IDS, track_map.split_at(BOUNDARIES)):
+        pts = [_svg_xy(x, y, ox, oy) for x, y in zip(xs, ys)]
+        sectors.append({
+            "id": sector_id,
+            "name": SECTION_NAMES.get(sector_id, "Sector %d" % sector_id),
+            "start": seg_start, "end": seg_end,
+            "color": SECTOR_PALETTE[sector_id],
+            "d": "M " + " L ".join("%s,%s" % (px, py) for px, py in pts),
+        })
+
+    gates = []
+    for dist, a, b, _normal in ticks:
+        ax, ay = _svg_xy(a[0], a[1], ox, oy)
+        bx, by = _svg_xy(b[0], b[1], ox, oy)
+        gates.append({"dist": dist, "x1": ax, "y1": ay, "x2": bx, "y2": by})
+
+    labels = []
+    for sector_id, lx, ly in slabels_local:
+        sx, sy = _svg_xy(lx, ly, ox, oy)
+        # The label at a boundary names the sector STARTING there -- 0 m is S1,
+        # 600 m is S2 -- the same convention the pit dashboard's map used.
+        labels.append({"text": "S%d" % sector_id, "x": sx, "y": sy,
+                       "color": SECTOR_PALETTE[sector_id]})
+
+    # The finish line is a gate too, but it is also a timing point, so it gets
+    # its own longer white mark rather than one of the grey ones.
+    _d, fa, fb, _n = track_map.boundary_ticks([0.0], FINISH_HALF_M)[0]
+    fa_x, fa_y = _svg_xy(fa[0], fa[1], ox, oy)
+    fb_x, fb_y = _svg_xy(fb[0], fb[1], ox, oy)
+
+    landmarks = []
+    for lm in landmarks_local:
+        sx, sy = _svg_xy(lm["px"], lm["py"], ox, oy)
+        exs, eys = _svg_xy(lm["ex"], lm["ey"], ox, oy)
+        landmarks.append({
+            "name": lm["name"], "speed": lm["speed"], "dist": lm["dist"],
+            "x1": sx, "y1": sy, "x2": exs, "y2": eys,
+            # Anchor away from the track: a callout on the left of the circuit
+            # must run leftwards, or its text crosses back over the tarmac.
+            "anchor": ("start" if lm["right"] else
+                       "end" if lm["left"] else "middle"),
+            "dy": 1 if eys > sy else -1,
+        })
+    landmarks.sort(key=lambda l: l["dist"])
+
+    return {
+        "viewBox": "0 0 %.0f %.0f" % (width, height),
+        "trackLength": track.TRACK_LENGTH_METERS,
+        "line": line,
+        "cum": cum,
+        "sectors": sectors,
+        "gates": gates,
+        "sectorLabels": labels,
+        "finish": {"x1": fa_x, "y1": fa_y, "x2": fb_x, "y2": fb_y},
+        "landmarks": landmarks,
+        "profile": [[round(d, 1), round(v, 2)] for d, v in _read_profile()],
+        "profileLapSeconds": round(_profile_lap_seconds(), 2),
+        "carColor": CAR_COLOR,
+        "attribution": OSM_ATTRIBUTION,
+        "style": {
+            "casing": TRACK_CASING_M, "core": TRACK_CORE_M,
+            "car": CAR_RADIUS_M, "trail": TRAIL_M,
+            "lmFont": LANDMARK_FONT_M, "lmSpeedFont": LANDMARK_SPEED_FONT_M,
+            "sFont": SECTOR_FONT_M,
+        },
+    }
+
+
+# --------------------------------------------------------------------------- #
+# The page. Data goes in as one JSON blob at __DATA__; nothing else is
+# substituted, so the CSS and JS below are exactly what ships.
+# --------------------------------------------------------------------------- #
+TEMPLATE = r"""<!DOCTYPE html>
 <!--
   GENERATED FILE - DO NOT EDIT BY HAND.
   Written by tools/build_zolder_animation.py; re-run that to change anything
@@ -259,7 +602,7 @@
 
 <script>
 "use strict";
-const DATA = {"viewBox":"0 0 1617 1614","trackLength":4000.0,"line":[[724.5,942.5],[687.8,966.6],[615.1,1013.5],[540.6,1062.1],[523.5,1073.5],[516.6,1079.5],[509.6,1085.5],[503.9,1091.5],[496.4,1099.4],[492.6,1104.3],[489.2,1108.7],[487.7,1110.7],[486.5,1113.7],[485.6,1116.9],[484.7,1120.7],[484.4,1124.5],[484.3,1129.0],[485.0,1135.7],[486.5,1143.3],[488.8,1150.2],[491.0,1156.6],[494.4,1165.3],[498.8,1174.0],[506.6,1185.6],[513.3,1195.5],[520.5,1205.0],[540.7,1232.2],[553.1,1250.1],[590.5,1301.7],[598.8,1313.6],[608.6,1327.7],[610.3,1330.1],[613.6,1336.9],[616.5,1343.5],[622.7,1362.9],[624.3,1368.4],[625.3,1376.4],[625.6,1380.9],[625.3,1388.0],[624.2,1395.0],[623.2,1399.3],[620.7,1405.8],[615.7,1413.1],[611.0,1418.4],[605.7,1422.9],[598.9,1427.3],[590.8,1431.2],[583.2,1434.7],[575.8,1437.1],[565.2,1439.8],[547.6,1443.2],[525.7,1446.9],[512.9,1449.0],[499.2,1450.4],[487.0,1450.8],[478.1,1450.1],[468.9,1449.1],[459.2,1446.7],[449.9,1443.7],[439.9,1439.2],[431.1,1434.5],[422.4,1429.4],[415.5,1424.4],[408.2,1418.4],[401.2,1411.8],[393.9,1403.7],[388.1,1396.2],[382.2,1387.7],[379.7,1384.2],[353.8,1335.7],[316.3,1266.8],[309.3,1253.9],[300.7,1238.3],[296.0,1229.8],[292.8,1221.4],[290.7,1214.9],[289.0,1206.8],[287.8,1198.5],[287.5,1189.6],[288.1,1181.8],[289.7,1175.2],[291.5,1167.4],[296.7,1154.7],[300.6,1148.0],[305.3,1141.2],[314.4,1131.2],[327.7,1120.9],[431.4,1049.5],[504.1,1000.5],[673.0,883.9],[778.8,815.2],[786.0,809.0],[789.1,805.1],[790.4,801.7],[789.7,798.0],[788.3,794.7],[786.7,791.4],[783.4,784.5],[782.3,781.6],[782.1,777.9],[782.9,774.4],[784.7,771.1],[803.8,741.1],[833.4,694.8],[848.5,670.0],[855.9,656.8],[879.5,611.1],[907.9,556.6],[915.3,540.1],[920.2,527.6],[924.6,512.1],[927.7,497.5],[929.2,481.6],[929.8,469.4],[930.1,453.5],[928.1,437.6],[924.8,422.1],[920.1,405.5],[916.2,392.6],[897.8,337.1],[887.4,310.7],[883.9,302.9],[883.3,298.6],[883.3,293.6],[884.2,290.1],[885.8,288.3],[888.0,286.4],[894.1,282.3],[902.2,277.5],[904.6,275.2],[906.7,272.5],[907.5,269.8],[908.1,266.5],[907.8,263.1],[906.7,258.2],[904.6,254.2],[898.3,242.3],[896.3,238.1],[893.3,230.3],[891.9,225.1],[891.7,217.8],[891.9,213.3],[893.3,207.5],[895.2,202.1],[898.0,197.3],[902.1,192.6],[919.7,179.3],[963.3,147.1],[973.7,139.8],[982.3,135.9],[992.4,133.2],[1003.5,131.5],[1013.7,131.0],[1021.0,131.7],[1031.9,133.6],[1044.8,137.9],[1054.3,142.7],[1060.7,147.3],[1068.9,154.1],[1142.5,218.8],[1157.0,231.4],[1172.0,243.5],[1178.9,248.3],[1188.9,254.8],[1198.6,260.5],[1203.3,263.1],[1216.8,269.6],[1249.6,282.8],[1286.7,298.0],[1321.0,311.3],[1356.4,325.0],[1399.2,341.7],[1407.4,345.2],[1411.6,348.0],[1414.9,351.4],[1417.5,355.4],[1419.2,358.6],[1420.1,361.7],[1420.5,363.3],[1420.7,366.6],[1420.4,369.3],[1418.8,373.1],[1417.1,376.5],[1413.0,381.2],[1401.5,389.4],[1382.8,401.6],[1368.7,410.5],[1362.5,415.4],[1356.1,421.2],[1351.9,425.8],[1348.4,430.3],[1343.0,438.0],[1327.3,460.4],[1322.1,466.1],[1317.3,470.2],[1255.3,511.8],[1166.1,572.5],[1067.2,639.7],[1014.8,675.5],[994.3,689.4],[975.2,701.9],[970.8,708.8],[969.7,714.0],[971.1,720.1],[973.2,725.7],[979.5,735.5],[984.1,742.9],[985.6,749.1],[986.0,755.4],[985.6,761.1],[983.1,767.1],[979.4,774.2],[976.8,777.7],[971.9,783.5],[965.2,788.3],[781.3,905.2]],"cum":[0.0,43.82,130.38,219.29,239.77,248.96,258.25,266.44,277.37,283.53,289.11,291.58,294.81,298.18,302.03,305.83,310.32,317.08,324.81,332.12,338.93,348.17,358.01,371.99,383.85,395.79,429.67,451.43,515.2,529.67,546.83,549.72,557.31,564.51,584.91,590.63,598.65,603.14,610.26,617.36,621.77,628.68,637.56,644.63,651.58,659.7,668.72,677.01,684.87,695.81,713.67,735.94,748.88,762.67,774.86,783.77,792.96,803.0,812.77,823.74,833.67,843.79,852.28,861.72,871.35,882.25,891.73,902.08,906.4,961.36,1039.77,1054.39,1072.23,1081.9,1090.89,1097.78,1106.03,1114.41,1123.3,1131.15,1137.87,1145.92,1159.69,1167.37,1175.63,1189.13,1205.96,1331.84,1419.51,1624.67,1750.78,1760.27,1765.27,1768.85,1772.6,1776.21,1779.9,1787.53,1790.62,1794.37,1797.97,1801.69,1837.17,1892.17,1921.19,1936.34,1987.69,2049.18,2067.24,2080.66,2096.81,2111.68,2127.66,2139.9,2155.75,2171.78,2187.63,2204.84,2218.36,2276.75,2305.12,2313.72,2318.09,2323.01,2326.64,2329.06,2332.02,2339.31,2348.78,2352.09,2355.48,2358.31,2361.63,2365.03,2370.07,2374.58,2388.04,2392.73,2401.12,2406.43,2413.8,2418.25,2424.26,2429.94,2435.49,2441.72,2463.78,2517.98,2530.71,2540.14,2550.57,2561.82,2571.99,2579.38,2590.43,2603.97,2614.64,2622.52,2633.15,2731.13,2750.4,2769.62,2778.02,2789.94,2801.2,2806.5,2821.55,2856.86,2896.93,2933.7,2971.65,3017.55,3026.49,3031.56,3036.27,3041.1,3044.64,3047.87,3049.59,3052.83,3055.54,3059.69,3063.47,3069.72,3083.83,3106.17,3122.83,3130.66,3139.35,3145.55,3151.27,3160.67,3188.01,3195.75,3202.05,3276.72,3384.53,3504.08,3567.5,3592.31,3615.08,3623.2,3628.51,3634.84,3640.75,3652.41,3661.17,3667.49,3673.78,3679.5,3685.99,3694.04,3698.44,3705.98,3714.25,3932.02,4000.0],"sectors":[{"id":1,"name":"Start / Turn 1","start":0.0,"end":600.0,"color":"#f87171","d":"M 724.5,942.5 L 687.8,966.6 L 615.1,1013.5 L 540.6,1062.1 L 523.5,1073.5 L 516.6,1079.5 L 509.6,1085.5 L 503.9,1091.5 L 496.4,1099.4 L 492.6,1104.3 L 489.2,1108.7 L 487.7,1110.7 L 486.5,1113.7 L 485.6,1116.9 L 484.7,1120.7 L 484.4,1124.5 L 484.3,1129.0 L 485.0,1135.7 L 486.5,1143.3 L 488.8,1150.2 L 491.0,1156.6 L 494.4,1165.3 L 498.8,1174.0 L 506.6,1185.6 L 513.3,1195.5 L 520.5,1205.0 L 540.7,1232.2 L 553.1,1250.1 L 590.5,1301.7 L 598.8,1313.6 L 608.6,1327.7 L 610.3,1330.1 L 613.6,1336.9 L 616.5,1343.5 L 622.7,1362.9 L 624.3,1368.4 L 625.3,1376.4 L 625.4,1377.7"},{"id":2,"name":"Turns 2 & 3","start":600.0,"end":1000.0,"color":"#fb923c","d":"M 625.4,1377.7 L 625.6,1380.9 L 625.3,1388.0 L 624.2,1395.0 L 623.2,1399.3 L 620.7,1405.8 L 615.7,1413.1 L 611.0,1418.4 L 605.7,1422.9 L 598.9,1427.3 L 590.8,1431.2 L 583.2,1434.7 L 575.8,1437.1 L 565.2,1439.8 L 547.6,1443.2 L 525.7,1446.9 L 512.9,1449.0 L 499.2,1450.4 L 487.0,1450.8 L 478.1,1450.1 L 468.9,1449.1 L 459.2,1446.7 L 449.9,1443.7 L 439.9,1439.2 L 431.1,1434.5 L 422.4,1429.4 L 415.5,1424.4 L 408.2,1418.4 L 401.2,1411.8 L 393.9,1403.7 L 388.1,1396.2 L 382.2,1387.7 L 379.7,1384.2 L 353.8,1335.7 L 335.3,1301.7"},{"id":3,"name":"Uphill Straight","start":1000.0,"end":1800.0,"color":"#fbbf24","d":"M 335.3,1301.7 L 316.3,1266.8 L 309.3,1253.9 L 300.7,1238.3 L 296.0,1229.8 L 292.8,1221.4 L 290.7,1214.9 L 289.0,1206.8 L 287.8,1198.5 L 287.5,1189.6 L 288.1,1181.8 L 289.7,1175.2 L 291.5,1167.4 L 296.7,1154.7 L 300.6,1148.0 L 305.3,1141.2 L 314.4,1131.2 L 327.7,1120.9 L 431.4,1049.5 L 504.1,1000.5 L 673.0,883.9 L 778.8,815.2 L 786.0,809.0 L 789.1,805.1 L 790.4,801.7 L 789.7,798.0 L 788.3,794.7 L 786.7,791.4 L 783.4,784.5 L 782.3,781.6 L 782.1,777.9 L 782.9,774.4 L 783.9,772.6"},{"id":4,"name":"Chicane","start":1800.0,"end":1910.0,"color":"#34d399","d":"M 783.9,772.6 L 784.7,771.1 L 803.8,741.1 L 833.4,694.8 L 842.7,679.6"},{"id":5,"name":"Middle Straight","start":1910.0,"end":2400.0,"color":"#2dd4bf","d":"M 842.7,679.6 L 848.5,670.0 L 855.9,656.8 L 879.5,611.1 L 907.9,556.6 L 915.3,540.1 L 920.2,527.6 L 924.6,512.1 L 927.7,497.5 L 929.2,481.6 L 929.8,469.4 L 930.1,453.5 L 928.1,437.6 L 924.8,422.1 L 920.1,405.5 L 916.2,392.6 L 897.8,337.1 L 887.4,310.7 L 883.9,302.9 L 883.3,298.6 L 883.3,293.6 L 884.2,290.1 L 885.8,288.3 L 888.0,286.4 L 894.1,282.3 L 902.2,277.5 L 904.6,275.2 L 906.7,272.5 L 907.5,269.8 L 908.1,266.5 L 907.8,263.1 L 906.7,258.2 L 904.6,254.2 L 898.3,242.3 L 896.3,238.1 L 893.7,231.3"},{"id":6,"name":"Hairpins","start":2400.0,"end":2500.0,"color":"#38bdf8","d":"M 893.7,231.3 L 893.3,230.3 L 891.9,225.1 L 891.7,217.8 L 891.9,213.3 L 893.3,207.5 L 895.2,202.1 L 898.0,197.3 L 902.1,192.6 L 919.7,179.3 L 948.9,157.8"},{"id":7,"name":"Back Straight","start":2500.0,"end":3000.0,"color":"#818cf8","d":"M 948.9,157.8 L 963.3,147.1 L 973.7,139.8 L 982.3,135.9 L 992.4,133.2 L 1003.5,131.5 L 1013.7,131.0 L 1021.0,131.7 L 1031.9,133.6 L 1044.8,137.9 L 1054.3,142.7 L 1060.7,147.3 L 1068.9,154.1 L 1142.5,218.8 L 1157.0,231.4 L 1172.0,243.5 L 1178.9,248.3 L 1188.9,254.8 L 1198.6,260.5 L 1203.3,263.1 L 1216.8,269.6 L 1249.6,282.8 L 1286.7,298.0 L 1321.0,311.3 L 1356.4,325.0 L 1382.8,335.3"},{"id":8,"name":"Slow Corner","start":3000.0,"end":3430.0,"color":"#a78bfa","d":"M 1382.8,335.3 L 1399.2,341.7 L 1407.4,345.2 L 1411.6,348.0 L 1414.9,351.4 L 1417.5,355.4 L 1419.2,358.6 L 1420.1,361.7 L 1420.5,363.3 L 1420.7,366.6 L 1420.4,369.3 L 1418.8,373.1 L 1417.1,376.5 L 1413.0,381.2 L 1401.5,389.4 L 1382.8,401.6 L 1368.7,410.5 L 1362.5,415.4 L 1356.1,421.2 L 1351.9,425.8 L 1348.4,430.3 L 1343.0,438.0 L 1327.3,460.4 L 1322.1,466.1 L 1317.3,470.2 L 1255.3,511.8 L 1166.1,572.5 L 1128.5,598.1"},{"id":9,"name":"Final Chicane","start":3430.0,"end":0.0,"color":"#e879f9","d":"M 1128.5,598.1 L 1067.2,639.7 L 1014.8,675.5 L 994.3,689.4 L 975.2,701.9 L 970.8,708.8 L 969.7,714.0 L 971.1,720.1 L 973.2,725.7 L 979.5,735.5 L 984.1,742.9 L 985.6,749.1 L 986.0,755.4 L 985.6,761.1 L 983.1,767.1 L 979.4,774.2 L 976.8,777.7 L 971.9,783.5 L 965.2,788.3 L 781.3,905.2 L 724.5,942.5"}],"gates":[{"dist":0,"x1":715.2,"y1":928.3,"x2":733.8,"y2":956.7},{"dist":600,"x1":608.5,"y1":1378.9,"x2":642.4,"y2":1376.6},{"dist":1000,"x1":350.2,"y1":1293.6,"x2":320.4,"y2":1309.9},{"dist":1800,"x1":799.2,"y1":780.0,"x2":768.6,"y2":765.2},{"dist":1910,"x1":857.2,"y1":688.4,"x2":828.2,"y2":670.7},{"dist":2400,"x1":909.8,"y1":225.9,"x2":877.6,"y2":236.8},{"dist":2500,"x1":958.9,"y1":171.5,"x2":938.8,"y2":144.1},{"dist":3000,"x1":1376.6,"y1":351.1,"x2":1389.0,"y2":319.4},{"dist":3430,"x1":1118.9,"y1":584.0,"x2":1138.0,"y2":612.1}],"sectorLabels":[{"text":"S1","x":749.7,"y":981.0,"color":"#f87171"},{"text":"S2","x":671.3,"y":1374.6,"color":"#fb923c"},{"text":"S3","x":294.9,"y":1323.7,"color":"#fbbf24"},{"text":"S4","x":742.5,"y":752.6,"color":"#34d399"},{"text":"S5","x":803.4,"y":655.6,"color":"#2dd4bf"},{"text":"S6","x":937.2,"y":216.6,"color":"#38bdf8"},{"text":"S7","x":921.6,"y":120.8,"color":"#818cf8"},{"text":"S8","x":1399.6,"y":292.4,"color":"#a78bfa"},{"text":"S9","x":1154.3,"y":636.1,"color":"#e879f9"}],"finish":{"x1":711.3,"y1":922.4,"x2":737.7,"y2":962.6},"landmarks":[{"name":"Turn 1","speed":75,"dist":600.0,"x1":625.4,"y1":1377.7,"x2":703.2,"y2":1372.4,"anchor":"start","dy":-1},{"name":"Turn 2","speed":80,"dist":710.0,"x1":551.2,"y1":1442.5,"x2":565.9,"y2":1519.1,"anchor":"start","dy":1},{"name":"Start of Uphill","speed":110,"dist":1010.0,"x1":330.5,"y1":1292.9,"x2":262.0,"y2":1330.2,"anchor":"end","dy":1},{"name":"Chicane (Turns 5,6)","speed":60,"dist":1860.0,"x1":816.1,"y1":721.9,"x2":750.4,"y2":679.9,"anchor":"end","dy":-1},{"name":"Turn 7","speed":78,"dist":2400.0,"x1":893.7,"y1":231.3,"x2":819.8,"y2":256.3,"anchor":"end","dy":1},{"name":"Turns 8,9","speed":45,"dist":2500.0,"x1":948.9,"y1":157.8,"x2":902.6,"y2":95.0,"anchor":"end","dy":-1},{"name":"Turns 10,11","speed":78,"dist":3000.0,"x1":1382.8,"y1":335.3,"x2":1411.2,"y2":262.6,"anchor":"start","dy":-1},{"name":"Turn 12","speed":40,"dist":3430.0,"x1":1128.5,"y1":598.1,"x2":1172.3,"y2":662.6,"anchor":"start","dy":1},{"name":"Chicane 15,16","speed":54,"dist":3900.0,"x1":808.4,"y1":888.0,"x2":850.2,"y2":953.8,"anchor":"start","dy":1}],"profile":[[0.0,90.67],[40.0,90.55],[80.0,90.46],[120.0,90.65],[160.0,91.51],[200.0,92.33],[240.0,93.11],[280.0,93.86],[320.0,95.13],[360.0,96.78],[400.0,95.92],[440.0,94.54],[480.0,92.68],[520.0,91.55],[560.0,90.52],[600.0,90.0],[640.0,90.0],[680.0,87.73],[720.0,44.16],[760.0,45.72],[800.0,51.13],[840.0,55.65],[880.0,60.17],[920.0,62.27],[960.0,64.11],[1000.0,65.04],[1040.0,60.68],[1080.0,54.25],[1120.0,48.11],[1160.0,42.09],[1200.0,90.0],[1240.0,90.0],[1280.0,90.0],[1320.0,90.0],[1360.0,90.0],[1400.0,90.0],[1440.0,90.0],[1480.0,90.0],[1520.0,90.0],[1560.0,90.0],[1600.0,88.26],[1640.0,82.17],[1680.0,75.6],[1720.0,68.4],[1760.0,60.35],[1800.0,51.04],[1840.0,39.6],[1880.0,35.46],[1920.0,45.12],[1960.0,48.74],[2000.0,54.71],[2040.0,58.38],[2080.0,61.22],[2120.0,65.19],[2160.0,68.86],[2200.0,71.76],[2240.0,74.08],[2280.0,75.26],[2320.0,76.34],[2360.0,74.89],[2400.0,32.99],[2440.0,32.4],[2480.0,39.6],[2520.0,79.72],[2560.0,80.66],[2600.0,82.1],[2640.0,83.71],[2680.0,83.42],[2720.0,83.15],[2760.0,83.6],[2800.0,86.39],[2840.0,88.98],[2880.0,90.77],[2920.0,91.61],[2960.0,91.05],[3000.0,68.31],[3040.0,60.24],[3080.0,50.91],[3120.0,39.44],[3160.0,36.0],[3200.0,43.8],[3240.0,52.42],[3280.0,59.81],[3320.0,66.38],[3360.0,72.36],[3400.0,77.88],[3440.0,79.72],[3480.0,80.66],[3520.0,82.1],[3560.0,83.71],[3600.0,83.42],[3640.0,83.15],[3680.0,83.6],[3720.0,86.39],[3760.0,88.98],[3800.0,90.77],[3840.0,91.61],[3880.0,91.05],[3920.0,90.18],[3960.0,90.36],[4000.0,90.57],[4010.0,90.62]],"profileLapSeconds":210.0,"carColor":"#00e5ff","attribution":"Circuit centreline \u00a9 OpenStreetMap contributors, ODbL 1.0 \u00b7 OSM relation 6006460, fetched 2026-08-27","style":{"casing":17.0,"core":11.0,"car":13.0,"trail":170.0,"lmFont":25.0,"lmSpeedFont":21.0,"sFont":30.0}};
+const DATA = __DATA__;
 
 const NS = "http://www.w3.org/2000/svg";
 const svg = document.getElementById("svg");
@@ -569,3 +912,52 @@ requestAnimationFrame(frame);
 </script>
 </body>
 </html>
+"""
+
+
+def render(data):
+    return TEMPLATE.replace("__DATA__", json.dumps(data, separators=(",", ":")))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[1])
+    ap.add_argument("--verify", action="store_true",
+                    help="write the page and print a geometry report")
+    args = ap.parse_args()
+
+    data = build_data()
+    html = render(data)
+    with open(OUT_PATH, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(html)
+
+    rel = os.path.relpath(OUT_PATH, _REPO)
+    print(f"wrote {rel}  ({len(html) / 1024:.1f} KB)")
+
+    if args.verify:
+        print(f"  built            {datetime.datetime.now(datetime.timezone.utc)}")
+        print(f"  centreline       {len(data['line'])} points, "
+              f"OSM relation {OSM_RELATION_ID} @ {OSM_TIMESTAMP}")
+        print(f"  baked centreline {BUILT_UTC}")
+        print(f"  viewBox          {data['viewBox']} (user unit = 1 m)")
+        print(f"  lap length       {data['trackLength']:.0f} m")
+        print(f"  sectors          {len(data['sectors'])}: " +
+              ", ".join(f"S{s['id']} {s['start']:.0f}-{s['end']:.0f}m"
+                        for s in data["sectors"]))
+        print(f"  landmarks        {len(data['landmarks'])}: " +
+              ", ".join(f"{l['name']}@{l['dist']:.0f}m" for l in data["landmarks"]))
+        print(f"  demo profile     {len(data['profile'])} points, "
+              f"modelled lap {data['profileLapSeconds']:.1f} s")
+        # The centreline is an OPEN polyline that is closed by one final
+        # segment from the last vertex back to the first, so the two ends being
+        # apart is expected -- what must hold is that the gap matches the length
+        # CUM_M budgets for that closing segment. If those two disagree, every
+        # distance on the page is off by the difference.
+        gap = math.hypot(data["line"][0][0] - data["line"][-1][0],
+                         data["line"][0][1] - data["line"][-1][1])
+        booked = track_map.CUM_M[-1] - track_map.CUM_M[-2]
+        print(f"  closing segment  drawn {gap:.1f} m vs {booked:.1f} m in CUM_M "
+              f"({'ok' if abs(gap - booked) < 1.0 else 'MISMATCH'})")
+
+
+if __name__ == "__main__":
+    main()

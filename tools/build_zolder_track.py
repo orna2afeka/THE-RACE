@@ -28,8 +28,9 @@ change this script and re-run.
 
 LICENCE
 OpenStreetMap data is ODbL 1.0, which requires attribution wherever it is shown.
-The generated module carries OSM_ATTRIBUTION and Pit_Dashboard/track_map_view.py
-renders it as a permanent caption under the chart.
+The generated module carries OSM_ATTRIBUTION, and every page that draws this
+geometry must show it: Pit_Dashboard/zolder_animation.html prints it in the
+footer, and tools/build_zolder_animation.py is what puts it there.
 """
 
 import argparse

@@ -270,7 +270,6 @@ THE RACE/                             # ← repo root
 │   ├── config.py                     # ⭐ Central config: bitrates, connection candidates, BMS poll list
 │   ├── can_worker.py                 # CAN QThread + LYNX decoder + driver-HUD signals
 │   ├── driver_dash_v2.py             # PySide6 driver HUD (the ACTIVE dashboard, RacingDashboard)
-│   ├── dashboard.py                  # Alternate standalone engineering dashboard (pyqtgraph)
 │   ├── test_connection.py            # Quick CAN probe — which bus is live + sample frames
 │   ├── requirements.txt              # Pi dependencies
 │   ├── modules/
@@ -305,6 +304,7 @@ THE RACE/                             # ← repo root
 │   ├── .streamlit/config.toml        # Streamlit server/theme settings
 │   ├── 210s.xlsx                     # Baseline 210 s Zolder velocity profile
 │   ├── requirements_pit.txt          # Pit dependencies
+│   ├── zolder_animation.html         # GENERATED presentation circuit map (see tools/, self-contained)
 │   ├── serviceAccountKey.json        # 🔒 Firebase admin key — SEE SECURITY NOTE BELOW
 │   └── telemetry.db                  # Local SQLite store (gitignored; created by collector.py)
 │
@@ -317,8 +317,8 @@ THE RACE/                             # ← repo root
 │   ├── replay_limits.py              # Replays telemetry.db: how often each tier would fire
 │   ├── generate_profiles.py          # Builds profiles/*.csv from Pit_Dashboard/210s.xlsx
 │   ├── hud_sim.py                    # Drives the driver HUD without a car, for UI work
-│   ├── backfill_columns.py           # Adds new columns to an existing telemetry.db
-│   └── fix_vehicle_speed.py          # Re-derives stored speed after a decode fix
+│   ├── build_zolder_track.py         # Bakes the OSM centreline → zolder_centreline.py
+│   └── build_zolder_animation.py     # Bakes the presentation map → zolder_animation.html
 │
 ├── deploy/                           # Raspberry Pi provisioning (systemd + desktop launcher)
 │   ├── README.md                     # ⭐ Pi setup guide — read this before touching the Pi
@@ -329,8 +329,7 @@ THE RACE/                             # ← repo root
 │   └── start_hud.sh / stop_hud.sh    # HUD start/stop scripts
 │
 └── docs/                             # Standalone task briefs (no code depends on these)
-    ├── PI_CAN_TASK.md                # Step-by-step: MMS + BMS on two CAN channels
-    └── REACT_MIGRATION_PROMPT.md     # Plan for a future React + FastAPI pit rewrite (NOT built)
+    └── PI_CAN_TASK.md                # Step-by-step: MMS + BMS on two CAN channels
 ```
 
 ### Shared modules — the one layout rule

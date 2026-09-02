@@ -105,8 +105,10 @@ METRIC_COLUMNS = [
     # applied both corrections before it reaches here.
     #
     # ⚠️ Rows written before that decode fix hold the RAW value, roughly 50x
-    # too high. They are wrong, not just old — back-fill before reading
-    # historical speed (tools/backfill_columns.py).
+    # too high. They are wrong, not just old. The one-off repair scripts that
+    # rewrote them have been removed now that every live database has had them
+    # applied; anything read out of a pre-fix .bak still needs correcting by
+    # hand, using _SPEED_RATIO_BOUNDARY below.
     "mms_vehicle_speed_kmh",
     # Distance counter from the controller (0x620). A counter, not an integral,
     # so it does not accumulate error across dropped frames.
@@ -354,7 +356,9 @@ _SPEED_RATIO_RAW_RECONFIGURED = 2.6656 * RPM_REPORT_SCALE        # 1.3328, curre
 _SPEED_DECODED_RATIO = _SPEED_RATIO_RAW / (10.0 * CONTROLLER_SPEED_DIVISOR_LEGACY)
 _SPEED_BOUNDARY_DECODED = (_SPEED_DECODED_RATIO * _SPEED_RATIO_RAW) ** 0.5
 _SPEED_BOUNDARY_ERA = (_SPEED_RATIO_RAW * _SPEED_RATIO_RAW_RECONFIGURED) ** 0.5
-# Kept under the old name: fix_vehicle_speed.py imports it.
+# Kept under the old name. Its importer (the one-off fix_vehicle_speed.py) has
+# been removed, but the boundary is the documented dividing line between the two
+# speed eras, so it stays as the reference for reading old rows.
 _SPEED_RATIO_BOUNDARY = _SPEED_BOUNDARY_DECODED
 
 

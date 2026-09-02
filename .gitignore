@@ -23,6 +23,12 @@ REACT_MIGRATION_PROMPT.md
 # Manual snapshots taken before risky migrations (tens of MB each).
 *.bak
 **/*.bak
+# ...and the WAL/shm sidecars SQLite leaves beside a snapshot that was copied
+# while the database was open. These do NOT match *.db-wal above -- the name is
+# telemetry.db.<date>.<label>.bak-wal -- which is how 5.3 MB of them ended up
+# committed once already.
+*.bak-wal
+*.bak-shm
 
 # ---------------------------------------------------------------------------
 # Firebase credentials
@@ -67,5 +73,3 @@ collector.err.log
 .Rhistory
 Thumbs.db
 desktop.ini
-
-tools/

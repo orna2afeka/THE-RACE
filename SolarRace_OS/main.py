@@ -46,15 +46,12 @@ from PySide6.QtGui import QGuiApplication
 from PySide6.QtCore import QObject, Signal, QTimer
 import subprocess
 # --- Core Logic & Parsing Modules ---
-# NOTE: `import dashboard` used to sit here and was dead code. dashboard.py is
-# the SEPARATE standalone engineering dashboard; the HUD this app runs is
-# driver_dash_v2.RacingDashboard. Nothing here ever referenced the module —
-# main() binds a LOCAL variable also called `dashboard` (see below), which
-# shadowed it completely. All the import did was pull in pyqtgraph and a second
-# full Qt GUI at startup, so the app refused to boot with
-# "ModuleNotFoundError: No module named 'pyqtgraph'" on any machine that had
-# not installed a dependency it never used. Run dashboard.py directly if you
-# want that tool.
+# NOTE: the HUD this app runs is driver_dash_v2.RacingDashboard, and it is the
+# only one. A second, standalone pyqtgraph dashboard used to live in
+# dashboard.py with a dead `import dashboard` here; the import pulled in
+# pyqtgraph and a whole second Qt GUI at startup, so the app refused to boot on
+# any machine that had not installed a dependency it never used. Both are gone.
+# `dashboard` below is a LOCAL variable in main(), unrelated.
 from modules.bms_parser import parse_jbd_bms_message
 from modules.mms_parser import parse_mms_message
 # The same module again, by name: _request_gpio_report() needs the GPIO-over-CAN
