@@ -327,6 +327,7 @@ THE RACE/                             # ← repo root
 │
 ├── deploy/                           # Raspberry Pi provisioning (systemd + desktop launcher)
 │   ├── README.md                     # ⭐ Pi setup guide — read this before touching the Pi
+│   ├── RACE_CHECKLIST.md             # ⭐ Everything that must happen before/at the race, in order
 │   ├── can-up.service                # Brings can0/can1 up at boot at the right bitrate
 │   ├── solarrace-hud.desktop         # Autostart entry for the driver HUD
 │   ├── solarrace-camera.desktop      # Autostart entry for the USB reverse camera
