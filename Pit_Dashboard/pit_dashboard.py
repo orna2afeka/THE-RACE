@@ -63,7 +63,7 @@ from constants import (
     # tile declares a limit like every other numeric tile, and so the gauge
     # scale stays shared with the driver HUD.
     SOLAR_CURRENT,
-    STRATEGIES, STRATEGY_BY_LABEL, DEFAULT_STRATEGY_KEY,
+    STRATEGIES, DEFAULT_STRATEGY_KEY,
     # speed_kmh() is deliberately NOT imported: road speed comes from the
     # controller's CAN field only (see build_state), and not importing the
     # RPM-derived formula here is what stops it quietly coming back as a
@@ -499,6 +499,73 @@ def _live_snapshot():
 # a second or two, so the remaining ninety seconds were pure blocking I/O on the
 # render thread for an answer that had either arrived or was never coming. The
 # "Check again" button covers the rare case where it is worth asking later.
+# The strategy list is read from profiles/ on disk (constants.load_strategies),
+# so it has to be re-read when a file changes -- profile_builder.py writes these
+# while the dashboard is running. Keyed on the profile mtimes: cheap to compute,
+# and it changes exactly when a profile is rebuilt. fileWatcherType is "none" in
+# config.toml, so nothing else would ever notice.
+def active_strategy_key():
+    """Which profile the car is believed to be running, best source first.
+
+    The CAR's own ack outranks the dropdown: the dropdown is what someone
+    selected, the ack is what the car confirmed it applied, and when they
+    disagree it is the car that is right about the car.
+    """
+    return (st.session_state.get("active_strategy_key")
+            or (st.session_state.get("strategy_choice") or {}).get("key")
+            or DEFAULT_STRATEGY_KEY)
+
+
+@st.cache_data(ttl=30, show_spinner=False, max_entries=4)
+def _profile_df_cached(_key, path, _mtime):
+    return strategy_engine.profile_to_df(path)
+
+
+def _active_profile_df():
+    """The speed curve the pit should be measuring against.
+
+    This used to be 210s.xlsx unconditionally, so the pit showed the 210 s
+    baseline's target speed no matter which profile the car was actually
+    following — the strategist and the driver read different numbers for the
+    same thing. Falls back to the xlsx if the profile is missing, because a
+    target readout that disappears is worse than one that is generic.
+
+    mtime is in the cache key on purpose: profile_builder.py rewrites these
+    files while the dashboard is running, and with fileWatcherType = "none" and
+    no ttl on the old loader a rebuilt profile would otherwise be served from
+    cache for the rest of the session.
+    """
+    try:
+        import speed_profile
+        key = active_strategy_key()
+        path = speed_profile.available_profiles().get(key)
+        if path:
+            return _profile_df_cached(key, path, os.path.getmtime(path))
+    except Exception:
+        pass
+    return load_velocity_profile(VELOCITY_PROFILE_PATH)
+
+
+def _profiles_stamp():
+    try:
+        import speed_profile
+        return tuple(sorted((k, round(os.path.getmtime(v), 3))
+                            for k, v in speed_profile.available_profiles().items()))
+    except Exception:
+        return ()
+
+
+@st.cache_data(ttl=30, show_spinner=False, max_entries=4)
+def _strategies_cached(_stamp):
+    import constants
+    return constants.load_strategies()
+
+
+def strategies():
+    """The profiles the car could actually be asked to run, right now."""
+    return _strategies_cached(_profiles_stamp()) or STRATEGIES
+
+
 ACK_POLL_WINDOW_S = 30
 
 # Dedupe within the window. The strategy panel ticks every 10s and the sidebar
@@ -926,8 +993,7 @@ def _live_context():
         # The distance READOUTS stay None so they show a dash — position being
         # unknown-but-drawn is fine, a fabricated odometer figure is not.
         current_lap_dist_m = 0.0
-    track_status = get_live_track_status(current_lap_dist_m,
-                                         load_velocity_profile(VELOCITY_PROFILE_PATH))
+    track_status = get_live_track_status(current_lap_dist_m, _active_profile_df())
     try:
         sec_raw = track_status.get("section", "Section 1")
         current_sector_id = int(sec_raw.split(" ")[-1]) if "Section" in sec_raw else 1
@@ -1877,10 +1943,55 @@ def _driver_fragment():
 SECTOR_BOUNDS = [(sid, info["range"][0], info["range"][1])
                  for sid, info in sorted(SECTIONS_INFO.items())]
 
-# Reference splits from the 210 s baseline's own Time(s) column — what each
-# sector "should" take on the base strategy.
-REFERENCE_SPLITS = {1: 23.35, 2: 23.64, 3: 40.44, 4: 10.08, 5: 27.93,
+# What each sector "should" take. Fallback only: these are the 210 s baseline's
+# own Time(s) figures, kept for when no profile can be read.
+_BASELINE_SPLITS = {1: 23.35, 2: 23.64, 3: 40.44, 4: 10.08, 5: 27.93,
                     6: 10.34, 7: 21.13, 8: 28.88, 9: 23.81}
+
+
+@st.cache_data(ttl=30, show_spinner=False, max_entries=4)
+def _splits_for(_key, path, _mtime):
+    """Per-sector reference times integrated from one profile.
+
+    The nine numbers above were themselves read off the 210 s baseline's Time(s)
+    column, so for base_210s this reproduces them — which is the regression
+    test. For any other profile it produces that profile's real splits, instead
+    of comparing a car running a 189 s strategy against 210 s references and
+    reporting nine large negative deltas that mean nothing.
+    """
+    import speed_profile
+    prof = speed_profile.load_csv(path, lap_length_m=TRACK_LENGTH_METERS)
+    d, v = prof.distances_m, prof.speeds_ms
+    cum, t = {0.0: 0.0}, 0.0
+    for i in range(1, len(d)):
+        ds = d[i] - d[i - 1]
+        t += ds / max(1e-6, 0.5 * (v[i] + v[i - 1]))
+        cum[d[i]] = t
+
+    def at(metres):
+        # The grid is every 10 m and SECTOR_BOUNDS land on it, so this is a
+        # lookup rather than an interpolation for every boundary we use.
+        return cum.get(float(metres))
+
+    out = {}
+    for sid, lo, hi in SECTOR_BOUNDS:
+        a, b = at(lo), at(hi if hi <= d[-1] else d[-1])
+        if a is not None and b is not None and b > a:
+            out[sid] = b - a
+    return out or dict(_BASELINE_SPLITS)
+
+
+def reference_splits():
+    """Sector references for the profile the car is running now."""
+    try:
+        import speed_profile
+        key = active_strategy_key()
+        path = speed_profile.available_profiles().get(key)
+        if path:
+            return _splits_for(key, path, os.path.getmtime(path))
+    except Exception:
+        pass
+    return dict(_BASELINE_SPLITS)
 
 
 def _crossing_time(samples, boundary_m):
@@ -1953,8 +2064,9 @@ def render_sector_times(current_lap, splits, deltas):
                 "`lap_distance_m`.", icon=":material/info:")
         return
 
+    refs = reference_splits()
     st.caption(f"Lap {current_lap} · delta vs previous lap · "
-               f"reference is the 210 s baseline")
+               f"reference is `{active_strategy_key()}`")
     cells = st.columns(len(SECTOR_BOUNDS))
     for col, (sid, _s, _e) in zip(cells, SECTOR_BOUNDS):
         secs = splits.get(sid)
@@ -1979,7 +2091,7 @@ def render_sector_times(current_lap, splits, deltas):
                 colour = "#2ecc71" if d < 0 else "#ff4444"
                 delta_html = (f"<span style='font-size:13px;font-weight:bold;"
                               f"color:{colour};'>{d:+.2f}</span>")
-            ref = REFERENCE_SPLITS.get(sid)
+            ref = refs.get(sid)
             ref_html = (f"<div style='font-size:10px;color:#556;'>ref "
                         f"{ref:.1f}s</div>" if ref else "")
             st.markdown(
@@ -2812,7 +2924,8 @@ def _strategy_fragment():
     # From constants.STRATEGIES so the matrix, the remote selector and the
     # generated profiles can never disagree about what a strategy is.
     consumption_table = [{'label': s['label'], 'lap_time_min': s['lap_time_min'],
-                          'energy_wh': s['energy_wh']} for s in STRATEGIES]
+                          'energy_wh': s['energy_wh']} for s in strategies()
+                         if s.get('energy_wh') is not None]
     # `not soc` covers both a missing reading and a reported 0: neither is a
     # usable capacity, so the matrix assumes a full pack rather than telling the
     # strategist the car is empty. (This already treated 0 that way; None just
@@ -2853,21 +2966,30 @@ def render_strategy_selector():
     st.markdown("### :material/route: Active Strategy")
     col_sel, col_send = st.columns([3, 1])
     with col_sel:
-        labels = [s["label"] for s in STRATEGIES]
-        default_idx = next((i for i, s in enumerate(STRATEGIES)
+        opts = strategies()
+        default_idx = next((i for i, s in enumerate(opts)
                             if s["key"] == DEFAULT_STRATEGY_KEY), 0)
-        choice = st.selectbox("Speed profile", labels, index=default_idx,
+        # The option IS the strategy dict, not its label. Looking the label back
+        # up in a dict keyed by label only works while every label is unique,
+        # and labels now come from profiles.json where a human types them.
+        choice = st.selectbox("Speed profile", opts, index=default_idx,
                               key="strategy_choice",
+                              format_func=lambda s: s["label"],
                               label_visibility="collapsed")
     with col_send:
         send = st.button(":material/send: Send to Car", width="stretch",
                          key="strategy_send")
 
-    chosen = STRATEGY_BY_LABEL[choice]
-    st.caption(f"{chosen['label']} — target lap "
+    chosen = choice
+    # Lap time is integrated from the profile itself, so once a measured lap
+    # replaces a synthetic one this reads the real figure rather than the target
+    # the file was named after. Energy still comes from the strategy matrix (a
+    # speed curve cannot know it), and reads "—" when nobody has supplied one.
+    energy = chosen.get("energy_wh")
+    st.caption(f"{chosen['label']} — lap "
                f"{chosen['lap_time_min'] * 60:.0f}s, "
-               f"{chosen['energy_wh']:.0f} Wh/lap · profile "
-               f"`{chosen['key']}`")
+               + (f"{energy:.0f} Wh/lap" if energy is not None else "energy —")
+               + f" · profile `{chosen['key']}`")
 
     if send:
         try:
@@ -2895,6 +3017,10 @@ def render_strategy_selector():
             # so the answer stays on screen without the node being read again.
             if isinstance(ack, dict) and (ack.get("applied") or ack.get("note")):
                 st.session_state.strategy_ack = ack
+                # What the CAR says it is running now drives the pit's target
+                # speed and sector references, so the two screens agree.
+                if ack.get("applied") and ack.get("strategy"):
+                    st.session_state["active_strategy_key"] = ack["strategy"]
 
         if isinstance(ack, dict) and ack.get("applied") \
                 and ack.get("strategy") == sent[0]:

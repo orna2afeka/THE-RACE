@@ -78,20 +78,98 @@ TARGET_LAP_TIME_MIN = 3.5
 # =========================
 # STRATEGY MATRIX
 # =========================
-# The five race strategies: what the Strategy tab plots, what the remote
-# selector offers, and what tools/generate_profiles.py builds a speed profile
-# for. Hoisted here from a literal inside _strategy_fragment so all three name
-# the same things — `key` must match the generated profiles/<key>.csv exactly,
-# because that string is what the pit sends and the car looks up.
-STRATEGIES = [
+# What the Strategy tab plots and what the remote selector offers. `key` must
+# match profiles/<key>.csv exactly, because that string is what the pit sends
+# and the car looks up.
+#
+# THE LIST COMES FROM DISK NOW, not from a literal here. The car has always
+# loaded whatever CSVs exist (speed_profile.load_all is a directory scan), while
+# the pit only knew these five — so a profile measured at the track and written
+# by profile_builder.py was invisible to the dropdown and therefore unreachable
+# in a race, no matter that the car was holding it in memory ready to use.
+#
+# Only the things that CANNOT be derived from a speed curve are kept here. The
+# label is a human name and energy_wh needs a vehicle model, so both are stored;
+# lap time is a property of the curve itself and is always computed from it, so
+# a profile rebuilt from a real lap immediately reports its real lap time
+# everywhere instead of the target it was once named after.
+_BUILTIN_STRATEGY_META = {
+    "fast_189s":     ("Fast (-10%)",    88.0),
+    "med_fast_199s": ("Med-Fast (-5%)", 84.0),
+    "base_210s":     ("Base (210s)",    80.0),
+    "med_slow_220s": ("Med-Slow (+5%)", 76.0),
+    "slow_231s":     ("Slow (+10%)",    72.0),
+}
+DEFAULT_STRATEGY_KEY = "base_210s"
+
+# Exactly what the five hardcoded entries used to be, to the digit. Returned
+# whenever the profiles cannot be read, so this module can never fail to import
+# — collector.py and export.py import it too, and neither has any business
+# crashing because a CSV is malformed.
+_FALLBACK_STRATEGIES = [
     {"key": "fast_189s",     "label": "Fast (-10%)",    "lap_time_min": 3.150, "energy_wh": 88.0},
     {"key": "med_fast_199s", "label": "Med-Fast (-5%)", "lap_time_min": 3.325, "energy_wh": 84.0},
     {"key": "base_210s",     "label": "Base (210s)",    "lap_time_min": 3.500, "energy_wh": 80.0},
     {"key": "med_slow_220s", "label": "Med-Slow (+5%)", "lap_time_min": 3.675, "energy_wh": 76.0},
     {"key": "slow_231s",     "label": "Slow (+10%)",    "lap_time_min": 3.850, "energy_wh": 72.0},
 ]
+
+_SIDECAR_PATH = os.path.join(_REPO_ROOT, "profiles", "profiles.json")
+
+
+def _sidecar_meta():
+    """{key: {label, energy_wh}} written by profile_builder.py. Optional."""
+    try:
+        import json
+        with open(_SIDECAR_PATH, encoding="utf-8") as fh:
+            return json.load(fh).get("categories") or {}
+    except Exception:
+        return {}
+
+
+def load_strategies():
+    """Every speed profile on disk, newest information first.
+
+    lap_time_min is ALWAYS integrated from the curve (SpeedProfile.lap_time_s),
+    never a stored claim, so the Strategy tab's consumption matrix tells the
+    truth the moment a profile is replaced by a measured lap.
+
+    Never raises. On any problem the five original entries are returned
+    unchanged, which is also exactly what this produces when the five original
+    CSVs are the only ones present.
+    """
+    try:
+        import speed_profile
+        import track
+        found = speed_profile.available_profiles()
+        if not found:
+            return list(_FALLBACK_STRATEGIES)
+        side = _sidecar_meta()
+
+        out = []
+        for key, path in found.items():
+            prof = speed_profile.load_csv(path, name=key,
+                                          lap_length_m=track.TRACK_LENGTH_METERS)
+            label, energy = _BUILTIN_STRATEGY_META.get(key, (None, None))
+            meta = side.get(key) or {}
+            label = meta.get("label") or label or key.replace("_", " ").title()
+            energy = meta.get("energy_wh", energy)
+            out.append({"key": key, "label": label,
+                        "lap_time_min": prof.lap_time_s() / 60.0,
+                        "energy_wh": energy,
+                        # True when nobody has said what this profile costs, so
+                        # the matrix can mark the number as unknown rather than
+                        # printing a confident dash-free zero.
+                        "energy_estimated": energy is None})
+        out.sort(key=lambda s: s["lap_time_min"])
+        return out or list(_FALLBACK_STRATEGIES)
+    except Exception as exc:     # noqa: BLE001 - importable above all else
+        print(f"⚠️ speed profiles unreadable ({exc}); using the built-in five")
+        return list(_FALLBACK_STRATEGIES)
+
+
+STRATEGIES = load_strategies()
 STRATEGY_BY_LABEL = {s["label"]: s for s in STRATEGIES}
-DEFAULT_STRATEGY_KEY = "base_210s"
 DATA_STALE_AFTER_S = 10.0   # latest sample older than this => collector likely down
 
 # =========================

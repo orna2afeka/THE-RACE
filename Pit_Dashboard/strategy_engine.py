@@ -21,6 +21,28 @@ def load_velocity_profile(filepath=_DEFAULT_PROFILE):
     except Exception:
         return None
 
+def profile_to_df(path):
+    """A generated speed profile CSV as the frame get_target_speed() expects.
+
+    Same three columns load_velocity_profile() produces from 210s.xlsx, so
+    get_target_speed, get_track_section and get_live_track_status need no change
+    at all — only a different frame handed to them.
+
+    Why this exists: the pit computed its target speed from 210s.xlsx no matter
+    which strategy the car was actually running, so selecting a faster profile
+    moved the driver's HUD target and left the strategist reading the 210 s
+    baseline. Two numbers called "target speed", disagreeing, on the two screens
+    the crew compares. Loaded through speed_profile.load_csv — the CAR's own
+    loader — so pit and car cannot interpret the same file differently.
+    """
+    import speed_profile
+    import track
+    p = speed_profile.load_csv(path, lap_length_m=track.TRACK_LENGTH_METERS)
+    return pd.DataFrame({"d(m)": list(p.distances_m),
+                         "V(km/h)": [v * 3.6 for v in p.speeds_ms],
+                         "section": list(p.sections)})
+
+
 def get_target_speed(profile_df, current_dist_m):
     if profile_df is None or profile_df.empty:
         return 68.0 
