@@ -22,6 +22,11 @@ UPDATE_INTERVAL_SECONDS = 0.5
 # pit's primary key), so unlike live_telemetry, nothing here is ever overwritten.
 HISTORY_PATH = 'telemetry_history'
 
+# Seconds any single Firebase request may take before it is abandoned. See the
+# note in initialize_firebase: the alternative is the library's 120 s default,
+# on the thread that reads the CAN bus.
+UPLOAD_HTTP_TIMEOUT_S = 8.0
+
 # State variable to track the last time we pinged the server
 _last_update_time = 0
 
@@ -146,7 +151,19 @@ def initialize_firebase(credential_file_path, database_url):
         print("Connecting to Firebase Pit Wall...")
         cred = credentials.Certificate(credential_file_path)
         firebase_admin.initialize_app(cred, {
-            'databaseURL': database_url
+            'databaseURL': database_url,
+            # firebase-admin defaults to 120 SECONDS per request, and these
+            # writes are synchronous on the CAN worker thread -- the same thread
+            # that drains the bus. One hung socket at the default would stop
+            # frame decoding for two minutes, overflow the SocketCAN receive
+            # buffer and silently lose everything in it.
+            #
+            # 8 s is far longer than a healthy write (measured ~40 ms at the
+            # bench) and long enough for a bad cellular link to still get a
+            # payload through, while capping what a single dead socket can cost.
+            # Note firebase-admin retries inside one call, so this bounds each
+            # ATTEMPT rather than the whole call.
+            'httpTimeout': UPLOAD_HTTP_TIMEOUT_S,
         })
         print("Firebase connection established successfully.")
     except Exception as e:
@@ -162,6 +179,23 @@ def push_telemetry_to_cloud(vehicle_state):
 
     # Check if enough time has passed since the last update
     if (current_time - _last_update_time) >= UPDATE_INTERVAL_SECONDS:
+        # STAMPED BEFORE THE WRITES, NOT AFTER, and that ordering is the whole
+        # point of this line being here rather than after ref.set().
+        #
+        # It used to be set after the live write succeeded. So a live write that
+        # RAISED never reached it, the elapsed test stayed true forever, and
+        # every subsequent CAN frame -- hundreds a second on a live bus -- went
+        # straight into this block and attempted a full blocking HTTPS write.
+        # The exact moment the link goes bad is the moment the car starts trying
+        # hardest to use it, on the CAN worker thread, which then stops draining
+        # frames. A failure is precisely when a throttle has to hold.
+        #
+        # Stamping the ATTEMPT also fixes the quieter half: the timestamp is now
+        # when this burst began rather than when the previous one did, so the
+        # interval means "0.5 s between attempts" instead of "0.5 s between the
+        # starts of bursts", which on a slow link had collapsed to the duration
+        # of the burst itself.
+        _last_update_time = current_time
         try:
             # We use a specific node in the database called 'live_telemetry'
             ref = db.reference('live_telemetry')
@@ -175,9 +209,6 @@ def push_telemetry_to_cloud(vehicle_state):
             # .set() OVERWRITES the current data at this node.
             # This is perfect for a live dashboard (we only care about the NOW).
             ref.set(payload)
-
-            # Update our timer
-            _last_update_time = current_time
 
             # ADDITIVE: also append an immutable, keyed copy to the history node so
             # the pit wall can store full history locally (.push() never overwrites).
