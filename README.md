@@ -263,6 +263,7 @@ THE RACE/                             # ← repo root
 │   #  — every importer breaks. See "Shared modules" below.
 │
 ├── Start Pit Dashboard.bat           # Double-click launcher → Pit_Dashboard/run_pit.bat
+├── Build Speed Profiles.bat          # Double-click launcher → the profile builder on port 8502
 ├── requirements.txt                  # Shared/root-tool dependencies
 │
 ├── SolarRace_OS/                     # Edge code — runs on the Raspberry Pi
@@ -303,11 +304,16 @@ THE RACE/                             # ← repo root
 │   ├── assets/pit_dashboard.css      # Dashboard styling
 │   ├── .streamlit/config.toml        # Streamlit server/theme settings
 │   ├── 210s.xlsx                     # Baseline 210 s Zolder velocity profile
+│   ├── profile_builder.py            # Speed Profile Builder app (port 8502, reads telemetry.db READ-ONLY)
+│   ├── profile_build.py              # The maths behind it — no Streamlit, self-checks headlessly
 │   ├── requirements_pit.txt          # Pit dependencies
 │   ├── serviceAccountKey.json        # 🔒 Firebase admin key — SEE SECURITY NOTE BELOW
 │   └── telemetry.db                  # Local SQLite store (gitignored; created by collector.py)
 │
-├── profiles/                         # Pre-generated target-speed CSVs, one per lap time
+├── profiles/                         # Target-speed CSVs, one per lap time. Generated:
+│   #  either synthetically by tools/generate_profiles.py, or from a lap the car
+│   #  really drove, by Pit_Dashboard/profile_builder.py. The car loads every
+│   #  file here ONCE at startup, so a replaced profile needs a HUD restart.
 │   ├── fast_189s.csv  med_fast_199s.csv  base_210s.csv
 │   └── med_slow_220s.csv  slow_231s.csv
 │

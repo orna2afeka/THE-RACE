@@ -19,6 +19,7 @@ Design choices
 """
 
 import json
+import pathlib
 import sqlite3
 
 from constants import (CONTROLLER_SPEED_DIVISOR, CONTROLLER_SPEED_DIVISOR_LEGACY,
@@ -294,6 +295,96 @@ def get_conn(path: str = SQLITE_PATH) -> sqlite3.Connection:
     # database, and every page lookup in every query paid to search it.
     conn.execute("PRAGMA journal_size_limit=33554432;")
     return conn
+
+
+def get_conn_ro(path: str = SQLITE_PATH):
+    """A connection that CANNOT write, for tools that must not disturb the race.
+
+    Returns (conn, mode) where mode is "ro" or "query_only", so a caller can say
+    on screen which protection it actually got.
+
+    The profile builder runs beside a live collector and a live pit wall against
+    the same file. `mode=ro` is the strong form -- SQLite refuses writes at the
+    VFS layer -- but it needs to create the -shm file to read a WAL database, and
+    a read-only directory (or a stale -shm) makes the open fail outright. The
+    fallback is a normal handle with `query_only=ON`, which refuses writes at the
+    SQL layer instead: weaker (a PRAGMA could turn it off) but identical in
+    practice for code that never tries.
+
+    NOTE: nothing that uses this may call init_db(). That function runs DDL --
+    ALTER TABLE, CREATE INDEX, and a full-table UPDATE -- and would fail here,
+    correctly, but only after the caller had already assumed a schema.
+    """
+    uri = "file:" + pathlib.Path(path).as_posix().replace("?", "%3f") + "?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=30000;")
+        conn.execute("SELECT 1 FROM telemetry LIMIT 1")   # prove it really opened
+        return conn, "ro"
+    except sqlite3.Error:
+        conn = sqlite3.connect(path, timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=30000;")
+        conn.execute("PRAGMA query_only=ON;")
+        return conn, "query_only"
+
+
+def fetch_lap_profile_samples(conn: sqlite3.Connection, lap: int,
+                              device_id: str = DEVICE_ID):
+    """(device_ts, lap_distance_m, mms_vehicle_speed_kmh, lap_source) for one lap.
+
+    A SIBLING of fetch_lap_track, not a widening of it. That one is on the 4s
+    cached path of the tab the dashboard opens on, and its two-column shape is
+    deliberate; this adds two more columns for a tool that runs a handful of
+    times by hand. Same half-open range on the raw column for the same reason --
+    see fetch_lap_track's docstring for why a CAST here costs 141 ms instead of
+    0.08 ms.
+
+    ⚠️ THE OFF-BY-ONE. `calculated_lap` is LapTracker.lap_count: the number of
+    laps COMPLETED. In the same snapshot `lap_distance_m` is the lap being driven
+    and `last_lap_time_s` is the one just finished. So these samples are the
+    trace of lap `lap` + 1, and that lap's time/energy/distance live on the rows
+    tagged `lap` + 1 (fetch_lap_summary's row `lap` + 1).
+
+    Confirmed on the real store, not just read off lap_tracker.py: for the trace
+    tagged 0, MAX(lap_distance_m) is 3990 m while last_lap_distance_m at 0 is
+    NULL and at 1 is 4020 m. Join these two the naive way and every profile is
+    filed under the wrong lap's time -- a wrong answer that looks completely
+    plausible, which is why profile_build.check_lap_alignment() re-proves it at
+    runtime instead of trusting this comment.
+    """
+    return conn.execute(
+        "SELECT device_ts, lap_distance_m, mms_vehicle_speed_kmh, lap_source "
+        "FROM telemetry "
+        "WHERE device_id = ? AND calculated_lap >= ? AND calculated_lap < ? "
+        "  AND device_ts IS NOT NULL AND lap_distance_m IS NOT NULL "
+        "ORDER BY device_ts ASC",
+        (device_id, float(int(lap)), float(int(lap)) + 1.0),
+    ).fetchall()
+
+
+def lap_overview(conn: sqlite3.Connection, device_id: str = DEVICE_ID):
+    """One grouped pass over every lap TRACE: cheap enough to run on a 300 MB
+    store, and the only query the builder's lap table needs before a human has
+    shortlisted anything.
+
+    Per-lap detail (gaps, coverage) costs a full read of that lap's samples, so
+    it is deliberately NOT here -- it is computed for the few laps that survive
+    this table's filters.
+    """
+    return conn.execute(
+        "SELECT CAST(calculated_lap AS INTEGER) AS trace_lap, "
+        "       COUNT(*) AS n_samples, "
+        "       SUM(mms_vehicle_speed_kmh IS NOT NULL) AS n_speed, "
+        "       MAX(lap_distance_m) AS trace_end_m, "
+        "       MIN(device_ts) AS t0, MAX(device_ts) AS t1, "
+        "       MAX(ABS(mms_vehicle_speed_kmh)) AS v_max_kmh "
+        "FROM telemetry "
+        "WHERE device_id = ? AND calculated_lap IS NOT NULL "
+        "GROUP BY trace_lap ORDER BY trace_lap",
+        (device_id,),
+    ).fetchall()
 
 
 def init_db(conn: sqlite3.Connection) -> None:
