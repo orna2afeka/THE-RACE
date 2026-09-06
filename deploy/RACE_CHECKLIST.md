@@ -75,18 +75,21 @@ baked centreline instead. Everything else stays private. The car and
 Repo → Settings → Pages → Deploy from a branch → `main`, folder `/docs`.
 The family link is then **`https://orna2afeka.github.io/THE-RACE/`**.
 
-### ☐ Set the race window
+### ☑ Race window — set
 
-Otherwise the spectator page hides its race clock rather than counting down to a
-guessed date. Either rebuild:
+**13:00 Sat 19 Sept → 13:00 Sun 20 Sept 2026, Belgian time (CEST).** Confirmed
+against europeansolarchallenge.eu: 24 hours continuous, Le Mans-style start,
+sunset 19:47 Saturday and sunrise 07:22 Sunday, with at least one and at most
+three recharging stops overnight.
+
+Already baked into the spectator page. If it ever moves, rebuild:
 
 ```bash
-python tools/build_zolder_animation.py --race-start "2026-09-19T12:00+02:00"
+python tools/build_zolder_animation.py --race-start "2026-09-19T13:00+02:00"
 ```
 
-(offset required — family watching from Israel should read it in their own
-timezone) or write `/public/race` with `start_ts` / `end_ts` in epoch seconds,
-which the page picks up live with no rebuild.
+or write `/public/race` with `start_ts` / `end_ts` in epoch seconds, which the
+page picks up live without a rebuild.
 
 ### ☐ Update the car
 

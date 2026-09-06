@@ -1063,6 +1063,7 @@ el("foot").innerHTML = DATA.attribution +
 // ── state ──────────────────────────────────────────────────────────────── //
 // `snap` is the last thing the car published, verbatim. Nothing here ever
 // invents a value to fill a gap in it.
+const CIRCUIT_TZ = "Europe/Brussels";   // the clock every announcement uses
 let snap = null;
 let lastRxWall = 0;        // our clock, for "how long since anything arrived"
 let dist = 0, target = null, everPainted = false;
@@ -1080,15 +1081,29 @@ function fmtCountdown(s) {
   return m + "m " + (s % 60) + "s";
 }
 
-// Shown in the VIEWER's timezone, deliberately. Family watching from Israel
-// should read the start time in their own evening, not in Belgian local time
-// they then have to convert.
+// The viewer's own clock FIRST -- family watching from Israel should not have
+// to convert -- but the circuit's clock alongside it, because every official
+// announcement and every photo caption will say the Belgian time, and a page
+// that shows only "14:00" to an Israeli reader quietly contradicts all of them.
+// When the viewer IS in Belgium the two are identical and only one is shown.
 function whenLocal(ts) {
   try {
-    return new Date(ts * 1000).toLocaleString(undefined,
-      { weekday: "short", day: "numeric", month: "short",
-        hour: "2-digit", minute: "2-digit" });
+    const opts = { weekday: "short", day: "numeric", month: "short",
+                   hour: "2-digit", minute: "2-digit" };
+    const here = new Date(ts * 1000).toLocaleString(undefined, opts);
+    const there = new Date(ts * 1000).toLocaleString(undefined,
+      Object.assign({ timeZone: CIRCUIT_TZ }, opts));
+    return here === there ? here : `${here} your time · ${there} at the circuit`;
   } catch (e) { return "—"; }
+}
+
+// Sunrise/sunset formatted at the CIRCUIT, whoever is reading. "Sunset 19:47"
+// is a fact about Zolder, not about where the viewer happens to be sitting.
+function hhmmAtCircuit(date) {
+  try {
+    return date.toLocaleTimeString(undefined, { timeZone: CIRCUIT_TZ,
+      hour: "2-digit", minute: "2-digit", hour12: false });
+  } catch (e) { return date.toTimeString().slice(0, 5); }
 }
 const dash = (v, digits, suffix) => v == null ? "—"
   : v.toLocaleString(undefined, { minimumFractionDigits: digits,
@@ -1165,7 +1180,14 @@ function loadWeather() {
   const u = "https://api.open-meteo.com/v1/forecast?latitude=" + CONFIG.lat +
             "&longitude=" + CONFIG.lon +
             "&current=temperature_2m,cloud_cover,wind_speed_10m" +
-            "&daily=sunrise,sunset&timezone=Europe%2FBrussels&forecast_days=2";
+            // timeformat=unixtime is the important part. The default returns
+            // naive strings like "2026-09-19T19:47", which JS parses in the
+            // VIEWER's timezone -- so for anyone not in Belgium the day/night
+            // state flipped at the wrong moment, and the page went on claiming
+            // daylight after dark at the track. Unix timestamps are absolute
+            // instants and cannot be misread that way.
+            "&daily=sunrise,sunset&timezone=Europe%2FBrussels" +
+            "&timeformat=unixtime&forecast_days=3";
   fetch(u).then(r => r.ok ? r.json() : null).then(w => {
     if (!w || !w.current) return;
     const c = w.current;
@@ -1184,19 +1206,19 @@ function renderDayNight() {
   const now = new Date();
   let label = null;
   for (let i = 0; i < sun.rise.length; i++) {
-    const rise = new Date(sun.rise[i]), set = new Date(sun.set[i]);
+    // Unix seconds -> a real instant, so this comparison is right wherever the
+    // reader is. It is answering "is it dark AT ZOLDER right now".
+    const rise = new Date(sun.rise[i] * 1000), set = new Date(sun.set[i] * 1000);
     if (now >= rise && now < set) {
-      label = "☀ Daylight · sunset " + set.toTimeString().slice(0, 5);
+      label = "☀ Daylight at the circuit · sunset " + hhmmAtCircuit(set);
       break;
     }
     if (now < rise) {
-      label = "🌙 Dark · sunrise " + rise.toTimeString().slice(0, 5);
+      label = "🌙 Dark at the circuit · sunrise " + hhmmAtCircuit(rise);
       break;
     }
   }
-  el("daynight").textContent = label ||
-    "🌙 Dark · sunrise " + new Date(sun.rise[sun.rise.length - 1])
-      .toTimeString().slice(0, 5);
+  el("daynight").textContent = label || "—";
 }
 
 // ── milestones ─────────────────────────────────────────────────────────── //
