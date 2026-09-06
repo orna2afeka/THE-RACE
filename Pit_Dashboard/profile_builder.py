@@ -163,6 +163,12 @@ def load_laps():
                 "Max speed": float(r["v_max_kmh"] or 0.0),
                 "When": (datetime.datetime.fromtimestamp(r["t0"]).strftime("%d %b %H:%M")
                          if r["t0"] else ""),
+                # How the lap boundary was decided. "gps" is a real finish-line
+                # crossing; "odometer" means the GPS trigger MISSED and the
+                # distance backstop fired, which makes the lap's whole distance
+                # axis an estimate — worth seeing before trusting a profile
+                # built from it.
+                "lap_source": r["lap_source"] or "—",
             })
         return pd.DataFrame(recs), offset, detail, mode
     finally:
@@ -199,6 +205,75 @@ def installed_profile(key):
 
 
 # --------------------------------------------------------------------------- #
+# Demo laps — so the tool can be reviewed before the car has ever run at Zolder
+# --------------------------------------------------------------------------- #
+# Every lap below is INVENTED. The point is to see how the table, the buckets
+# and the rejection reasons read while there is still time to change them, so
+# the set deliberately includes the failures a real session produces: a
+# telemetry hole, a lap the trigger cut short, a lap the GPS never triggered,
+# and one carrying the 50x speeds of a pre-decode-fix database.
+#
+# Nothing here can be written to a real profile — see the guard on the write
+# button — because a synthetic lap in profiles/base_210s.csv would be a lie the
+# car would then drive to.
+DEMO_LAPS = [
+    # (lap_time_s, energy_wh, lap_source, flaw)
+    (208.4, 79.6, "gps", None),
+    (211.9, 82.1, "gps", None),
+    (209.7, 78.9, "gps", None),
+    (213.2, 84.7, "gps", None),
+    (210.6, 81.3, "gps", "gap"),
+    (207.9, 77.8, "gps", None),
+    (231.4, 71.2, "gps", None),
+    (229.8, 69.9, "gps", None),
+    (233.1, 72.6, "gps", None),
+    (190.2, 95.4, "gps", None),
+    (188.7, 97.1, "gps", None),
+    (191.5, 94.2, "odometer", None),
+    (204.3, 80.2, "gps", "short"),
+    (215.0, 83.4, "odometer", None),
+    (198.6, 88.0, "gps", None),
+    (212.4, 81.9, "gps", "legacy"),
+]
+
+
+def _demo_samples(trace_lap):
+    """One demo lap's samples, in the shape fetch_lap_profile_samples returns."""
+    idx = int(trace_lap)
+    lap_time, _wh, source, flaw = DEMO_LAPS[idx % len(DEMO_LAPS)]
+    length = 3860.0 if flaw == "short" else 4000.0
+    rows = pb._synthetic_lap(lap_time_s=lap_time, spacing_m=19.0,
+                             length_m=length, jitter=1.4, seed=idx + 1)
+    if flaw == "gap":
+        rows = [r for r in rows if not (1500.0 < r[1] < 1660.0)]
+    if flaw == "legacy":
+        rows = [(t, d, v * 50.0, source) for t, d, v, _s in rows]
+    return [(r[0], r[1], r[2], source) for r in rows]
+
+
+def _demo_laps_df():
+    """The lap table, built from DEMO_LAPS rather than telemetry.db."""
+    recs = []
+    for i, (lap_time, wh, source, flaw) in enumerate(DEMO_LAPS):
+        samples = _demo_samples(i)
+        d, v, diag = pb.clean_samples(samples)
+        recs.append({
+            "Trace lap": i,
+            "Lap time (s)": lap_time,
+            "Car distance (m)": diag["length_m"] + 8.0,
+            "Trace distance (m)": diag["length_m"],
+            "Energy (Wh)": wh,
+            "Samples": diag["n_used"],
+            "Speed %": 100.0,
+            "Spacing (m)": diag["mean_spacing_m"],
+            "Max speed": diag["max_kmh"],
+            "When": f"demo lap {i}",
+            "lap_source": source,
+        })
+    return pd.DataFrame(recs)
+
+
+# --------------------------------------------------------------------------- #
 # UI
 # --------------------------------------------------------------------------- #
 st.title(":material/route: Speed Profile Builder")
@@ -206,9 +281,32 @@ st.caption("Builds `profiles/*.csv` from laps the car actually drove. "
            "Reads `telemetry.db` read-only — it cannot affect the pit dashboard "
            "or the collector.")
 
-laps_df, offset, align_detail, db_mode = load_laps()
+real_laps_df, real_offset, real_detail, db_mode = load_laps()
+
+# Default ON while there is nothing real to look at, so opening the tool shows
+# the thing being reviewed rather than a dead end. It switches itself off the
+# moment the store has laps of its own.
+_has_real = (real_offset is not None and not real_laps_df.empty)
+demo = st.sidebar.toggle(
+    "Demo laps", value=not _has_real, key="demo_mode",
+    help="Invented laps, for seeing how this reads before the car has run at "
+         "Zolder. Nothing built from them can be written to a real profile.")
+
+if demo:
+    laps_df, offset, align_detail = _demo_laps_df(), 1, "demo data — not measured"
+else:
+    laps_df, offset, align_detail = real_laps_df, real_offset, real_detail
 
 # --- the alignment proof, which gates everything -------------------------- #
+if demo:
+    st.warning(
+        "**DEMO LAPS — every number below is invented.** The car has not run at "
+        "Zolder yet, so this is here to review how the tool reads: the table, "
+        "the categories, the rejection reasons and the preview chart. Some laps "
+        "are deliberately faulty. Nothing built from them can be written to a "
+        "profile. Turn *Demo laps* off in the sidebar once the car has run.",
+        icon=":material/science:")
+
 if offset is None:
     st.error("Cannot verify how lap traces line up with lap times — there are "
              "not enough completed laps in the store yet. Build nothing from "
@@ -281,9 +379,15 @@ for _, row in laps_df.iterrows():
         why.append("no lap time from the car")
     if abs((row["Trace distance (m)"] or 0) - pb.LAP_M) > pb.MAX_LENGTH_ERROR_M:
         why.append(f"{row['Trace distance (m)']:.0f} m, not ~{pb.LAP_M:.0f} m")
-    verdicts.append("Usable" if not why else "Rejected")
+    verdicts.append("Looks usable" if not why else "Rejected")
     details.append("; ".join(why))
-laps_df = laps_df.assign(Verdict=verdicts, Why=details)
+# "Quick check", not "Verdict", and the difference is not pedantry: everything
+# in this table comes from one grouped query, so it can see lap time, distance,
+# sample count and speed scale but NOT gaps or coverage — those need the lap's
+# own samples read, which is why they are checked when you pick a lap. A lap can
+# pass here and still be refused below, and saying "Verdict" would make that
+# look like the tool contradicting itself.
+laps_df = laps_df.assign(**{"Quick check": verdicts, "Why": details})
 
 st.dataframe(
     laps_df.style.format({"Lap time (s)": "{:.1f}", "Car distance (m)": "{:.0f}",
@@ -292,13 +396,19 @@ st.dataframe(
                           "Max speed": "{:.0f}"}, na_rep="—"),
     width="stretch", hide_index=True)
 st.caption(
-    "**Car distance** is what the car reported for that lap; **Trace distance** "
-    "is how far this lap's own samples reach. They should agree to within one "
-    "sample — a big disagreement means the trace/lap join is wrong for that lap. "
-    f"Spacing is the average gap between samples: the profile grid is 10 m, so "
-    f"anything above that is interpolated up, not measured.")
+    "**Quick check** is what one grouped query can see. Telemetry gaps and "
+    "coverage need the lap's own samples, so they are checked when you "
+    "select a lap below — a lap can look usable here and still be refused "
+    "there.\n\n"
+    "**Car distance** is what the car reported for that lap; **Trace "
+    "distance** is how far this lap's own samples reach. They should agree "
+    "to within one sample — a big disagreement means the trace/lap join is "
+    "wrong for that lap. Spacing is the average gap between samples: the "
+    "profile grid is 10 m, so anything above that is interpolated up, not "
+    "measured.")
 
-usable = laps_df[laps_df["Verdict"] == "Usable"].dropna(subset=["Lap time (s)"])
+usable = laps_df[laps_df["Quick check"] == "Looks usable"].dropna(
+    subset=["Lap time (s)"])
 if usable.empty:
     st.warning("No lap in the store is usable as a profile yet. The columns "
                "above say why for each one.", icon=":material/warning:")
@@ -391,7 +501,7 @@ pick = st.selectbox(
         f"{inb.loc[inb['Trace lap'] == l, 'Samples'].iloc[0]} samples · "
         f"{inb.loc[inb['Trace lap'] == l, 'When'].iloc[0]}"))
 
-samples = load_lap_samples(pick)
+samples = _demo_samples(pick) if demo else load_lap_samples(pick)
 src_path, baseline = installed_profile(chosen_key)
 measured_time = float(inb.loc[inb["Trace lap"] == pick, "Lap time (s)"].iloc[0])
 
@@ -459,7 +569,12 @@ exists = os.path.exists(final_path)
 st.write(f"Target file: `profiles/{chosen_key}.csv`"
          + ("  — **this replaces the profile the car follows today**" if exists else ""))
 
-if st.button(":material/save: Build and write this profile", type="primary"):
+if demo:
+    st.button(":material/save: Build and write this profile", type="primary",
+              disabled=True)
+    st.caption(":orange[Disabled while Demo laps is on] — a made-up lap written "
+               "into `profiles/` is a target the car would actually drive to.")
+elif st.button(":material/save: Build and write this profile", type="primary"):
     os.makedirs(BACKUP_DIR, exist_ok=True)
     staged = final_path + ".staged"
     pb.write_rows(staged, pb.GRID_M.tolist(), v_ms.tolist(), baseline.sections)

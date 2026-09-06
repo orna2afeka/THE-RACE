@@ -444,7 +444,8 @@ def lap_overview(conn: sqlite3.Connection, device_id: str = DEVICE_ID):
         "       SUM(mms_vehicle_speed_kmh IS NOT NULL) AS n_speed, "
         "       MAX(lap_distance_m) AS trace_end_m, "
         "       MIN(device_ts) AS t0, MAX(device_ts) AS t1, "
-        "       MAX(ABS(mms_vehicle_speed_kmh)) AS v_max_kmh "
+        "       MAX(ABS(mms_vehicle_speed_kmh)) AS v_max_kmh, "
+        "       MAX(lap_source) AS lap_source "
         "FROM telemetry "
         "WHERE device_id = ? AND calculated_lap IS NOT NULL "
         "GROUP BY trace_lap ORDER BY trace_lap",
