@@ -15,6 +15,11 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Afeka Solar Racing &mdash; Live from Circuit Zolder</title>
 <meta name="description" content="Follow the Afeka Solar &amp; Electric Racing team live from the iESC 24-hour race at Circuit Zolder.">
+<!-- Inline SVG, not a file: the page stays a single self-contained
+     document that works from a USB stick, and there is no second
+     request to fail on hostile wifi. -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2064%2064%22%3E%3Crect%20width%3D%2264%22%20height%3D%2264%22%20rx%3D%2214%22%20fill%3D%22%2306090f%22%2F%3E%3Cg%20stroke%3D%22%2300e5ff%22%20stroke-width%3D%225%22%20stroke-linecap%3D%22round%22%3E%3Cpath%20d%3D%22M32%207v7M32%2050v7M7%2032h7M50%2032h7M14.3%2014.3l5%205M44.7%2044.7l5%205M49.7%2014.3l-5%205M19.3%2044.7l-5%205%22%2F%3E%3C%2Fg%3E%3Ccircle%20cx%3D%2232%22%20cy%3D%2232%22%20r%3D%2212.5%22%20fill%3D%22%2300e5ff%22%2F%3E%3Ccircle%20cx%3D%2232%22%20cy%3D%2232%22%20r%3D%225%22%20fill%3D%22%23ffffff%22%2F%3E%3C%2Fsvg%3E">
+<meta name="theme-color" content="#06090f">
 <!-- Progressive enhancement only, and deliberately NOT render-blocking: these
      pages get opened on hostile wifi, and a plain stylesheet link holds first
      paint until the request resolves. Loaded as print media and promoted on
@@ -162,16 +167,26 @@
   /* The car stops being drawn as a live thing the moment the feed is not. */
   #car, #car-core, #trail { transition: opacity 0.4s ease; }
   body.stale #car, body.stale #car-core, body.stale #trail { opacity: 0.28; }
+  /* Hidden by sliding UP out of view, but the offset is in PIXELS, not a
+     percentage of its own height. It was -140%, and an EMPTY banner is only
+     about 24px tall (padding, no line box), so -140% lifted it just 34px from a
+     22px offset and left a cyan sliver of itself permanently visible at the top
+     of the page -- on every load, before any milestone had happened. It looked
+     correct in testing only because a banner WITH text is tall enough for the
+     percentage to clear the viewport. opacity is belt and braces: even if a
+     browser disagrees about the transform, an invisible banner cannot leak. */
   #milestone {
-    position: fixed; left: 50%; top: 22px; transform: translateX(-50%) translateY(-140%);
+    position: fixed; left: 50%; top: 22px;
+    transform: translateX(-50%) translateY(-200px);
+    opacity: 0; pointer-events: none;
     background: linear-gradient(90deg, #0ea5e9, #22d3ee);
     color: #04121a; font-weight: 700; letter-spacing: 2px;
     text-transform: uppercase; padding: 12px 26px; border-radius: 999px;
     box-shadow: 0 14px 40px rgba(34, 211, 238, 0.35);
-    transition: transform 0.5s cubic-bezier(.2,.9,.3,1.2); z-index: 50;
-    font-size: 0.95rem; text-align: center;
+    transition: transform 0.5s cubic-bezier(.2,.9,.3,1.2), opacity 0.35s ease;
+    z-index: 50; font-size: 0.95rem; text-align: center;
   }
-  #milestone.show { transform: translateX(-50%) translateY(0); }
+  #milestone.show { transform: translateX(-50%) translateY(0); opacity: 1; }
   @media (max-width: 900px) {
     #stage { grid-template-columns: 1fr; height: auto; padding: 12px; }
     #map { height: 56vh; }
