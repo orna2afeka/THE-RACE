@@ -71,66 +71,93 @@ DEFAULT_SMOOTH_POINTS = 5          # 5 x 10 m = a 50 m window
 # --------------------------------------------------------------------------- #
 # The alignment proof
 # --------------------------------------------------------------------------- #
+def _pearson(xs, ys):
+    """Correlation coefficient, or None when it is undefined."""
+    n = len(xs)
+    if n < 3:
+        return None
+    mx, my = sum(xs) / n, sum(ys) / n
+    dx = [x - mx for x in xs]
+    dy = [y - my for y in ys]
+    sx = math.sqrt(sum(v * v for v in dx))
+    sy = math.sqrt(sum(v * v for v in dy))
+    if sx == 0 or sy == 0:            # a constant series has no correlation
+        return None
+    return sum(a * b for a, b in zip(dx, dy)) / (sx * sy)
+
+
 def check_lap_alignment(overview, summary):
     """Work out empirically whether trace N pairs with summary N or N+1.
 
     `overview` is db.lap_overview() rows, `summary` is db.fetch_lap_summary().
     Returns (offset, detail) where offset is 0 or 1, or (None, detail) when the
-    data cannot settle it.
+    data genuinely cannot settle it.
 
-    SCORED ON LAP TIME, NOT LAP DISTANCE, and that choice is load-bearing.
-    Distance looks like the obvious discriminator and is nearly useless for it:
-    every lap of a circuit is the same length, so on real racing data both
-    offsets score about equally and the answer is a coin toss. Lap TIMES
-    genuinely differ lap to lap -- traffic, driver, strategy -- so comparing
-    each trace's own wall-clock span against the car's reported lap time picks
-    the pairing out cleanly.
+    SCORED BY CORRELATION, and the two rejected alternatives are worth stating
+    because each was tried and each failed on real-shaped data:
 
-    (This was found by testing, not by reasoning: a synthetic store with four
-    equal-length laps scored 10 m for both offsets and reported itself
-    inconclusive, which is exactly the situation Zolder will produce.)
+      * Lap DISTANCE is useless. Every lap of a circuit is the same length, so
+        both offsets score identically and the answer is a coin toss.
+      * Median ERROR between a trace's own duration and the reported lap time
+        looks right and quietly breaks on a car that is driving WELL. Laps of
+        208 +/- 2 s make the two offsets score 0.9 s and 1.8 s -- close enough
+        to be called inconclusive, so the better the driving, the more likely
+        the tool refuses to run. That is precisely backwards.
 
-    Distance is still computed and reported as a secondary signal, because when
-    the two disagree that is worth seeing.
+    Correlation does not care about the magnitude of the differences, only
+    whether the two series move together. At the true offset each trace's span
+    IS that lap's time, so they track almost exactly; at the wrong offset a
+    trace is being compared against a neighbouring lap, and neighbouring lap
+    times are close to independent. It stays decisive on consistent laps, which
+    is the case that matters.
+
+    Falls back to median error when correlation is undefined (fewer than three
+    laps, or every lap identical to the millisecond), and returns None rather
+    than guess when neither can separate them.
     """
     by_lap = {int(r["lap"]): r for r in summary if r["lap"] is not None}
     traces = [r for r in overview if r["trace_lap"] is not None]
 
-    def score(field, get_trace, get_summary):
-        out = {}
-        for offset in (0, 1):
-            errs = []
-            for r in traces:
-                s_row = by_lap.get(int(r["trace_lap"]) + offset)
-                a, b = get_trace(r), (get_summary(s_row) if s_row else None)
-                if a is not None and b is not None and b > 0:
-                    errs.append(abs(float(a) - float(b)))
-            if errs:
-                out[offset] = (float(np.median(errs)), len(errs))
-        return out
+    pairs = {}
+    for offset in (0, 1):
+        xs, ys = [], []
+        for r in traces:
+            s_row = by_lap.get(int(r["trace_lap"]) + offset)
+            if not s_row or s_row["lap_time_s"] is None:
+                continue
+            if not r["t0"] or not r["t1"]:
+                continue
+            xs.append(float(r["t1"]) - float(r["t0"]))
+            ys.append(float(s_row["lap_time_s"]))
+        if xs:
+            errs = sorted(abs(a - b) for a, b in zip(xs, ys))
+            pairs[offset] = {"corr": _pearson(xs, ys), "n": len(xs),
+                             "err": errs[len(errs) // 2]}
 
-    t_scores = score("time",
-                     lambda r: (r["t1"] - r["t0"]) if (r["t0"] and r["t1"]) else None,
-                     lambda s: s["lap_time_s"])
-    d_scores = score("dist", lambda r: r["trace_end_m"], lambda s: s["distance_m"])
+    if not pairs:
+        return None, "no completed laps to compare"
 
-    parts = []
-    if t_scores:
-        parts.append("lap time: " + ", ".join(
-            f"offset {o} median |trace span - lap time| = {v:.1f}s ({n} lap(s))"
-            for o, (v, n) in sorted(t_scores.items())))
-    if d_scores:
-        parts.append("distance: " + ", ".join(
-            f"offset {o} = {v:.0f}m" for o, (v, _n) in sorted(d_scores.items())))
-    detail = " | ".join(parts) or "no completed laps to compare"
+    detail = " | ".join(
+        f"offset {o}: correlation "
+        + ("n/a" if v["corr"] is None else f"{v['corr']:+.3f}")
+        + f", median |span - lap time| {v['err']:.1f}s over {v['n']} lap(s)"
+        for o, v in sorted(pairs.items()))
 
-    scores = t_scores or d_scores
-    if not scores:
-        return None, detail
-    best = min(scores, key=lambda o: scores[o][0])
-    if len(scores) == 2:
+    if len(pairs) == 2 and all(v["corr"] is not None for v in pairs.values()):
+        best = max(pairs, key=lambda o: pairs[o]["corr"])
         other = 1 - best
-        if scores[best][0] > 0.5 * scores[other][0]:
+        b, o = pairs[best]["corr"], pairs[other]["corr"]
+        # Decisive when the winner actually tracks AND clearly beats the loser.
+        if b > 0.6 and (b - o) > 0.25:
+            return best, detail
+        return None, (detail + "  -- neither offset tracks the lap times well "
+                      "enough to be sure; do not build profiles from this store")
+
+    # Correlation unavailable: fall back to the magnitude test.
+    best = min(pairs, key=lambda o: pairs[o]["err"])
+    if len(pairs) == 2:
+        other = 1 - best
+        if pairs[best]["err"] > 0.5 * pairs[other]["err"]:
             return None, (detail + "  -- the two offsets score too similarly to "
                           "be conclusive; do not build profiles from this store")
     return best, detail
