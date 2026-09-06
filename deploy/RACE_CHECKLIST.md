@@ -172,6 +172,22 @@ holds an exclusive lock for the duration.
 
 ---
 
+## 3b. After every `git pull` on the pit laptop — restart the apps
+
+**Streamlit does not pick up changed code in imported modules.** It re-runs the
+main script on every interaction, but `db.py`, `constants.py` and friends stay
+in memory as they were when the process started — and `.streamlit/config.toml`
+sets `fileWatcherType = "none"`, so nothing restarts on its own either.
+
+A pulled change therefore lands half-applied: the page code is new, the modules
+it calls are old. That shows up as a confusing error naming a column or function
+that plainly does exist on disk.
+
+Close the dashboard, collector and profile-builder windows and start them again.
+Same rule as the car: `git pull` alone changes nothing that is already running.
+
+---
+
 ## 4. During the race
 
 - **A dash means the car did not report it. It never means zero.** This holds

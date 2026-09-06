@@ -124,6 +124,25 @@ def save_sidecar(cats, provenance=None):
 # --------------------------------------------------------------------------- #
 # Reading the store (read-only, always)
 # --------------------------------------------------------------------------- #
+def _col(row, name, default=None):
+    """One column off a sqlite3.Row, tolerating its absence.
+
+    Row raises IndexError for a key that is not in the result, which is a hard
+    crash for what may be a cosmetic column. It happens for a mundane reason
+    that will happen again: Streamlit re-runs the main script on every
+    interaction but does NOT re-import modules, and this project sets
+    fileWatcherType = "none", so an app left running while db.py gains a column
+    keeps the OLD db module in memory and the new page code asks it for
+    something it cannot return. Restarting the app fixes it; crashing over a
+    display field is not a reasonable way to say so.
+    """
+    try:
+        value = row[name]
+    except (IndexError, KeyError):
+        return default
+    return default if value is None else value
+
+
 @st.cache_data(ttl=60, show_spinner="Reading laps…")
 def load_laps():
     """The lap table, plus the alignment proof. One grouped pass over the store.
@@ -168,7 +187,7 @@ def load_laps():
                 # distance backstop fired, which makes the lap's whole distance
                 # axis an estimate — worth seeing before trusting a profile
                 # built from it.
-                "lap_source": r["lap_source"] or "—",
+                "lap_source": _col(r, "lap_source", "—"),
             })
         return pd.DataFrame(recs), offset, detail, mode
     finally:
