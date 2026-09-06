@@ -11,30 +11,44 @@ for first-time Pi setup.
 
 ## 1. Before you travel
 
-### ☐ Rotate the Firebase service-account key — **nothing works without this**
+### ☐ Get a working key onto the Pi — **nothing uploads without this**
 
-A key was public in this repo for 12 days and must be treated as compromised.
-The symptom of a stale key is not obvious: the car prints
+**Checked 6 Sep 2026: the key is valid and Google accepts it.** It was NOT
+rotated and does NOT need to be. Run this on any machine to confirm for
+yourself:
 
+```bash
+python tools/check_firebase_key.py
 ```
-[Network Error] Failed to update Firebase: invalid_grant: Invalid JWT Signature
+
+The car stopped uploading on **1 Sep 23:10**. The pit laptop's copy of the key
+authenticates fine, so the fault is that **the Pi's copy differs from it** — the
+Pi reported `invalid_grant: Invalid JWT Signature`, which means a well-formed
+file that Google does not recognise.
+
+Fix it by copying the working file from the pit laptop to the Pi:
+
+```bash
+# from the pit laptop
+scp Pit_Dashboard/serviceAccountKey.json     orna2@raspberrypi:~/Desktop/THE-RACE-main/SolarRace_OS/cloud/
 ```
 
-which means the file parses fine but Google has revoked it.
+A USB stick works too — but copy the file, do not paste its contents into an
+editor. A pasted key usually loses its newlines, and `check_firebase_key.py`
+tests for exactly that (a real key has ~28; a mangled one has 0 or 1).
 
-1. Google Cloud console → IAM → Service Accounts → Keys → create a new key,
-   delete the old one.
-2. Put it at **both** paths (they are gitignored, so they do not travel with a
-   `git pull` — you must copy them by hand):
-   - `SolarRace_OS/cloud/serviceAccountKey.json` (on the Pi)
-   - `Pit_Dashboard/serviceAccountKey.json` (on the pit laptop)
-3. Restart `main.py` on the Pi and look for `Firebase connection established
-   successfully.`
+Then on the Pi:
 
-> A missing file fails differently and more confusingly: `initialize_firebase`
-> catches the error, prints `CRITICAL: Failed to initialize Firebase`, and lets
-> the app carry on — so every later push fails with *"The default Firebase app
-> does not exist"*, which sounds like a code bug and is not.
+```bash
+python tools/check_firebase_key.py     # expect: token issued, HTTP 200
+```
+
+> **Separately, and still true:** this key was public in the repo for 12 days,
+> so anyone who cloned it in that window can read and write your race telemetry.
+> Rotating it is worth doing before the race — but it is *security work, not a
+> fix for this outage*, and rotating means putting the new file on **both**
+> machines by hand, because both paths are gitignored and do not travel with a
+> `git pull`.
 
 ### ☐ Publish the database rules (only needed for the spectator page)
 
