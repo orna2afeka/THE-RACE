@@ -921,7 +921,7 @@ __BANNER__
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Afeka Solar Racing &mdash; Live from Circuit Zolder</title>
+<title>Afeka Solar Racing Live</title>
 <meta name="description" content="Follow the Afeka Solar &amp; Electric Racing team live from the iESC 24-hour race at Circuit Zolder.">
 __ICON__
 __FONT_LINK__
