@@ -182,6 +182,14 @@ holds an exclusive lock for the duration.
 - After any pit command, the dashboard polls the car for an acknowledgement for
   30 s. "Sent" and "the car is running it" are different things — wait for the
   ack.
+- **Energy per lap starts as an estimate and becomes a measurement.** The
+  Strategy tab's Wh/lap is the number somebody guessed before the car ever ran,
+  and it decides laps-possible, the stint plan and how many charge stops get
+  recommended. After **3 completed laps under a profile** it is replaced by the
+  median the car actually measured for that profile, and the caption under the
+  matrix says which rows are real. Practice laps at Zolder are what turn it
+  real — and only laps recorded from this build onward can be attributed,
+  because older rows never stored which profile was active.
 
 ---
 

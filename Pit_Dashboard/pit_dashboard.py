@@ -504,6 +504,40 @@ def _live_snapshot():
 # while the dashboard is running. Keyed on the profile mtimes: cheap to compute,
 # and it changes exactly when a profile is rebuilt. fileWatcherType is "none" in
 # config.toml, so nothing else would ever notice.
+# Laps needed before a measured figure replaces the assumed one. Two laps can
+# disagree by a lot -- traffic, a driver change, a cloud over the array -- and a
+# median of two is just the mean of two. Three is the smallest number where an
+# outlier cannot drag the answer on its own.
+MIN_LAPS_FOR_MEASURED = 3
+
+# The car finishes a lap about every 3.5 minutes, so nothing here can change
+# faster than that: a 2-minute cache costs nothing in freshness and keeps the
+# underlying grouped query off the render path. Measured on the pit's own store,
+# that query is ~0.6 s, which is exactly the sort of thing that must not run on
+# every tick -- see what the History chart used to do.
+ENERGY_CACHE_S = 120
+
+
+@st.cache_data(ttl=ENERGY_CACHE_S, show_spinner=False, max_entries=2)
+def _measured_energy_wh():
+    """{strategy_key: (median_wh, n_laps)} from laps the car actually drove.
+
+    The number the strategy matrix runs on used to be an estimate made before
+    the car ever turned a wheel, and it decides laps_possible, the stint plan
+    and how many charge stops get recommended. This replaces it with what the
+    car measured, per profile, as soon as there are enough laps to mean
+    something.
+    """
+    import statistics
+    conn = db.get_conn()
+    try:
+        raw = db.lap_energy_by_strategy(conn)
+    finally:
+        conn.close()
+    return {k: (statistics.median(v), len(v))
+            for k, v in raw.items() if len(v) >= MIN_LAPS_FOR_MEASURED}
+
+
 def active_strategy_key():
     """Which profile the car is believed to be running, best source first.
 
@@ -2923,9 +2957,22 @@ def _strategy_fragment():
     st.markdown("### :material/insights: Strategy Matrix")
     # From constants.STRATEGIES so the matrix, the remote selector and the
     # generated profiles can never disagree about what a strategy is.
-    consumption_table = [{'label': s['label'], 'lap_time_min': s['lap_time_min'],
-                          'energy_wh': s['energy_wh']} for s in strategies()
-                         if s.get('energy_wh') is not None]
+    # Energy per lap: what the car MEASURED under this profile when we have
+    # enough laps of it, otherwise the stored estimate. Replaced silently and
+    # per profile -- a profile nobody has driven yet keeps its original number,
+    # so switching to measurement never disturbs a row it knows nothing about.
+    measured = _measured_energy_wh()
+    consumption_table, measured_note = [], []
+    for st_ in strategies():
+        wh, n = measured.get(st_["key"], (None, 0))
+        if wh is None:
+            wh = st_.get("energy_wh")
+        else:
+            measured_note.append(f"{st_['label']} ({n} laps)")
+        if wh is not None:
+            consumption_table.append({'label': st_['label'],
+                                      'lap_time_min': st_['lap_time_min'],
+                                      'energy_wh': wh})
     # `not soc` covers both a missing reading and a reported 0: neither is a
     # usable capacity, so the matrix assumes a full pack rather than telling the
     # strategist the car is empty. (This already treated 0 that way; None just
@@ -2939,6 +2986,17 @@ def _strategy_fragment():
                    f"car yet.] These figures are a placeholder until it reports.")
     all_strategies = calculate_all_strategies(time_left_min, car_battery_wh,
                                               active_lap or 0, consumption_table)
+    # Provenance, not a second opinion: the matrix shows one number per row, and
+    # this says which of them the car actually paid for. Without it there is no
+    # way to tell a measured plan from an estimated one, and they justify very
+    # different confidence in "you can make 3 more stints".
+    if measured_note:
+        st.caption(f":green[Energy per lap measured from the car for] "
+                   f"{', '.join(measured_note)}:green[.] The rest are estimates.")
+    else:
+        st.caption(f":orange[Energy per lap is estimated] — no profile has "
+                   f"{MIN_LAPS_FOR_MEASURED} completed laps yet. These figures "
+                   f"become measurements once it does.")
     display_df = pd.DataFrame(all_strategies)
     graph_data_list = display_df.pop('_graph_data').tolist()
     st.dataframe(display_df, width="stretch", hide_index=True)

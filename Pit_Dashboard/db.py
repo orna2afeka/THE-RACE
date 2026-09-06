@@ -220,6 +220,13 @@ STATE_COLUMNS = [
     # "odometer" means the GPS trigger MISSED and the distance backstop fired —
     # a visible signal that finish-line detection needs looking at.
     "lap_source",
+    # Which speed profile the car was following, as the CAR reports it. The car
+    # has always published this and the pit used to drop it on the floor, which
+    # meant a stored lap could not be attributed to the profile it was driven
+    # under — so "what does 189s pace actually cost per lap" was unanswerable
+    # from the record, and the strategy matrix had to keep using numbers
+    # somebody estimated before the car ever turned a wheel.
+    "active_strategy",
 ]
 
 # Every data column the dashboard/exporter can name, in a stable order.
@@ -239,6 +246,7 @@ _COL_TYPES = {
     "mms_throttle_zone": "TEXT",
     "solar_sensor_status": "TEXT",
     "lap_source": "TEXT",
+    "active_strategy": "TEXT",
 }
 
 _DATA_COL_DEFS = ",\n    ".join(f"{c} {_COL_TYPES[c]}" for c in EXPORT_COLUMNS)
@@ -362,6 +370,63 @@ def fetch_lap_profile_samples(conn: sqlite3.Connection, lap: int,
         "ORDER BY device_ts ASC",
         (device_id, float(int(lap)), float(int(lap)) + 1.0),
     ).fetchall()
+
+
+def lap_energy_by_strategy(conn: sqlite3.Connection, recent_laps: int = 60,
+                           device_id: str = DEVICE_ID):
+    """Measured energy per lap, grouped by the profile the lap was driven under.
+
+    Returns {strategy_key: [wh, wh, ...]} — the raw per-lap figures, recent laps
+    only, for the caller to take a median of. Energy is the car's own
+    integration (signed motor power, trapezoidal, regen subtracting), so nothing
+    is re-derived here: this reads a number the car already computed and held
+    for the whole of the following lap.
+
+    MINDS THE OFF-BY-ONE, and it matters more here than anywhere else.
+    `calculated_lap` counts COMPLETED laps, so rows tagged N carry lap N's
+    energy in last_lap_energy while their active_strategy is the profile being
+    followed during lap N+1. Pairing those two off the same row attributes every
+    lap's cost to the NEXT lap's profile — invisible while nobody changes
+    strategy, and wrong exactly when someone does, which is the moment this
+    number is being looked at. So the strategy for lap N comes from the rows
+    tagged N-1, the trace of that lap.
+
+    Bounded to the most recent `recent_laps` laps: a median over the whole race
+    would average this morning's conditions into tonight's answer, and the query
+    stays the same size at lap 400 as at lap 40.
+    """
+    top = conn.execute(
+        "SELECT MAX(calculated_lap) AS m FROM telemetry WHERE device_id = ?",
+        (device_id,)).fetchone()
+    if not top or top["m"] is None:
+        return {}
+    floor = max(0.0, float(top["m"]) - float(recent_laps))
+
+    rows = conn.execute(
+        "SELECT CAST(calculated_lap AS INTEGER) AS lap, "
+        "       MAX(last_lap_energy) AS energy_wh, "
+        "       active_strategy AS strat, COUNT(*) AS n "
+        "FROM telemetry "
+        "WHERE device_id = ? AND calculated_lap >= ? "
+        "GROUP BY lap, strat",
+        (device_id, floor)).fetchall()
+
+    energy, modal = {}, {}
+    for r in rows:
+        lap = r["lap"]
+        if r["energy_wh"] is not None:
+            energy[lap] = max(energy.get(lap, float("-inf")), float(r["energy_wh"]))
+        if r["strat"]:
+            best = modal.get(lap)
+            if best is None or r["n"] > best[1]:
+                modal[lap] = (r["strat"], r["n"])
+
+    out = {}
+    for lap, wh in energy.items():
+        driven_under = modal.get(lap - 1)      # the trace of THIS lap
+        if driven_under:
+            out.setdefault(driven_under[0], []).append(wh)
+    return out
 
 
 def lap_overview(conn: sqlite3.Connection, device_id: str = DEVICE_ID):
@@ -631,6 +696,7 @@ def flatten_record(rtdb_key: str, record: dict, device_id: str = DEVICE_ID) -> d
         "last_lap_distance_m": _num(motor.get("last_lap_distance_m")),
         "lap_distance_m": _num(motor.get("lap_distance_m")),
         "lap_source": _join(motor.get("lap_source")),
+        "active_strategy": _join(motor.get("active_strategy")),
         "odometer_m": _num(motor.get("odometer_m")),
         "calculated_lap": _num(motor.get("calculated_lap")),
         "lat": _num(gps.get("lat")),
