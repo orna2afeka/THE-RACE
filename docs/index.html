@@ -139,6 +139,21 @@
   .bar > i { position: absolute; left: 0; top: 0; bottom: 0; display: block;
              border-radius: 5px; background: var(--accent); width: 0; }
   #soc-bar > i { background: var(--good); }
+  /* Both clocks, named. "Your time" was worse than it looks: it depends on
+     whatever device the page happens to be opened on, so the same family got
+     different numbers on a phone abroad and a laptop at home, and neither
+     matched the 13:00 every official announcement quotes. Naming the zones
+     removes the ambiguity entirely. */
+  .tz { display: grid; grid-template-columns: 1fr 1fr;
+        margin-top: 11px; border-top: 1px solid #1e293b; padding-top: 10px; }
+  .tz .z { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+  .tz .z + .z { border-left: 1px solid #1e293b; padding-left: 14px; }
+  .tz .name { font-size: 0.6rem; letter-spacing: 2.4px; text-transform: uppercase;
+              color: var(--dim); font-weight: 700; }
+  .tz .time { font-size: 1.15rem; font-weight: 700; line-height: 1.15;
+              font-variant-numeric: tabular-nums; }
+  .tz .date { font-size: 0.72rem; color: var(--dim);
+              font-variant-numeric: tabular-nums; }
   #race-bar > i { background: var(--accent); }
   #sector-name { color: var(--accent); }
   .foot { font-size: 0.7rem; color: #64748b; line-height: 1.55; }
@@ -202,6 +217,18 @@
         id="race-total">24h</span></span></div>
       <div class="bar" id="race-bar"><i></i></div>
       <div class="sub" id="race-sub">&mdash;</div>
+      <div class="tz">
+        <div class="z">
+          <span class="name">Zolder &middot; BE</span>
+          <span class="time" id="tz-be-time">&mdash;</span>
+          <span class="date" id="tz-be-date">&mdash;</span>
+        </div>
+        <div class="z">
+          <span class="name">Israel</span>
+          <span class="time" id="tz-il-time">&mdash;</span>
+          <span class="date" id="tz-il-date">&mdash;</span>
+        </div>
+      </div>
     </div>
 
     <div class="card row">
@@ -463,6 +490,7 @@ el("foot").innerHTML = DATA.attribution +
 // `snap` is the last thing the car published, verbatim. Nothing here ever
 // invents a value to fill a gap in it.
 const CIRCUIT_TZ = "Europe/Brussels";   // the clock every announcement uses
+const HOME_TZ = "Asia/Jerusalem";       // where most of the people watching are
 let snap = null;
 let lastRxWall = 0;        // our clock, for "how long since anything arrived"
 let dist = 0, target = null, everPainted = false;
@@ -480,20 +508,25 @@ function fmtCountdown(s) {
   return m + "m " + (s % 60) + "s";
 }
 
-// The viewer's own clock FIRST -- family watching from Israel should not have
-// to convert -- but the circuit's clock alongside it, because every official
-// announcement and every photo caption will say the Belgian time, and a page
-// that shows only "14:00" to an Israeli reader quietly contradicts all of them.
-// When the viewer IS in Belgium the two are identical and only one is shown.
-function whenLocal(ts) {
-  try {
-    const opts = { weekday: "short", day: "numeric", month: "short",
-                   hour: "2-digit", minute: "2-digit" };
-    const here = new Date(ts * 1000).toLocaleString(undefined, opts);
-    const there = new Date(ts * 1000).toLocaleString(undefined,
-      Object.assign({ timeZone: CIRCUIT_TZ }, opts));
-    return here === there ? here : `${here} your time · ${there} at the circuit`;
-  } catch (e) { return "—"; }
+// Both clocks, each named. Not "your time": that silently depends on the device
+// the page is opened on, so the same family saw different numbers on a phone
+// abroad and a laptop at home, and neither matched the 13:00 in the official
+// timetable. Naming Zolder and Israel means nobody has to work out which is
+// which, or convert anything.
+function renderZones(ts) {
+  const zones = [["tz-be", CIRCUIT_TZ], ["tz-il", HOME_TZ]];
+  for (const [id, tz] of zones) {
+    let t = "—", d = "—";
+    try {
+      const when = new Date(ts * 1000);
+      t = when.toLocaleTimeString("en-GB",
+            { timeZone: tz, hour: "2-digit", minute: "2-digit", hour12: false });
+      d = when.toLocaleDateString("en-GB",
+            { timeZone: tz, weekday: "short", day: "numeric", month: "short" });
+    } catch (e) { /* an engine without this zone: dashes, never a wrong time */ }
+    el(id + "-time").textContent = t;
+    el(id + "-date").textContent = d;
+  }
 }
 
 // Sunrise/sunset formatted at the CIRCUIT, whoever is reading. "Sunset 19:47"
@@ -697,20 +730,25 @@ function render() {
       el("race-label").textContent = "Race starts in";
       el("race-elapsed").textContent = fmtCountdown(race.start - now);
       el("race-of").style.display = "none";
-      el("race-sub").textContent = "Lights out " + whenLocal(race.start);
+      el("race-sub").textContent = "Lights out";
+      renderZones(race.start);
       bar.style.width = "0%";
     } else if (now >= race.end) {
       el("race-label").textContent = "Race complete";
       el("race-elapsed").textContent = fmtClock(total);
       el("race-of").style.display = "none";
-      el("race-sub").textContent = "Finished " + whenLocal(race.end);
+      el("race-sub").textContent = "Chequered flag";
+      renderZones(race.end);
       bar.style.width = "100%";
     } else {
       const done = now - race.start;
       el("race-label").textContent = "Race clock";
       el("race-elapsed").textContent = fmtClock(done);
       el("race-of").style.display = "inline";
-      el("race-sub").textContent = fmtClock(total - done) + " remaining";
+      // Mid-race the useful instant is the FINISH, not the start.
+      el("race-sub").textContent = fmtClock(total - done)
+                                   + " remaining · chequered flag at";
+      renderZones(race.end);
       bar.style.width = (done / total * 100) + "%";
     }
   } else {
