@@ -226,119 +226,485 @@ def calculate_soc_charging_strategy(
     consumption_table,
     battery_capacity_wh=8550,
     minimum_battery_wh=450,
-    max_stops=3
+    max_stops=4,
+    top_k=5
 ):
     """
-    Calculates race strategies using SOC-dependent charging power.
+    Optimize the complete remaining race.
 
-    The function checks different target SOC values and finds strategies
-    that maximize the number of completed laps.
+    Each charging stop is optimized independently.
+    The optimizer is free to choose a different charge target
+    at every stop.
+
+    Ranking:
+    1. Maximum completed laps
+    2. Minimum total charging time
+    3. Minimum number of charging stops
     """
+
+    # Charging targets that may be selected independently at each stop.
+    charge_targets = [55, 60, 65, 70, 75, 80, 85, 90]
 
     strategies = []
 
-    # Current battery SOC
-    current_soc = (current_available_wh / battery_capacity_wh) * 100
+    # ------------------------------------------------------------------
+    # Convert the existing consumption table into driving alternatives.
+    # ------------------------------------------------------------------
+    driving_options = []
 
-    # Possible target SOC values for each charging stop
-    target_soc_options = range(60, 101, 5)
+    if isinstance(consumption_table, dict):
+        iterable = consumption_table.items()
+    else:
+        try:
+            iterable = consumption_table.iterrows()
+        except AttributeError:
+            iterable = []
 
-    for option in consumption_table:
+    for key, row in iterable:
 
-        lap_time_min = option["lap_time_min"]
-        energy_per_lap_wh = option["energy_wh"]
-        speed_kmh = option.get("speed_kmh", 0)
+        try:
+            if hasattr(row, "to_dict"):
+                row = row.to_dict()
 
-        for target_soc in target_soc_options:
+            label = (
+                row.get("Label")
+                or row.get("label")
+                or str(key)
+            )
 
-            soc = current_soc
-            available_wh = current_available_wh
-            time_used = 0.0
-            total_laps = 0
-            charging_stops = 0
-            total_charging_time = 0.0
+            lap_time = (
+                row.get("lap_time_min")
+                or row.get("Lap Time")
+                or row.get("lap_time")
+            )
 
-            stop_plan = []
+            energy_per_lap = (
+                row.get("energy_per_lap_wh")
+                or row.get("Energy/Lap (Wh)")
+                or row.get("energy_per_lap")
+            )
 
-            while time_used + lap_time_min <= time_left_min:
+            speed = (
+                row.get("speed_kmh")
+                or row.get("Speed (km/h)")
+                or row.get("speed")
+                or 0
+            )
 
-                # Check if another lap can be completed safely
-                if available_wh - energy_per_lap_wh >= minimum_battery_wh:
+            # Handle strings such as "3.15 m"
+            if isinstance(lap_time, str):
+                lap_time = float(
+                    lap_time.lower().replace("min", "").replace("m", "").strip()
+                )
 
-                    available_wh -= energy_per_lap_wh
+            if isinstance(energy_per_lap, str):
+                energy_per_lap = float(
+                    energy_per_lap.lower().replace("wh", "").strip()
+                )
 
-                    soc = (
-                        available_wh
-                        / battery_capacity_wh
-                    ) * 100
+            if isinstance(speed, str):
+                speed = float(
+                    speed.lower().replace("km/h", "").strip()
+                )
 
-                    time_used += lap_time_min
-                    total_laps += 1
+            lap_time = float(lap_time)
+            energy_per_lap = float(energy_per_lap)
 
-                else:
+            if lap_time > 0 and energy_per_lap > 0:
+                driving_options.append({
+                    "label": label,
+                    "lap_time": lap_time,
+                    "energy_per_lap": energy_per_lap,
+                    "speed": float(speed),
+                })
 
-                    # No more charging stops are allowed
-                    if charging_stops >= max_stops:
-                        break
+        except (TypeError, ValueError, AttributeError):
+            continue
 
-                    # Do not charge if target SOC is already reached
-                    if target_soc <= soc:
-                        break
+    # Fallback to the known strategy matrix if the supplied table
+    # is not in the expected structure.
+    if not driving_options:
+        driving_options = [
+            {
+                "label": "Fast (-10%)",
+                "lap_time": 3.15,
+                "energy_per_lap": 88.0,
+                "speed": 76.2,
+            },
+            {
+                "label": "Med-Fast (-5%)",
+                "lap_time": 3.33,
+                "energy_per_lap": 84.0,
+                "speed": 72.2,
+            },
+            {
+                "label": "Base (210s)",
+                "lap_time": 3.50,
+                "energy_per_lap": 80.0,
+                "speed": 68.6,
+            },
+            {
+                "label": "Med-Slow (+5%)",
+                "lap_time": 3.67,
+                "energy_per_lap": 76.0,
+                "speed": 65.3,
+            },
+            {
+                "label": "Slow (+10%)",
+                "lap_time": 3.85,
+                "energy_per_lap": 72.0,
+                "speed": 62.3,
+            },
+        ]
 
-                    charging_time = calculate_charging_time(
-                        soc,
+    # ------------------------------------------------------------------
+    # Charging-time wrapper.
+    #
+    # Uses the project's existing SOC-dependent charging calculation.
+    # ------------------------------------------------------------------
+    def get_charge_time(start_soc, target_soc):
+
+        if target_soc <= start_soc:
+            return 0.0
+
+        try:
+            return float(
+                calculate_charging_time(start_soc, target_soc)
+            )
+        except TypeError:
+            try:
+                return float(
+                    calculate_charging_time(
+                        start_soc,
                         target_soc,
-                        battery_capacity_wh / 1000
+                        battery_capacity_wh / 1000.0
                     )
+                )
+            except Exception:
+                pass
+        except Exception:
+            pass
 
-                    # Not enough race time left for the charging stop
-                    if time_used + charging_time > time_left_min:
-                        break
+        # Fallback only if the existing charging function cannot be called.
+        # Approximation uses the same principle: charging slows at high SOC.
+        soc = float(start_soc)
+        total_minutes = 0.0
 
-                    charging_stops += 1
-                    total_charging_time += charging_time
+        while soc < target_soc:
 
-                    stop_plan.append({
-                        "stop_number": charging_stops,
-                        "after_lap": current_lap + total_laps,
-                        "laps_completed": total_laps,
-                        "race_time_min": time_used,
-                        "soc_before": soc,
-                        "target_soc": target_soc,
-                        "charging_time_min": charging_time
-                    })
+            next_soc = min(soc + 1.0, target_soc)
 
-                    time_used += charging_time
+            if soc < 50:
+                power_kw = 9.0
+            elif soc < 55:
+                power_kw = 8.8
+            elif soc < 60:
+                power_kw = 8.5
+            elif soc < 65:
+                power_kw = 8.0
+            elif soc < 70:
+                power_kw = 7.0
+            elif soc < 75:
+                power_kw = 6.0
+            elif soc < 80:
+                power_kw = 4.5
+            elif soc < 85:
+                power_kw = 3.5
+            elif soc < 90:
+                power_kw = 2.5
+            elif soc < 95:
+                power_kw = 1.5
+            else:
+                power_kw = 0.5
 
-                    soc = target_soc
+            energy_added_wh = (
+                battery_capacity_wh * ((next_soc - soc) / 100.0)
+            )
 
-                    available_wh = (
-                        target_soc / 100
-                    ) * battery_capacity_wh
+            total_minutes += (
+                energy_added_wh / (power_kw * 1000.0)
+            ) * 60.0
 
-            strategies.append({
-                "strategy": option.get("label", ""),
-                "speed_kmh": speed_kmh,
-                "lap_time_min": lap_time_min,
-                "energy_per_lap_wh": energy_per_lap_wh,
+            soc = next_soc
 
-                "target_soc": target_soc,
+        return total_minutes
 
-                "total_laps": total_laps,
-                "charging_stops": charging_stops,
-                "total_charging_time_min": total_charging_time,
+    # ------------------------------------------------------------------
+    # Optimize one driving strategy.
+    #
+    # State:
+    #   time used
+    #   current battery energy
+    #   completed laps
+    #   number of stops
+    #
+    # At each low-battery event the optimizer independently tests every
+    # possible charging target.
+    # ------------------------------------------------------------------
+    def optimize_driving_option(option):
 
-                "final_soc": soc,
-                "time_used_min": time_used,
+        lap_time = option["lap_time"]
+        energy_per_lap = option["energy_per_lap"]
 
-                "stop_plan": stop_plan
-            })
+        start_energy = min(
+            float(current_available_wh),
+            float(battery_capacity_wh)
+        )
 
-    # Best result:
-    # 1. Maximum number of laps
-    # 2. Minimum charging time
-    # 3. Minimum number of stops
+        # If no live battery data is available, the dashboard currently
+        # starts its simulation from a full battery.
+        if start_energy <= 0:
+            start_energy = float(battery_capacity_wh)
 
+        best_result = None
+
+        # Memoization keeps the recursive search manageable.
+        memo = {}
+
+        def search(
+            time_used,
+            energy_wh,
+            laps_done,
+            stops_used,
+            stop_plan,
+            soc_trace
+        ):
+            nonlocal best_result
+
+            # ----------------------------------------------------------
+            # First drive as many complete laps as possible before the
+            # next charging decision.
+            # ----------------------------------------------------------
+            local_time = float(time_used)
+            local_energy = float(energy_wh)
+            local_laps = int(laps_done)
+            local_trace = list(soc_trace)
+
+            while True:
+
+                if local_time + lap_time > time_left_min:
+                    break
+
+                if local_energy - energy_per_lap < minimum_battery_wh:
+                    break
+
+                local_time += lap_time
+                local_energy -= energy_per_lap
+                local_laps += 1
+
+                local_trace.append({
+                    "race_time_min": local_time,
+                    "soc": (
+                        local_energy /
+                        battery_capacity_wh
+                    ) * 100.0
+                })
+
+            # ----------------------------------------------------------
+            # Current state is always a valid race result.
+            # ----------------------------------------------------------
+            final_soc = (
+                local_energy /
+                battery_capacity_wh
+            ) * 100.0
+
+            total_charging_time = sum(
+                stop["charging_time_min"]
+                for stop in stop_plan
+            )
+
+            candidate = {
+                "strategy": option["label"],
+                "speed_kmh": option["speed"],
+                "lap_time_min": lap_time,
+                "energy_per_lap_wh": energy_per_lap,
+
+                "total_laps": local_laps,
+                "laps": local_laps,
+
+                "charging_stops": len(stop_plan),
+
+                "total_charging_time_min":
+                    total_charging_time,
+
+                "charging_time":
+                    total_charging_time,
+
+                "final_soc": final_soc,
+                "time_used_min": local_time,
+                "time_used": local_time,
+
+                "stop_plan": list(stop_plan),
+                "soc_trace": list(local_trace),
+            }
+
+            if best_result is None:
+                best_result = candidate
+            else:
+                old_score = (
+                    best_result["total_laps"],
+                    -best_result["total_charging_time_min"],
+                    -best_result["charging_stops"]
+                )
+
+                new_score = (
+                    candidate["total_laps"],
+                    -candidate["total_charging_time_min"],
+                    -candidate["charging_stops"]
+                )
+
+                if new_score > old_score:
+                    best_result = candidate
+
+            # Race finished or maximum stops reached.
+            if local_time >= time_left_min:
+                return
+
+            if stops_used >= max_stops:
+                return
+
+            # Cannot make another lap -> this is a possible pit point.
+            current_soc = (
+                local_energy /
+                battery_capacity_wh
+            ) * 100.0
+
+            # ----------------------------------------------------------
+            # Independently test every target SOC for THIS stop.
+            # ----------------------------------------------------------
+            for target_soc in charge_targets:
+
+                if target_soc <= current_soc + 1.0:
+                    continue
+
+                charge_time = get_charge_time(
+                    current_soc,
+                    target_soc
+                )
+
+                if charge_time <= 0:
+                    continue
+
+                if local_time + charge_time >= time_left_min:
+                    continue
+
+                target_energy = (
+                    battery_capacity_wh *
+                    target_soc / 100.0
+                )
+
+                # Charging must provide enough energy to make at least
+                # one more legal lap.
+                if (
+                    target_energy - energy_per_lap
+                    < minimum_battery_wh
+                ):
+                    continue
+
+                stop = {
+                    "stop_number": stops_used + 1,
+
+                    "after_lap":
+                        current_lap + local_laps,
+
+                    "race_time_min":
+                        local_time,
+
+                    "soc_before":
+                        current_soc,
+
+                    "target_soc":
+                        target_soc,
+
+                    "soc_after":
+                        target_soc,
+
+                    "charging_time_min":
+                        charge_time,
+
+                    "target_energy_wh":
+                        target_energy,
+                }
+
+                new_trace = list(local_trace)
+
+                new_trace.append({
+                    "race_time_min": local_time,
+                    "soc": current_soc
+                })
+
+                new_trace.append({
+                    "race_time_min":
+                        local_time + charge_time,
+                    "soc": target_soc
+                })
+
+                # Quantized memoization key.
+                key = (
+                    round(local_time + charge_time, 1),
+                    round(target_energy, 0),
+                    local_laps,
+                    stops_used + 1
+                )
+
+                previous = memo.get(key)
+
+                if previous is not None:
+                    previous_laps, previous_time = previous
+
+                    if (
+                        previous_laps >= local_laps
+                        and previous_time <=
+                        local_time + charge_time
+                    ):
+                        continue
+
+                memo[key] = (
+                    local_laps,
+                    local_time + charge_time
+                )
+
+                search(
+                    local_time + charge_time,
+                    target_energy,
+                    local_laps,
+                    stops_used + 1,
+                    stop_plan + [stop],
+                    new_trace
+                )
+
+        initial_soc = (
+            start_energy /
+            battery_capacity_wh
+        ) * 100.0
+
+        search(
+            0.0,
+            start_energy,
+            0,
+            0,
+            [],
+            [{
+                "race_time_min": 0.0,
+                "soc": initial_soc
+            }]
+        )
+
+        return best_result
+
+    # ------------------------------------------------------------------
+    # Run the optimizer for every driving strategy.
+    # ------------------------------------------------------------------
+    for option in driving_options:
+
+        result = optimize_driving_option(option)
+
+        if result is not None:
+            strategies.append(result)
+
+    # ------------------------------------------------------------------
+    # Best race result first.
+    # ------------------------------------------------------------------
     strategies.sort(
         key=lambda x: (
             -x["total_laps"],
@@ -347,7 +713,8 @@ def calculate_soc_charging_strategy(
         )
     )
 
-    return strategies
+    return strategies[:top_k]
+
 
 def create_combined_graph(graph_data_list):
     fig, ax = plt.subplots(figsize=(10, 3))

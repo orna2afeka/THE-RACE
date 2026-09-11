@@ -558,10 +558,9 @@ def fmt(value, spec=".0f", missing=None):
 
 
 def _age_text(seconds):
-    """Data age in units a human reads at a glance.
-
-    "Stale · 77585s ago" is a number you have to do arithmetic on before you know
-    whether to worry; "21h 33m ago" is not."""
+    """Data age in units a human reads at a glance."""
+    if seconds is None:
+        return "unknown"
     seconds = int(seconds)
     if seconds < 90:
         return f"{seconds}s"
@@ -1127,11 +1126,15 @@ def _live_metrics_fragment():
     state = ctx["state"]
 
     if not ctx["fresh"]:
-        # Every tile below is from the same stale sample, so say it once here
-        # rather than decorating twenty-three tiles. Without this the page looks
-        # identical to a live one, which is the worst way to read old numbers.
-        st.warning(f":material/warning: Not live \u2014 every reading below is from "
-                   f"the last sample received, {_age_text(ctx['age'])} ago.")
+        if ctx["age"] is None:
+            st.warning(
+                ":material/warning: Not live — no telemetry sample has been received yet."
+            )
+        else:
+            st.warning(
+                f":material/warning: Not live — every reading below is from "
+                f"the last sample received, {_age_text(ctx['age'])} ago."
+            )
 
     for group, metrics in LIVE_METRIC_GROUPS:
         st.markdown(f"##### {group}")
@@ -2036,110 +2039,214 @@ def _strategy_fragment():
 
     render_strategy_selector()
 
-    st.markdown("### :material/battery_charging_full: Recommended Charging Strategy")
+    # ==============================================================
+    # NEW CHARGING STRATEGY ALTERNATIVES
+    # ==============================================================
 
-    # Build the consumption table from the real strategy data
+    st.markdown(
+        "### :material/battery_charging_full: Charging Strategy Alternatives"
+    )
+
+    # Build consumption data from the existing driving strategies
     consumption_table = [
         {
-            'label': s['label'],
-            'lap_time_min': s['lap_time_min'],
-            'energy_wh': s['energy_wh']
+            "label": s["label"],
+            "lap_time_min": s["lap_time_min"],
+            "energy_wh": s["energy_wh"]
         }
         for s in STRATEGIES
     ]
 
-    # Convert the live SOC to available battery energy
-    car_battery_wh = 8550 if not soc else (soc / 100.0) * 8550
+    # Current battery energy
+    car_battery_wh = (
+        8550
+        if not soc
+        else (soc / 100.0) * 8550
+    )
 
     if soc is None or active_lap is None:
-        missing = " or ".join(
-            n for n, v in (
-                ("battery SoC", soc),
-                ("lap count", active_lap)
-            )
-            if v is None
-        )
-
         st.caption(
-            f":orange[Assuming a full pack / lap 0 — no {missing} "
-            f"from the car yet.]"
+            ":orange[No live battery/lap data — "
+            "simulation starts with a full battery and lap 0.]"
         )
 
-    # Run the new SOC-dependent charging calculation
+    # Calculate all complete-race charging alternatives
     charging_strategies = calculate_soc_charging_strategy(
         time_left_min,
         car_battery_wh,
         active_lap or 0,
         consumption_table
     )
-
+   
     if charging_strategies:
 
-        # Results are already sorted:
-        # maximum laps first, then minimum charging time
-        best = charging_strategies[0]
 
-        # --------------------------------------------------------------
-        # Main recommendation
-        # --------------------------------------------------------------
+        # Show the five best complete-race alternatives
+        best_by_strategy = {}
+
+        for strategy in charging_strategies:
+            label = strategy["strategy"]
+
+            if label not in best_by_strategy:
+                best_by_strategy[label] = strategy
+
+        alternatives = list(best_by_strategy.values())
+
+        # ----------------------------------------------------------
+        # Alternatives summary table
+        # ----------------------------------------------------------
+
+        summary_rows = []
+
+        for i, strategy in enumerate(alternatives, start=1):
+            first_stop = strategy["stop_plan"][0] if strategy["stop_plan"] else None
+
+            summary_rows.append({
+                "Plan": f"Plan {i}",
+                "Driving Strategy": strategy["strategy"],
+                "Projected Laps": strategy["total_laps"],
+                "Stops": strategy["charging_stops"],
+                "First Pit SOC (%)": (
+                    round(first_stop["soc_before"], 1)
+                    if first_stop else None
+                ),
+                "First Charge To (%)": (
+                    first_stop["target_soc"]
+                    if first_stop else None
+                ),
+                "Total Charging (min)": round(
+                    strategy["total_charging_time_min"], 1
+                ),
+                "Final SOC (%)": round(
+                    strategy["final_soc"], 1
+                )
+            })
+
+        summary_df = pd.DataFrame(summary_rows)
+
+        st.dataframe(
+            summary_df,
+            width="stretch",
+            hide_index=True
+        )
+
+        # ----------------------------------------------------------
+        # NEW GRAPH - SOC forecast for our alternatives
+        # ----------------------------------------------------------
+
+        st.markdown(
+            "#### :material/show_chart: "
+            "SOC Forecast — Charging Alternatives"
+        )
+
+        fig_new, ax_new = plt.subplots(figsize=(11, 5))
+
+        for i, strategy in enumerate(alternatives, start=1):
+
+            trace = strategy["soc_trace"]
+
+            race_hours = [
+                point["race_time_min"] / 60.0
+                for point in trace
+            ]
+
+            soc_values = [
+                point["soc"]
+                for point in trace
+            ]
+
+            ax_new.plot(
+                race_hours,
+                soc_values,
+                linewidth=2,
+                label=(
+                    f"Plan {i} | "
+                    f"{strategy['strategy']} | "
+                    f"{strategy['charging_stops']} stops"
+                )
+            )
+
+        ax_new.set_xlabel("Race Time (hours)")
+        ax_new.set_ylabel("Battery SOC (%)")
+        ax_new.set_title(
+            "SOC Forecast — Complete Race Alternatives"
+        )
+
+        ax_new.set_ylim(0, 100)
+        ax_new.set_xlim(0, time_left_min / 60.0)
+
+        ax_new.grid(True, alpha=0.3)
+        ax_new.legend(fontsize=8)
+
+        st.pyplot(fig_new)
+        plt.close(fig_new)
+
+        # ----------------------------------------------------------
+        # Select one complete race plan
+        # ----------------------------------------------------------
+
+        st.markdown("#### Inspect Race Plan")
+
+        selected_index = st.selectbox(
+            "Choose alternative",
+            options=list(range(len(alternatives))),
+            format_func=lambda i: (
+                f"Plan {i + 1} — "
+                f"{alternatives[i]['strategy']} | "
+                f"{alternatives[i]['charging_stops']} stops | "
+                f"{alternatives[i]['total_laps']} laps"
+            )
+        )
+
+        selected = alternatives[selected_index]
 
         c1, c2, c3, c4 = st.columns(4)
 
         c1.metric(
-            "Strategy",
-            best["strategy"]
+            "Projected Laps",
+            selected["total_laps"]
         )
 
         c2.metric(
-            "Projected Laps",
-            best["total_laps"]
+            "Charging Stops",
+            selected["charging_stops"]
         )
 
         c3.metric(
-            "Charging Stops",
-            best["charging_stops"]
+            "Total Charging Time",
+            f"{selected['total_charging_time_min']:.1f} min"
         )
 
         c4.metric(
-            "Total Charging Time",
-            f"{best['total_charging_time_min']:.1f} min"
+            "Final SOC",
+            f"{selected['final_soc']:.1f}%"
         )
 
-        # --------------------------------------------------------------
-        # Charging stop plan
-        # --------------------------------------------------------------
+        # ----------------------------------------------------------
+        # Full charging plan for selected alternative
+        # ----------------------------------------------------------
 
-        st.markdown("#### :material/pit_stop: Charging Stop Plan")
+        st.markdown(
+            "#### :material/pit_stop: Full Race Stop Plan"
+        )
 
-        if best["stop_plan"]:
+        if selected["stop_plan"]:
 
             stop_rows = []
 
-            previous_race_time = 0.0
-
-            for stop in best["stop_plan"]:
-
-                drive_time = (
-                    stop["race_time_min"]
-                    - previous_race_time
-                )
+            for stop in selected["stop_plan"]:
 
                 stop_rows.append({
                     "Stop": stop["stop_number"],
                     "After Lap": stop["after_lap"],
-                    "Drive Until Stop (min)": round(drive_time, 1),
-                    "Race Time (min)": round(stop["race_time_min"], 1),
-                    "SOC Before (%)": round(stop["soc_before"], 1),
-                    "Charge To (%)": stop["target_soc"],
-                    "Charge For (min)": round(
+                    "SOC In (%)": round(
+                        stop["soc_before"], 1
+                    ),
+                    "SOC Out (%)": stop["target_soc"],
+                    "Charge Time (min)": round(
                         stop["charging_time_min"], 1
                     )
                 })
-
-                previous_race_time = (
-                    stop["race_time_min"]
-                    + stop["charging_time_min"]
-                )
 
             stop_df = pd.DataFrame(stop_rows)
 
@@ -2149,31 +2256,19 @@ def _strategy_fragment():
                 hide_index=True
             )
 
-            # Highlight the next stop separately
-            next_stop = best["stop_plan"][0]
-
-            st.info(
-                f"Next recommended stop: after lap "
-                f"**{next_stop['after_lap']}** — "
-                f"charge from **{next_stop['soc_before']:.1f}%** "
-                f"to **{next_stop['target_soc']}%** for approximately "
-                f"**{next_stop['charging_time_min']:.1f} minutes**.",
-                icon=":material/battery_charging_full:"
-            )
-
         else:
+
             st.success(
-                "No charging stop is currently required within the "
-                "remaining race time.",
-                icon=":material/check_circle:"
+                "This alternative requires no charging stop."
             )
 
     else:
+
         st.warning(
-            "No valid charging strategy could be calculated.",
-            icon=":material/warning:"
+            "No valid charging alternatives were found."
         )
 
+    
 
     # ==============================================================
     # EXISTING STRATEGY MATRIX
