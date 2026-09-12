@@ -67,6 +67,7 @@ from modules.lap_tracker import LapTracker
 from modules.charge_detector import ChargeDetector
 from modules.lap_command import LapCommandInbox, StrategyCommandInbox
 from modules.vehicle_inputs import VehicleInputs
+from modules.regen_light import RegenLight
 # Solar charge current over USB (Yoctopuce Yocto-Amp). Importing this is safe
 # with no sensor fitted and even with the yoctopuce package absent — the module
 # degrades to reporting "no_library" rather than failing the import, so the HUD
@@ -247,6 +248,13 @@ class SmartCANWorker(CANWorker):
         # Solar charge current. Constructed here and started with the CAN loop;
         # its own daemon thread does the blocking USB reads and reconnects by
         # itself when the cable vibrates loose, so this loop never waits on it.
+        # Brake light, driven by regenerative braking. The ESC reports negative
+        # power when it is recovering energy, which means the car is slowing --
+        # and nothing else on the car knows that, because the brake pedal switch
+        # does not move when the driver simply lifts and lets regen do the work.
+        # See modules/regen_light.py, and READ ITS ELECTRICAL NOTE before wiring:
+        # a GPIO pin switches a MOSFET, it does not drive a lamp.
+        self.regen_light = RegenLight()
         self.solar = SolarCurrentReader()
         self._last_solar_poll = 0.0
         self._last_solar_status = None
@@ -362,6 +370,9 @@ class SmartCANWorker(CANWorker):
             ("lap inbox", self.lap_inbox.stop),
             ("strategy inbox", self.strategy_inbox.stop),
             ("vehicle inputs", self.vehicle_inputs.stop),
+            # Before the bus goes down, so the lamp is explicitly extinguished
+            # rather than left showing whatever it was doing when we quit.
+            ("regen brake light", self.regen_light.stop),
             ("solar sensor", self.solar.stop),
             ("CAN bus(es)", self._shutdown_bus),
         ):
@@ -413,6 +424,9 @@ class SmartCANWorker(CANWorker):
         self.vehicle_inputs.start()
         print(f"🔌 {self.vehicle_inputs.status()}")
 
+        self.regen_light.start()
+        print(f"🛑 {self.regen_light.status()}")
+
         if self.profiles:
             print(f"🎯 {len(self.profiles)} speed profile(s) loaded; "
                   f"active: {self.active_strategy}")
@@ -436,6 +450,9 @@ class SmartCANWorker(CANWorker):
             self._sample_lap_gps()
             self._poll_vehicle_inputs()
             self._poll_solar()
+            # A tick, not a poll: the lamp's minimum-on hold and its stale
+            # release are timers, and a quiet bus is exactly when they matter.
+            self.regen_light.tick()
             self._tick_profile()
             self._publish_gps()
             self._save_lap_checkpoint()
@@ -1285,6 +1302,11 @@ class SmartCANWorker(CANWorker):
                 self._last_mms_rpm = float(mms_data["mms_rpm"])
             if "mms_power_W" in mms_data:
                 self.laps.update_energy(mms_data["mms_power_W"])
+                # Negative power is the car slowing itself down, so the brake
+                # light comes on. Driven from the same frame that feeds the
+                # energy integrator, so the lamp can never disagree with the
+                # regen figure the pit is reading.
+                self.regen_light.update(mms_data["mms_power_W"])
             # The controller broadcasts its own TRIP counter (0x620). Prefer it
             # over our integration: it comes from the controller's configured
             # wheel size rather than our unmeasured tire constant, and being a

@@ -102,6 +102,22 @@ cd ~/Desktop/THE-RACE-main && git pull
 
 ## 2. At the circuit, before the session
 
+### ☐ Check the regen brake light
+
+The brake light on GPIO 17 comes on whenever the motor is regenerating (below
+−50 W), because regen slows the car and nothing else on it knows that — the
+pedal switch does not move when the driver simply lifts. Scrutineering will
+look at this.
+
+Watch for `🛑 regen brake light: GPIO 17 …` in the HUD's boot log. If it says
+**NOT DRIVEN**, the pin was not claimed and no lamp is being switched, however
+good the wiring looks.
+
+> ⚠️ **A GPIO pin cannot drive a lamp.** 3.3 V, ~16 mA. It switches a
+> logic-level MOSFET or an opto-isolated SSR, with a 10k pull-down on the gate
+> so the lamp stays off while the Pi boots. Circuit is in
+> `SolarRace_OS/modules/regen_light.py`.
+
 ### ☐ Put the pit on its own network
 
 Campus and venue WiFi use client isolation, so two devices on the same SSID

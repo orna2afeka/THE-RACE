@@ -282,7 +282,8 @@ THE RACE/                             # ← repo root
 │   │   ├── solar_current.py          # ☀ MPPT→battery current, Yocto-Amp on USB
 │   │   ├── lap_tracker.py            # Lap/sector detection from GPS + wheel distance
 │   │   ├── lap_command.py            # Manual lap triggers / pit commands
-│   │   └── vehicle_inputs.py         # Throttle, brake, and switch inputs
+│   │   ├── vehicle_inputs.py         # Throttle, brake, and switch inputs
+│   │   └── regen_light.py           # 🛑 Brake light on GPIO 17, driven by regen (READ its electrical note)
 │   ├── cloud/
 │   │   ├── firebase_client.py        # Pushes telemetry to the Realtime DB (throttled)
 │   │   └── serviceAccountKey.json    # 🔒 Firebase admin key — SEE SECURITY NOTE BELOW
@@ -379,6 +380,7 @@ Almost everything car-side is centralised in **`SolarRace_OS/config.py`**:
 | `THROTTLE_GPIO_*` | The throttle report: whether the Pi asks for it at all, which wire and ESC address, which reply bank, which GPIO, how fast, and how often the request is re-armed. **This is the only place the car transmits to the motor controller** — see the note in the file. |
 | `CAN_CANDIDATES` | Connections tried in order: CAN HAT (`socketcan:can0`) first, then a USB-to-CAN adapter. First that opens wins. |
 | `BMS_POLL_IDS` / `BMS_POLL_BYTE` / `BMS_POLL_INTERVAL_S` | Which BMS frames to request, the query byte (`0x5A`), and how often (1 Hz). |
+| `modules/regen_light.py` | Brake-light pin and thresholds. `REGEN_LIGHT_PIN` (GPIO 17), the on/off watt hysteresis, and the minimum flash length. ⚠️ A GPIO pin CANNOT drive a lamp — it switches a MOSFET. The module docstring has the circuit. |
 | `modules/solar_current.py` | Solar sensor tunables live in the module, not here — same as `gps_reader.py`. Poll rate, rescan interval, plausibility ceiling, and `target_serial` (pin this the moment a SECOND Yoctopuce device joins the car). |
 | `efficiency.py` (repo root) | Not in `config.py`, because the **pit reads it too**: the pedal's millivolt calibration and the Eco / Normal / Power boundaries. ⚠️ Every number in it is still a placeholder — nothing has been measured on the car. |
 | `SIM_LOG_PATH` | Recorded log replayed when no CAN bus is found. |
