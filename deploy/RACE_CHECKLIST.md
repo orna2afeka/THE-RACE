@@ -259,12 +259,66 @@ option, `python tools/generate_profiles.py` rebuilds the synthetic five from
 
 ---
 
+## 5b. The pit wall (big screen)
+
+Double-click `Start Pit Wall.bat`, or `python tools/pit_wall.py`. It serves
+http://localhost:8503 and prints the LAN addresses a TV can open.
+
+It is a **second screen, not a second dashboard**: no controls, nothing to
+click, and it reads `telemetry.db` read-only on its own thread, so it cannot
+slow the dashboard down the way another Streamlit tab would.
+
+### ☐ Set the TV up before the car exists
+
+`python tools/pit_wall.py --demo` drives the page from `profiles/base_210s.csv`
+instead of the database - a car that is not there, lapping Zolder. Use it to sort
+out the TV, the mount, the viewing angle and the LAN without waiting for a
+session. It opens no database at all, so it works on any laptop.
+
+The page says **DEMO — NOT LIVE DATA** in amber the whole time it is running.
+If you ever see that badge during a race, somebody started the wrong one.
+
+### ☐ The TV can reach it
+
+The console window lists addresses like `http://192.168.1.24:8503/`. If the TV
+cannot open one, the venue WiFi is isolating clients - put both on the pit's own
+hotspot. This is the same failure that stops a second laptop reaching the
+dashboard, and it has nothing to do with this program.
+
+### ☐ The page says LIVE, not NO SIGNAL
+
+Top right. `LIVE · 0.8s` means the car's last reading is 0.8 s old. Anything
+over 20 s dims the whole screen and says `NO SIGNAL · 32s` - visible from
+across the garage without reading a word.
+
+### ☐ Nothing on it is a dash that should not be
+
+A dash means "the car is not sending this", never zero. If a value you expect is
+dashed, the car stopped reporting that metric - the wall will not draw the last
+value it saw as though it were current. Startup also prints any field this
+database cannot supply at all, which is a bug in the wall, not in the car.
+
+### ☐ The lap delta names a strategy
+
+Bottom of the LAP card: `Last 3:29.4 · -0.6 s vs base_210s`. If it says "no
+strategy set", the car has not reported `active_strategy` and there is nothing
+to compare a lap against - the wall shows no target rather than inventing one.
+
+### ☐ Rebuild the page after changing a profile
+
+`wall.html` bakes in each profile's lap time for the delta. After writing new
+profiles at the track, run `python tools/build_zolder_animation.py` and reload
+the TV. The server does not need restarting.
+
+---
+
 ## 6. Quick reference
 
 | Thing | Where |
 |---|---|
 | Pit dashboard | `Start Pit Dashboard.bat` → http://localhost:8501 |
 | Profile builder | `Build Speed Profiles.bat` → http://localhost:8502 |
+| Pit wall (big screen) | `python tools/pit_wall.py` → http://localhost:8503 |
 | Spectator page (public) | https://orna2afeka.github.io/THE-RACE/ |
 | Presentation map | `docs/zolder_animation.html` (self-contained, works offline) |
 | Car logs | `~/hud-logs/hud.log` on the Pi |

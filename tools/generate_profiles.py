@@ -106,6 +106,46 @@ def find_corners(dist, speed, section):
     return corners
 
 
+# An acceleration is treated as a spreadsheet artifact, not as data, when it is
+# both large and ISOLATED — far bigger than the rows either side of it.
+#
+# Pit_Dashboard/210s.xlsx was assembled block by block, and five of the blocks
+# were dropped in without matching the speed at the join. At 1190 m the baseline
+# coasts up the hill at 36.7 km/h and the next row is a pasted "cruise at 90.0
+# km/h, a = 0.00" block: 26.05 m/s², two and a half g, in ten metres. The same
+# happens at 710, 2400, 2500 and 3000 m.
+#
+# The test is the neighbours, because that is what tells a join from a corner.
+# Real braking ramps: the rows around the hardest one are also braking hard. A
+# join is a single spike between two quiet rows — the five above are 13-26 m/s²
+# next to neighbours of at most 1.00 m/s².
+SPIKE_FLOOR_MS2 = 5.0     # below this, nothing is worth questioning
+SPIKE_RATIO = 3.0         # ... and it must dwarf both neighbours by this much
+
+
+def _accelerations(dist, speed):
+    """[(index, distance, a)] from v² = u² + 2as, one per interval."""
+    out = []
+    for i in range(1, len(dist)):
+        ds = dist[i] - dist[i - 1]
+        if ds > 0:
+            out.append((i, dist[i], (speed[i] ** 2 - speed[i - 1] ** 2) / (2 * ds)))
+    return out
+
+
+def find_discontinuities(dist, speed):
+    """Rows where the baseline steps rather than accelerates. See the note above."""
+    acc = _accelerations(dist, speed)
+    bad = []
+    for n, (i, d, a) in enumerate(acc):
+        prev = abs(acc[n - 1][2]) if n else 0.0
+        nxt = abs(acc[n + 1][2]) if n + 1 < len(acc) else 0.0
+        neighbour = max(prev, nxt)
+        if abs(a) > SPIKE_FLOOR_MS2 and abs(a) > SPIKE_RATIO * neighbour:
+            bad.append({"i": i, "d": d, "a": a, "neighbour": neighbour})
+    return bad
+
+
 def peak_accel_decel(dist, speed):
     """(max acceleration, max deceleration) in the baseline, both positive.
 
@@ -113,14 +153,20 @@ def peak_accel_decel(dist, speed):
     for harder braking or sharper acceleration than this car has already been
     shown to do. "No worse than the baseline" is a guarantee we can actually
     justify; a made-up number is not.
+
+    !!️ The guarantee is only worth anything if the baseline is clean. It is not:
+    the five join artifacts above used to set these limits themselves, so the
+    generator was calibrating "no harder than the baseline" against 26.05 and
+    20.31 m/s² and every profile it wrote passed its own safety check while
+    demanding two g of braking at four corners. A driver cannot follow that — the
+    HUD would call them slow at every corner for driving as hard as the car can.
+    Excluding the five artifacts, the baseline's real limits are ±4.56 m/s².
     """
     up = down = 0.0
-    for i in range(1, len(dist)):
-        ds = dist[i] - dist[i - 1]
-        if ds <= 0:
+    skip = {b["i"] for b in find_discontinuities(dist, speed)}
+    for i, d, a in _accelerations(dist, speed):
+        if i in skip:
             continue
-        # v² = u² + 2as  ->  a = (v² - u²) / 2s
-        a = (speed[i] ** 2 - speed[i - 1] ** 2) / (2 * ds)
         up = max(up, a)
         down = max(down, -a)
     return (up if up > 0 else 2.0), (down if down > 0 else 2.0)
@@ -284,7 +330,21 @@ def main():
 
     print(f"baseline: {os.path.basename(args.baseline)}  "
           f"{len(dist)} points, {dist[-1]:.0f} m, {base_time:.2f} s")
-    print(f"limits taken from the baseline: accel {accel_limit:.2f}, "
+
+    # Say it out loud every run. These are defects in the team's spreadsheet,
+    # and the generator works around them rather than fixing them at source —
+    # so the only place anyone will ever find out is here.
+    bad = find_discontinuities(dist, speed)
+    if bad:
+        print(f"\n!! {len(bad)} discontinuity/ies in the baseline "
+              f"(block joins, not driving) - excluded from the limits:")
+        for b in bad:
+            print(f"    {b['d']:>5.0f} m   a = {b['a']:+7.2f} m/s²   "
+                  f"(neighbouring rows at most {b['neighbour']:.2f})")
+        print("    The braking/acceleration passes below smooth these out, so the")
+        print("    generated profiles are drivable even though the baseline is not.")
+
+    print(f"\nlimits taken from the baseline: accel {accel_limit:.2f}, "
           f"brake {brake_limit:.2f} m/s²")
     print(f"\n{len(corners)} corner(s) detected — apex speeds are held fixed:")
     for n, c in enumerate(corners, 1):

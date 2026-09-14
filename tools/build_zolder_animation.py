@@ -77,6 +77,13 @@ from constants import SECTION_NAMES                           # noqa: E402
 _SITE = os.path.join(_REPO, "docs")
 OUT_PATH = os.path.join(_SITE, "zolder_animation.html")
 SPECTATOR_PATH = os.path.join(_SITE, "index.html")
+
+# The pit wall is NOT in docs/. docs/ is what GitHub Pages publishes, and this
+# page carries pack voltage, temperatures and true GPS -- everything the
+# spectator page is starved of precisely because that one is public. It lives
+# beside the dashboard and is served by tools/pit_wall.py on the pit LAN only.
+WALL_PATH = os.path.join(_REPO, "Pit_Dashboard", "wall.html")
+PROFILES_DIR = os.path.join(_REPO, "profiles")
 PROFILE_PATH = os.path.join(_REPO, "profiles", "base_210s.csv")
 
 BOUNDARIES = [SECTIONS_INFO[s]["range"][0] for s in sorted(SECTIONS_INFO)]
@@ -173,6 +180,34 @@ def _read_profile():
     if thinned[-1][0] < rows[-1][0]:
         thinned.append(rows[-1])
     return thinned
+
+
+def _all_profile_lap_seconds():
+    """{key: modelled lap seconds} for every profile in profiles/.
+
+    Read from the CSVs rather than restated here, so the pit wall's "target"
+    and the file the car is actually following can never drift apart. The car
+    names its choice in `active_strategy`, which is the same key as the
+    filename, so the wall looks the target up by that name and shows nothing
+    at all if the car is following something this build has never seen.
+    """
+    out = {}
+    if not os.path.isdir(PROFILES_DIR):
+        return out
+    for name in sorted(os.listdir(PROFILES_DIR)):
+        if not name.endswith(".csv"):
+            continue
+        path = os.path.join(PROFILES_DIR, name)
+        last = None
+        try:
+            with open(path, encoding="utf-8-sig") as fh:
+                for row in csv.DictReader(fh):
+                    last = float(row["Time(s)"])
+        except (OSError, KeyError, ValueError):
+            continue
+        if last:
+            out[name[:-4]] = round(last, 2)
+    return out
 
 
 def _profile_lap_seconds():
@@ -950,6 +985,16 @@ __BASE_CSS__
   .pill.live .dot { animation: pulse 1.6s ease-in-out infinite; }
   .pill.stale { color: var(--warn); border-color: var(--warn); }
   .pill.off { color: var(--bad); border-color: var(--bad); }
+  /* Loud on purpose. A pit wall showing invented numbers without saying so is
+     worse than a blank one: somebody walks past it mid-race and reads it as
+     real. Filled, not outlined, so it cannot be mistaken for a status pill. */
+  .pill.demo { color: #0b1220; background: var(--warn); border-color: var(--warn);
+               font-weight: 700; }
+  /* REQUIRED, and not redundant. The browser hides [hidden] with a USER-AGENT
+     rule, and any author rule beats it -- so `.pill { display: inline-flex }`
+     above silently defeated el("demo").hidden and the DEMO badge showed on the
+     live wall too. Exactly the failure the badge exists to prevent. */
+  .pill[hidden] { display: none !important; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.25; } }
   .hero { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
   .hero .value { font-size: 3.1rem; line-height: 1;
@@ -1420,6 +1465,441 @@ requestAnimationFrame(frame);
 """
 
 
+# --------------------------------------------------------------------------- #
+# The pit wall
+# --------------------------------------------------------------------------- #
+# A TV in the garage, read from across it. Three things drive every decision
+# here and none of them apply to the other two pages:
+#
+#   IT IS READ FROM FOUR METRES AWAY.  Every size is in vw/clamp(), not px, so
+#   the same file fills a 1080p monitor and a 4K panel. The spectator page uses
+#   fixed px with one breakpoint, which is why it needs browser zoom on a TV.
+#
+#   NOBODY WILL BE TOUCHING IT.  No controls, no tabs, no hover. It reconnects
+#   by itself and it never shows a modal anyone would have to dismiss.
+#
+#   A WRONG NUMBER IS WORSE THAN NO NUMBER.  The pit makes calls off this. Every
+#   field that was carried forward from an earlier reading rather than sent now
+#   is rendered as a dash, and the whole panel dims when the car goes quiet, so
+#   nothing on screen can be mistaken for current when it is not.
+WALL_TEMPLATE = r"""<!DOCTYPE html>
+__BANNER__
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pit Wall — Afeka Solar Racing</title>
+__ICON__
+__FONT_LINK__
+<style>
+__BASE_CSS__
+  /* Everything scales off the viewport so one file fits any panel. */
+  html, body { height: 100%; overflow: hidden; }
+  #stage {
+    display: grid; grid-template-columns: 1fr minmax(300px, 27vw);
+    gap: 0.9vw; padding: 0.9vw; height: 100vh;
+  }
+  /* min-height:0 on both columns and on the map itself. Grid and flex items
+     default to min-height:auto, which refuses to shrink below their content --
+     and the map's content is a 1617x1614 SVG, so without these three the track
+     runs off the bottom of the screen and takes the sector legend, the lap
+     strip and the footer with it. */
+  #left { display: flex; flex-direction: column; gap: 0.7vw;
+          min-width: 0; min-height: 0; }
+  /* A GRID, not a flex column. As a flex column the cards were free to shrink
+     below their own content (min-height:0 is what lets the map fit), and the
+     overflow then painted straight over the card below -- "Target 65 km/h" and
+     the POWER/SOLAR row disappeared under their neighbours. Explicit rows plus
+     overflow:hidden means a card can only ever clip its own content. */
+  #rail { display: grid; gap: 0.7vw; min-width: 0; min-height: 0;
+          grid-template-rows: auto auto auto auto minmax(0, 1fr); }
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 0.6vw; padding: 0.8vw 1vw; min-height: 0;
+    overflow: hidden;
+  }
+  .card.grow { display: flex; flex-direction: column; min-height: 0; }
+  /* -- top strip ------------------------------------------------------- */
+  #top { display: flex; align-items: center; gap: 1.2vw; flex: 0 0 auto; }
+  #top h1 { font-size: clamp(14px, 1.5vw, 34px); margin: 0; }
+  #top .spacer { flex: 1 1 auto; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 0.5vw;
+    border-radius: 999px; padding: 0.35vw 1vw;
+    font-size: clamp(10px, 0.85vw, 20px);
+    letter-spacing: 0.2vw; text-transform: uppercase; font-weight: 700;
+    border: 1px solid var(--line); color: var(--dim); white-space: nowrap;
+  }
+  .pill .dot { width: 0.65vw; height: 0.65vw; min-width: 6px; min-height: 6px;
+               border-radius: 50%; background: currentColor; }
+  .pill.live { color: var(--good); border-color: var(--good); }
+  .pill.live .dot { animation: pulse 1.6s ease-in-out infinite; }
+  .pill.stale { color: var(--warn); border-color: var(--warn); }
+  .pill.off { color: var(--bad); border-color: var(--bad); }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.25; } }
+  /* -- the numbers ----------------------------------------------------- */
+  .label { font-size: clamp(9px, min(0.72vw, 1.5vh), 16px);
+           letter-spacing: 0.18vw; }
+  .sub { font-size: clamp(10px, min(0.85vw, 1.7vh), 19px); }
+  .huge {
+    font-size: clamp(34px, min(7.2vw, 11vh), 170px); font-weight: 700;
+    line-height: 0.95;
+    font-variant-numeric: tabular-nums; letter-spacing: -0.02em;
+  }
+  .big {
+    font-size: clamp(22px, min(3.4vw, 6vh), 80px); font-weight: 700;
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+  }
+  .mid {
+    font-size: clamp(14px, min(1.7vw, 3.2vh), 40px); font-weight: 700;
+    line-height: 1.1;
+    font-variant-numeric: tabular-nums;
+  }
+  .unit { font-size: clamp(10px, min(1vw, 2vh), 22px); margin-left: 0.4vw; }
+  .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 0.7vw; }
+  .quad { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5vw 1vw; }
+  .accent { color: var(--accent); }
+  .good { color: var(--good); } .warn { color: var(--warn); }
+  .bad  { color: var(--bad); }
+  /* A value that is not current is never drawn as if it were. */
+  .stale-val { color: var(--dim); opacity: 0.45; }
+  /* -- battery bar ----------------------------------------------------- */
+  .bar { position: relative; height: 0.9vw; min-height: 8px; border-radius: 0.45vw;
+         background: #0f172a; overflow: hidden; margin-top: 0.5vw; }
+  .bar > i { display: block; height: 100%; width: 0%; background: var(--good);
+             transition: width 0.4s ease, background 0.4s ease; }
+  /* -- lap list -------------------------------------------------------- */
+  /* flex:1 1 auto so the list fills its card. Without it the list is only as
+     tall as flex-shrink leaves it, the trim below measures against that
+     smaller box, and rows get dropped while visible space sits empty under
+     them. */
+  #laps { flex: 1 1 auto; overflow: hidden; margin-top: 0.4vw; min-height: 0; }
+  .lap-row {
+    display: grid; grid-template-columns: auto 1fr auto;
+    gap: 0.6vw; align-items: baseline;
+    font-size: clamp(11px, min(1.15vw, 2.1vh), 26px);
+    font-variant-numeric: tabular-nums;
+    padding: 0.18vw 0; border-bottom: 1px solid rgba(51, 65, 85, 0.45);
+  }
+  .lap-row b { color: var(--dim); font-weight: 600; }
+  .lap-row .t { font-weight: 700; }
+  /* -- faults ---------------------------------------------------------- */
+  #faults {
+    display: none; flex: 0 0 auto; background: rgba(248, 113, 113, 0.14);
+    border: 1px solid var(--bad); color: #fecaca; border-radius: 0.5vw;
+    padding: 0.5vw 1vw; font-weight: 700; letter-spacing: 0.12vw;
+    font-size: clamp(11px, 1.05vw, 24px);
+  }
+  #faults.show { display: block; }
+  /* The whole screen fades when the car stops talking: visible from across
+     the garage without anyone having to read a word of it. */
+  #stage.dead #left, #stage.dead #rail { opacity: 0.34; filter: grayscale(0.75); }
+  #stage.dead { transition: none; }
+  #map { flex: 1 1 auto; min-height: 0; }
+  #legend { font-size: clamp(9px, 0.78vw, 17px); right: 1vw; bottom: 1vw;
+            padding: 0.6vw 1vw; }
+  #foot { flex: 0 0 auto; display: flex; gap: 1.2vw; align-items: baseline;
+          font-size: clamp(10px, 0.85vw, 19px); color: var(--dim); }
+  #foot .spacer { flex: 1 1 auto; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="left">
+    <div id="top">
+      <div>
+        <div class="eyebrow">Afeka Solar &amp; Electric Racing</div>
+        <h1>Pit <span>Wall</span></h1>
+      </div>
+      <div class="spacer"></div>
+      <div id="demo" class="pill demo" hidden>Demo &mdash; not live data</div>
+      <div id="race" class="pill">Race <span id="raceclock">&mdash;</span></div>
+      <div id="status" class="pill off"><span class="dot"></span><span id="statustext">Connecting</span></div>
+    </div>
+    <div id="faults"></div>
+    <div class="card grow" id="map">
+      __MAP_SVG__
+      <div id="legend"></div>
+    </div>
+    <div id="progress"><div id="progress-mark"></div></div>
+    <div id="foot">
+      <span>Next: <b id="nextcorner" style="color:var(--text)">&mdash;</b></span>
+      <span>Sector <b id="sector" style="color:var(--text)">&mdash;</b></span>
+      <span class="spacer"></span>
+      <span id="src">&mdash;</span>
+    </div>
+  </div>
+
+  <div id="rail">
+    <div class="card">
+      <div class="label">Speed</div>
+      <div class="huge"><span id="speed">&mdash;</span><span class="unit accent">KM/H</span></div>
+      <div class="sub">Target <span id="target">&mdash;</span> km/h</div>
+    </div>
+
+    <div class="card">
+      <div class="pair">
+        <div>
+          <div class="label">Lap</div>
+          <div class="big accent" id="lap">&mdash;</div>
+        </div>
+        <div>
+          <div class="label">This lap</div>
+          <div class="big" id="laptime">&mdash;</div>
+        </div>
+      </div>
+      <div class="sub">Last <span id="lastlap">&mdash;</span> &middot; <span id="lapdelta">&mdash;</span></div>
+    </div>
+
+    <div class="card">
+      <div class="label">Battery</div>
+      <div class="big" id="soc">&mdash;<span class="unit">%</span></div>
+      <div class="bar"><i id="socbar"></i></div>
+      <div class="quad" style="margin-top:0.6vw">
+        <div><div class="label">Pack</div><div class="mid" id="packv">&mdash;</div></div>
+        <div><div class="label">Current</div><div class="mid" id="packa">&mdash;</div></div>
+        <div><div class="label">Power</div><div class="mid" id="power">&mdash;</div></div>
+        <div><div class="label">Solar</div><div class="mid" id="solar">&mdash;</div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="quad">
+        <div><div class="label">Motor temp</div><div class="mid" id="mtemp">&mdash;</div></div>
+        <div><div class="label">Pack temp</div><div class="mid" id="btemp">&mdash;</div></div>
+        <div><div class="label">Race energy</div><div class="mid" id="energy">&mdash;</div></div>
+        <div><div class="label">Regen</div><div class="mid" id="regen">&mdash;</div></div>
+      </div>
+    </div>
+
+    <div class="card grow">
+      <div class="label">Completed laps <span id="strategy" style="float:right"></span></div>
+      <div id="laps"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const DATA = __DATA__;
+const CONFIG = __CONFIG__;
+__MAP_JS__
+
+// ── the feed ───────────────────────────────────────────────────────────── //
+// Plain polling, not SSE. The spectator page streams from Firebase because it
+// is talking to the internet across the world; this is a LAN hop to a process
+// on the next table, where a 1 s poll costs 0.3 ms of SQLite and cannot get
+// stuck in a half-open stream that needs a human to notice and reload.
+let snap = null;          // the last payload that arrived
+let snapAt = 0;           // performance.now() when it did
+let failures = 0;
+
+function poll() {
+  fetch("/live.json", { cache: "no-store" })
+    .then(r => r.ok ? r.json() : Promise.reject(r.status))
+    .then(j => { snap = j; snapAt = performance.now(); failures = 0; })
+    .catch(() => { failures++; })
+    .finally(() => setTimeout(poll, CONFIG.pollMs));
+}
+
+// Age is measured from the SERVER's own clock difference, plus however long
+// ago this browser received it. A TV with a wrong clock -- which is most TVs --
+// therefore cannot make a live car look stale or a dead one look live.
+function ageOf(s) {
+  if (!s || s.device_ts == null || s.served_ts == null) return null;
+  return (s.served_ts - s.device_ts) + (performance.now() - snapAt) / 1000;
+}
+
+// A field the car is no longer sending. carried_ts only holds fields that came
+// from last_known instead of the newest row, so this is exactly "the car has
+// gone quiet about this one thing" -- a dead sensor on an otherwise live car.
+function isCarried(s, name) {
+  const t = s && s.carried_ts ? s.carried_ts[name] : undefined;
+  if (t == null) return false;
+  return (s.device_ts - t) > CONFIG.staleAfterS;
+}
+
+function num(v) {
+  const n = typeof v === "number" ? v : parseFloat(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+// One place decides whether a value may be drawn, so no tile can forget.
+function put(id, s, field, fmt) {
+  const node = el(id);
+  if (!node) return null;
+  const v = isCarried(s, field) ? null : num(s ? s[field] : null);
+  node.textContent = v == null ? "—" : fmt(v);
+  node.classList.toggle("stale-val", v == null);
+  return v;
+}
+
+function fmtLapTime(sec) {
+  if (sec == null || !isFinite(sec)) return "—";
+  const m = Math.floor(sec / 60), r = sec - m * 60;
+  return m + ":" + (r < 10 ? "0" : "") + r.toFixed(1);
+}
+
+function fmtDelta(d) {
+  if (d == null) return "—";
+  return (d >= 0 ? "+" : "−") + Math.abs(d).toFixed(1) + " s";
+}
+
+// ── painting ───────────────────────────────────────────────────────────── //
+function render() {
+  const s = snap;
+  const age = ageOf(s);
+  const dead = s == null || age == null || age > CONFIG.staleAfterS;
+  el("stage").classList.toggle("dead", dead);
+
+  const pill = el("status");
+  pill.className = "pill " + (dead ? (failures > 2 ? "off" : "stale") : "live");
+  el("statustext").textContent =
+    s == null        ? "Connecting"
+    : failures > 2   ? "Pit wall server unreachable"
+    : age == null    ? "No reading"
+    : dead           ? "No signal · " + Math.round(age) + "s"
+                     : "Live · " + age.toFixed(1) + "s";
+
+  if (!s) return;
+  el("demo").hidden = !s.demo;
+
+  // -- speed, battery, power ------------------------------------------- //
+  put("speed",  s, "mms_vehicle_speed_kmh", v => Math.round(v));
+  put("target", s, "target_speed_kmh",      v => Math.round(v));
+  const soc = put("soc", s, "bms_soc_percent", v => Math.round(v) + "%");
+  const bar = el("socbar");
+  bar.style.width = (soc == null ? 0 : Math.max(0, Math.min(100, soc))) + "%";
+  bar.style.background = soc == null ? "var(--line)"
+                       : soc < 20 ? "var(--bad)"
+                       : soc < 40 ? "var(--warn)" : "var(--good)";
+  put("packv", s, "bms_voltage_V",    v => v.toFixed(1) + " V");
+  put("packa", s, "bms_current_A",    v => v.toFixed(1) + " A");
+  put("power", s, "mms_power_W",      v => (v / 1000).toFixed(2) + " kW");
+  put("solar", s, "solar_current_A",  v => v.toFixed(1) + " A");
+  put("mtemp", s, "mms_temperature_C", v => Math.round(v) + "°C");
+  put("btemp", s, "battery_temp_C",    v => Math.round(v) + "°C");
+  put("energy", s, "total_race_energy", v => v.toFixed(2) + " kWh");
+  put("regen",  s, "regen_energy",      v => v.toFixed(2) + " kWh");
+
+  // -- lap -------------------------------------------------------------- //
+  const lap = num(s.calculated_lap);
+  el("lap").textContent = lap == null ? "—" : Math.round(lap);
+
+  // The running lap clock advances on the CAR's timeline: device_ts is when
+  // the car sampled, lap_started_ts when it crossed the line, and the wall
+  // adds only the time since this browser received the payload. A stopped feed
+  // therefore freezes the clock instead of running it up while the car is
+  // parked in the pit box.
+  let running = null;
+  if (s.lap_started_ts != null && s.device_ts != null) {
+    running = (s.device_ts - s.lap_started_ts) + (performance.now() - snapAt) / 1000;
+    if (running < 0 || running > CONFIG.maxLapS) running = null;
+  }
+  el("laptime").textContent = dead ? "—" : fmtLapTime(running);
+  el("laptime").classList.toggle("stale-val", dead || running == null);
+
+  const last = isCarried(s, "last_lap_time_s") ? null : num(s.last_lap_time_s);
+  el("lastlap").textContent = fmtLapTime(last);
+
+  // Delta is against the profile the car says it is following, and only that.
+  // Guessing a target when active_strategy is unset would put a number on the
+  // wall that the car is not trying to hit.
+  const key = s.active_strategy;
+  const targetLap = key && CONFIG.profiles[key] != null ? CONFIG.profiles[key] : null;
+  el("strategy").textContent = key ? key : "";
+  const dnode = el("lapdelta");
+  if (targetLap != null && last != null) {
+    const d = last - targetLap;
+    dnode.textContent = fmtDelta(d) + " vs " + key;
+    dnode.className = "sub " + (Math.abs(d) < 2 ? "good" : d > 0 ? "warn" : "accent");
+  } else {
+    dnode.textContent = key ? "no target for " + key : "no strategy set";
+    dnode.className = "sub";
+  }
+
+  // -- faults ----------------------------------------------------------- //
+  const notes = [];
+  if (num(s.bms_has_error)) notes.push("BMS fault " + (s.bms_error_code ?? "?"));
+  if (num(s.mms_has_error)) notes.push("Motor fault " + (s.mms_error_code ?? "?"));
+  const fnode = el("faults");
+  fnode.textContent = notes.join("   ·   ");
+  fnode.classList.toggle("show", notes.length > 0);
+
+  // -- the map ---------------------------------------------------------- //
+  const dist = isCarried(s, "lap_distance_m") ? null : num(s.lap_distance_m);
+  if (dist != null) {
+    const sec = paintMap(dist);
+    el("sector").textContent = "S" + sec.id + " " + sec.name;
+    const nx = nextLandmark(dist);
+    el("nextcorner").textContent = nx
+      ? nx[0].name + (nx[0].speed != null ? " · " + nx[0].speed + " km/h" : "") +
+        " in " + Math.round(nx[1]) + " m"
+      : "—";
+  }
+
+  el("src").textContent =
+    "store " + (s.store_mode || "?") +
+    (s.lap_source ? " · lap by " + s.lap_source : "") +
+    (s.error ? " · " + s.error : "");
+
+  // -- completed laps --------------------------------------------------- //
+  const box = el("laps");
+  const rows = s.recent_laps || [];
+  box.innerHTML = rows.length ? "" : '<div class="sub">No completed laps yet.</div>';
+  rows.forEach(r => {
+    const d = document.createElement("div");
+    d.className = "lap-row";
+    const delta = (targetLap != null && r.time_s != null)
+                  ? fmtDelta(r.time_s - targetLap) : "";
+    d.innerHTML = "<b>" + r.lap + "</b>" +
+                  '<span class="t">' + fmtLapTime(r.time_s) + "</span>" +
+                  '<span class="sub" style="margin:0">' + delta + "</span>";
+    box.appendChild(d);
+  });
+  // Drop whole rows rather than let the card clip one through the middle. The
+  // card already hides its overflow, so nothing can escape it -- this is only
+  // about a half-drawn lap time looking like a fault on a screen whose whole
+  // job is that a fault is obvious.
+  // Measured against the list's own box. offsetTop would be wrong here: it is
+  // relative to the nearest POSITIONED ancestor, not to #laps, so it read far
+  // too large and deleted every row.
+  const room = box.getBoundingClientRect().bottom;
+  while (box.lastElementChild &&
+         box.lastElementChild.getBoundingClientRect().bottom > room + 0.5) {
+    box.removeChild(box.lastElementChild);
+  }
+}
+
+// ── the race clock ─────────────────────────────────────────────────────── //
+// The race clock counts only while the pit says the race is running.
+// race_start_time survives in app_state long after a session ends, so counting
+// from it unconditionally put "RACE 1321H 26M ELAPSED" on the wall -- a clock
+// that is obviously broken is still a clock somebody has to stop and think
+// about, in a garage where the whole point is being read at a glance.
+function renderRace() {
+  const node = el("raceclock");
+  const s = snap;
+  el("race").classList.toggle("live", !!(s && s.is_racing));
+  if (!s || !s.race_start_time) { node.textContent = "not started"; return; }
+  const elapsed = (Date.now() / 1000) - s.race_start_time;
+  if (elapsed < 0) { node.textContent = "starts in " + fmtClock(-elapsed); return; }
+  if (!s.is_racing) { node.textContent = "not started"; return; }
+  node.textContent = fmtClock(elapsed) + " elapsed";
+}
+
+poll();
+// Repaint faster than the feed so the lap clock and the age counter move
+// smoothly; every repaint draws the same payload until a new one lands.
+setInterval(render, 100);
+setInterval(renderRace, 1000);
+render();
+</script>
+</body>
+</html>
+"""
+
+
 def render_demo(data):
     return (DEMO_TEMPLATE
             .replace("__BANNER__", BANNER)
@@ -1443,6 +1923,28 @@ def render_spectator(data, race_start, race_end):
         "lon": track.FINISH_LINE_LON,
     }
     return (SPECTATOR_TEMPLATE
+            .replace("__BANNER__", BANNER)
+            .replace("__FONT_LINK__", FONT_LINK)
+            .replace("__ICON__", ICON_LINK)
+            .replace("__BASE_CSS__", BASE_CSS)
+            .replace("__MAP_SVG__", MAP_SVG)
+            .replace("__MAP_JS__", MAP_JS)
+            .replace("__CONFIG__", json.dumps(config, separators=(",", ":")))
+            .replace("__DATA__", json.dumps(data, separators=(",", ":"))))
+
+
+def render_wall(data):
+    """The pit-wall page. Same map, same sectors, same landmark list as the
+    other two -- only the panel beside it differs."""
+    config = {
+        "pollMs": 1000,
+        "staleAfterS": STALE_AFTER_S,
+        "profiles": _all_profile_lap_seconds(),
+        # A running lap longer than this is not a lap, it is a stopped feed or a
+        # car sitting in the box, and the clock is blanked rather than counted.
+        "maxLapS": 900,
+    }
+    return (WALL_TEMPLATE
             .replace("__BANNER__", BANNER)
             .replace("__FONT_LINK__", FONT_LINK)
             .replace("__ICON__", ICON_LINK)
@@ -1499,6 +2001,12 @@ def main():
           f"({len(spec) / 1024:.1f} KB)"
           + ("" if start else "   [race clock hidden — no --race-start given]"))
 
+    wall = render_wall(data)
+    with open(WALL_PATH, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(wall)
+    print(f"wrote {os.path.relpath(WALL_PATH, _REPO)}  ({len(wall) / 1024:.1f} KB)"
+          f"   [pit LAN only - serve it with tools/pit_wall.py]")
+
     if args.verify:
         print(f"  built            {datetime.datetime.now(datetime.timezone.utc)}")
         print(f"  centreline       {len(data['line'])} points, "
@@ -1511,6 +2019,9 @@ def main():
                         for s in data["sectors"]))
         print(f"  landmarks        {len(data['landmarks'])}: " +
               ", ".join(f"{l['name']}@{l['dist']:.0f}m" for l in data["landmarks"]))
+        targets = _all_profile_lap_seconds()
+        print(f"  wall targets     " + ", ".join(
+            f"{k} {v:.0f}s" for k, v in sorted(targets.items(), key=lambda kv: kv[1])))
         print(f"  demo profile     {len(data['profile'])} points, "
               f"modelled lap {data['profileLapSeconds']:.1f} s")
         print(f"  spectator feed   {DB_URL}/{PUBLIC_PATH}.json "

@@ -264,6 +264,7 @@ THE RACE/                             # ← repo root
 │
 ├── Start Pit Dashboard.bat           # Double-click launcher → Pit_Dashboard/run_pit.bat
 ├── Build Speed Profiles.bat          # Double-click launcher → the profile builder on port 8502
+├── Start Pit Wall.bat                # Double-click launcher → the big-screen pit wall on port 8503
 ├── requirements.txt                  # Shared/root-tool dependencies
 │
 ├── SolarRace_OS/                     # Edge code — runs on the Raspberry Pi
@@ -306,6 +307,7 @@ THE RACE/                             # ← repo root
 │   ├── .streamlit/config.toml        # Streamlit server/theme settings
 │   ├── 210s.xlsx                     # Baseline 210 s Zolder velocity profile
 │   ├── profile_builder.py            # Speed Profile Builder app (port 8502, reads telemetry.db READ-ONLY)
+│   ├── wall.html                     # GENERATED big-screen pit page — pit LAN only, NOT published
 │   ├── profile_build.py              # The maths behind it — no Streamlit, self-checks headlessly
 │   ├── requirements_pit.txt          # Pit dependencies
 │   ├── serviceAccountKey.json        # 🔒 Firebase admin key — SEE SECURITY NOTE BELOW
@@ -324,7 +326,11 @@ THE RACE/                             # ← repo root
 │   ├── generate_profiles.py          # Builds profiles/*.csv from Pit_Dashboard/210s.xlsx
 │   ├── hud_sim.py                    # Drives the driver HUD without a car, for UI work
 │   ├── build_zolder_track.py         # Bakes the OSM centreline → zolder_centreline.py
-│   └── build_zolder_animation.py     # Bakes the presentation map → zolder_animation.html
+│   ├── build_zolder_animation.py     # Bakes ALL THREE pages: the presentation map, the
+│   │                                 #   spectator page and Pit_Dashboard/wall.html
+│   └── pit_wall.py                   # Serves wall.html + /live.json on the pit LAN (port 8503),
+│                                     #   telemetry.db READ-ONLY, one thread, never published.
+│                                     #   --demo drives it from base_210s.csv with no database at all
 │
 ├── deploy/                           # Raspberry Pi provisioning (systemd + desktop launcher)
 │   ├── README.md                     # ⭐ Pi setup guide — read this before touching the Pi
