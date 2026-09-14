@@ -1,0 +1,1181 @@
+"""
+db.py — SQLite schema and helpers for the pit-side telemetry store
+==================================================================
+This local SQLite file is the pit's SOURCE OF TRUTH. The collector writes to it;
+the dashboard and export read from it. Firebase is only the live feed.
+
+Design choices
+--------------
+* PRIMARY KEY is the RTDB push key (`rtdb_key`). It is unique and chronological,
+  so `INSERT OR IGNORE` makes ingest idempotent: replayed events after a
+  reconnect (the boundary key always re-arrives because RTDB `startAt` is
+  inclusive) silently no-op instead of duplicating.
+* We keep the full record as `raw_json` (nothing is lost — every BMS cell, every
+  flag), PLUS a handful of "hot" flattened columns for fast charting/filtering.
+  Telemetry is wide (many metrics per sample), so a wide row beats an EAV
+  (metric/value) table here: one sample = one row, no fan-out on read.
+* `device_ts` is the CAR's timestamp, so history stays chronologically correct
+  regardless of the order samples actually arrive in.
+"""
+
+import json
+import pathlib
+import sqlite3
+
+from constants import (CONTROLLER_SPEED_DIVISOR, CONTROLLER_SPEED_DIVISOR_LEGACY,
+                       RPM_REPORT_SCALE)
+from pit_config import SQLITE_PATH, DEVICE_ID
+
+# Hot columns extracted from each record for charting/filtering. The dashboard
+# can name any of these as an exportable/plottable "metric". Anything not listed
+# is still recoverable from raw_json.
+# How many individual cell-voltage columns to carry. 30, not the currently-
+# wired count, because it is the true UPPER BOUND of what the BMS protocol can
+# address at all: cell voltages arrive 3-per-frame over 10 CAN IDs (0x107..
+# 0x110 — see bms_parser.py), so 30 is the most this wiring could ever report
+# without a protocol change, regardless of how many taps are physically
+# connected today.
+#
+# Deliberately NOT the live "how many are actually wired" count — that number
+# is not even constant across this project's own history (bms_string_count has
+# been seen as both 13 and 28 in stored samples, presumably as the pack was
+# built out), so hard-coding today's figure here would need a second schema
+# migration the next time a cell gets added. bms_string_count is stored as its
+# own column instead (below) and is what a display must gate on, per-row, to
+# tell a real 0.000 V-if-that-ever-happens from "this tap isn't wired yet."
+BMS_CELL_COLUMN_COUNT = 30
+
+# How many per-thermistor temperature COLUMNS to carry. Sized to the wiring,
+# not to DS003's 30: the Orion module on this car reports 26 thermistors
+# enabled across an id range that runs past 30 (ids 1-13 and 21-onwards, with
+# 14-20 never loaded), so 30 columns silently truncated the last few real
+# sensors into raw_json only.
+#
+# 40 covers that range with headroom while staying far below the module's own
+# 80-thermistor ceiling (temp_controller_parser.THERMISTOR_MAX, which is what
+# the DECODER bounds against). A column that is never populated costs nothing
+# — 38 of this table's columns have never held a value — whereas a reading
+# with nowhere to land is gone from every query and every export.
+#
+# Not imported from the car-side module: that lives under SolarRace_OS/modules,
+# off this app's sys.path. Kept in sync by hand, the same way
+# DS004_MODULE_COUNT in pit_dashboard.py is its own independent constant.
+THERMISTOR_CELL_COLUMN_COUNT = 40
+
+METRIC_COLUMNS = [
+    "bms_soc_percent",
+    "bms_voltage_V",
+    "bms_current_A",
+    # How many cell taps the BMS itself reports as configured (ID 0x104). The
+    # authoritative "is this cell real" signal for the bms_cell_NN_V columns
+    # below — see BMS_CELL_COLUMN_COUNT for why that fixed 30 is a wiring limit,
+    # not a live count.
+    "bms_string_count",
+    # Individual cell voltages, 1-indexed to match the BMS's own numbering.
+    # Absent (None) for any cell beyond what was polled/wired for a given
+    # sample, exactly like every other "car never reported this" field here —
+    # never coalesced to 0, so an unwired tap cannot be mistaken for a shorted
+    # cell. See bms_parser.py's cell-voltage decode for the source.
+    *[f"bms_cell_{i:02d}_V" for i in range(1, BMS_CELL_COLUMN_COUNT + 1)],
+    "battery_temp_C",
+    # DS003 — individual cell temperatures from the Orion Thermistor
+    # Expansion Module's per-sensor round-robin broadcast (0x1838F3xx), NOT
+    # from the BMS's 3 onboard NTC probes battery_temp_C can fall back to.
+    # Absent (None) for any cell not yet loaded/enabled on the module via
+    # Orion's own utility software — see temp_controller_parser.py's
+    # docstring for why there is no wire signal that means "not configured",
+    # only the absence of a value ever arriving. Never coalesced to 0, same
+    # reasoning as bms_cell_NN_V above.
+    *[f"bms_cell_temp_{i:02d}_C" for i in range(1, THERMISTOR_CELL_COLUMN_COUNT + 1)],
+    "mms_rpm",
+    "mms_power_W",
+    "mms_temperature_C",
+    # The motor controller's OWN measurements, from the LYNX frames. These were
+    # published by the car all along but had no column, so they were dropped on
+    # arrival and only recoverable by hand out of raw_json.
+    #
+    # `mms_measured_voltage_V` is the controller's pack voltage and is the one to
+    # trust: bench-confirmed against the cell count, whereas `bms_voltage_V` above
+    # reads ~2.25x high (112 V for a ~50 V pack) and its JBD decode is a known
+    # open bug. Both are stored so the disagreement stays visible and diagnosable.
+    "mms_measured_voltage_V",
+    "mms_current_A",
+    # THE road-speed source for the HUD, the pit tiles, the history charts and
+    # the Excel export. Stored already decoded: the raw CAN field is 0.1 km/h
+    # and is not gear-corrected, so mms_parser.decode_vehicle_speed_kmh() has
+    # applied both corrections before it reaches here.
+    #
+    # ⚠️ Rows written before that decode fix hold the RAW value, roughly 50x
+    # too high. They are wrong, not just old. The one-off repair scripts that
+    # rewrote them have been removed now that every live database has had them
+    # applied; anything read out of a pre-fix .bak still needs correcting by
+    # hand, using _SPEED_RATIO_BOUNDARY below.
+    "mms_vehicle_speed_kmh",
+    # Distance counter from the controller (0x620). A counter, not an integral,
+    # so it does not accumulate error across dropped frames.
+    "mms_trip_m",
+    # The controller's own SoC estimate — independent of the BMS's, so a
+    # disagreement between them is itself information.
+    "mms_estimated_soc_percent",
+    # Regen energy recovered, Wh. Sits beside total_race_energy, which is NET of
+    # this, so having both is what lets you see gross consumption.
+    "regen_energy",
+    # What the car was TOLD to do at each moment, from the active speed profile.
+    # Storing it makes "did the driver hold the target" answerable after the race
+    # instead of only watchable live.
+    "target_speed_kmh",
+    # Motor PT1000 sensor. Both halves are stored: the converted °C is what the
+    # pit reads during a race, and the raw Ω is what lets you re-derive it (or
+    # spot a dead probe) afterwards without trusting the car's conversion.
+    "mms_motor_ohms",
+    "mms_motor_temp_C",
+    # Active power map as the raw controller value. Numeric so it can be charted
+    # as a step trace across a race; the human name is stored beside it below.
+    "mms_motor_map_raw",
+    # Throttle pedal position, 0-100 %, from the ESC's GPIO0 reading. The
+    # pit-wall coaching signal: a trace full of spikes is a driver pumping the
+    # pedal, a flat one is the steady input that wins an endurance race.
+    "mms_throttle_percent",
+    # The RAW millivolts the same reading came from. Stored for two reasons, both
+    # of which the PT1000 pair above already demonstrate the value of:
+    #   * It is what the team reads off the pit wall to replace the placeholder
+    #     pedal calibration in efficiency.py (the released/floored voltages).
+    #   * Until that calibration is measured, every percentage above is only
+    #     approximately right — so keeping the raw value means the whole race
+    #     can be RE-DERIVED afterwards once the real span is known, instead of
+    #     being permanently stored at whatever the placeholder implied.
+    "mms_throttle_mv",
+    # Solar charge current, AMPS, from the Yocto-Amp in series between the MPPT
+    # and the pack. Stored in amps because that is what the car publishes — the
+    # sensor's own mA are converted once, on the car, in
+    # modules/solar_current.py, so there is exactly one place that knows the
+    # wire unit and no chance of a second conversion here.
+    #
+    # Independent of bms_current_A and of mms_current_A, and worth having
+    # alongside both: pack current is net (charge minus draw), so solar input is
+    # not recoverable from it. Having both is what makes "how much did the array
+    # actually contribute over the night" answerable.
+    "solar_current_A",
+    # Per-lap analytics, all computed ON THE CAR (see lap_tracker.py). The Pi
+    # holds each lap's figures for the whole of the FOLLOWING lap, so the pit
+    # only has to receive one sample anywhere in a lap to record that lap
+    # exactly — which is what makes the per-lap history survive a dropped link.
+    # Energy is in Wh and is NET of regen, so it can legitimately decrease.
+    "total_race_energy",
+    "last_lap_energy",
+    # Regen counterpart of the two above. "last_lap_regen_energy" needs no
+    # lap-boundary special case of its own here — it is held for the whole of
+    # the following lap by the SAME mechanism as last_lap_energy (see
+    # lap_tracker.py's snapshot() docstring).
+    "last_lap_regen_energy",
+    # Since the last detected charging stop (charge_detector.py on the car),
+    # NOT since the last lap. Reads the same as total_race_energy/regen_energy
+    # until the first charging stop this race — see LapTracker.mark_stint_start.
+    "stint_energy",
+    "stint_regen_energy",
+    "last_lap_time_s",
+    "last_lap_distance_m",
+    "lap_distance_m",
+    "odometer_m",
+    "calculated_lap",
+    "lat",
+    "lon",
+]
+
+# Fault / error columns — surfaced and exported separately from the numeric
+# metrics above. `bms_protections` is the comma-joined list of active JBD
+# protection labels (e.g. "Cell Overvoltage, Discharge Overcurrent"); the
+# *_error_code columns hold the raw bitmask words; the *_has_error flags are
+# 0/1 (NULL when the device didn't report).
+ERROR_COLUMNS = [
+    "bms_has_error",
+    "bms_error_code",
+    "bms_protections",
+    "mms_has_error",
+    "mms_error_code",
+    "mms_alerts",
+]
+
+# Textual state columns — not numbers to chart, not faults. The map NAME is
+# stored as the car computed it (rather than re-deriving it here from the raw
+# value) so the pit always reads exactly what the driver's badge reads, even if
+# the two ever run different builds.
+STATE_COLUMNS = [
+    "mms_motor_map",
+    # Which efficiency zone the DRIVER was actually shown — "eco" | "normal" |
+    # "power" — as the car classified it. Stored rather than re-derived here for
+    # the same reason mms_motor_map is: after the race, "we radioed them because
+    # they were in the red" has to be answerable from what the HUD displayed,
+    # not from re-running today's thresholds over yesterday's percentages. That
+    # distinction matters precisely because efficiency.py's boundaries are
+    # placeholders and WILL change.
+    "mms_throttle_zone",
+    # Why the solar current is missing, when it is: "online" | "offline" |
+    # "searching" | "no_hub" | "no_library" | "implausible" | "error". A blank
+    # solar trace has several very different causes — night, a cloud, a USB
+    # cable shaken loose, a missing udev rule — and this is the column that
+    # tells them apart after the fact.
+    "solar_sensor_status",
+    # How the last lap was triggered: gps | odometer | manual | gps_no_can.
+    # "odometer" means the GPS trigger MISSED and the distance backstop fired —
+    # a visible signal that finish-line detection needs looking at.
+    "lap_source",
+    # Which speed profile the car was following, as the CAR reports it. The car
+    # has always published this and the pit used to drop it on the floor, which
+    # meant a stored lap could not be attributed to the profile it was driven
+    # under — so "what does 189s pace actually cost per lap" was unanswerable
+    # from the record, and the strategy matrix had to keep using numbers
+    # somebody estimated before the car ever turned a wheel.
+    "active_strategy",
+
+    # --- Pi health ------------------------------------------------------- #
+    # What the car can say about ITSELF, independent of anything on the CAN
+    # bus. These arrive on a heartbeat that fires even with no CAN traffic and
+    # no GPS fix, which is the one combination that used to publish nothing at
+    # all -- leaving "CAN unplugged in the garage" looking exactly like "the Pi
+    # is dead". See HEARTBEAT_INTERVAL_S in SolarRace_OS/main.py.
+    "pi_uptime_s",
+    "can_state",        # starting | live | silent | disconnected
+    "can_silent_s",     # since the last frame on ANY bus; None if none open
+    "can_detail",       # names only the QUIET channels, e.g. "can1 silent 47s"
+    "can_frames",
+    "gps_fix",          # 1 / 0
+    "gps_detail",
+]
+
+# Every data column the dashboard/exporter can name, in a stable order.
+EXPORT_COLUMNS = METRIC_COLUMNS + ERROR_COLUMNS + STATE_COLUMNS
+
+# Column -> SQLite declared type. Numeric metrics are REAL; flags/codes are
+# INTEGER; the protections summary is TEXT.
+_COL_TYPES = {
+    **{c: "REAL" for c in METRIC_COLUMNS},
+    "bms_has_error": "INTEGER",
+    "bms_error_code": "INTEGER",
+    "bms_protections": "TEXT",
+    "mms_has_error": "INTEGER",
+    "mms_error_code": "INTEGER",
+    "mms_alerts": "TEXT",
+    "mms_motor_map": "TEXT",
+    "mms_throttle_zone": "TEXT",
+    "solar_sensor_status": "TEXT",
+    "lap_source": "TEXT",
+    "active_strategy": "TEXT",
+    "pi_uptime_s": "REAL",
+    "can_silent_s": "REAL",
+    "can_state": "TEXT",
+    "can_detail": "TEXT",
+    "gps_detail": "TEXT",
+    "gps_fix": "INTEGER",
+    "can_frames": "INTEGER",
+}
+
+_DATA_COL_DEFS = ",\n    ".join(f"{c} {_COL_TYPES[c]}" for c in EXPORT_COLUMNS)
+
+_SCHEMA = f"""
+CREATE TABLE IF NOT EXISTS telemetry (
+    rtdb_key          TEXT PRIMARY KEY,   -- RTDB push id (unique, chronological)
+    device_id         TEXT NOT NULL,
+    device_ts         REAL,               -- car timestamp (unix seconds)
+    ingested_ts       REAL,               -- when the pit stored it
+    {_DATA_COL_DEFS},
+    raw_json          TEXT                -- full car_data, nothing dropped
+);
+CREATE INDEX IF NOT EXISTS idx_telemetry_device_ts ON telemetry (device_ts);
+CREATE INDEX IF NOT EXISTS idx_telemetry_dev_ts    ON telemetry (device_id, device_ts);
+
+-- Small key/value store for dashboard state that must survive a page refresh
+-- (e.g. the race clock), so the pit engineer never has to re-enter it.
+CREATE TABLE IF NOT EXISTS app_state (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+
+-- The last known-non-null value of every metric, per device. Separate from
+-- telemetry on purpose: telemetry keeps real NULLs/gaps for History, Export
+-- and fault-episode detection, while the live view falls back to this table
+-- so a tile never blanks out just because the newest row happens to be NULL
+-- for that one field. Narrow/long (not a wide table mirroring METRIC_COLUMNS)
+-- so a newly-added metric needs no schema migration -- it just starts getting
+-- rows here the first time it's non-null.
+CREATE TABLE IF NOT EXISTS last_known (
+    device_id   TEXT NOT NULL,
+    metric      TEXT NOT NULL,
+    value_num   REAL,
+    value_text  TEXT,
+    device_ts   REAL NOT NULL,
+    PRIMARY KEY (device_id, metric)
+);
+"""
+
+
+def get_conn(path: str = SQLITE_PATH) -> sqlite3.Connection:
+    """Open a connection in WAL mode so the dashboard/export can read while the
+    collector writes concurrently from another process."""
+    conn = sqlite3.connect(path, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA busy_timeout=30000;")
+    # Cap the write-ahead log at 32 MB when it is next reset. A no-op on its
+    # own -- it takes effect only when a checkpoint actually succeeds, which is
+    # what collector._maybe_checkpoint is for. Without both halves the WAL grows
+    # for the life of the file: this store had reached 151 MB beside a 290 MB
+    # database, and every page lookup in every query paid to search it.
+    conn.execute("PRAGMA journal_size_limit=33554432;")
+    return conn
+
+
+def get_conn_ro(path: str = SQLITE_PATH):
+    """A connection that CANNOT write, for tools that must not disturb the race.
+
+    Returns (conn, mode) where mode is "ro" or "query_only", so a caller can say
+    on screen which protection it actually got.
+
+    The profile builder runs beside a live collector and a live pit wall against
+    the same file. `mode=ro` is the strong form -- SQLite refuses writes at the
+    VFS layer -- but it needs to create the -shm file to read a WAL database, and
+    a read-only directory (or a stale -shm) makes the open fail outright. The
+    fallback is a normal handle with `query_only=ON`, which refuses writes at the
+    SQL layer instead: weaker (a PRAGMA could turn it off) but identical in
+    practice for code that never tries.
+
+    NOTE: nothing that uses this may call init_db(). That function runs DDL --
+    ALTER TABLE, CREATE INDEX, and a full-table UPDATE -- and would fail here,
+    correctly, but only after the caller had already assumed a schema.
+    """
+    uri = "file:" + pathlib.Path(path).as_posix().replace("?", "%3f") + "?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=30000;")
+        conn.execute("SELECT 1 FROM telemetry LIMIT 1")   # prove it really opened
+        return conn, "ro"
+    except sqlite3.Error:
+        conn = sqlite3.connect(path, timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=30000;")
+        conn.execute("PRAGMA query_only=ON;")
+        return conn, "query_only"
+
+
+def fetch_lap_profile_samples(conn: sqlite3.Connection, lap: int,
+                              device_id: str = DEVICE_ID):
+    """(device_ts, lap_distance_m, mms_vehicle_speed_kmh, lap_source) for one lap.
+
+    A SIBLING of fetch_lap_track, not a widening of it. That one is on the 4s
+    cached path of the tab the dashboard opens on, and its two-column shape is
+    deliberate; this adds two more columns for a tool that runs a handful of
+    times by hand. Same half-open range on the raw column for the same reason --
+    see fetch_lap_track's docstring for why a CAST here costs 141 ms instead of
+    0.08 ms.
+
+    ⚠️ THE OFF-BY-ONE. `calculated_lap` is LapTracker.lap_count: the number of
+    laps COMPLETED. In the same snapshot `lap_distance_m` is the lap being driven
+    and `last_lap_time_s` is the one just finished. So these samples are the
+    trace of lap `lap` + 1, and that lap's time/energy/distance live on the rows
+    tagged `lap` + 1 (fetch_lap_summary's row `lap` + 1).
+
+    Confirmed on the real store, not just read off lap_tracker.py: for the trace
+    tagged 0, MAX(lap_distance_m) is 3990 m while last_lap_distance_m at 0 is
+    NULL and at 1 is 4020 m. Join these two the naive way and every profile is
+    filed under the wrong lap's time -- a wrong answer that looks completely
+    plausible, which is why profile_build.check_lap_alignment() re-proves it at
+    runtime instead of trusting this comment.
+    """
+    return conn.execute(
+        "SELECT device_ts, lap_distance_m, mms_vehicle_speed_kmh, lap_source "
+        "FROM telemetry "
+        "WHERE device_id = ? AND calculated_lap >= ? AND calculated_lap < ? "
+        "  AND device_ts IS NOT NULL AND lap_distance_m IS NOT NULL "
+        "ORDER BY device_ts ASC",
+        (device_id, float(int(lap)), float(int(lap)) + 1.0),
+    ).fetchall()
+
+
+def lap_energy_by_strategy(conn: sqlite3.Connection, recent_laps: int = 60,
+                           device_id: str = DEVICE_ID):
+    """Measured energy per lap, grouped by the profile the lap was driven under.
+
+    Returns {strategy_key: [wh, wh, ...]} — the raw per-lap figures, recent laps
+    only, for the caller to take a median of. Energy is the car's own
+    integration (signed motor power, trapezoidal, regen subtracting), so nothing
+    is re-derived here: this reads a number the car already computed and held
+    for the whole of the following lap.
+
+    MINDS THE OFF-BY-ONE, and it matters more here than anywhere else.
+    `calculated_lap` counts COMPLETED laps, so rows tagged N carry lap N's
+    energy in last_lap_energy while their active_strategy is the profile being
+    followed during lap N+1. Pairing those two off the same row attributes every
+    lap's cost to the NEXT lap's profile — invisible while nobody changes
+    strategy, and wrong exactly when someone does, which is the moment this
+    number is being looked at. So the strategy for lap N comes from the rows
+    tagged N-1, the trace of that lap.
+
+    Bounded to the most recent `recent_laps` laps: a median over the whole race
+    would average this morning's conditions into tonight's answer, and the query
+    stays the same size at lap 400 as at lap 40.
+    """
+    top = conn.execute(
+        "SELECT MAX(calculated_lap) AS m FROM telemetry WHERE device_id = ?",
+        (device_id,)).fetchone()
+    if not top or top["m"] is None:
+        return {}
+    floor = max(0.0, float(top["m"]) - float(recent_laps))
+
+    rows = conn.execute(
+        "SELECT CAST(calculated_lap AS INTEGER) AS lap, "
+        "       MAX(last_lap_energy) AS energy_wh, "
+        "       active_strategy AS strat, COUNT(*) AS n "
+        "FROM telemetry "
+        "WHERE device_id = ? AND calculated_lap >= ? "
+        "GROUP BY lap, strat",
+        (device_id, floor)).fetchall()
+
+    energy, modal = {}, {}
+    for r in rows:
+        lap = r["lap"]
+        if r["energy_wh"] is not None:
+            energy[lap] = max(energy.get(lap, float("-inf")), float(r["energy_wh"]))
+        if r["strat"]:
+            best = modal.get(lap)
+            if best is None or r["n"] > best[1]:
+                modal[lap] = (r["strat"], r["n"])
+
+    out = {}
+    for lap, wh in energy.items():
+        driven_under = modal.get(lap - 1)      # the trace of THIS lap
+        if driven_under:
+            out.setdefault(driven_under[0], []).append(wh)
+    return out
+
+
+def lap_overview(conn: sqlite3.Connection, device_id: str = DEVICE_ID):
+    """One grouped pass over every lap TRACE: cheap enough to run on a 300 MB
+    store, and the only query the builder's lap table needs before a human has
+    shortlisted anything.
+
+    Per-lap detail (gaps, coverage) costs a full read of that lap's samples, so
+    it is deliberately NOT here -- it is computed for the few laps that survive
+    this table's filters.
+    """
+    return conn.execute(
+        "SELECT CAST(calculated_lap AS INTEGER) AS trace_lap, "
+        "       COUNT(*) AS n_samples, "
+        "       SUM(mms_vehicle_speed_kmh IS NOT NULL) AS n_speed, "
+        "       MAX(lap_distance_m) AS trace_end_m, "
+        "       MIN(device_ts) AS t0, MAX(device_ts) AS t1, "
+        "       MAX(ABS(mms_vehicle_speed_kmh)) AS v_max_kmh, "
+        "       MAX(lap_source) AS lap_source "
+        "FROM telemetry "
+        "WHERE device_id = ? AND calculated_lap IS NOT NULL "
+        "GROUP BY trace_lap ORDER BY trace_lap",
+        (device_id,),
+    ).fetchall()
+
+
+def init_db(conn: sqlite3.Connection) -> None:
+    conn.executescript(_SCHEMA)
+    # Migrate older DBs in place: add any data columns the table is missing
+    # (e.g. the fault columns added later). CREATE TABLE IF NOT EXISTS won't
+    # alter an existing table, so we do it explicitly. Existing rows get NULL.
+    existing = {r["name"] for r in conn.execute("PRAGMA table_info(telemetry)")}
+    for col in EXPORT_COLUMNS:
+        if col not in existing:
+            conn.execute(f"ALTER TABLE telemetry ADD COLUMN {col} {_COL_TYPES[col]}")
+    # Partial index over only the fault rows — makes the errors-history query
+    # cheap even on a huge table. Created here (not in _SCHEMA) so the fault
+    # columns are guaranteed to exist first (after the migration above).
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_telemetry_faults ON telemetry (device_ts) "
+        "WHERE bms_has_error = 1 OR mms_has_error = 1"
+    )
+    # The per-lap charts GROUP BY calculated_lap on every history refresh.
+    # Without this the 10s fragment full-scans the whole race every tick.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_telemetry_lap "
+        "ON telemetry (device_id, calculated_lap)"
+    )
+    # One-time correction of historical rows: motor power is signed (negative on
+    # regen) but was stored as a raw uint16, so regen samples read as ~65000 W.
+    # Fold any such rows back to their true signed value. Idempotent — after the
+    # first pass nothing exceeds the int16 range, and new rows are stored signed.
+    conn.execute("UPDATE telemetry SET mms_power_W = mms_power_W - 65536 "
+                 "WHERE mms_power_W > 32767")
+    conn.commit()
+
+
+# The two regimes the speed field can arrive in, as a ratio to motor RPM:
+#
+#   RAW        speed = rpm x 1.0366     (0.1 km/h, gear ratio never applied)
+#   CORRECTED  speed = rpm x 0.020355   (true km/h)
+#
+# They differ by a factor of 50.909, so telling them apart is not a close call.
+# The boundary below is the geometric mean of the two, which sits ~7x away from
+# either regime — far outside any plausible measurement noise.
+# Raw sits at rpm x 0.5183; a decoded value sits at rpm x (0.5183 / (10*DIV)).
+# The boundary is their geometric mean, derived from the constants so it cannot
+# silently go stale when one of them is corrected.
+#
+# 0.5183, not the 1.0366 that was here before, because mms_rpm now arrives
+# ALREADY CORRECTED for the controller's 2x under-report (see
+# drivetrain.RPM_REPORT_SCALE). The raw speed field did not change, so its ratio
+# to a doubled RPM is halved. Getting this wrong would not fail loudly - it
+# would quietly misfile decoded speeds as raw and divide them a second time.
+_SPEED_RATIO_RAW = 1.0366 * RPM_REPORT_SCALE                    # 0.5183, legacy
+_SPEED_RATIO_RAW_RECONFIGURED = 2.6656 * RPM_REPORT_SCALE        # 1.3328, current
+
+# THREE regimes, not two, and a row says which it belongs to by the ratio of its
+# speed field to its RPM. Boundaries are the geometric means, so each sits a
+# factor of ~3 from either regime - far outside measurement noise.
+#
+#   ratio ~ 0.0204  the value is already true km/h        -> pass through
+#   ratio ~ 0.5183  raw field, controller pre-2026-08-20  -> / 2.5455
+#   ratio ~ 1.3328  raw field, controller post-2026-08-20 -> / 6.5455
+#
+# The middle regime is why this is not one constant: the controller was
+# reconfigured mid-history and the same raw number means different speeds on
+# either side of it. Using one divisor for both made every pre-reconfiguration
+# row come out 2.57x too low.
+_SPEED_DECODED_RATIO = _SPEED_RATIO_RAW / (10.0 * CONTROLLER_SPEED_DIVISOR_LEGACY)
+_SPEED_BOUNDARY_DECODED = (_SPEED_DECODED_RATIO * _SPEED_RATIO_RAW) ** 0.5
+_SPEED_BOUNDARY_ERA = (_SPEED_RATIO_RAW * _SPEED_RATIO_RAW_RECONFIGURED) ** 0.5
+# Kept under the old name. Its importer (the one-off fix_vehicle_speed.py) has
+# been removed, but the boundary is the documented dividing line between the two
+# speed eras, so it stays as the reference for reading old rows.
+_SPEED_RATIO_BOUNDARY = _SPEED_BOUNDARY_DECODED
+
+
+def _vehicle_speed(raw_speed, rpm):
+    """Normalise the controller's speed field to true km/h.
+
+    WHY THIS IS HERE AND NOT ONLY ON THE CAR
+    mms_parser.decode_vehicle_speed_kmh() is the real fix, but it only takes
+    effect once SolarRace_OS is deployed to the Pi. A car already on track keeps
+    publishing the raw value, and those samples are useless if the pit stores
+    them as km/h. This normalises at ingest so the pit is correct immediately,
+    whichever firmware the car happens to be running.
+
+    It stays correct AFTER the car is updated too, which is the point of using a
+    ratio rather than a date or a version flag: an already-decoded value sits at
+    0.0204 x rpm and is passed through untouched. No cutover to get right, and
+    no window where the two ends disagree.
+
+    With no RPM to compare against, it falls back to plausibility: above
+    200 km/h the value is certainly still raw, and below that it is passed
+    through unchanged. That ambiguous band is narrow in practice — RPM and
+    speed ride in the same 0x610 frame, so one is rarely present without the
+    other.
+    """
+    speed = _num(raw_speed)
+    if speed is None:
+        return None
+    speed = abs(speed)
+    if speed == 0.0:
+        return 0.0                      # identical under either interpretation
+
+    r = _num(rpm)
+    if r is not None and abs(r) > 0:
+        ratio = speed / abs(r)
+        if ratio >= _SPEED_BOUNDARY_ERA:
+            # Raw, from the reconfigured controller.
+            return speed * 0.1 / CONTROLLER_SPEED_DIVISOR
+        if ratio > _SPEED_BOUNDARY_DECODED:
+            # Raw, from the controller as it was configured before 2026-08-20.
+            return speed * 0.1 / CONTROLLER_SPEED_DIVISOR_LEGACY
+        return speed                                        # already true km/h
+    # No usable RPM. Fall back to plausibility: this car does not exceed 200
+    # km/h, so anything above that is certainly still raw.
+    if speed > 200.0:
+        # No RPM, so the era is unknowable. Assume the current controller: it is
+        # what a live car is running, and this branch only fires on a row that
+        # arrived without RPM in the same frame, which is rare.
+        return speed * 0.1 / CONTROLLER_SPEED_DIVISOR
+    return speed
+
+
+def _num(value):
+    """Coerce to float when possible, else None — RTDB values arrive as
+    int/float/str/bool depending on the parser."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _flag(value):
+    """Boolean fault flag -> 1/0, or None when the device didn't report it."""
+    if value is None:
+        return None
+    return 1 if value else 0
+
+
+def _int(value):
+    """Coerce to int (error-code bitmask) when possible, else None."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _signed16(value):
+    """Reinterpret a raw uint16 as a signed int16.
+
+    Motor power is a SIGNED value (negative during regen/coasting), but the LYNX
+    frame was historically decoded unsigned on the car, so small negatives arrive
+    as ~65000. Fold them back to the true signed value. No-op once the car sends
+    signed values (or for anything already in the int16 range) — a 2-byte field
+    can't legitimately exceed 32767 W here anyway."""
+    v = _num(value)
+    if v is None:
+        return None
+    return v - 65536 if v > 32767 else v
+
+
+def _join(value):
+    """List of protection labels -> comma-joined text, or None if absent."""
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return ", ".join(str(x) for x in value)
+    return str(value)
+
+
+def flatten_record(rtdb_key: str, record: dict, device_id: str = DEVICE_ID) -> dict:
+    """Turn one pushed record `{timestamp, car_data:{battery,motor,...}}` into a
+    flat column dict ready for upsert."""
+    record = record or {}
+    car = record.get("car_data") or {}
+    battery = car.get("battery") or {}
+    motor = car.get("motor") or {}
+    temp = car.get("temp_controller") or {}
+    gps = car.get("gps") or {}
+    # The Yocto-Amp's own block. .get with a default because every build older
+    # than this feature simply has no "solar" key, and those rows must land as
+    # NULL rather than raising on ingest.
+    solar = car.get("solar") or {}
+    health = car.get("health") or {}
+
+    return {
+        "rtdb_key": rtdb_key,
+        "device_id": device_id,
+        "device_ts": _num(record.get("timestamp")),
+        # ingested_ts is filled at write time (caller passes time.time())
+        "bms_soc_percent": _num(battery.get("bms_soc_percent")),
+        "bms_voltage_V": _num(battery.get("bms_voltage_V")),
+        "bms_current_A": _num(battery.get("bms_current_A")),
+        "bms_string_count": _num(battery.get("bms_string_count")),
+        # One key per possible cell tap. .get() returns None for anything the
+        # car never reported (fewer cells wired than BMS_CELL_COLUMN_COUNT, or
+        # a build that predates this column existing) — never a fabricated 0.
+        **{f"bms_cell_{i:02d}_V": _num(battery.get(f"bms_cell_{i:02d}_V"))
+           for i in range(1, BMS_CELL_COLUMN_COUNT + 1)},
+        "battery_temp_C": _num(temp.get("battery_temp_C")),
+        # DS003. One key per possible thermistor slot; .get() returns None
+        # for anything the module hasn't loaded/enabled (or reported yet) —
+        # never a fabricated 0 (see BMS_CELL_COLUMN_COUNT's cell-voltage
+        # comment above for the same reasoning applied to voltage taps).
+        **{f"bms_cell_temp_{i:02d}_C": _num(temp.get(f"bms_cell_temp_{i:02d}_C"))
+           for i in range(1, THERMISTOR_CELL_COLUMN_COUNT + 1)},
+        "mms_rpm": _num(motor.get("mms_rpm")),
+        "mms_power_W": _signed16(motor.get("mms_power_W")),
+        "mms_temperature_C": _num(motor.get("mms_temperature_C")),
+        # Controller-side measurements — see the METRIC_COLUMNS notes. All live in
+        # the "motor" block the car publishes.
+        "mms_measured_voltage_V": _num(motor.get("mms_measured_voltage_V")),
+        "mms_current_A": _num(motor.get("mms_current_A")),
+        # Normalised, not stored verbatim: a car running pre-fix firmware sends
+        # this in 0.1 km/h without the gear reduction. See _vehicle_speed().
+        "mms_vehicle_speed_kmh": _vehicle_speed(
+            motor.get("mms_vehicle_speed_kmh"), motor.get("mms_rpm")),
+        "mms_trip_m": _num(motor.get("mms_trip_m")),
+        "mms_estimated_soc_percent": _num(motor.get("mms_estimated_soc_percent")),
+        "regen_energy": _num(motor.get("regen_energy")),
+        "target_speed_kmh": _num(motor.get("target_speed_kmh")),
+        "mms_motor_ohms": _num(motor.get("mms_motor_ohms")),
+        "mms_motor_temp_C": _num(motor.get("mms_motor_temp_C")),
+        "mms_motor_map_raw": _num(motor.get("mms_motor_map_raw")),
+        "mms_motor_map": _join(motor.get("mms_motor_map")),
+        # Throttle. _num keeps a missing reading NULL rather than 0: the car
+        # omits mms_throttle_percent entirely when the pedal voltage is
+        # implausible (unplugged sensor), and a stored 0 there would read as a
+        # driver who lifted off.
+        "mms_throttle_percent": _num(motor.get("mms_throttle_percent")),
+        "mms_throttle_mv": _num(motor.get("mms_throttle_mv")),
+        "mms_throttle_zone": _join(motor.get("mms_throttle_zone")),
+        # Solar. _num keeps an absent reading NULL: the car publishes None when
+        # the sensor is offline, and a 0 stored there would be indistinguishable
+        # from a genuine night-time zero.
+        "solar_current_A": _num(solar.get("solar_current_A")),
+        "solar_sensor_status": _join(solar.get("solar_sensor_status")),
+        "total_race_energy": _num(motor.get("total_race_energy")),
+        "last_lap_energy": _num(motor.get("last_lap_energy")),
+        "last_lap_regen_energy": _num(motor.get("last_lap_regen_energy")),
+        "stint_energy": _num(motor.get("stint_energy")),
+        "stint_regen_energy": _num(motor.get("stint_regen_energy")),
+        "last_lap_time_s": _num(motor.get("last_lap_time_s")),
+        "last_lap_distance_m": _num(motor.get("last_lap_distance_m")),
+        "lap_distance_m": _num(motor.get("lap_distance_m")),
+        "lap_source": _join(motor.get("lap_source")),
+        "active_strategy": _join(motor.get("active_strategy")),
+        "odometer_m": _num(motor.get("odometer_m")),
+        "calculated_lap": _num(motor.get("calculated_lap")),
+        "lat": _num(gps.get("lat")),
+        "lon": _num(gps.get("lon")),
+        # Faults
+        "bms_has_error": _flag(battery.get("bms_has_error")),
+        "bms_error_code": _int(battery.get("bms_error_code")),
+        "bms_protections": _join(battery.get("bms_protections")),
+        "mms_has_error": _flag(motor.get("mms_has_error")),
+        "mms_error_code": _int(motor.get("mms_error_code")),
+        "mms_alerts": _join(motor.get("mms_alerts")),
+        # The car's own health block. Absent from every build older than the
+        # heartbeat, and .get() lands those rows as NULL rather than raising --
+        # the same rule the solar block follows.
+        "pi_uptime_s": _num(health.get("pi_uptime_s")),
+        "can_state": health.get("can_state"),
+        "can_silent_s": _num(health.get("can_silent_s")),
+        "can_detail": health.get("can_detail"),
+        "can_frames": _int(health.get("can_frames")),
+        "gps_fix": _flag(health.get("gps_fix")),
+        "gps_detail": health.get("gps_detail"),
+        "raw_json": json.dumps(car, separators=(",", ":")),
+    }
+
+
+_COLUMNS = ["rtdb_key", "device_id", "device_ts", "ingested_ts", *EXPORT_COLUMNS, "raw_json"]
+_INSERT_SQL = (
+    f"INSERT OR IGNORE INTO telemetry ({', '.join(_COLUMNS)}) "
+    f"VALUES ({', '.join(':' + c for c in _COLUMNS)})"
+)
+
+_LAST_KNOWN_SQL = (
+    "INSERT INTO last_known (device_id, metric, value_num, value_text, device_ts) "
+    "VALUES (:device_id, :metric, :value_num, :value_text, :device_ts) "
+    "ON CONFLICT(device_id, metric) DO UPDATE SET "
+    "value_num = excluded.value_num, value_text = excluded.value_text, "
+    "device_ts = excluded.device_ts "
+    "WHERE excluded.device_ts > last_known.device_ts"
+)
+
+
+def _last_known_rows(row: dict):
+    """Expand one flattened telemetry row into its non-null (metric, value)
+    pairs for the last_known upsert. Skipped entirely if the row has no
+    device_ts -- there is nothing to order a carry-forward against."""
+    ts = row.get("device_ts")
+    if ts is None:
+        return []
+    device_id = row["device_id"]
+    out = []
+    for col in EXPORT_COLUMNS:
+        val = row.get(col)
+        if val is None:
+            continue
+        is_text = _COL_TYPES[col] == "TEXT"
+        out.append({
+            "device_id": device_id,
+            "metric": col,
+            "value_num": None if is_text else val,
+            "value_text": val if is_text else None,
+            "device_ts": ts,
+        })
+    return out
+
+
+def upsert_many(conn: sqlite3.Connection, items, ingested_ts: float,
+                device_id: str = DEVICE_ID) -> int:
+    """Idempotently store a batch of (rtdb_key, record) pairs.
+
+    Returns the number of NEW rows actually inserted (duplicates are ignored).
+    `items` may be a dict {key: record} or an iterable of (key, record) pairs.
+    """
+    if isinstance(items, dict):
+        items = items.items()
+
+    rows = []
+    for key, record in items:
+        if not key or not isinstance(record, dict):
+            continue
+        row = flatten_record(key, record, device_id)
+        row["ingested_ts"] = ingested_ts
+        rows.append(row)
+
+    if not rows:
+        return 0
+
+    before = conn.total_changes
+    conn.executemany(_INSERT_SQL, rows)
+
+    last_known_rows = [lk for row in rows for lk in _last_known_rows(row)]
+    if last_known_rows:
+        conn.executemany(_LAST_KNOWN_SQL, last_known_rows)
+
+    conn.commit()
+    return conn.total_changes - before
+
+
+def latest_known(conn: sqlite3.Connection, device_id: str = DEVICE_ID) -> dict:
+    """{metric: (value, device_ts)} for every metric ever reported non-null by
+    this device. At most ~73 rows, a primary-key range scan, so cost is
+    independent of how large telemetry itself has grown."""
+    rows = conn.execute(
+        "SELECT metric, value_num, value_text, device_ts FROM last_known "
+        "WHERE device_id = ?",
+        (device_id,),
+    ).fetchall()
+    out = {}
+    for r in rows:
+        value = r["value_text"] if r["value_text"] is not None else r["value_num"]
+        out[r["metric"]] = (value, r["device_ts"])
+    return out
+
+
+def get_last_key(conn: sqlite3.Connection):
+    """Stream cursor: the highest RTDB key stored so far, or None if empty.
+    Push keys sort lexicographically in chronological order, so MAX() is the
+    newest sample — the point to resume streaming from after a restart/dropout.
+    Intentionally NOT filtered by device_id: the cursor tracks the whole node."""
+    row = conn.execute("SELECT MAX(rtdb_key) AS k FROM telemetry").fetchone()
+    return row["k"] if row else None
+
+
+def save_cursor(conn: sqlite3.Connection, key) -> None:
+    """Persist the last RTDB key seen, independent of the telemetry rows.
+    Survives a history reset so the collector resumes from the tail instead of
+    re-backfilling everything that was just cleared. No-op for a falsy key."""
+    if not key:
+        return
+    conn.execute(
+        "INSERT INTO app_state (key, value) VALUES ('stream_cursor', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key,),
+    )
+    conn.commit()
+
+
+def get_cursor(conn: sqlite3.Connection):
+    """The persisted stream cursor, or None. Used as a fallback resume point
+    when the telemetry table is empty (e.g. right after a history reset)."""
+    row = conn.execute(
+        "SELECT value FROM app_state WHERE key = 'stream_cursor'"
+    ).fetchone()
+    return row["value"] if row and row["value"] else None
+
+
+def clear_history(conn: sqlite3.Connection, device_id: str = DEVICE_ID) -> int:
+    """Delete all stored telemetry for a device. Returns the row count removed.
+
+    Records the current stream position first so the collector picks up from the
+    live tail afterwards rather than re-downloading the whole RTDB history. The
+    race-clock state in app_state is left untouched. Also clears last_known for
+    the device, so a fresh race doesn't carry forward values from the last
+    one."""
+    save_cursor(conn, get_last_key(conn))
+    cur = conn.execute("DELETE FROM telemetry WHERE device_id = ?", (device_id,))
+    conn.execute("DELETE FROM last_known WHERE device_id = ?", (device_id,))
+    conn.commit()
+    return cur.rowcount
+
+
+def fetch_lap_summary(conn: sqlite3.Connection, device_id: str = DEVICE_ID):
+    """One row per completed lap: (lap, energy_wh, lap_time_s, distance_m).
+
+    Cheap on purpose. The CAR already did the integration and the timing, and
+    holds each lap's figures constant for the whole of the following lap, so
+    every sample within a lap carries identical values and MAX() just picks
+    them up — no re-integration of power over time happens on the pit at all.
+
+    Rows before a lap has completed carry NULL and are excluded, as are rows
+    from before this feature existed.
+
+    `calculated_lap` is stored REAL (everything numeric goes through _num), so
+    it needs an explicit CAST to group cleanly.
+    """
+    return conn.execute(
+        "SELECT CAST(calculated_lap AS INTEGER) AS lap, "
+        "       MAX(last_lap_energy)  AS energy_wh, "
+        "       MAX(last_lap_time_s)  AS lap_time_s, "
+        "       MAX(last_lap_distance_m) AS distance_m "
+        "FROM telemetry "
+        "WHERE device_id = ? AND calculated_lap IS NOT NULL "
+        "  AND (last_lap_energy IS NOT NULL OR last_lap_time_s IS NOT NULL) "
+        "GROUP BY lap ORDER BY lap",
+        (device_id,),
+    ).fetchall()
+
+
+def fetch_lap_track(conn: sqlite3.Connection, lap: int, device_id: str = DEVICE_ID):
+    """(device_ts, lap_distance_m) for one lap, ascending — for sector timing.
+
+    Only the two columns sector splits need, so a lap's worth of samples is a
+    cheap read even at 1 Hz over a long race.
+
+    MATCHED AS A HALF-OPEN RANGE, NOT WITH A CAST. This used to say
+    `CAST(calculated_lap AS INTEGER) = ?`, and wrapping the column in a function
+    makes the term unusable as an index constraint: SQLite fell back to
+    idx_telemetry_dev_ts with only `device_id = ?` to go on and walked every row
+    the car has ever sent, evaluating the CAST on each one, to return the two
+    hundred belonging to one lap.
+
+    It was not a small difference. read_sector_times calls this TWICE, behind a
+    4-second cache, from the Driver Telemetry tab — the tab the dashboard opens
+    on. Measured against a 96 MB store: 141 ms per call, so 282 ms of the pit
+    wall's single script-run thread every four seconds, for the whole race,
+    growing with the database. As a range on the raw column it plans as
+    SEARCH telemetry USING INDEX idx_telemetry_lap and takes 0.08 ms.
+
+    The range is [lap, lap+1) rather than = lap because calculated_lap is stored
+    REAL (everything numeric goes through _num), so an equality test against an
+    int would depend on float representation. The half-open interval selects
+    exactly the same rows without caring.
+    """
+    return conn.execute(
+        "SELECT device_ts, lap_distance_m FROM telemetry "
+        "WHERE device_id = ? AND calculated_lap >= ? AND calculated_lap < ? "
+        "  AND device_ts IS NOT NULL AND lap_distance_m IS NOT NULL "
+        "ORDER BY device_ts ASC",
+        (device_id, float(int(lap)), float(int(lap)) + 1.0),
+    ).fetchall()
+
+
+def recent_laps(conn: sqlite3.Connection, count: int = 2,
+                device_id: str = DEVICE_ID):
+    """The newest `count` lap numbers that have samples, newest first."""
+    rows = conn.execute(
+        "SELECT DISTINCT CAST(calculated_lap AS INTEGER) AS lap FROM telemetry "
+        "WHERE device_id = ? AND calculated_lap IS NOT NULL "
+        "ORDER BY lap DESC LIMIT ?",
+        (device_id, int(count)),
+    ).fetchall()
+    return [r["lap"] for r in rows]
+
+
+def latest_sample(conn: sqlite3.Connection, device_id: str = DEVICE_ID):
+    """Most recent sample by car timestamp — the dashboard's 'live' value."""
+    return conn.execute(
+        "SELECT * FROM telemetry WHERE device_id = ? "
+        "ORDER BY device_ts DESC LIMIT 1",
+        (device_id,),
+    ).fetchone()
+
+
+def count_samples(conn: sqlite3.Connection, device_id: str = DEVICE_ID) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM telemetry WHERE device_id = ?", (device_id,)
+    ).fetchone()
+    return int(row["n"]) if row else 0
+
+
+def count_samples_since(conn: sqlite3.Connection, start_ts: float,
+                        device_id: str = DEVICE_ID) -> int:
+    """How many samples arrived at/after `start_ts`. Used by the History tab to
+    say how much new data piled up while a frozen chart was being examined —
+    a COUNT, so it never re-reads the rows it is counting."""
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM telemetry WHERE device_id = ? AND device_ts >= ?",
+        (device_id, start_ts),
+    ).fetchone()
+    return int(row["n"]) if row else 0
+
+
+def time_bounds(conn: sqlite3.Connection, device_id: str = DEVICE_ID):
+    """(min_device_ts, max_device_ts) over stored samples, or (None, None)."""
+    row = conn.execute(
+        "SELECT MIN(device_ts) AS lo, MAX(device_ts) AS hi FROM telemetry "
+        "WHERE device_id = ?",
+        (device_id,),
+    ).fetchone()
+    if not row:
+        return None, None
+    return row["lo"], row["hi"]
+
+
+def fetch_samples(conn: sqlite3.Connection, start_ts: float = None,
+                  end_ts: float = None, limit: int = None,
+                  device_id: str = DEVICE_ID):
+    """Rows ordered by car timestamp, optionally filtered by [start_ts, end_ts].
+    When `limit` is set, returns the most recent `limit` rows (still ascending)."""
+    clauses = ["device_id = ?"]
+    params = [device_id]
+    if start_ts is not None:
+        clauses.append("device_ts >= ?")
+        params.append(start_ts)
+    if end_ts is not None:
+        clauses.append("device_ts <= ?")
+        params.append(end_ts)
+    where = " AND ".join(clauses)
+
+    if limit is not None:
+        # newest `limit`, then re-sort ascending for charting
+        sql = (f"SELECT * FROM (SELECT * FROM telemetry WHERE {where} "
+               f"ORDER BY device_ts DESC LIMIT ?) ORDER BY device_ts ASC")
+        params.append(limit)
+    else:
+        sql = f"SELECT * FROM telemetry WHERE {where} ORDER BY device_ts ASC"
+
+    return conn.execute(sql, params).fetchall()
+
+
+# Names a caller is allowed to ask fetch_series for. The list is interpolated
+# into SQL rather than bound as parameters (column names cannot be bound), so it
+# is checked against the real schema first. Every caller passes a module
+# constant, so in practice this catches a typo rather than an attack -- but it
+# means the f-string below is obviously safe to whoever reads it next.
+_COLUMN_SET = frozenset(_COLUMNS)
+
+
+def count_range(conn: sqlite3.Connection, start_ts: float = None,
+                end_ts: float = None, device_id: str = DEVICE_ID) -> int:
+    """How many samples fall in [start_ts, end_ts].
+
+    Index-only against idx_telemetry_dev_ts, so it stays milliseconds even when
+    the range is the whole race. fetch_series needs it to work out a stride, and
+    the History caption needs it to say honestly how many samples a thinned
+    chart was built from.
+    """
+    clauses = ["device_id = ?"]
+    params = [device_id]
+    if start_ts is not None:
+        clauses.append("device_ts >= ?")
+        params.append(start_ts)
+    if end_ts is not None:
+        clauses.append("device_ts <= ?")
+        params.append(end_ts)
+    row = conn.execute(
+        f"SELECT COUNT(*) AS n FROM telemetry WHERE {' AND '.join(clauses)}",
+        params).fetchone()
+    return int(row["n"]) if row else 0
+
+
+def fetch_series(conn: sqlite3.Connection, columns, start_ts: float = None,
+                 end_ts: float = None, limit: int = None,
+                 stride_target: int = None, device_id: str = DEVICE_ID):
+    """Rows for CHARTING: only the columns asked for, optionally thinned in SQL.
+
+    Returns (rows, total, step) -- the rows ascending by car time, how many
+    samples the range actually holds, and the stride that was applied (1 when
+    every row in range was returned).
+
+    WHY THIS EXISTS ALONGSIDE fetch_samples
+    fetch_samples is `SELECT *`, and it has to stay that way: the CSV/Excel
+    export resolves its column list at runtime and genuinely wants all 118 of
+    them. The chart wants 16. The other 102 include raw_json, which is ~1.6 kB
+    per row and 61% of the database file -- read off disk, boxed into Python and
+    thrown away, once per row, on a path that runs every 10 seconds. Measured on
+    the real store: 100k rows took 25.7 s as `SELECT *` and 1.6 s as the sixteen
+    columns the chart reads.
+
+    WHY THE STRIDE IS IN SQL
+    The chart draws at most OVERLAY_MAX_POINTS (900) points and thins to that in
+    pandas -- after transferring every row. Doing it here means a 24-hour window
+    never materialises 100k rows to draw 900 of them.
+
+    It is a STRIDE, not a time-bucket average, and that is deliberate: every
+    point drawn stays a value the car actually measured at a moment it actually
+    measured it. Bucketing would need a different aggregate per metric (max for
+    temperatures, min for voltage sag, mean for speed) and would put numbers on
+    screen that were never sampled -- in a dashboard whose whole convention is
+    that a missing reading shows as an em dash rather than a plausible zero,
+    that is the wrong trade.
+
+    `(rn - 1) % step = 0` counts from the NEWEST row, so rn = 1 always
+    survives: the live end of every trace is exact no matter the stride.
+    """
+    bad = [c for c in columns if c not in _COLUMN_SET]
+    if bad:
+        raise ValueError(f"fetch_series: unknown column(s) {bad}")
+    cols = ", ".join(columns)
+
+    clauses = ["device_id = ?"]
+    params = [device_id]
+    if start_ts is not None:
+        clauses.append("device_ts >= ?")
+        params.append(start_ts)
+    if end_ts is not None:
+        clauses.append("device_ts <= ?")
+        params.append(end_ts)
+    where = " AND ".join(clauses)
+
+    total = count_range(conn, start_ts, end_ts, device_id)
+    # `limit` keeps its fetch_samples meaning: the newest N rows in range.
+    considered = min(total, limit) if limit is not None else total
+
+    step = 1
+    if stride_target and considered > stride_target:
+        step = -(-considered // stride_target)      # ceil, no float rounding
+
+    if step > 1:
+        inner_limit = limit if limit is not None else considered
+        sql = (f"SELECT {cols} FROM ("
+               f"SELECT {cols}, ROW_NUMBER() OVER (ORDER BY device_ts DESC) "
+               f"AS _rn FROM telemetry WHERE {where} "
+               f"ORDER BY device_ts DESC LIMIT ?) "
+               f"WHERE (_rn - 1) % ? = 0 ORDER BY device_ts ASC")
+        rows = conn.execute(sql, [*params, inner_limit, step]).fetchall()
+    elif limit is not None:
+        sql = (f"SELECT {cols} FROM (SELECT {cols} FROM telemetry WHERE {where} "
+               f"ORDER BY device_ts DESC LIMIT ?) ORDER BY device_ts ASC")
+        rows = conn.execute(sql, [*params, limit]).fetchall()
+    else:
+        sql = f"SELECT {cols} FROM telemetry WHERE {where} ORDER BY device_ts ASC"
+        rows = conn.execute(sql, params).fetchall()
+
+    return rows, total, step
+
+
+def fetch_faults(conn: sqlite3.Connection, limit: int = 2000,
+                 device_id: str = DEVICE_ID, columns=None):
+    """Rows with a BMS or MMS fault flag set, ascending by car time.
+    With `limit`, returns the most recent `limit` fault rows (still ascending).
+    Backed by the partial fault index, so it stays cheap on a large table."""
+    where = "device_id = ? AND (bms_has_error = 1 OR mms_has_error = 1)"
+    # Defaults to SELECT * so the CSV export keeps every column; the dashboard's
+    # fault timeline passes the seven it actually reads.
+    if columns is None:
+        cols = "*"
+    else:
+        bad = [c for c in columns if c not in _COLUMN_SET]
+        if bad:
+            raise ValueError(f"fetch_faults: unknown column(s) {bad}")
+        cols = ", ".join(columns)
+    if limit is not None:
+        sql = (f"SELECT {cols} FROM (SELECT {cols} FROM telemetry WHERE {where} "
+               f"ORDER BY device_ts DESC LIMIT ?) ORDER BY device_ts ASC")
+        return conn.execute(sql, (device_id, limit)).fetchall()
+    sql = f"SELECT {cols} FROM telemetry WHERE {where} ORDER BY device_ts ASC"
+    return conn.execute(sql, (device_id,)).fetchall()
+
+
+# --------------------------------------------------------------------------- #
+# Race state (persisted so a browser refresh keeps the running race)
+# --------------------------------------------------------------------------- #
+def save_race_state(conn: sqlite3.Connection, is_racing, race_start_time) -> None:
+    """Persist the race clock. `race_start_time` is a unix epoch (or None)."""
+    payload = json.dumps({
+        "is_racing": bool(is_racing),
+        "race_start_time": race_start_time,
+    })
+    conn.execute(
+        "INSERT INTO app_state (key, value) VALUES ('race', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (payload,),
+    )
+    conn.commit()
+
+
+def load_race_state(conn: sqlite3.Connection) -> dict:
+    """Return {'is_racing': bool, 'race_start_time': float|None}; defaults if unset."""
+    row = conn.execute("SELECT value FROM app_state WHERE key = 'race'").fetchone()
+    if row and row["value"]:
+        try:
+            data = json.loads(row["value"])
+            return {
+                "is_racing": bool(data.get("is_racing")),
+                "race_start_time": data.get("race_start_time"),
+            }
+        except (ValueError, TypeError):
+            pass
+    return {"is_racing": False, "race_start_time": None}

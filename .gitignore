@@ -1,0 +1,83 @@
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Virtual environments
+venv/
+.venv/
+**/venv/
+**/.venv/
+REACT_MIGRATION_PROMPT.md
+# ---------------------------------------------------------------------------
+# Pit-side telemetry store
+# ---------------------------------------------------------------------------
+# collector.py writes telemetry.db locally on each pit machine. It is local
+# state, not source: never commit it.
+*.db
+*.db-wal
+*.db-shm
+
+# Manual snapshots taken before risky migrations (tens of MB each).
+*.bak
+**/*.bak
+# ...and the WAL/shm sidecars SQLite leaves beside a snapshot that was copied
+# while the database was open. These do NOT match *.db-wal above -- the name is
+# telemetry.db.<date>.<label>.bak-wal -- which is how 5.3 MB of them ended up
+# committed once already.
+*.bak-wal
+*.bak-shm
+
+# ---------------------------------------------------------------------------
+# Firebase credentials
+# ---------------------------------------------------------------------------
+# Real service-account keys for the solar-race-telemetry Firebase project.
+# NEVER commit these -- this repo is public. Get your own copy from the
+# team's shared folder (see README) and drop it in place; both collector.py
+# and main.py load it from these exact paths.
+#
+# This is not a hypothetical: a key WAS committed here for 12 days across 49
+# commits before this line was added, and was purged from history with
+# git-filter-repo. That key must be treated as compromised regardless -- see
+# the README note next to this same warning.
+Pit_Dashboard/serviceAccountKey.json
+SolarRace_OS/cloud/serviceAccountKey.json
+
+# ---------------------------------------------------------------------------
+# Car-side runtime state
+# ---------------------------------------------------------------------------
+# main.py writes this on the Pi so a reboot mid-race resumes the running
+# distance/energy totals instead of restarting from zero. Local state, not
+# source: never commit it, same reasoning as telemetry.db above.
+SolarRace_OS/lap_checkpoint.json
+SolarRace_OS/lap_checkpoint.json.tmp
+
+# ---------------------------------------------------------------------------
+# Launcher / runtime bookkeeping
+# ---------------------------------------------------------------------------
+# Hash of the last requirements file run_pit.bat pip-installed.
+.deps_stamp
+**/.deps_stamp
+# docs/ is private by default -- the task briefs in it are working notes, not
+# something the public repo needs. The two GENERATED web pages are the
+# exception: GitHub Pages publishes this folder at the site root, so if they
+# are not committed the spectator page simply does not exist for anyone but
+# whoever last ran the build script.
+docs/*
+!docs/*.html
+# collector stdout/stderr when launched detached by run_pit.bat
+collector.out.log
+collector.err.log
+
+# ---------------------------------------------------------------------------
+# Editors / OS
+# ---------------------------------------------------------------------------
+.idea/
+.Rhistory
+Thumbs.db
+desktop.ini
+
+# The demo store built by tools/demo_seed.py. Synthetic, rebuildable, large.
+demo_telemetry.db
