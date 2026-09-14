@@ -45,6 +45,8 @@ from weather_service import fetch_zolder_weather
 from strategy_engine import (
     calculate_all_strategies,
     create_combined_graph,
+    CHARGING_CURVE_IS_MEASURED,
+    MIN_STOP_DURATION_MIN,
     load_velocity_profile,
     get_live_track_status,
     SECTIONS_INFO,          # sector boundaries — the same ones already displayed
@@ -442,6 +444,17 @@ def _live_snapshot():
     # lap_source is deliberately NOT carried forward — it's only meaningful
     # paired with the lap that JUST happened, not as a standing fact.
     state["lap_source"] = _val(row, "lap_source", None)
+    # --- the Pi's own health ------------------------------------------- #
+    # NEVER carried forward. Every one of these answers "what is true right
+    # now", and a carried-forward "can_state: live" from four minutes ago is
+    # the precise lie this feature exists to stop -- it would report a healthy
+    # bus while the bus is exactly what has died.
+    state["can_state"] = _val(row, "can_state", None)
+    state["can_silent_s"] = _val(row, "can_silent_s", None)
+    state["can_detail"] = _val(row, "can_detail", None)
+    state["gps_fix"] = _val(row, "gps_fix", None)
+    state["gps_detail"] = _val(row, "gps_detail", None)
+    state["pi_uptime_s"] = _val(row, "pi_uptime_s", None)
     auto_lap = cf("auto_lap", "calculated_lap")
     state["auto_lap"] = None if auto_lap is None else int(auto_lap)
     odometer_m = cf("odometer_km", "odometer_m")
@@ -1053,13 +1066,64 @@ def _live_context():
     }
 
 
+# A channel quiet for longer than this is worth naming in the sidebar. Matches
+# CHANNEL_QUIET_AFTER_S on the car; the car decides WHICH channel, this only
+# decides whether to raise the subject at all.
+CAN_QUIET_AFTER_S = 3.0
+
+
+def car_health(state):
+    """(ok, problems) -- what the car says about itself, or (True, []) if it
+    says nothing.
+
+    Returns ok=True for a car that predates the heartbeat, on purpose. Silence
+    from an old build is not evidence of a fault, and turning the badge amber
+    for every team member still running last week's image would train everyone
+    to ignore it by Saturday.
+    """
+    if state.get("can_state") is None and state.get("gps_fix") is None:
+        return True, []
+
+    problems = []
+
+    can_state = state.get("can_state")
+    silent = state.get("can_silent_s")
+    detail = (state.get("can_detail") or "").strip()
+    if can_state == "disconnected":
+        problems.append("CAN bus not open")
+    elif can_state in ("silent", "starting") or (
+            silent is not None and silent > CAN_QUIET_AFTER_S):
+        # The car names the channel, because the channel names live on the car
+        # -- socketcan gives can0/can1, a USB adapter gives something else.
+        problems.append(detail or "CAN silent")
+    elif detail:
+        # Live overall, but the car still flagged a channel. This is the one
+        # that used to be invisible: can0 talking normally while can1 (the
+        # second BMS) has been dead for an hour.
+        problems.append(detail)
+
+    if state.get("gps_fix") == 0:
+        problems.append("no GPS fix")
+
+    return (not problems), problems
+
+
 @st.fragment(run_every=2)
 def _sidebar_status_fragment():
     """Live race status block in the sidebar — updates in place, no flash."""
     c = _live_context()
     age = c["age"]
     if c["fresh"]:
-        st.success(f"LIVE · {age:.0f}s ago", icon=":material/sensors:")
+        # The feed is live. That now means the PI is alive -- it heartbeats
+        # every few seconds whether or not CAN and GPS are working -- so a live
+        # badge no longer implies the car's sensors are talking. Say so when
+        # they are not, and stay out of the way when they are.
+        healthy, problems = car_health(c["state"])
+        if healthy:
+            st.success(f"LIVE · {age:.0f}s ago", icon=":material/sensors:")
+        else:
+            st.warning(f"Pi alive {age:.0f}s ago · " + " · ".join(problems),
+                       icon=":material/sensors_off:")
     elif age is None:
         st.error("No data — is collector.py running?", icon=":material/cloud_off:")
     else:
@@ -2943,6 +3007,29 @@ def _weather_fragment():
         st.warning("Weather API unavailable.")
 
 
+# How coarsely the strategy inputs are rounded before planning.
+#
+# The search costs ~300 ms and the fragment reruns every 10 s on the one
+# Streamlit thread the whole dashboard shares. Rounding the inputs makes the
+# cache key stable for about a minute, so five ticks in six cost nothing.
+#
+# Nothing is lost by it. A minute of race clock and 50 Wh of pack are far below
+# the model's own uncertainty -- the charge curve it plans against is not even
+# measured yet. What would be lost is the pit noticing a change a minute late,
+# and a strategy that turns over in under a minute was never a strategy.
+STRATEGY_TIME_ROUND_MIN = 1.0
+STRATEGY_WH_ROUND = 50.0
+
+
+@st.cache_data(ttl=90, show_spinner=False)
+def _plan_strategies(time_left_min, battery_wh, active_lap, table_key):
+    """Cached strategy search. `table_key` is a tuple so it can be hashed."""
+    consumption = [{'label': l, 'lap_time_min': t, 'energy_wh': w}
+                   for l, t, w in table_key]
+    return calculate_all_strategies(time_left_min, battery_wh, active_lap,
+                                    consumption)
+
+
 @st.fragment(run_every=10)
 def _strategy_fragment():
     """Strategy tab — consumption matrix + combined graph. In place."""
@@ -2984,8 +3071,12 @@ def _strategy_fragment():
                               if v is None)
         st.caption(f":orange[Assuming a full pack / lap 0 — no {missing} from the "
                    f"car yet.] These figures are a placeholder until it reports.")
-    all_strategies = calculate_all_strategies(time_left_min, car_battery_wh,
-                                              active_lap or 0, consumption_table)
+    all_strategies = _plan_strategies(
+        round(time_left_min / STRATEGY_TIME_ROUND_MIN) * STRATEGY_TIME_ROUND_MIN,
+        round(car_battery_wh / STRATEGY_WH_ROUND) * STRATEGY_WH_ROUND,
+        active_lap or 0,
+        tuple((r['label'], r['lap_time_min'], r['energy_wh'])
+              for r in consumption_table))
     # Provenance, not a second opinion: the matrix shows one number per row, and
     # this says which of them the car actually paid for. Without it there is no
     # way to tell a measured plan from an estimated one, and they justify very
@@ -2997,6 +3088,20 @@ def _strategy_fragment():
         st.caption(f":orange[Energy per lap is estimated] — no profile has "
                    f"{MIN_LAPS_FOR_MEASURED} completed laps yet. These figures "
                    f"become measurements once it does.")
+    # Charge times come from the SoC curve, not a flat rate: a pack charges at
+    # full power to about 55% and tapers hard above it, so "Pit Time" is the
+    # real cost of the targets in "Charge To", and each stop still costs the
+    # MIN_STOP_DURATION_MIN floor even when charging finishes sooner.
+    if CHARGING_CURVE_IS_MEASURED:
+        st.caption(":green[Charge times from the measured pack curve.] Each "
+                   f"stop costs at least {MIN_STOP_DURATION_MIN:.0f} min.")
+    else:
+        st.caption(":orange[Charge times are MODELLED, not measured.] The SoC "
+                   "curve came from the charging branch marked *example data* "
+                   "and has never been checked against this charger or pack — "
+                   "its shape is right, its numbers are not ours. Lap counts "
+                   "are sound; treat **Pit Time** as an estimate until someone "
+                   "times a real charge.")
     display_df = pd.DataFrame(all_strategies)
     graph_data_list = display_df.pop('_graph_data').tolist()
     st.dataframe(display_df, width="stretch", hide_index=True)

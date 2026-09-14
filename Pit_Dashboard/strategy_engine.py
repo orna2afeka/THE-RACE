@@ -57,113 +57,408 @@ def get_track_section(profile_df, current_dist_m):
     idx = (np.abs(profile_df['d(m)'] - current_dist_m)).argmin()
     return profile_df.iloc[idx]['section']
 
-def calculate_all_strategies(time_left_min, current_available_wh, current_lap, consumption_table, track_length_km=4.0):
-    CHARGE_RATE_WH_MIN = 150
-    MAX_STOPS = 3
-    MIN_STOP_DURATION = 30
-    DRIVER_STINT_LIMIT_MIN = 120
-    DRIVER_CHANGE_TIME_MIN = 5
-    BATTERY_FLOOR_WH = 450  
-    FULL_CHARGE_WH = 8550  
-    FULL_STINT_USABLE_WH = FULL_CHARGE_WH - BATTERY_FLOOR_WH  
+# =============================================================================
+# SOC-DEPENDENT CHARGING
+# =============================================================================
+# Merged from the charging-strategy-test branch. That branch could not be merged
+# with git -- it sits on the history from before the repo was flattened, so the
+# two have no common ancestor and git refuses outright. The model below is the
+# part worth keeping, rewritten against this branch's race rules.
+#
+# WHAT IT CHANGES
+# The old model charged at a flat 150 Wh/min. That is true only up to about 55%
+# SoC. Above it the pack tapers hard, and the error is not small:
+#
+#     charge from 5% to    our old flat model      this curve
+#              55%               28.5 min           28.5 min
+#              70%               37.0 min           38.0 min
+#              80%               42.8 min           46.9 min
+#              90%               48.5 min           62.0 min
+#             100%               54.1 min          103.3 min
+#
+# A full charge was being planned at half its real cost. Across three stops in a
+# 24 h race that is over two hours of pit time the strategy did not know about.
+#
+# WHAT IT MEANS ON RACE DAY
+# Because a stop costs MIN_STOP_DURATION regardless, charging to ~70% is very
+# nearly free -- 38 min against a 30 min floor -- while the last 10% costs more
+# than the first 60%. So the optimiser below is free to pick a different target
+# at every stop, and it will normally choose partial charges.
+#
+# !! THE CURVE ITSELF IS NOT MEASURED !!
+# It came over marked "Example charging curve - replace with real battery data"
+# and nothing here has verified it against the actual charger or pack. The
+# SHAPE is certainly right (every lithium pack tapers on CV) but the numbers are
+# not ours. Everything derived from it is labelled as modelled on screen.
+# Replacing it is a one-place edit: measure a real charge, put the kW readings
+# in CHARGING_CURVE, and every table, graph and plan follows.
+CHARGING_CURVE = {          # SoC % -> charging power, kW
+    5: 9.0,   10: 9.0,  15: 9.0,  20: 9.0,  25: 9.0,
+    30: 9.0,  35: 9.0,  40: 9.0,  45: 9.0,  50: 9.0,
+    55: 8.8,  60: 8.5,  65: 8.0,  70: 7.0,  75: 6.0,
+    80: 4.5,  85: 3.5,  90: 2.5,  95: 1.5, 100: 0.5,
+}
+CHARGING_CURVE_IS_MEASURED = False     # flip when the curve is real; the
+                                       # dashboard captions read this.
 
-    current_usable_wh = max(0, current_available_wh - BATTERY_FLOOR_WH)
-    all_strategies = []
+BATTERY_FULL_WH = 8550.0
+BATTERY_FLOOR_WH = 450.0       # never plan to go below this
 
+# Race rules, confirmed by the team. These are the reason the merged model is
+# not simply her optimiser: hers has none of them, so its lap counts are
+# optimistic and its "many short stops" plans are not actually cheap.
+MIN_STOP_DURATION_MIN = 30.0   # a stop costs this even if charging is quicker
+DRIVER_STINT_LIMIT_MIN = 120.0 # continuous driving before a driver must change
+DRIVER_CHANGE_TIME_MIN = 5.0   # cost of that change
+MAX_STOPS = 4
+
+# Targets the optimiser may pick from, independently at each stop. Stopping at
+# 95/100 is deliberately not offered: past 90 the curve charges slower than the
+# car discharges on track, so it can never be the right call in a timed race.
+CHARGE_TARGETS_PCT = (55, 60, 65, 70, 75, 80, 85, 90)
+
+
+def get_charging_power(soc_pct):
+    """Charging power in kW at this state of charge, linear between points."""
+    if soc_pct <= 5:
+        return CHARGING_CURVE[5]
+    if soc_pct >= 100:
+        return CHARGING_CURVE[100]
+    lower = int(soc_pct // 5) * 5
+    upper = lower + 5
+    lo, hi = CHARGING_CURVE[lower], CHARGING_CURVE[upper]
+    return lo + ((soc_pct - lower) / (upper - lower)) * (hi - lo)
+
+
+def _build_charge_clock(capacity_wh, step=0.1):
+    """Cumulative minutes to charge from 5% up to each point on a 0.1% grid.
+
+    Charging time is an integral over SoC, so it is path independent: the time
+    from a to b is just clock(b) - clock(a). Building the clock once turns every
+    later query into two lookups.
+
+    This is not a micro-optimisation. Integrating the curve on every call made
+    the strategy table take 9.6 SECONDS, inside a fragment that reruns every 10
+    on the same Streamlit thread as the rest of the dashboard -- the exact
+    failure that once made the whole pit refresh at 7-10 s instead of 1.
+    """
+    n = int(round(100.0 / step)) + 1
+    clock = [0.0] * n
+    total = 0.0
+    for i in range(1, n):
+        lo = i * step
+        hi = lo + step
+        kw = get_charging_power(lo + step / 2.0)
+        total += ((capacity_wh * step / 100.0) / (kw * 1000.0)) * 60.0
+        clock[i] = total
+    return clock
+
+
+_CHARGE_CLOCK_CACHE = {}
+
+
+def _charge_clock(capacity_wh):
+    key = round(float(capacity_wh), 3)
+    clock = _CHARGE_CLOCK_CACHE.get(key)
+    if clock is None:
+        clock = _build_charge_clock(key)
+        _CHARGE_CLOCK_CACHE[key] = clock
+    return clock
+
+
+def charging_time_min(start_soc, target_soc, capacity_wh=BATTERY_FULL_WH):
+    """Minutes to charge between two SoC percentages, following the curve."""
+    if target_soc <= start_soc:
+        return 0.0
+    clock = _charge_clock(capacity_wh)
+    last = len(clock) - 1
+
+    def at(soc):
+        x = min(max(float(soc), 0.0), 100.0) * 10.0     # 0.1% grid
+        i = int(x)
+        if i >= last:
+            return clock[last]
+        return clock[i] + (x - i) * (clock[i + 1] - clock[i])
+
+    return max(0.0, at(target_soc) - at(max(start_soc, 5.0)))
+
+
+def stop_duration_min(start_soc, target_soc, capacity_wh=BATTERY_FULL_WH):
+    """What the stop actually costs: charging, but never less than the floor."""
+    return max(MIN_STOP_DURATION_MIN,
+               charging_time_min(start_soc, target_soc, capacity_wh))
+
+
+def _plan_one_strategy(label, lap_time_min, energy_per_lap_wh, speed_kmh,
+                       time_left_min, start_wh, current_lap,
+                       capacity_wh=BATTERY_FULL_WH):
+    """Best race plan for ONE driving strategy: laps, stops, and a full trace.
+
+    Depth-first over "drive until you must stop, then pick a charge target",
+    trying every target at every stop. Ranked on laps first, then total pit
+    time, then number of stops -- laps win the race, and between two plans that
+    finish on the same lap, the one that spends less time stationary is the one
+    with room for a mistake.
+
+    THE SEARCH CARRIES NO TRACE. It decides a stop plan and nothing else; the
+    ~400-point curve the graph needs is rebuilt once, afterwards, by _replay().
+    Threading the trace through the recursion meant copying a 400-element list
+    at every node of a few-thousand-node search, and that was most of the cost.
+
+    Returns ONE simulation. The table and the graph both render this same
+    result and cannot disagree, which is exactly what went wrong before: the
+    graph kept its own copy of the constants and re-derived the plan at a flat
+    charge rate, so it drew a straight charging line under a table computed
+    from the curve.
+    """
+    if lap_time_min <= 0 or energy_per_lap_wh <= 0:
+        return None
+
+    start_wh = min(float(start_wh), capacity_wh)
+    if start_wh <= 0:
+        start_wh = capacity_wh
+
+    floor = BATTERY_FLOOR_WH
+    stint_limit = DRIVER_STINT_LIMIT_MIN
+    swap_min = DRIVER_CHANGE_TIME_MIN
+
+    def drive(t, e, n, d, swaps):
+        """Run laps until time, energy or the driver clock stops us.
+
+        Advances a BLOCK of laps at a time -- as many as fit before the next
+        driver change -- rather than one lap per iteration. Same answer, about
+        twelve iterations instead of four hundred, and this is the hot loop of
+        the whole search: it runs at every node.
+        """
+        while True:
+            # Laps that fit in this driver's remaining stint. Zero means the
+            # next lap would cross the limit, so a change comes first.
+            in_stint = int((stint_limit - d) / lap_time_min)
+            if in_stint <= 0:
+                if t + swap_min + lap_time_min > time_left_min:
+                    break
+                if e - energy_per_lap_wh < floor:
+                    break
+                t += swap_min
+                d = 0.0
+                swaps += 1
+                continue
+
+            by_time = int((time_left_min - t) / lap_time_min)
+            by_energy = int((e - floor) / energy_per_lap_wh)
+            k = min(in_stint, by_time, by_energy)
+            if k <= 0:
+                break
+
+            t += k * lap_time_min
+            e -= k * energy_per_lap_wh
+            n += k
+            d += k * lap_time_min
+            if k < in_stint:
+                break          # stopped by time or energy, not by the stint
+        return t, e, n, d, swaps
+
+    best = {}
+    memo = {}
+
+    def search(t0, e0, n0, d0, stops, pit_min, swaps0):
+        # Admissible bound: even driving flat out with free energy and no
+        # further stops, the laps still available are (time left) / lap time.
+        # If that cannot beat the best plan found so far, nothing below this
+        # node can either. Pure pruning -- it changes the search cost, never
+        # the answer, which the self-check's lap counts verify.
+        if best:
+            ceiling = n0 + int((time_left_min - t0) // lap_time_min)
+            if ceiling < best["laps"]:
+                return
+
+        t, e, n, d, swaps = drive(t0, e0, n0, d0, swaps0)
+
+        key = (n, -pit_min, -len(stops))
+        if not best or key > best["_key"]:
+            best.update({"_key": key, "laps": n, "stops": list(stops),
+                         "pit_min": pit_min, "swaps": swaps,
+                         "final_wh": e, "time_used": t})
+
+        if t >= time_left_min or len(stops) >= MAX_STOPS:
+            return
+
+        soc_now = (e / capacity_wh) * 100.0
+        for target in CHARGE_TARGETS_PCT:
+            if target <= soc_now + 1.0:
+                continue
+            target_wh = capacity_wh * target / 100.0
+            if target_wh - energy_per_lap_wh < floor:
+                continue
+            charge = charging_time_min(soc_now, target, capacity_wh)
+            dur = max(MIN_STOP_DURATION_MIN, charge)
+            # A stop that does not finish before the flag is pure loss.
+            if t + dur >= time_left_min:
+                continue
+
+            # Memo on where the stop LEAVES us. Two routes to the same
+            # (time, energy, stop count) cannot be told apart afterwards, so
+            # only the one that arrived there with more laps is worth expanding.
+            mkey = (round(t + dur, 1), round(target_wh, -1), len(stops) + 1)
+            seen = memo.get(mkey)
+            if seen is not None and seen >= n:
+                continue
+            memo[mkey] = n
+
+            search(t + dur, target_wh, n, 0.0,
+                   stops + [{"number": len(stops) + 1,
+                             "after_lap": current_lap + n,
+                             "at_min": t,
+                             "soc_before": soc_now,
+                             "soc_after": float(target),
+                             "charge_min": charge,
+                             "stop_min": dur}],
+                   pit_min + dur, swaps)
+
+    search(0.0, start_wh, 0, 0.0, [], 0.0, 0)
+
+    if not best:
+        return None
+    best.update({"label": label, "lap_time_min": lap_time_min,
+                 "energy_per_lap_wh": energy_per_lap_wh, "speed_kmh": speed_kmh,
+                 "total_time_min": time_left_min, "start_wh": start_wh,
+                 "capacity_wh": capacity_wh})
+    best["trace"] = _replay(best)
+    return best
+
+
+def _replay(plan):
+    """Rebuild the (minute, Wh) curve for a finished plan, for the graph.
+
+    Deterministic given the stop plan, so it reproduces the search exactly --
+    and being separate means the search pays nothing for it.
+    """
+    lap_time = plan["lap_time_min"]
+    per_lap = plan["energy_per_lap_wh"]
+    cap = plan["capacity_wh"]
+    limit = plan["total_time_min"]
+
+    t, e, d = 0.0, plan["start_wh"], 0.0
+    pts = [(0.0, e, "start")]
+    stops = list(plan["stops"])
+
+    while True:
+        stop = stops.pop(0) if stops else None
+        while True:
+            if stop is not None and t >= stop["at_min"] - 1e-9:
+                break
+            swap = DRIVER_CHANGE_TIME_MIN if (
+                d + lap_time > DRIVER_STINT_LIMIT_MIN) else 0.0
+            if t + swap + lap_time > limit:
+                break
+            if e - per_lap < BATTERY_FLOOR_WH:
+                break
+            if swap:
+                # Stationary for the change: time moves, energy does not, so a
+                # swap reads on the graph as a flat step, not a kink.
+                t += swap
+                d = 0.0
+                pts.append((t, e, "swap"))
+            t += lap_time
+            e -= per_lap
+            d += lap_time
+            pts.append((t, e, "lap"))
+
+        if stop is None:
+            break
+
+        soc_before = (e / cap) * 100.0
+        target = stop["soc_after"]
+        pts.append((t, e, "stop"))
+        # Sample the charge so the graph draws the real taper, not a straight
+        # line between the endpoints.
+        steps = 10
+        for i in range(1, steps + 1):
+            soc_i = soc_before + (target - soc_before) * i / steps
+            pts.append((t + charging_time_min(soc_before, soc_i, cap),
+                        cap * soc_i / 100.0, "charge"))
+        t += stop["stop_min"]
+        e = cap * target / 100.0
+        d = 0.0
+        # Waiting out the minimum-stop floor after charging has finished.
+        if pts[-1][0] < t - 1e-9:
+            pts.append((t, e, "hold"))
+
+    return pts
+
+
+def calculate_all_strategies(time_left_min, current_available_wh, current_lap,
+                             consumption_table, track_length_km=4.0):
+    """One row per driving strategy, each carrying its own full simulation.
+
+    Same signature and same column names as before, so the dashboard and the
+    exports keep working; the Pit Strategy column now says what the plan
+    actually charges to, and three columns are new.
+    """
+    rows = []
     for option in consumption_table:
         label = option['label']
-        lap_time_min = option['lap_time_min']
-        energy_per_lap = option['energy_wh']
+        lap_time_min = float(option['lap_time_min'])
+        energy_per_lap = float(option['energy_wh'])
+        speed_kmh = track_length_km / (lap_time_min / 60.0) if lap_time_min else 0.0
 
-        laps_possible = int(time_left_min // lap_time_min)
-        valid_strategy = False
-        best_stops = 0
-        best_pit_time = 0
-        best_driver_changes = 0
-        stint_laps_list = []
+        plan = _plan_one_strategy(label, lap_time_min, energy_per_lap, speed_kmh,
+                                  time_left_min, current_available_wh,
+                                  current_lap)
 
-        while laps_possible > 0 and not valid_strategy:
-            energy_needed = laps_possible * energy_per_lap
+        if plan is None or plan["laps"] == 0:
+            rows.append({
+                'Label': label, 'Lap Time': f"{lap_time_min:.2f} m",
+                'Speed (km/h)': "-", 'Total Laps': 0,
+                'Energy/Lap (Wh)': round(energy_per_lap, 1),
+                'Pit Strategy': "-", 'Charge To': "-", 'Pit Time': "-",
+                'Driver Swaps': "-", 'Final SoC': "-", '_graph_data': None,
+            })
+            continue
 
-            if energy_needed <= current_usable_wh:
-                stint_time = laps_possible * lap_time_min
-                driver_changes = int((stint_time - 0.001) // DRIVER_STINT_LIMIT_MIN)
-                if driver_changes < 0: driver_changes = 0
-                total_race_time = stint_time + (driver_changes * DRIVER_CHANGE_TIME_MIN)
+        stops = plan["stops"]
+        final_soc = (plan["final_wh"] / plan["capacity_wh"]) * 100.0
+        # A plan that stops driving well before the flag has not run out of
+        # time -- it has run out of ALLOWED STOPS, and is sitting in the pit
+        # box for the rest of the race. Worth saying: MAX_STOPS is our own
+        # assumption, not a regulation, so a strategist seeing this can decide
+        # to raise it rather than accept the lap count underneath it.
+        idle_min = time_left_min - plan["time_used"]
+        # Idle long enough that ANOTHER STOP would have fitted. Less than that
+        # is just time left over at the flag, which is normal and not worth
+        # putting on screen.
+        stop_limited = (len(stops) >= MAX_STOPS
+                        and idle_min > MIN_STOP_DURATION_MIN)
+        pit_label = f"{len(stops)} Stops" if stops else "No Stops"
+        if stop_limited:
+            pit_label += f" (limit, {idle_min:.0f}m idle)"
+        rows.append({
+            'Label': label,
+            'Lap Time': f"{lap_time_min:.2f} m",
+            'Speed (km/h)': f"{speed_kmh:.1f}",
+            'Total Laps': plan["laps"],
+            'Energy/Lap (Wh)': round(energy_per_lap, 1),
+            'Pit Strategy': pit_label,
+            'Charge To': (" / ".join(f"{s['soc_after']:.0f}%" for s in stops)
+                          if stops else "-"),
+            'Pit Time': f"{plan['pit_min']:.0f} m" if stops else "-",
+            'Driver Swaps': (f"{plan['swaps']} Swaps" if plan["swaps"]
+                             else "0 Swaps"),
+            'Final SoC': f"{final_soc:.0f}%",
+            '_graph_data': plan,
+        })
+    return rows
 
-                if total_race_time <= time_left_min:
-                    valid_strategy = True
-                    best_stops = 0
-                    best_pit_time = 0
-                    best_driver_changes = driver_changes
-                    stint_laps_list = [laps_possible]
-            else:
-                remaining_energy_needed = energy_needed - current_usable_wh
-                min_stops = math.ceil(remaining_energy_needed / FULL_STINT_USABLE_WH)
-
-                if 1 <= min_stops <= MAX_STOPS:
-                    for s in range(min_stops, MAX_STOPS + 1):
-                        min_mandatory_pit_time = s * MIN_STOP_DURATION
-                        actual_charge_time_needed = remaining_energy_needed / CHARGE_RATE_WH_MIN
-                        total_pit_time = max(min_mandatory_pit_time, actual_charge_time_needed)
-
-                        laps_first_stint = int(current_usable_wh // energy_per_lap)
-                        temp_stint_laps = [laps_first_stint]
-                        laps_left = laps_possible - laps_first_stint
-                        
-                        if laps_left < 0: continue
-                        laps_per_full_stint = laps_left // s
-
-                        for _ in range(s - 1):
-                            temp_stint_laps.append(laps_per_full_stint)
-                        temp_stint_laps.append(laps_left - (laps_per_full_stint * (s - 1)))
-
-                        total_driver_changes = 0
-                        for stint_laps in temp_stint_laps:
-                            stint_time = stint_laps * lap_time_min
-                            changes = int((stint_time - 0.001) // DRIVER_STINT_LIMIT_MIN)
-                            if changes < 0: changes = 0
-                            total_driver_changes += changes
-
-                        total_driver_time_lost = total_driver_changes * DRIVER_CHANGE_TIME_MIN
-                        total_race_time = (laps_possible * lap_time_min) + total_pit_time + total_driver_time_lost
-
-                        if total_race_time <= time_left_min:
-                            valid_strategy = True
-                            best_stops = s
-                            best_pit_time = total_pit_time
-                            best_driver_changes = total_driver_changes
-                            stint_laps_list = temp_stint_laps
-                            break
-            if valid_strategy:
-                break
-            laps_possible -= 1
-
-        if valid_strategy:
-            speed_kmh = track_length_km / (lap_time_min / 60)
-            pit_msg = f"{best_stops} Stops" if best_stops > 0 else "No Stops"
-            driver_msg = f"{best_driver_changes} Swaps" if best_driver_changes > 0 else "0 Swaps"
-            strategy_data = {
-                'Label': label, 'Lap Time': f"{lap_time_min:.2f} m", 'Speed (km/h)': f"{speed_kmh:.1f}",
-                'Total Laps': laps_possible, 'Energy/Lap (Wh)': energy_per_lap,
-                'Pit Strategy': pit_msg, 'Driver Swaps': driver_msg,
-                '_graph_data': {
-                    'label': label, 'start_wh': current_available_wh, 'stints': stint_laps_list,
-                    'lap_time': lap_time_min, 'energy_per_lap': energy_per_lap,
-                    'pit_time': best_pit_time / best_stops if best_stops > 0 else 0, 'total_time': time_left_min
-                }
-            }
-        else:
-            strategy_data = {
-                'Label': label, 'Lap Time': f"{lap_time_min:.2f} m", 'Speed (km/h)': "-", 
-                'Total Laps': 0, 'Energy/Lap (Wh)': energy_per_lap,
-                'Pit Strategy': "-", 'Driver Swaps': "-", '_graph_data': None
-            }
-        all_strategies.append(strategy_data)
-    return all_strategies
 
 def create_combined_graph(graph_data_list):
-    fig, ax = plt.subplots(figsize=(10, 3))
+    """Plot the simulations the table was built from. It does NOT re-derive.
+
+    The previous version kept its own CHARGE_RATE, DRIVER_STINT and swap
+    constants and replayed the plan itself, so the picture could drift from the
+    numbers beside it. Now it only draws the trace it is handed, which is why
+    the charging segments curve: that is the real taper, not a straight line.
+    """
+    fig, ax = plt.subplots(figsize=(10, 3.4))
     colors = ['#e74c3c', '#e67e22', '#f1c40f', '#3498db', '#9b59b6']
     fig.patch.set_facecolor('#0e1117')
     ax.set_facecolor('#0e1117')
@@ -171,55 +466,44 @@ def create_combined_graph(graph_data_list):
     ax.xaxis.label.set_color('white')
     ax.yaxis.label.set_color('white')
     ax.title.set_color('white')
-    
-    CHARGE_RATE = 150
-    DRIVER_STINT = 120
-    DRIVER_SWAP = 5
 
-    for idx, graph_data in enumerate(graph_data_list):
-        if not graph_data: continue
-        t_points, wh_points = [0], [graph_data['start_wh']]
-        t_current, wh_current = 0, graph_data['start_wh']
-        lap_time, energy_per_lap = graph_data['lap_time'], graph_data['energy_per_lap']
+    total_time = 0.0
+    for plan in graph_data_list:
+        if plan:
+            total_time = max(total_time, plan.get("total_time_min", 0.0))
 
-        for i, stint_laps in enumerate(graph_data['stints']):
-            t_stint_rem = stint_laps * lap_time
-            discharge_rate = energy_per_lap / lap_time
+    for idx, plan in enumerate(graph_data_list):
+        if not plan:
+            continue
+        color = colors[idx % len(colors)]
+        trace = plan["trace"]
+        xs = [max(0.0, plan["total_time_min"] - t) for t, _wh, _k in trace]
+        ys = [wh for _t, wh, _k in trace]
+        ax.plot(xs, ys, label=plan["label"], color=color, linewidth=2)
 
-            while t_stint_rem > 0.001:
-                if t_stint_rem > DRIVER_STINT:
-                    t_current += DRIVER_STINT
-                    wh_current -= DRIVER_STINT * discharge_rate
-                    t_points.append(t_current)
-                    wh_points.append(wh_current)
-                    t_current += DRIVER_SWAP
-                    t_points.append(t_current)
-                    wh_points.append(wh_current)
-                    t_stint_rem -= DRIVER_STINT
-                else:
-                    t_current += t_stint_rem
-                    wh_current -= t_stint_rem * discharge_rate
-                    t_points.append(t_current)
-                    wh_points.append(wh_current)
-                    t_stint_rem = 0
+        # Mark where the car enters the pit lane. The charge that follows is
+        # already visible as the curve; this says which lap it happens on.
+        for stop in plan["stops"]:
+            x = max(0.0, plan["total_time_min"] - stop["at_min"])
+            y = plan["capacity_wh"] * stop["soc_before"] / 100.0
+            ax.plot([x], [y], marker='v', markersize=6, color=color,
+                    markeredgecolor='white', markeredgewidth=0.6, zorder=5)
 
-            if i < len(graph_data['stints']) - 1:
-                t_current += graph_data['pit_time']
-                wh_current += graph_data['pit_time'] * CHARGE_RATE
-                if wh_current > 8550: wh_current = 8550
-                t_points.append(t_current)
-                wh_points.append(wh_current)
-
-        x_points = [max(0, graph_data['total_time'] - t) for t in t_points]
-        ax.plot(x_points, wh_points, label=graph_data['label'], color=colors[idx], linewidth=2)
-
-    ax.axhline(y=450, color='#e74c3c', linestyle='--', linewidth=1.5, label="450 Wh Floor")
+    ax.axhline(y=BATTERY_FLOOR_WH, color='#e74c3c', linestyle='--',
+               linewidth=1.5, label=f"{BATTERY_FLOOR_WH:.0f} Wh Floor")
+    ax.set_ylim(0, BATTERY_FULL_WH * 1.05)
     ax.invert_xaxis()
-    ax.set_title("Battery SoC Forecast (Wh vs Mins Left)")
+    # The taper is in the data but is not visible at this zoom -- a 46 minute
+    # charge is 3% of a 24 hour axis -- so the title does not claim it. Where
+    # the taper actually shows is the Pit Time column beside this.
+    ax.set_title("Battery forecast - Wh remaining vs minutes left")
+    ax.set_xlabel("Minutes remaining")
     ax.grid(True, linestyle='--', alpha=0.3, color='gray')
-    ax.legend(loc='upper left', fontsize='small', facecolor='#1a1a1a', edgecolor='none', labelcolor='white')
-    
+    ax.legend(loc='upper left', fontsize='small', facecolor='#1a1a1a',
+              edgecolor='none', labelcolor='white', ncol=2)
+    fig.tight_layout()
     return fig
+
 
     # ==============================================================================
 # LIVE TRACK MAPPING (Based on the defined Track Segments)
@@ -302,3 +586,117 @@ def get_live_track_status(current_dist_m, profile_df=None):
         "next_feature_speed": next_landmark["max_speed"],
         "distance_to_next": dist_to_landmark
     }
+
+
+# =============================================================================
+# Self-check:  python Pit_Dashboard/strategy_engine.py
+# =============================================================================
+# The strategy table is how the pit decides when to stop and how long to charge,
+# and a plan that quietly breaks a race rule looks exactly like one that does
+# not. So every plan this produces is checked against the rules it claims to
+# obey, and -- the part that actually went wrong before the merge -- the trace
+# the GRAPH draws is checked against the numbers in the TABLE.
+if __name__ == "__main__":
+    _TABLE = [
+        {"label": "Fast (-10%)",    "lap_time_min": 3.15, "energy_wh": 88.0},
+        {"label": "Med-Fast (-5%)", "lap_time_min": 3.33, "energy_wh": 84.0},
+        {"label": "Base (210s)",    "lap_time_min": 3.50, "energy_wh": 80.0},
+        {"label": "Med-Slow (+5%)", "lap_time_min": 3.67, "energy_wh": 76.0},
+        {"label": "Slow (+10%)",    "lap_time_min": 3.85, "energy_wh": 72.0},
+    ]
+    _ok = True
+
+    def _fail(msg):
+        global _ok
+        _ok = False
+        print("    ** FAIL ** " + msg)
+
+    def _want(cond, msg):
+        if not cond:
+            _fail(msg)
+
+    print("charging curve (NOT measured -- see CHARGING_CURVE):")
+    for _a, _b in ((5, 55), (5, 70), (5, 80), (5, 90), (5, 100)):
+        _t = charging_time_min(_a, _b)
+        _wh = BATTERY_FULL_WH * (_b - _a) / 100.0
+        print("    %2d%% -> %3d%%   %6.1f min   %5.0f Wh   %5.1f Wh/min"
+              % (_a, _b, _t, _wh, _wh / _t))
+    _want(charging_time_min(5, 55) < charging_time_min(5, 70)
+          < charging_time_min(5, 90) < charging_time_min(5, 100),
+          "charge time is not monotonic in target SoC")
+    _want(charging_time_min(70, 70) == 0.0, "charging to where we already are costs time")
+    _want(charging_time_min(90, 70) == 0.0, "charging DOWN returns a time")
+    # The taper is the whole point: the last 10% must cost more than the first 50%.
+    _want(charging_time_min(90, 100) > charging_time_min(5, 55),
+          "the curve does not taper -- 90-100% should cost more than 5-55%")
+
+    for _label, _left, _start in (("full 24 h, full pack", 24 * 60.0, BATTERY_FULL_WH),
+                                  ("6 h left, part charged", 360.0, 3000.0),
+                                  ("45 min, no stop fits", 45.0, BATTERY_FULL_WH),
+                                  ("20 min, nearly empty", 20.0, 600.0),
+                                  ("24 h from the floor", 24 * 60.0, 500.0)):
+        print("\n%s:" % _label)
+        for _row in calculate_all_strategies(_left, _start, 0, _TABLE):
+            _p = _row["_graph_data"]
+            if _p is None:
+                _want(_row["Total Laps"] == 0,
+                      "%s: no plan but laps > 0" % _row["Label"])
+                continue
+            _tr = _p["trace"]
+            _laps = sum(1 for _, _, k in _tr if k == "lap")
+            _swaps = sum(1 for _, _, k in _tr if k == "swap")
+            _stops = sum(1 for _, _, k in _tr if k == "stop")
+            _pit = sum(x["stop_min"] for x in _p["stops"])
+            _nm = _row["Label"]
+
+            # graph and table must describe the same race
+            _want(_laps == _row["Total Laps"],
+                  "%s: trace %d laps, table %d" % (_nm, _laps, _row["Total Laps"]))
+            _want(_stops == len(_p["stops"]), "%s: stop count disagrees" % _nm)
+            _want(_swaps == _p["swaps"], "%s: swap count disagrees" % _nm)
+
+            # the race must be legal
+            _want(_tr[-1][0] <= _left + 1e-6, "%s: runs past the flag" % _nm)
+            _want(min(w for _, w, _ in _tr) >= BATTERY_FLOOR_WH - 1e-6,
+                  "%s: goes below the %.0f Wh floor" % (_nm, BATTERY_FLOOR_WH))
+            _want(max(w for _, w, _ in _tr) <= _p["capacity_wh"] + 1e-6,
+                  "%s: goes above capacity" % _nm)
+            _want(all(_tr[i][0] >= _tr[i - 1][0] - 1e-9 for i in range(1, len(_tr))),
+                  "%s: time runs backwards" % _nm)
+            for _st in _p["stops"]:
+                _want(_st["stop_min"] >= MIN_STOP_DURATION_MIN - 1e-6,
+                      "%s: a stop is under the %.0f min minimum"
+                      % (_nm, MIN_STOP_DURATION_MIN))
+                _want(_st["stop_min"] >= _st["charge_min"] - 1e-6,
+                      "%s: a stop is shorter than its own charge" % _nm)
+            _want(abs(_pit - _p["pit_min"]) < 1e-6, "%s: pit time does not add up" % _nm)
+            _want(abs((_row["Total Laps"] * _p["lap_time_min"]
+                       + _p["swaps"] * DRIVER_CHANGE_TIME_MIN + _pit)
+                      - _p["time_used"]) < 1e-6,
+                  "%s: drive + swaps + pit != time used" % _nm)
+            # no driver may exceed the stint limit
+            _run = _worst = 0.0
+            for _, _, _k in _tr:
+                if _k == "lap":
+                    _run += _p["lap_time_min"]
+                    _worst = max(_worst, _run)
+                elif _k in ("swap", "stop"):
+                    _run = 0.0
+            _want(_worst <= DRIVER_STINT_LIMIT_MIN + 1e-6,
+                  "%s: a driver runs %.1f min, over the %.0f limit"
+                  % (_nm, _worst, DRIVER_STINT_LIMIT_MIN))
+
+            print("    %-16s %3d laps | %-26s | pit %5.1f | %d swaps"
+                  % (_nm, _row["Total Laps"], _row["Pit Strategy"], _pit, _p["swaps"]))
+
+    import time as _time
+    _t0 = _time.perf_counter()
+    calculate_all_strategies(24 * 60.0, BATTERY_FULL_WH, 0, _TABLE)
+    _ms = (_time.perf_counter() - _t0) * 1000
+    print("\nfull 24 h table: %.0f ms" % _ms)
+    # This runs inside a fragment that reruns every 10 s on the dashboard's one
+    # Streamlit thread. Half a second here is half a second nothing else moves.
+    _want(_ms < 500, "too slow for the 10 s strategy fragment: %.0f ms" % _ms)
+
+    print("\nSELF-CHECK", "PASSED" if _ok else "FAILED")
+    raise SystemExit(0 if _ok else 1)

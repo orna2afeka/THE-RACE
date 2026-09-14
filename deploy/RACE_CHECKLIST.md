@@ -312,6 +312,37 @@ the TV. The server does not need restarting.
 
 ---
 
+## 5c. The sidebar badge now tells you WHICH thing is broken
+
+The car heartbeats to Firebase every 5 s whether or not CAN and GPS are working.
+So the sidebar badge no longer means "the car's sensors are fine" — it means
+"the Pi is reachable", and it says separately if anything on the car is not.
+
+| Badge | What it means | What to do |
+|---|---|---|
+| `LIVE · 3s ago` | Everything is fine | Nothing |
+| `Pi alive 3s ago · can0 silent 47s` | Pi and network fine, **CAN is not talking** | Check the CAN wiring / `can-up.service`, not the network |
+| `Pi alive 3s ago · no GPS fix` | Pi and CAN fine, no sky | Normal in the garage; must clear on track |
+| `Pi alive 3s ago · can1 silent 3600s` | One channel dead, the other fine | The second BMS is not answering |
+| `Stale · 4m ago` | The Pi itself is not reaching us | Power, WiFi, or the Pi is down |
+| `No data — is collector.py running?` | Nothing received at all | Start the collector |
+
+### ☐ Before the race: see it work
+
+With the car on and CAN connected, the badge must read plain `LIVE`. Then unplug
+CAN for ten seconds — it must change to `Pi alive … · canN silent …s` and
+change back when you reconnect. If it stays `LIVE` with CAN unplugged, the Pi is
+running an older image: `git pull` and restart the HUD.
+
+### ☐ The Pi needs the new code
+
+None of this reaches the pit until the Pi has pulled and the HUD has restarted.
+An older car simply sends no health block, and the badge then behaves exactly as
+it always did — plain `LIVE` — which is deliberate: silence from an old build
+is not evidence of a fault.
+
+---
+
 ## 6. Quick reference
 
 | Thing | Where |

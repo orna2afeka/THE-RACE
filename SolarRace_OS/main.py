@@ -136,6 +136,31 @@ TRACK_LENGTH_METERS = track.TRACK_LENGTH_METERS   # Circuit Zolder, Belgium
 # no extra writes while CAN is live.
 GPS_PUBLISH_INTERVAL_S = 0.5
 
+# --- Health heartbeat ------------------------------------------------------ #
+# The Pi publishes at least this often NO MATTER WHAT -- no CAN traffic, no GPS
+# fix, nothing.
+#
+# Without it there is one failure the pit cannot see at all. Telemetry is
+# normally pushed from _decode_message (a CAN frame arrived) or from the GPS
+# timer, and that timer is gated on actually having a fix. So a Pi that is
+# powered, networked and running, but whose CAN is unplugged, in a garage with
+# no sky, publishes NOTHING -- and on the pit wall that is indistinguishable
+# from a dead Pi, a flat battery or a WiFi dropout. The crew would go looking
+# for the wrong fault.
+#
+# With the heartbeat, that case says exactly what it is: the feed stays live and
+# reports "can0 silent 47s, no GPS fix".
+#
+# Cheap: push_telemetry_to_cloud throttles itself to PUBLISH_INTERVAL_SECONDS,
+# so while CAN is live the 0.5 s pushes already satisfy this and the heartbeat
+# adds no writes at all. It only actually fires when nothing else is publishing.
+HEARTBEAT_INTERVAL_S = 5.0
+
+# A channel quiet for longer than this is called out by name in the health
+# string. Deliberately longer than CAN_SILENCE_TIMEOUT_S: this is "worth telling
+# the pit about", not "blank the driver's gauges".
+CHANNEL_QUIET_AFTER_S = 3.0
+
 # How often the lap trigger looks at GPS. Faster than the publish rate on
 # purpose — see _sample_lap_gps.
 LAP_GPS_SAMPLE_INTERVAL_S = 0.1
@@ -210,6 +235,14 @@ class SmartCANWorker(CANWorker):
         # is a (bus, label) tuple. The base class keeps a single self._bus we
         # don't use here.
         self._buses: list = []
+        # Health tracking. Per CHANNEL, not one global "last frame": two CAN
+        # channels carry different devices (can1 is the second BMS), so one of
+        # them dying while the other keeps talking is a real and otherwise
+        # invisible fault -- the aggregate would stay healthy the whole time.
+        self._boot_ts = time.time()
+        self._last_frame_by_channel: dict = {}
+        self._frames_by_channel: dict = {}
+        self._can_state = "starting"
         self.vehicle_state = {
             "battery": {},          # JBD BMS
             "motor": {},            # SiliXcon LYNX MMS
@@ -326,6 +359,7 @@ class SmartCANWorker(CANWorker):
         # cannot fail (no gpsd / no receiver just means "no fix yet").
         self.gps = GPSReader()
         self._last_gps_publish = 0.0
+        self._last_heartbeat = 0.0
         self._last_gps_log = ""
 
     def run(self) -> None:
@@ -462,7 +496,7 @@ class SmartCANWorker(CANWorker):
                 self._buses, errors = open_buses()
                 if not self._buses:
                     if state != "disconnected":
-                        state = "disconnected"
+                        state = self._can_state = "disconnected"
                         print(f"⚠️ No CAN bus opened ({errors}).")
                         self._emit_zeros()
                     self._report_no_data(bus_open=False)
@@ -471,7 +505,7 @@ class SmartCANWorker(CANWorker):
                 self._bus_label = " + ".join(lbl for _, lbl in self._buses)
                 print(f"✅ CAN bus(es) open: {self._bus_label}. Live mode.")
                 last_real = time.time()   # brief grace before calling it silent
-                state = "silent"
+                state = self._can_state = "silent"
                 self._silent_since = last_real
                 # open_buses() already falls back to a USB adapter itself when
                 # NEITHER can0 nor can1 opens — if that's what happened, a USB
@@ -499,14 +533,14 @@ class SmartCANWorker(CANWorker):
                         got_any = True
                         last_real = time.time()
                         if state != "live":
-                            state = "live"
+                            state = self._can_state = "live"
                             print("📡 Live CAN traffic detected.")
                             self._set_status(f"● CAN LIVE  |  {self._bus_label}")
                         self._decode_message(msg, channel)
             except can.CanError as exc:
                 print(f"⚠️ CAN read error: {exc} — reopening buses.")
                 self._shutdown_bus()          # forces a reopen next iteration
-                state = "disconnected"
+                state = self._can_state = "disconnected"
                 self._emit_zeros()
                 self._report_no_data(bus_open=False)
                 self._interruptible_sleep(0.5)
@@ -529,7 +563,7 @@ class SmartCANWorker(CANWorker):
                     self._last_gpio_request = now
                 # Fall to silent if ALL buses go completely quiet.
                 if CAN_SILENCE_TIMEOUT_S and now - last_real > CAN_SILENCE_TIMEOUT_S:
-                    state = "silent"
+                    state = self._can_state = "silent"
                     self._silent_since = now
                     print(f"⚠️ {CAN_SILENCE_TIMEOUT_S:.0f}s CAN silence — zeroing gauges.")
                     self._emit_zeros()
@@ -538,6 +572,13 @@ class SmartCANWorker(CANWorker):
                 # Buses are open but no frames — zero gauges & report why.
                 self._report_no_data(bus_open=True)
                 self._maybe_fallback_to_usb(now)
+
+            # The heartbeat, last in the pass so it reports the state this
+            # iteration just settled on. Unconditional: no CAN and no GPS fix
+            # is precisely the case it exists for.
+            if now - self._last_heartbeat >= HEARTBEAT_INTERVAL_S:
+                self._last_heartbeat = now
+                self._publish_heartbeat()
 
             if not got_any:
                 time.sleep(0.05)  # yield the CPU while idle
@@ -1096,7 +1137,79 @@ class SmartCANWorker(CANWorker):
         # With no GPS the behaviour is exactly as before: _decode_message is the
         # only publisher, so nothing is sent while the bus is quiet.
         if self.vehicle_state["gps"]:
+            self.vehicle_state["health"] = self._health_snapshot()
             push_telemetry_to_cloud(self.vehicle_state)
+
+    # ------------------------------------------------------------------ #
+    # Health — what the pit needs to tell a dead bus from a dead Pi          #
+    # ------------------------------------------------------------------ #
+    def _health_snapshot(self) -> dict:
+        """Small, always-computable block describing the Pi itself.
+
+        Never raises and never depends on CAN or GPS having worked, because the
+        entire point of it is to survive both of them failing.
+
+        `can_detail` is built HERE rather than in the pit because the channel
+        names live here: socketcan gives can0/can1, a USB adapter gives
+        something else entirely, and the pit should not have to guess. It names
+        only channels that are actually quiet, so a healthy car sends an empty
+        string and the pit shows nothing.
+        """
+        now = time.time()
+        try:
+            open_names = [getattr(bus, "channel", None) or lbl
+                          for bus, lbl in self._buses]
+        except Exception:
+            open_names = []
+
+        ages = {}
+        for nm in open_names:
+            last = self._last_frame_by_channel.get(nm)
+            ages[nm] = (now - last) if last else None
+
+        # Silence across the WHOLE car: the freshest channel wins, because one
+        # live bus means the car is still talking to us.
+        seen = [a for a in ages.values() if a is not None]
+        can_silent_s = min(seen) if seen else None
+
+        quiet = []
+        for nm, age in sorted(ages.items(), key=lambda kv: str(kv[0])):
+            if age is None:
+                quiet.append(f"{nm} no frames yet")
+            elif age > CHANNEL_QUIET_AFTER_S:
+                quiet.append(f"{nm} silent {age:.0f}s")
+
+        if not open_names:
+            detail = "no CAN bus open"
+        else:
+            detail = ", ".join(quiet)
+
+        gps_fix = 1 if self.vehicle_state.get("gps") else 0
+        try:
+            gps_detail = self.gps.status()
+        except Exception:
+            gps_detail = None
+
+        return {
+            "pi_uptime_s": round(now - self._boot_ts, 1),
+            "can_state": self._can_state,
+            "can_silent_s": (round(can_silent_s, 1)
+                             if can_silent_s is not None else None),
+            "can_detail": detail,
+            "can_frames": sum(self._frames_by_channel.values()) or 0,
+            "gps_fix": gps_fix,
+            "gps_detail": gps_detail,
+        }
+
+    def _publish_heartbeat(self) -> None:
+        """Push telemetry regardless of CAN and GPS. See HEARTBEAT_INTERVAL_S."""
+        try:
+            self.vehicle_state["health"] = self._health_snapshot()
+            push_telemetry_to_cloud(self.vehicle_state)
+        except Exception as exc:
+            # A heartbeat that can crash the read loop is worse than no
+            # heartbeat: it would take the car's telemetry down with it.
+            print(f"[Heartbeat] {type(exc).__name__}: {exc}")
 
     def _shutdown_bus(self) -> None:
         """Release every open CAN interface (overrides the single-bus base)."""
@@ -1194,6 +1307,13 @@ class SmartCANWorker(CANWorker):
         is the one piece of information that tells them apart. Defaults to
         None so the base class and any other caller keep working unchanged.
         """
+        # Health first, before any decoding can raise: the question this
+        # answers is "is the bus alive", and a frame we failed to parse still
+        # proves that it is.
+        name = channel or "bus"
+        self._last_frame_by_channel[name] = time.time()
+        self._frames_by_channel[name] = self._frames_by_channel.get(name, 0) + 1
+
         data_bytes = bytes(msg.data)
         msg_id = msg.arbitration_id
 

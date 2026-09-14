@@ -227,6 +227,20 @@ STATE_COLUMNS = [
     # from the record, and the strategy matrix had to keep using numbers
     # somebody estimated before the car ever turned a wheel.
     "active_strategy",
+
+    # --- Pi health ------------------------------------------------------- #
+    # What the car can say about ITSELF, independent of anything on the CAN
+    # bus. These arrive on a heartbeat that fires even with no CAN traffic and
+    # no GPS fix, which is the one combination that used to publish nothing at
+    # all -- leaving "CAN unplugged in the garage" looking exactly like "the Pi
+    # is dead". See HEARTBEAT_INTERVAL_S in SolarRace_OS/main.py.
+    "pi_uptime_s",
+    "can_state",        # starting | live | silent | disconnected
+    "can_silent_s",     # since the last frame on ANY bus; None if none open
+    "can_detail",       # names only the QUIET channels, e.g. "can1 silent 47s"
+    "can_frames",
+    "gps_fix",          # 1 / 0
+    "gps_detail",
 ]
 
 # Every data column the dashboard/exporter can name, in a stable order.
@@ -247,6 +261,13 @@ _COL_TYPES = {
     "solar_sensor_status": "TEXT",
     "lap_source": "TEXT",
     "active_strategy": "TEXT",
+    "pi_uptime_s": "REAL",
+    "can_silent_s": "REAL",
+    "can_state": "TEXT",
+    "can_detail": "TEXT",
+    "gps_detail": "TEXT",
+    "gps_fix": "INTEGER",
+    "can_frames": "INTEGER",
 }
 
 _DATA_COL_DEFS = ",\n    ".join(f"{c} {_COL_TYPES[c]}" for c in EXPORT_COLUMNS)
@@ -635,6 +656,7 @@ def flatten_record(rtdb_key: str, record: dict, device_id: str = DEVICE_ID) -> d
     # than this feature simply has no "solar" key, and those rows must land as
     # NULL rather than raising on ingest.
     solar = car.get("solar") or {}
+    health = car.get("health") or {}
 
     return {
         "rtdb_key": rtdb_key,
@@ -709,6 +731,16 @@ def flatten_record(rtdb_key: str, record: dict, device_id: str = DEVICE_ID) -> d
         "mms_has_error": _flag(motor.get("mms_has_error")),
         "mms_error_code": _int(motor.get("mms_error_code")),
         "mms_alerts": _join(motor.get("mms_alerts")),
+        # The car's own health block. Absent from every build older than the
+        # heartbeat, and .get() lands those rows as NULL rather than raising --
+        # the same rule the solar block follows.
+        "pi_uptime_s": _num(health.get("pi_uptime_s")),
+        "can_state": health.get("can_state"),
+        "can_silent_s": _num(health.get("can_silent_s")),
+        "can_detail": health.get("can_detail"),
+        "can_frames": _int(health.get("can_frames")),
+        "gps_fix": _flag(health.get("gps_fix")),
+        "gps_detail": health.get("gps_detail"),
         "raw_json": json.dumps(car, separators=(",", ":")),
     }
 
