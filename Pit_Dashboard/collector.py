@@ -48,6 +48,7 @@ from pit_config import (
     RECONNECT_BACKOFF_START,
     RECONNECT_BACKOFF_MAX,
     INITIAL_BACKFILL_LIMIT,
+    CATCHUP_PAGE_SIZE,
     DATA_SILENCE_TIMEOUT,
 )
 
@@ -65,6 +66,15 @@ STREAM_URL = f"{DB_URL}/{TELEMETRY_PATH}.json"
 # has gone completely silent, that one catches a socket that is chatty but no
 # longer carrying samples.
 STREAM_READ_TIMEOUT = 70.0
+
+
+# RTDB sends a keep-alive every ~30-45s. Log one line every this many so a
+# connected-but-idle collector proves it is alive: after "stream connected" the
+# window otherwise prints nothing at all until the car pushes a sample, which on
+# a quiet pit lane can be hours. Same argument as the staleness indicator —
+# nobody should be fooled about collector state.
+KEEPALIVES_PER_HEARTBEAT = 10
+_keepalives = 0
 
 
 class StreamStalled(RuntimeError):
@@ -199,6 +209,70 @@ def _handle_put(conn, payload: dict) -> int:
     return _store(conn, key, data)
 
 
+def catch_up(conn, creds, start_key) -> str:
+    """Page the backlog in with bounded REST GETs, returning the new cursor.
+
+    WHY. The live stream asks for the whole tail at once
+    (orderBy=$key&startAt=<cursor>) and RTDB answers with a SINGLE 'put' event
+    holding every sample since. Fine seconds after a dropout; catastrophic days
+    after one — measured on 2026-09-08, a 12-day gap was 166.6 MB in one event.
+    requests' iter_lines() accumulates that as ONE line before yielding,
+    json.loads() expands it, and only then is anything stored or logged. The
+    collector printed "stream connected" and then nothing for minutes on a
+    multi-GB working set: indistinguishable from hung, and liable to be killed.
+
+    StreamStalled does not cover this. Bytes arrive the whole time, so the feed
+    is not stalled — it is simply too big to swallow whole. And
+    INITIAL_BACKFILL_LIMIT only applies when the database is EMPTY.
+
+    So before opening the stream we walk forward in CATCHUP_PAGE_SIZE-sized
+    requests, committing each page as it lands: progress is visible, memory
+    stays flat, and an interrupted catch-up resumes from the last stored key.
+    The stream's own initial event is then small by construction.
+
+    startAt is inclusive, so every page re-delivers its boundary key; the
+    idempotent upsert makes that a no-op and it is how we detect the end.
+    """
+    total_new = 0
+    pages = 0
+    while True:
+        params = {"orderBy": '"$key"', "limitToFirst": CATCHUP_PAGE_SIZE}
+        if start_key:
+            params["startAt"] = f'"{start_key}"'
+        headers = {"Authorization": f"Bearer {fresh_token(creds)}"}
+        resp = requests.get(STREAM_URL, params=params, headers=headers,
+                            timeout=(10.0, 120.0))
+        resp.raise_for_status()
+        data = resp.json() or {}
+        if not isinstance(data, dict) or not data:
+            break
+
+        keys = sorted(data)
+        newest = keys[-1]
+        # Only the boundary key came back: nothing newer than us.
+        if len(keys) == 1 and newest == start_key:
+            break
+
+        n = db.upsert_many(conn, data, ingested_ts=time.time(),
+                           device_id=DEVICE_ID)
+        db.save_cursor(conn, newest)
+        total_new += n
+        pages += 1
+        _log(f"catch-up page {pages}: +{n} sample(s) up to {newest} "
+             f"(total {db.count_samples(conn)})")
+
+        # A short page means the end of the node. A page that did not advance
+        # the cursor would loop forever, so treat that as done too.
+        if len(keys) < CATCHUP_PAGE_SIZE or newest == start_key:
+            start_key = newest
+            break
+        start_key = newest
+
+    if total_new:
+        _log(f"catch-up complete: {total_new} sample(s) in {pages} page(s)")
+    return start_key
+
+
 def stream_once(conn, creds, start_after_key) -> str:
     """Open one streaming connection and process events until it drops.
 
@@ -328,6 +402,11 @@ def _dispatch(conn, event_type: str, data_str: str) -> bool:
     liveness is precisely the bug StreamStalled exists to catch.
     """
     if event_type in ("keep-alive",):
+        global _keepalives
+        _keepalives += 1
+        if _keepalives % KEEPALIVES_PER_HEARTBEAT == 0:
+            _log(f"idle — connected, no new samples "
+                 f"(total {db.count_samples(conn)})")
         return False
     if event_type == "auth_revoked":
         raise PermissionError("auth_revoked: access token rejected by RTDB")
@@ -389,6 +468,9 @@ def run():
         # re-backfilling everything that was cleared.
         last_key = db.get_last_key(conn) or db.get_cursor(conn)
         try:
+            # Close any gap with bounded requests FIRST, so the stream's own
+            # initial event is small however long we were away.
+            last_key = catch_up(conn, creds, last_key)
             stream_once(conn, creds, last_key)
             # clean close — reconnect immediately (no penalty), reset backoff
             backoff = RECONNECT_BACKOFF_START

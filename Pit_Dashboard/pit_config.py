@@ -128,6 +128,22 @@ DATA_SILENCE_TIMEOUT = 120.0
 # history), or 0/None for the old unbounded full backfill.
 INITIAL_BACKFILL_LIMIT = 200
 
+# How many samples to pull per request while CATCHING UP after a gap.
+#
+# Restarting the collector days behind asks RTDB for the entire tail in one
+# streamed event. Measured on 2026-09-08 against a 12-day gap that was a single
+# 166.6 MB SSE event: requests' iter_lines() buffers it as ONE line, json.loads
+# expands it, and only then is anything stored or logged — so the process sat
+# silent for minutes on a multi-GB working set, looking hung. Nothing bounded
+# it, because INITIAL_BACKFILL_LIMIT only covers the EMPTY-database case, not a
+# resume. StreamStalled does not catch it either: bytes are arriving the whole
+# time, so the feed is not stalled, just enormous.
+#
+# Catch-up is now paged through plain REST GETs of this size before the live
+# stream opens. 5,000 samples is roughly 1.7 MB per request — quick, loggable,
+# and few enough round trips to close a long gap sensibly.
+CATCHUP_PAGE_SIZE = 5000
+
 # OAuth2 scopes required for RTDB REST access with a service account.
 OAUTH_SCOPES = [
     "https://www.googleapis.com/auth/firebase.database",
