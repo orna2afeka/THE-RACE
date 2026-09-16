@@ -96,9 +96,13 @@ def track_m(doc_m):
     return (float(doc_m) - DOC_TO_TRACK_OFFSET_M) % track.TRACK_LENGTH_METERS
 
 
-# Where each sector starts ON THE MAP, in sector order. Shifted by the document
-# offset, so S1 no longer starts on the finish line and wraps across it.
-BOUNDARIES = [track_m(SECTIONS_INFO[s]["range"][0]) for s in SECTOR_IDS]
+# Where each sector starts ON THE MAP, in sector order. Deliberately NOT shifted
+# by the document offset: S1 starts on the start/finish line, where the team
+# expects to see it, even though that leaves a few turns just outside the
+# sector the document lists them in. Only the 210 s profile lookup keeps the
+# offset (docOffset below).
+BOUNDARIES = [float(SECTIONS_INFO[s]["range"][0]) % track.TRACK_LENGTH_METERS
+              for s in SECTOR_IDS]
 
 
 def landmark_track_m(lm):
@@ -309,8 +313,8 @@ def build_data():
     line = [_svg_xy(x, y, ox, oy) for x, y in track_map.CENTRELINE_XY]
     cum = [round(c, 2) for c in track_map.CUM_M]
 
-    # split_at returns runs sorted by start distance, and S1 no longer starts
-    # lowest, so name each run by its start rather than by position.
+    # split_at returns runs sorted by start distance; name each run by its
+    # start rather than by position so the order can never mislabel one.
     id_at = {b: sid for b, sid in zip(BOUNDARIES, SECTOR_IDS)}
     sectors = []
     for seg_start, seg_end, xs, ys in sorted(
@@ -355,8 +359,9 @@ def build_data():
     return {
         "viewBox": "0 0 %.0f %.0f" % (width, height),
         "trackLength": track.TRACK_LENGTH_METERS,
-        # Sector-document zero minus the car's zero. Sectors and the profile
-        # are in the document's frame; posAt() and lap distance are not.
+        # Sector-document zero minus the car's zero. Only the 210 s profile is
+        # read in the document's frame; sectors, posAt() and lap distance are
+        # all counted from the start/finish line.
         "docOffset": DOC_TO_TRACK_OFFSET_M,
         "line": line,
         "cum": cum,
@@ -623,7 +628,7 @@ function posAt(d) {
 function sectorAt(d) {
   const L = DATA.trackLength;
   d = ((d % L) + L) % L;
-  // S1 wraps across the finish line (it starts before it), so start > end.
+  // S9 ends on the finish line (end 0 m), so its start > end: allow wrapping.
   for (const s of DATA.sectors) {
     if (s.start < s.end ? (d >= s.start && d < s.end)
                         : (d >= s.start || d < s.end)) return s;
@@ -679,10 +684,9 @@ function paintMap(dist) {
   el("trail").setAttribute("opacity", "0.55");
 
   if (progress) {
-    // The bar is laid out S1..S9 from the sector document's zero.
+    // The bar is laid out S1..S9 from the start/finish line.
     const L = DATA.trackLength;
-    el("progress-mark").style.left =
-      (((dist + DATA.docOffset) % L + L) % L / L * 100) + "%";
+    el("progress-mark").style.left = ((dist % L + L) % L / L * 100) + "%";
   }
   if (s.id !== lastSector) {
     DATA.sectors.forEach(o => {

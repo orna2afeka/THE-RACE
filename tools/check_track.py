@@ -101,8 +101,8 @@ check("offset %.0f m is inside the window that fits every turn"
 print("\n3. The map draws those positions")
 data = bza.build_data()
 drawn = {s["id"]: s["start"] for s in data["sectors"]}
-want = {sid: (SECTIONS_INFO[sid]["range"][0] - DOC_TO_TRACK_OFFSET_M) % L
-        for sid in SECTIONS_INFO}
+# Sectors are drawn from the start/finish line, not shifted by the offset.
+want = {sid: SECTIONS_INFO[sid]["range"][0] % L for sid in SECTIONS_INFO}
 check("sector starts", all(abs(drawn[s] - want[s]) < 0.01 for s in want),
       ", ".join("S%d %.0f" % (s, drawn[s]) for s in sorted(drawn)))
 by_name = {lm["name"]: lm["dist"] for lm in data["landmarks"]}

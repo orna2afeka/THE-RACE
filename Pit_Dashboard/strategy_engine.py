@@ -568,10 +568,11 @@ TURN_START_TRACK_M = {
 # 210s.xlsx slowest points trail the real corners by 65-85 m. 120 is the middle
 # of that window. check_track.py prints the window again.
 #
-# MAP ONLY. The car's lap distance, the target-speed lookup and the pit's sector
-# timing all still count from the track.py line; this only moves where the map
-# DRAWS the sectors. Set it to 0 once profiles measured on the car replace
-# 210s.xlsx and the sector distances are measured in the car's frame.
+# DEMO PROFILE ONLY. The car's lap distance, the target-speed lookup, the pit's
+# sector timing AND the map's sector drawing all count from the track.py line
+# (the team wants S1 to start on the start/finish line); this only shifts where
+# the presentation map reads the 210 s profile. Set it to 0 once profiles
+# measured on the car replace 210s.xlsx.
 DOC_TO_TRACK_OFFSET_M = 120.0
 
 SECTIONS_INFO = {
