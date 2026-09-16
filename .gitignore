@@ -79,4 +79,7 @@ collector.err.log
 .idea/
 .Rhistory
 Thumbs.db
+
+# The demo store built by tools/demo_seed.py. Synthetic, rebuildable, large.
+demo_telemetry.db
 desktop.ini

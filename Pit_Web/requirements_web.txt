@@ -1,0 +1,49 @@
+# requirements_web.txt — everything this folder needs.
+#
+#     pip install -r Pit_Web/requirements_web.txt
+#
+# This clone runs the React/FastAPI pit dashboard ONLY. The Streamlit app and
+# the car software live in ../THE RACE; nothing here imports Streamlit, and it
+# is deliberately absent from this list.
+#
+# Two processes:
+#     python Pit_Dashboard/collector.py             # Firebase -> telemetry.db
+#     python -m uvicorn Pit_Web.api:app --port 8000 # the dashboard
+#
+# Pins match Pit_Dashboard/requirements_pit.txt in the original repo, so the two
+# folders resolve the same versions of the modules they share.
+
+# --- the web backend --------------------------------------------------------
+fastapi>=0.115
+pydantic>=2.9
+uvicorn>=0.30
+websockets>=13
+
+# --- shared modules the backend imports -------------------------------------
+# pandas/numpy  : strategy_engine, weather_service, the CSV export frame
+# matplotlib    : imported at the top of strategy_engine.py, which is kept
+#                 identical to the race repo. The web dashboard no longer
+#                 renders a PNG (the chart is drawn in the browser from the
+#                 served simulation), but the import still has to resolve.
+# openpyxl      : export.py's 3-sheet workbook
+pandas==2.2.1
+numpy==1.26.4
+matplotlib==3.8.3
+openpyxl==3.1.2
+
+# --- collector --------------------------------------------------------------
+# requests   : the RTDB REST stream, and weather_service
+# google-auth: the collector's OAuth2 token from the service account
+#
+# requests is >= rather than == on purpose. The race repo pins it to 2.31.0, but
+# this environment already has a newer one, and a hard pin would make every
+# launch downgrade a package other things share — for a plain HTTP GET with a
+# timeout, which any recent version does identically. The four pins above stay
+# exact because they shape OUTPUT: the workbook, the CSV and the strategy PNG.
+requests>=2.31.0
+google-auth==2.29.0
+
+# Timezone database for zoneinfo. Windows ships no system tz database, so
+# without this the export cannot resolve Asia/Jerusalem or Europe/Brussels and
+# raises ZoneInfoNotFoundError. The pit laptop is Windows.
+tzdata==2026.3

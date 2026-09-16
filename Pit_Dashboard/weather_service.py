@@ -1,6 +1,10 @@
 import requests
 import pandas as pd
-import streamlit as st
+
+# Was @st.cache_data. This clone runs the React dashboard only, so it does not
+# install Streamlit; memo keeps the two behaviours this module relies on —
+# a TTL, and NOT memoising an exception (see _fetch_or_raise's caller).
+from memo import memo
 
 # (connect, read) seconds. requests defaults to NO timeout at all, which meant a
 # hung link to open-meteo blocked indefinitely — and it blocked on the script-run
@@ -15,7 +19,7 @@ def fetch_zolder_weather():
 
     DELIBERATELY NOT CACHED — the cache is one level down, on _fetch_or_raise.
 
-    The split exists because st.cache_data memoises whatever a function returns,
+    The split exists because the cache memoises whatever a function returns,
     including a None. With the try/except inside the cached function, a single
     dropped packet blanked the weather tab for the full hour and the only cure
     was restarting the dashboard. A cached function that RAISES is not memoised,
@@ -31,7 +35,7 @@ def fetch_zolder_weather():
         return None
 
 
-@st.cache_data(ttl=3600)  # Saves the answer for 1 hour to avoid unnecessary API calls
+@memo(ttl=3600)  # Saves the answer for 1 hour to avoid unnecessary API calls
 def _fetch_or_raise():
     """Fetch and shape the forecast. Raises on any failure — see the caller."""
     # Latitude and longitude of the Zolder track, Belgium

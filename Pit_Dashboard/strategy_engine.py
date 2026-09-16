@@ -3,7 +3,10 @@ import os
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import streamlit as st
+
+# Was `import streamlit as st` -- see memo.py. This clone does not install
+# Streamlit; memo() is the same in-process cache st.cache_data degrades to.
+from memo import memo
 
 # Default velocity profile lives next to this file, so a no-arg call works no
 # matter what the launch directory is (the dashboard passes an absolute path).
@@ -11,7 +14,7 @@ _DEFAULT_PROFILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "210s.xlsx")
 
 
-@st.cache_data
+@memo()
 def load_velocity_profile(filepath=_DEFAULT_PROFILE):
     try:
         df = pd.read_excel(filepath)
@@ -110,12 +113,17 @@ BATTERY_FLOOR_WH = 450.0       # never plan to go below this
 MIN_STOP_DURATION_MIN = 30.0   # a stop costs this even if charging is quicker
 DRIVER_STINT_LIMIT_MIN = 120.0 # continuous driving before a driver must change
 DRIVER_CHANGE_TIME_MIN = 5.0   # cost of that change
-MAX_STOPS = 4
+# REGULATION, not a guess: a car that charges more than 3 times is classified
+# behind every car that charged 3 times or fewer, however many laps it drove.
+# A fourth stop can therefore never win a place, so the planner never offers one.
+MAX_STOPS = 3
 
-# Targets the optimiser may pick from, independently at each stop. Stopping at
-# 95/100 is deliberately not offered: past 90 the curve charges slower than the
-# car discharges on track, so it can never be the right call in a timed race.
-CHARGE_TARGETS_PCT = (55, 60, 65, 70, 75, 80, 85, 90)
+# Targets the optimiser may pick from, independently at each stop. 95 and 100
+# used to be left out on the grounds that the top of the curve is too slow to
+# pay. That holds only while stops are free: with the 3-charge cap, a car that
+# runs dry sits out the rest of the race, and a slow top-off beats sitting.
+# Dropping them cost up to 30 laps over 24 h, so the search decides, not us.
+CHARGE_TARGETS_PCT = (55, 60, 65, 70, 75, 80, 85, 90, 95, 100)
 
 
 def get_charging_power(soc_pct):
@@ -387,6 +395,12 @@ def _replay(plan):
     return pts
 
 
+def format_lap_time(minutes):
+    """3.5 -> '3:30'. The pit reads lap times as a stopwatch, never 3.50 min."""
+    total_s = int(round(float(minutes) * 60.0))
+    return f"{total_s // 60}:{total_s % 60:02d}"
+
+
 def calculate_all_strategies(time_left_min, current_available_wh, current_lap,
                              consumption_table, track_length_km=4.0):
     """One row per driving strategy, each carrying its own full simulation.
@@ -408,7 +422,7 @@ def calculate_all_strategies(time_left_min, current_available_wh, current_lap,
 
         if plan is None or plan["laps"] == 0:
             rows.append({
-                'Label': label, 'Lap Time': f"{lap_time_min:.2f} m",
+                'Label': label, 'Lap Time': format_lap_time(lap_time_min),
                 'Speed (km/h)': "-", 'Total Laps': 0,
                 'Energy/Lap (Wh)': round(energy_per_lap, 1),
                 'Pit Strategy': "-", 'Charge To': "-", 'Pit Time': "-",
@@ -420,9 +434,9 @@ def calculate_all_strategies(time_left_min, current_available_wh, current_lap,
         final_soc = (plan["final_wh"] / plan["capacity_wh"]) * 100.0
         # A plan that stops driving well before the flag has not run out of
         # time -- it has run out of ALLOWED STOPS, and is sitting in the pit
-        # box for the rest of the race. Worth saying: MAX_STOPS is our own
-        # assumption, not a regulation, so a strategist seeing this can decide
-        # to raise it rather than accept the lap count underneath it.
+        # box for the rest of the race. MAX_STOPS is the regulation cap, so
+        # this is not a knob to raise: it says the charges should have been
+        # spent differently (fewer, fuller ones), or the pace should drop.
         idle_min = time_left_min - plan["time_used"]
         # Idle long enough that ANOTHER STOP would have fitted. Less than that
         # is just time left over at the flag, which is normal and not worth
@@ -434,7 +448,7 @@ def calculate_all_strategies(time_left_min, current_available_wh, current_lap,
             pit_label += f" (limit, {idle_min:.0f}m idle)"
         rows.append({
             'Label': label,
-            'Lap Time': f"{lap_time_min:.2f} m",
+            'Lap Time': format_lap_time(lap_time_min),
             'Speed (km/h)': f"{speed_kmh:.1f}",
             'Total Laps': plan["laps"],
             'Energy/Lap (Wh)': round(energy_per_lap, 1),
@@ -704,9 +718,10 @@ if __name__ == "__main__":
     _ms = min(_runs)
     print("\nfull 24 h table: %.0f ms (best of 3: %s)"
           % (_ms, ", ".join("%.0f" % r for r in _runs)))
-    # This runs inside a fragment that reruns every 10 s on the dashboard's one
-    # Streamlit thread. Half a second here is half a second nothing else moves.
-    _want(_ms < 500, "too slow for the 10 s strategy fragment: %.0f ms" % _ms)
+    # The pit backend recomputes this table on its strategy poll, in a worker
+    # thread shared with the other heavy endpoints. Half a second here is half
+    # a second those wait.
+    _want(_ms < 500, "too slow for the strategy poll: %.0f ms" % _ms)
 
     print("\nSELF-CHECK", "PASSED" if _ok else "FAILED")
     raise SystemExit(0 if _ok else 1)
