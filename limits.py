@@ -231,6 +231,20 @@ def cell_temp_label(index):
     return f"C{i}"
 
 
+def battery_temp_from_cells(cell_temps):
+    """THE battery temperature, wherever it is shown or stored: the hottest
+    plausible individual Orion thermistor reading. None when no cell has a
+    plausible reading — deliberately NO fallback to the Orion module's own
+    summary (its average used to be shown as "battery temp") or to the BMS
+    probes, so a silent thermistor module reads as a dash, not as a different
+    number under the same name.
+
+    `cell_temps` is any iterable of readings (None allowed).
+    """
+    vals = [v for v in (plausible_cell_temp(t) for t in cell_temps) if v is not None]
+    return max(vals) if vals else None
+
+
 PACK_V_FULL = CELL_COUNT * CELL_V_MAX      # 54.6 V
 
 # ⚠️ THE WEAKEST THRESHOLD HERE. Judge the CONTROLLER's measurement only
@@ -386,26 +400,6 @@ def _validate(name, t):
                 f"saturates before the gauge is allowed to change colour.")
 
 
-# ── Solar charge current ────────────────────────────────────── #
-#
-# What the MPPT is pushing into the pack, from the Yocto-Amp in series on the
-# charge line (SolarRace_OS/modules/solar_current.py).
-#
-# NO WARNING AND NO CRITICAL, deliberately. More solar current is unambiguously
-# better, so there is nothing to alarm on at the top; and the bottom is not a
-# fault either — 0 A at night, 0 A in a tunnel and 0 A under a cloud are all
-# correct readings. A low-side threshold here would hold the gauge amber for the
-# entire night stint, which is exactly the always-on warning this file exists to
-# prevent. The gauge therefore shows a number and an arc, and no colour.
-#
-# full_scale is the SENSOR's continuous rating, not the array's expected output.
-# Ending the arc where the Yocto-Amp stops being able to measure is the honest
-# choice: a pinned gauge then means "at the limit of what we can measure", which
-# is a real thing to know. Keep in step with
-# solar_current.SENSOR_MAX_CONTINUOUS_A.
-SOLAR_CURRENT = Threshold(warn=None, crit=None, full_scale=10.0)
-
-
 # Every metric, for the self-test and for anything that wants to iterate them.
 ALL_THRESHOLDS = (
     ("motor temp", "°C", MOTOR_TEMP),
@@ -417,7 +411,6 @@ ALL_THRESHOLDS = (
     ("motor current", "A", MOTOR_CURRENT),
     ("motor power", "W", POWER),
     ("speed", "km/h", SPEED),
-    ("solar current", "A", SOLAR_CURRENT),
 )
 
 
@@ -436,7 +429,7 @@ if __name__ == "__main__":
     for name, unit, t in ALL_THRESHOLDS:
         star = "*" if t.low_side else " "
         # Three cases, not two: a threshold with neither bound set is not
-        # "amber only", it is deliberately uncoloured (see SOLAR_CURRENT).
+        # "amber only", it is deliberately uncoloured.
         if t.warn is None and t.crit is None:
             note = "   no colour"
         elif t.crit is None:

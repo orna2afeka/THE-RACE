@@ -53,6 +53,8 @@ import subprocess
 # any machine that had not installed a dependency it never used. Both are gone.
 # `dashboard` below is a LOCAL variable in main(), unrelated.
 from modules.bms_parser import parse_jbd_bms_message
+# Rule 3.5.6 rolling 2-hour cell extremes (repo root, shared with the pit).
+from cell_extremes import RollingExtremes
 from modules.mms_parser import parse_mms_message
 # The same module again, by name: _request_gpio_report() needs the GPIO-over-CAN
 # protocol constants and the request builder, and writing them as
@@ -68,11 +70,6 @@ from modules.charge_detector import ChargeDetector
 from modules.lap_command import LapCommandInbox, StrategyCommandInbox
 from modules.vehicle_inputs import VehicleInputs
 from modules.regen_light import RegenLight
-# Solar charge current over USB (Yoctopuce Yocto-Amp). Importing this is safe
-# with no sensor fitted and even with the yoctopuce package absent — the module
-# degrades to reporting "no_library" rather than failing the import, so the HUD
-# still starts on a laptop.
-from modules.solar_current import SolarCurrentReader, safe_print
 
 # --- Cloud Sync Modules ---
 from cloud.firebase_client import (
@@ -120,6 +117,7 @@ from config import (
 # Re-exported here because this module's own name for them is referenced widely.
 import drivetrain      # noqa: E402  (sys.path prepared at the top of this file)
 import track           # noqa: E402  circuit geometry, shared with the pit
+import limits          # noqa: E402  battery temp = hottest plausible cell
 import speed_profile   # noqa: E402  target-speed curves, shared with the pit
 
 GEAR_RATIO = drivetrain.GEAR_RATIO
@@ -188,14 +186,20 @@ LAP_CHECKPOINT_PATH = os.path.join(
 # in _teardown) without meaningfully wearing an SD card over a 24 h race.
 LAP_CHECKPOINT_INTERVAL_S = 15.0
 
+# Rule 3.5.6 report (HUD screen R3.5.6): the highest/lowest cell temperature and
+# voltage over the last 2 hours. Saved beside the lap checkpoint so a Pi restart
+# mid-race does not wipe up to two hours of the report. Once a minute is enough:
+# the window is kept in one-minute buckets, so a more frequent save would only
+# rewrite the same buckets.
+CELL_EXTREMES_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "cell_extremes.json")
+CELL_EXTREMES_SAVE_S = 60.0
+# The report changes at most once per reading; the screen needs it once a second.
+CELL_EXTREMES_EMIT_S = 1.0
+
 # How often the brake/lights switches are read. 5 Hz is instant to a human eye
 # and costs nothing; gpiozero debounces the contacts for us.
 VEHICLE_INPUT_POLL_S = 0.2
-
-# How often the solar-current snapshot is collected. 5 Hz, and it is FREE: the
-# Yocto-Amp is polled on its own background thread, so this only copies a small
-# dict under a lock. Nothing here touches USB.
-SOLAR_POLL_S = 0.2
 
 # Target speed + corner look-ahead refresh. 5 Hz: fast enough that the number
 # tracks the car down a straight, slow enough to be free.
@@ -248,13 +252,6 @@ class SmartCANWorker(CANWorker):
             "motor": {},            # SiliXcon LYNX MMS
             "temp_controller": {},  # J1939 battery-temperature module
             "gps": {},
-            # Solar charge current from the Yocto-Amp on USB. Its OWN block
-            # rather than a key inside "battery": that block is the JBD BMS's
-            # view of the pack and everything in it is prefixed bms_. This is a
-            # different device on a different bus measuring a different
-            # conductor, and mixing them would make "where did this number come
-            # from" unanswerable the next time the two disagree.
-            "solar": {},
         }
         # Distance, energy, laps and lap timing all live in one object so they
         # cannot drift apart — a lap is defined by distance, lap energy is the
@@ -262,6 +259,17 @@ class SmartCANWorker(CANWorker):
         self.laps = LapTracker()
         self._last_checkpoint_save = 0.0
         self._load_lap_checkpoint()
+        # Rule 3.5.6 rolling 2 h extremes. Owned by this (CAN worker) thread,
+        # like LapTracker: readings are offered where they are decoded, and the
+        # report is emitted from the loop on a timer.
+        self.cell_extremes = RollingExtremes()
+        kept = self.cell_extremes.load(CELL_EXTREMES_PATH)
+        if kept:
+            print(f"📋 rule 3.5.6 report resumed: {kept} minute(s) of the last 2 h")
+        self._last_extremes_emit = 0.0
+        # Live BMS NTC probes per pack, {"A": {1: °C, ...}, "B": {...}}.
+        self._bms_probe_C = {}
+        self._last_extremes_save = time.monotonic()
         self.lap_inbox = LapCommandInbox()
         # Detects a real charging stop from bms_current_A + mms_rpm — see
         # charge_detector.py for why both readings are needed (current alone
@@ -278,9 +286,6 @@ class SmartCANWorker(CANWorker):
         # UNKNOWN rather than as a confident "off".
         self.vehicle_inputs = VehicleInputs()
         self._last_input_poll = 0.0
-        # Solar charge current. Constructed here and started with the CAN loop;
-        # its own daemon thread does the blocking USB reads and reconnects by
-        # itself when the cable vibrates loose, so this loop never waits on it.
         # Brake light, driven by regenerative braking. The ESC reports negative
         # power when it is recovering energy, which means the car is slowing --
         # and nothing else on the car knows that, because the brake pedal switch
@@ -288,9 +293,6 @@ class SmartCANWorker(CANWorker):
         # See modules/regen_light.py, and READ ITS ELECTRICAL NOTE before wiring:
         # a GPIO pin switches a MOSFET, it does not drive a lamp.
         self.regen_light = RegenLight()
-        self.solar = SolarCurrentReader()
-        self._last_solar_poll = 0.0
-        self._last_solar_status = None
         # Target speed + corner look-ahead. The car holds every generated
         # profile and the pit switches between them by name, so a strategy
         # change is a few bytes over the link instead of a 400-row table.
@@ -310,9 +312,6 @@ class SmartCANWorker(CANWorker):
         self._gpio_fail_count = 0
         self._gpio_requested_ok = False
         self._have_bms_soc = False   # once True, ignore the LYNX SoC estimate
-        # Once the dedicated temp module reports a max cell temp, stop falling
-        # back to the BMS's own NTC probes (the module measures more points).
-        self._have_module_cell_temp = False
         # DS003 — individual cell temperatures from the Orion Thermistor
         # Expansion Module's per-sensor broadcast. _thermistor_configured is
         # STICKY (see cell_temps_updated's docstring in can_worker.py): once a
@@ -400,6 +399,7 @@ class SmartCANWorker(CANWorker):
             # Unconditional (force=True) so a clean quit doesn't lose up to
             # LAP_CHECKPOINT_INTERVAL_S of distance/energy to the throttle.
             ("lap checkpoint", lambda: self._save_lap_checkpoint(force=True)),
+            ("cell extremes", lambda: self.cell_extremes.save(CELL_EXTREMES_PATH)),
             ("gps", self.gps.stop),
             ("lap inbox", self.lap_inbox.stop),
             ("strategy inbox", self.strategy_inbox.stop),
@@ -407,7 +407,6 @@ class SmartCANWorker(CANWorker):
             # Before the bus goes down, so the lamp is explicitly extinguished
             # rather than left showing whatever it was doing when we quit.
             ("regen brake light", self.regen_light.stop),
-            ("solar sensor", self.solar.stop),
             ("CAN bus(es)", self._shutdown_bus),
         ):
             try:
@@ -437,10 +436,6 @@ class SmartCANWorker(CANWorker):
         # CAN: GPS keeps working (and keeps reaching the pit) even if the bus
         # never opens.
         self.gps.start()
-        # Independent of CAN for the same reason GPS is: the array charges the
-        # pack whether or not the motor controller is powered, and the pit wants
-        # to see it while the car sits in the paddock in the sun.
-        self.solar.start()
         self._last_gps_log = self.gps.status()
         print(f"🛰️ {self._last_gps_log}")
         print(f"🏁 {track.TRACK_LENGTH_METERS:.0f} m lap, finish line "
@@ -483,13 +478,13 @@ class SmartCANWorker(CANWorker):
             self._apply_strategy_commands()
             self._sample_lap_gps()
             self._poll_vehicle_inputs()
-            self._poll_solar()
             # A tick, not a poll: the lamp's minimum-on hold and its stale
             # release are timers, and a quiet bus is exactly when they matter.
             self.regen_light.tick()
             self._tick_profile()
             self._publish_gps()
             self._save_lap_checkpoint()
+            self._tick_cell_extremes()
 
             # ---- (Re)open the buses if we have none ---------------------- #
             if not self._buses:
@@ -615,28 +610,23 @@ class SmartCANWorker(CANWorker):
         self.cell_temp_updated.emit(None)
         # Values blank like every other gauge; _thermistor_configured does
         # NOT reset -- a module that has already proven it's configured stays
-        # configured through a later dead bus, same as _have_module_cell_temp.
+        # configured through a later dead bus.
         self._cell_temps_C = {}
+        self.vehicle_state["temp_controller"]["battery_temp_C"] = None
         self.cell_temps_updated.emit(self._thermistor_configured, {})
         # DS004 blanks like every other gauge — no sticky flag to preserve,
         # since a dead bus means the BMS itself has gone quiet too.
         self._cell_voltages_V = {}
         self.cell_voltages_updated.emit(None, {})
+        # Live BMS probes blank like every other live reading. The R3.5.6
+        # extremes above them are NOT blanked — see _tick_cell_extremes.
+        self._bms_probe_C = {}
+        self.bms_probe_temps_updated.emit({})
         # 0 Ω is below the PT1000's physical floor, so the HUD reads it as
         # "no sensor data" and blanks both fields rather than showing the
         # -246 °C that extrapolating 0 Ω would imply.
         self.motor_temp_updated.emit(0.0, -1000.0, "no_reading")
-        # Blank the efficiency bar too. 0 % would tell the driver they are off
-        # the throttle — a statement about how they are driving — when the truth
-        # is only that the controller has stopped talking to us.
-        self.throttle_updated.emit(None)
         self.alerts_updated.emit([])
-        # NOTHING BLANKS THE SOLAR GAUGE HERE, deliberately. Solar current comes
-        # from a USB ammeter, not from CAN, so a dead bus tells us nothing about
-        # it — blanking it would erase a perfectly good reading. It has its own
-        # staleness handling in modules/solar_current.py, which is the only
-        # thing that actually knows whether that sensor is still talking.
-        #
         # The controller has stopped talking, so we can no longer say it is on.
         # Brake/lights are GPIO-sourced and unaffected by a dead CAN bus, so
         # they keep whatever the Pi can actually read.
@@ -909,50 +899,6 @@ class SmartCANWorker(CANWorker):
         # GPIO ones. _emit_vehicle_flags emits only when something changed.
         self._emit_vehicle_flags(None)
 
-    def _poll_solar(self) -> None:
-        """Copy the newest solar-current snapshot into vehicle_state + the HUD.
-
-        Placed with the other CAN-independent pollers at the top of the loop, on
-        purpose: the array produces power whenever the sun is up, regardless of
-        whether the motor controller is powered or the CAN bus ever opened. A
-        solar reading that only appeared while CAN was live would go blank in
-        the paddock — which is exactly when the crew is checking the array.
-
-        Costs nothing: SolarCurrentReader.get_reading() takes a lock and copies
-        a dict. All USB I/O happens on the reader's own thread.
-        """
-        now = time.monotonic()
-        if now - self._last_solar_poll < SOLAR_POLL_S:
-            return
-        self._last_solar_poll = now
-
-        reading = self.solar.get_reading()
-        amps = reading["solar_current_A"]
-
-        # Publish the whole snapshot, not just the number. The status is what
-        # lets the pit tell "the array is producing nothing" from "the USB cable
-        # fell out", which are the same missing value and completely different
-        # problems.
-        self.vehicle_state["solar"] = {
-            "solar_current_A": amps,
-            "solar_sensor_status": reading["solar_sensor_status"],
-            "solar_sensor_serial": reading["solar_sensor_serial"],
-        }
-        self.solar_current_updated.emit(amps)
-
-        # Log status CHANGES only — a line per poll would be 5 Hz of noise, but
-        # a cable coming loose mid-race is exactly what you want in the log with
-        # a timestamp on it.
-        status = reading["solar_sensor_status"]
-        if status != self._last_solar_status:
-            self._last_solar_status = status
-            detail = reading["solar_last_error"]
-            # safe_print, not print: this runs inside the CAN loop, and an
-            # encoding error escaping here would propagate out of _run_loop and
-            # take the whole worker down over a status message.
-            safe_print(f"☀️ Solar sensor: {status}"
-                       + (f" — {detail}" if detail else ""))
-
     def _tick_profile(self) -> None:
         """Target speed + corner look-ahead for the driver, from the active profile.
 
@@ -1100,6 +1046,24 @@ class SmartCANWorker(CANWorker):
             os.replace(tmp_path, LAP_CHECKPOINT_PATH)
         except Exception as exc:
             print(f"⚠️ failed to save lap checkpoint: {exc}")
+
+    def _tick_cell_extremes(self) -> None:
+        """Emit the rule 3.5.6 report once a second and save it once a minute.
+
+        Deliberately NOT blanked by _emit_zeros: a quiet bus ends the flow of
+        new readings, it does not make the extremes of the last 2 hours
+        untrue. They age out of the window on their own.
+        """
+        now = time.monotonic()
+        if now - self._last_extremes_emit >= CELL_EXTREMES_EMIT_S:
+            self._last_extremes_emit = now
+            self.cell_extremes_updated.emit(self.cell_extremes.result())
+        if now - self._last_extremes_save >= CELL_EXTREMES_SAVE_S:
+            self._last_extremes_save = now
+            try:
+                self.cell_extremes.save(CELL_EXTREMES_PATH)
+            except Exception as exc:
+                print(f"⚠️ failed to save cell extremes: {exc}")
 
     def _publish_gps(self) -> None:
         """Refresh GPS and push telemetry on a timer, independent of CAN.
@@ -1325,12 +1289,28 @@ class SmartCANWorker(CANWorker):
             # accumulates per-cell temperatures (3 cells land per frame,
             # across 10 CAN IDs); push a full snapshot + the BMS's own wired
             # count on every BMS frame, not just the ones carrying a cell.
+            string_count = self.vehicle_state["battery"].get("bms_string_count")
             for _k, _v in bms_data.items():
                 if _k.startswith("bms_cell_") and _k.endswith("_V"):
-                    self._cell_voltages_V[int(_k[len("bms_cell_"):-len("_V")])] = _v
+                    _cell = int(_k[len("bms_cell_"):-len("_V")])
+                    self._cell_voltages_V[_cell] = _v
+                    # Rule 3.5.6. Same string-count gate as DS004, plus a
+                    # plausibility range, so an unwired tap's 0.000 V never
+                    # becomes the "lowest cell voltage" handed to officials.
+                    self.cell_extremes.add_volt(_cell, _v, string_count)
             self.cell_voltages_updated.emit(
                 self.vehicle_state["battery"].get("bms_string_count"),
                 dict(self._cell_voltages_V))
+            # R3.5.6 screen: the BMS's own NTC probes (0x105), per pack. The
+            # probe number is read off the key, so the primary pack's
+            # bms_temp_N_C and the secondary's remapped bms2_temp_N_C land the
+            # same way, under the pack letter the fault labels already use.
+            probes = {int(k.split("_")[2]): v for k, v in bms_data.items()
+                      if k.startswith(("bms_temp_", "bms2_temp_")) and k.endswith("_C")}
+            if probes:
+                self._bms_probe_C.setdefault(self._pack_name(channel), {}).update(probes)
+                self.bms_probe_temps_updated.emit(
+                    {pack: dict(t) for pack, t in self._bms_probe_C.items()})
             # Drive the driver HUD's SoC gauge from the REAL BMS (same value the
             # pit shows). The LYNX 0x618 SoC is only the controller's estimate
             # and is suppressed once we have a real reading (see _decode_battery).
@@ -1347,13 +1327,6 @@ class SmartCANWorker(CANWorker):
             if "bms_current_A" in bms_data:
                 self.battery_current_updated.emit(float(bms_data["bms_current_A"]))
                 self._last_bms_current_A = float(bms_data["bms_current_A"])
-            # Hottest cell — the number that actually matters for battery
-            # safety. Prefer the dedicated temp module (below); fall back to the
-            # BMS's own NTC probes when it isn't reporting.
-            ntcs = [bms_data[k] for k in ("bms_temp_1_C", "bms_temp_2_C",
-                                          "bms_temp_3_C") if k in bms_data]
-            if ntcs and not self._have_module_cell_temp:
-                self.cell_temp_updated.emit(float(max(ntcs)))
             # Faults are tracked PER PACK. After _remap_bms_frame the second
             # pack's key is bms2_protections, so testing only the plain name
             # would have made every fault on pack B invisible to the driver —
@@ -1374,13 +1347,9 @@ class SmartCANWorker(CANWorker):
         # intentionally NOT surfaced on the driver HUD.
         temp_data = parse_temp_controller_message(msg_id, data_bytes)
         if temp_data:
+            # Summary only (low/high/avg). It does NOT drive battery temp:
+            # that is the hottest per-sensor reading, below.
             self.vehicle_state["temp_controller"].update(temp_data)
-            # The J1939 module measures the pack directly and reports the
-            # highest cell it sees — the authoritative "max cell temp" for
-            # DS001/DS002. Once it speaks, it wins over the BMS NTC fallback.
-            if "battery_temp_high_C" in temp_data:
-                self._have_module_cell_temp = True
-                self.cell_temp_updated.emit(float(temp_data["battery_temp_high_C"]))
 
         # DS003 — the per-sensor round-robin frame. Each one updates exactly
         # ONE cell's entry in self._cell_temps_C, which is why this dict is
@@ -1401,11 +1370,26 @@ class SmartCANWorker(CANWorker):
             # unreported, same as one never loaded at all) rather than
             # freezing on a number known to be wrong.
             self._thermistor_configured = True
-            if not therm_data["fault"]:
-                key = f"bms_cell_temp_{therm_data['cell_num']:02d}_C"
+            key = f"bms_cell_temp_{therm_data['cell_num']:02d}_C"
+            if therm_data["fault"]:
+                # A sensor that faults AFTER reporting must lose its last good
+                # value, or a once-hot reading would stay the battery temp
+                # (the pack maximum) for as long as the sensor stays broken.
+                self._cell_temps_C.pop(therm_data["cell_num"], None)
+                self.vehicle_state["temp_controller"].pop(key, None)
+            else:
                 self.vehicle_state["temp_controller"][key] = therm_data["value_C"]
                 self._cell_temps_C[therm_data["cell_num"]] = therm_data["value_C"]
+                # Rule 3.5.6 — the fault-bit skip above plus the shared
+                # plausibility gate inside add_temp.
+                self.cell_extremes.add_temp(therm_data["cell_num"], therm_data["value_C"])
             self.cell_temps_updated.emit(True, dict(self._cell_temps_C))
+            # Battery temp, everywhere (MAX CELL gauges, pit, spectator page):
+            # the hottest plausible cell. Published in vehicle_state under the
+            # name the pit has always read.
+            batt = limits.battery_temp_from_cells(self._cell_temps_C.values())
+            self.vehicle_state["temp_controller"]["battery_temp_C"] = batt
+            self.cell_temp_updated.emit(batt)
 
         mms_data = parse_mms_message(msg_id, data_bytes)
         if mms_data: 

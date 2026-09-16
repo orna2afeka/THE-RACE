@@ -88,9 +88,11 @@ def parse_temp_controller_message(arb_id, data_bytes):
     Returns a dict with the pack temperature summary, or None if the frame
     is not the summary broadcast we care about.
 
-    'battery_temp_C' mirrors the average and is the single headline value
-    the pit dashboard and driver HUD display; low/high/avg are kept for
-    completeness. 'thermistors_enabled_count' is DS003's own "has the car
+    NO 'battery_temp_C' here any more. It used to mirror the module's AVERAGE,
+    and was shown as "battery temp". Battery temp is now the hottest individual
+    thermistor, computed by main.py from the per-sensor frames
+    (limits.battery_temp_from_cells); low/high/avg are still published as the
+    module's own summary. 'thermistors_enabled_count' is DS003's own "has the car
     been configured yet" signal — see parse_thermistor_general_message's
     docstring for why the per-sensor frame can't answer that on its own.
     """
@@ -106,7 +108,6 @@ def parse_temp_controller_message(arb_id, data_bytes):
         "battery_temp_low_C": lowest_C,
         "battery_temp_high_C": highest_C,
         "battery_temp_avg_C": average_C,
-        "battery_temp_C": average_C,   # headline value for the pit dashboard
         "temp_module": data_bytes[0],
     }
     if len(data_bytes) >= 5:

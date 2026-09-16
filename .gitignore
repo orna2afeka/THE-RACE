@@ -53,6 +53,8 @@ SolarRace_OS/cloud/serviceAccountKey.json
 # source: never commit it, same reasoning as telemetry.db above.
 SolarRace_OS/lap_checkpoint.json
 SolarRace_OS/lap_checkpoint.json.tmp
+SolarRace_OS/cell_extremes.json
+SolarRace_OS/cell_extremes.json.tmp
 
 # ---------------------------------------------------------------------------
 # Launcher / runtime bookkeeping

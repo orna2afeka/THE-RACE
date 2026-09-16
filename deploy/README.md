@@ -72,43 +72,6 @@ This runs as root at boot, so the HUD never needs `sudo` — see the note in
 `can-up.service` for why that matters. `main.py` checks whether each interface
 is already up and does nothing when this unit has done its job.
 
-### 6. Solar current sensor (Yoctopuce Yocto-Amp)
-
-Two steps. The pip package alone is **not** enough — without the udev rule the
-USB device is root-only, and the HUD deliberately does not run as root, so the
-solar reading stays blank with status `no_hub`.
-
-```bash
-pip install yoctopuce            # or: pip install -r SolarRace_OS/requirements.txt
-
-# Let non-root processes open Yoctopuce devices (vendor id 24e0).
-echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="24e0", MODE="0666"' \
-    | sudo tee /etc/udev/rules.d/51-yoctopuce.rules
-sudo udevadm control --reload-rules && sudo udevadm trigger
-```
-
-Then unplug and replug the sensor, and verify **before** blaming the dashboard:
-
-```bash
-lsusb | grep 24e0                                  # the module must be listed
-python SolarRace_OS/modules/solar_current.py       # prints amps once a second
-```
-
-The self-test prints a status word on every line, and each one has one meaning:
-
-| Status | What it means | Fix |
-|--------|---------------|-----|
-| `online` | Reading normally | — |
-| `no_library` | `pip install yoctopuce` was never run | install it |
-| `no_hub` | Cannot claim the USB bus | the udev rule above; or a VirtualHub / second copy of the app already holds the device |
-| `searching` | Bus claimed, no Yocto-Amp found | check `lsusb`, the cable, the port |
-| `offline` | It was there and vanished | the cable came loose — the expected race failure |
-| `implausible` | Past the sensor's 17 A peak rating | wrong sensor for this current, or a fault |
-
-Wiring the sensor into the car is a separate job — see
-[☀ Solar Current Sensor](../README.md#-solar-current-sensor-yocto-amp) in the root
-README, and read the 10 A limit warning there before cutting anything.
-
 ### 5. Auto-login and no screen blanking
 
 ```bash

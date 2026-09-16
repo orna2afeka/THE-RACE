@@ -86,7 +86,6 @@ FIELDS = (
     "mms_temperature_C", "mms_measured_voltage_V",
     "bms_soc_percent", "bms_voltage_V", "bms_current_A", "battery_temp_C",
     "bms_estimated_soc_percent",
-    "solar_current_A", "solar_sensor_status",
     "last_lap_time_s", "last_lap_energy", "last_lap_distance_m",
     "total_race_energy", "regen_energy", "stint_energy", "stint_regen_energy",
     # The GPS columns are "lat"/"lon" -- NOT gps_lat/gps_lon, which is what this
@@ -240,8 +239,6 @@ class DemoFeed:
             "bms_current_A": max(0.0, power) / 52.0,
             "battery_temp_C": 31.0 + kmh / 60.0,
             "bms_estimated_soc_percent": None,
-            "solar_current_A": 4.4,
-            "solar_sensor_status": "ok",
             "last_lap_time_s": recent[0]["time_s"] if recent else None,
             "last_lap_energy": recent[0]["energy_wh"] if recent else None,
             "last_lap_distance_m": 4000.0 if recent else None,

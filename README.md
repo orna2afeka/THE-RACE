@@ -43,7 +43,6 @@ giving engineers live battery, motor, temperature, and strategy data.
 | Retune when a gauge goes amber or red | `limits.py`, then re-run `python tools/replay_limits.py` to see how often the new number would have fired |
 | Change CAN bitrate / channels / BMS polling / throttle reporting | `SolarRace_OS/config.py` |
 | Retune the Eco / Normal / Power zones, or calibrate the throttle pedal | `efficiency.py` at the repo root — **both** subsystems read it |
-| Wire up or debug the solar current sensor | [☀ Solar Current Sensor](#-solar-current-sensor-yocto-amp) below |
 
 > **Two things that surprise everyone:**
 > 1. `Pit_Dashboard` never talks to Firebase — only `collector.py` does. The dashboard
@@ -159,90 +158,6 @@ overlap, so the parsers can tell the protocols apart regardless of channel:
 
 ---
 
-## ☀ Solar Current Sensor (Yocto-Amp)
-
-Measures the DC current the MPPT pushes into the pack — the only *inbound*
-energy number on the car. Hardware: a Yoctopuce **Yocto-Amp** (or **Yocto-Amp-C**,
-the identical board with a USB-C socket), read by
-[`SolarRace_OS/modules/solar_current.py`](SolarRace_OS/modules/solar_current.py).
-
-| Property | Value | Why it matters here |
-|----------|-------|---------------------|
-| Max continuous | **10 A DC** | **Check the MPPT output rating against this before fitting anything.** |
-| Max peak | 17 A DC | Beyond this the reading is meaningless and the shunt is in trouble |
-| Insertion impedance | 5 mΩ | 0.5 W at 10 A — negligible loss, but it is a real heat source |
-| Terminal block | **26–16 AWG**, 5 mm strip, 0.4 Nm | A thicker charge cable will not physically land in it |
-| Isolation | 3 kV r.m.s. USB ↔ sensor | The Pi is NOT exposed to pack potential |
-| Reported unit | **milliamps** | Converted to amps once, on the car. Never store mA |
-| Refresh | 10 Hz | We poll at 4 Hz; the pit sees it at the 0.5 s Firebase rate |
-
-### ⚠️ Before wiring: confirm the current fits
-
-The Yocto-Amp is a **10 A continuous** device. Take the MPPT's rated maximum
-output current — not the array's nominal power, the MPPT's *output spec* — and
-check it is comfortably under 10 A. A 1 kW array into a ~48 V pack is roughly
-20 A, which is **twice this sensor's continuous rating**: it would overheat the
-shunt, and a 5 mΩ resistor cooking inside a sealed box in a race car is a fire
-risk, not a measurement problem. If the number is above ~8 A, stop and fit a
-hall-effect sensor instead. At a sustained 10 A the PCB already runs ~15 °C above
-ambient and Yoctopuce recommend forced airflow.
-
-### Wiring, step by step
-
-1. **Make it safe first.** Open the battery isolator, then isolate the array.
-   A solar panel cannot be switched off — it is live whenever light falls on it,
-   so either open the array isolator or physically cover the panels. Confirm 0 V
-   across the point you are about to cut.
-2. **Pick the point.** Anywhere on the conductor between the **MPPT output** and
-   the **battery**. The MPPT's positive output lead is the conventional choice.
-   Because the sensor is isolated, positive or negative return both work
-   electrically — pick whichever gives a shorter, better-supported cable run.
-3. **Cut that one conductor and land both ends on the terminal block.** The
-   ammeter goes **IN SERIES** — the whole charge current must flow through it.
-   Never wire it across the battery or across anything else: a 5 mΩ shunt in
-   parallel with a pack is a dead short.
-4. **Observe polarity so charging reads positive.** MPPT side → **`+` (measure
-   input positive)**; battery side → **`−` (measure input negative)**. Get this
-   backwards and the car simply reports negative amps all race — which the
-   dashboards deliberately display rather than hide, so you will see it
-   immediately and can swap the two wires.
-5. **Check the wire fits.** The block takes **16 AWG at the thickest**. A solar
-   charge line is often heavier than that. If so, do NOT force strands in: make a
-   short 16 AWG pigtail with a properly crimped joint to the main cable, and
-   remember the pigtail is now the current-limiting element in that path.
-6. **Crimp ferrules on stranded wire, strip 5 mm, torque to 0.4 Nm.** This is a
-   race car: a screw terminal that backs out under vibration becomes a
-   high-resistance hot spot carrying the full charge current.
-7. **Mount the module, not the wires.** Bolt or tie the board to structure so
-   its mass and the USB cable's tugging are never carried by the terminal
-   screws. Leave it in open air — do not bury it in a sealed box.
-8. **Leave the existing fuse in place.** The ammeter protects nothing. The
-   charge line still needs its own fuse, and that fuse should be rated at or
-   below what the Yocto-Amp can survive.
-9. **Restore power** — array last — and verify against a clamp meter before
-   trusting the number.
-
-### How the USB side works
-
-The Yocto-Amp is two electrically separate halves on one board. The shunt sits in
-the charge line at pack potential; the USB half is powered and read by the Pi;
-between them is 3 kV of isolation. **This is why the Pi can safely measure a
-line at pack voltage** — there is no galvanic path from the traction system to
-the Raspberry Pi, so no ground loop and no shared reference.
-
-Plug it into any **USB-A** port on the Pi 5 (the Pi's own USB-C socket is power
-input only — with the Yocto-Amp-C you want a USB-C-to-USB-A cable). It draws
-little enough to run from the port directly. **Strain-relieve and secure the
-connector**: a USB plug shaken loose is the expected failure here, which is why
-`solar_current.py` reconnects on its own and why the pit shows a sensor status
-beside the number — "offline" means the cable, "0.00 A" means the weather.
-
-The device is enumerated by `libusb`, so it needs a udev rule before a non-root
-process can open it. See [`deploy/README.md`](deploy/README.md) § 6 — without it
-the reading is permanently blank and the status reads `no_hub`.
-
----
-
 ## 📂 Repository Structure
 
 The repository root **is** the project root: `SolarRace_OS/` (car) and
@@ -280,7 +195,6 @@ THE RACE/                             # ← repo root
 │   │   ├── temp_controller_parser.py # J1939 battery-temperature decoder (low/high/avg)
 │   │   ├── pt1000.py                 # PT1000 thermistor linearisation
 │   │   ├── gps_reader.py             # GPS position via gpsd (background thread)
-│   │   ├── solar_current.py          # ☀ MPPT→battery current, Yocto-Amp on USB
 │   │   ├── lap_tracker.py            # Lap/sector detection from GPS + wheel distance
 │   │   ├── lap_command.py            # Manual lap triggers / pit commands
 │   │   ├── vehicle_inputs.py         # Throttle, brake, and switch inputs
@@ -306,7 +220,10 @@ THE RACE/                             # ← repo root
 │   ├── assets/pit_dashboard.css      # Dashboard styling
 │   ├── .streamlit/config.toml        # Streamlit server/theme settings
 │   ├── 210s.xlsx                     # Baseline 210 s Zolder velocity profile
-│   ├── profile_builder.py            # Speed Profile Builder app (port 8502, reads telemetry.db READ-ONLY)
+│   ├── profile_builder.py            # Speed Profile Builder app (port 8502, reads telemetry.db READ-ONLY).
+│   │                                 #   Rows are DRIVES, not lap numbers — the counter repeats. Shows each
+│   │                                 #   lap's Wh, Wh/km and a nine-sector energy split that self-checks
+│   │                                 #   against the car's own total and says so when it disagrees
 │   ├── wall.html                     # GENERATED big-screen pit page — pit LAN only, NOT published
 │   ├── profile_build.py              # The maths behind it — no Streamlit, self-checks headlessly
 │   ├── requirements_pit.txt          # Pit dependencies
@@ -387,7 +304,6 @@ Almost everything car-side is centralised in **`SolarRace_OS/config.py`**:
 | `CAN_CANDIDATES` | Connections tried in order: CAN HAT (`socketcan:can0`) first, then a USB-to-CAN adapter. First that opens wins. |
 | `BMS_POLL_IDS` / `BMS_POLL_BYTE` / `BMS_POLL_INTERVAL_S` | Which BMS frames to request, the query byte (`0x5A`), and how often (1 Hz). |
 | `modules/regen_light.py` | Brake-light pin and thresholds. `REGEN_LIGHT_PIN` (GPIO 17), the on/off watt hysteresis, and the minimum flash length. ⚠️ A GPIO pin CANNOT drive a lamp — it switches a MOSFET. The module docstring has the circuit. |
-| `modules/solar_current.py` | Solar sensor tunables live in the module, not here — same as `gps_reader.py`. Poll rate, rescan interval, plausibility ceiling, and `target_serial` (pin this the moment a SECOND Yoctopuce device joins the car). |
 | `efficiency.py` (repo root) | Not in `config.py`, because the **pit reads it too**: the pedal's millivolt calibration and the Eco / Normal / Power boundaries. ⚠️ Every number in it is still a placeholder — nothing has been measured on the car. |
 | `SIM_LOG_PATH` | Recorded log replayed when no CAN bus is found. |
 
@@ -600,14 +516,8 @@ live_telemetry/
       mms_has_error, mms_error_code,
       odometer_m, calculated_lap
     temp_controller:   // J1939 battery-temperature module
-      battery_temp_C (= average), battery_temp_avg_C,
+      battery_temp_C (= hottest plausible cell; null if none), battery_temp_avg_C,
       battery_temp_low_C, battery_temp_high_C, temp_module
-    solar:             // live from the Yocto-Amp on USB (solar_current.py)
-      solar_current_A,   // AMPS (the sensor reports mA; converted on the car).
-                         // null — never 0 — when the sensor is not reporting
-      solar_sensor_status,  // online | offline | searching | no_hub |
-                            // no_library | implausible | error
-      solar_sensor_serial
     gps:               // live from gpsd (gps_reader.py)
       lat, lon,        // ABSENT entirely when there is no fix — never 0,0
       fix_mode (2=2D, 3=3D), alt_m, speed_kmh, track_deg,

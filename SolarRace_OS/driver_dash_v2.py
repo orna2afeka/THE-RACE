@@ -10,6 +10,7 @@ import html
 import math
 import os
 import sys
+import time
 from typing import Optional
 
 # Drivetrain constants live at the repo root, shared with the pit dashboard so
@@ -29,12 +30,6 @@ import drivetrain  # noqa: E402  (path set up immediately above)
 # It has to be imported HERE, above the palette, because the tier colours below
 # are built from limits.TIER_COLOURS.
 import limits      # noqa: E402  (same path bootstrap as drivetrain above)
-# Throttle zone boundaries and their colours, shared with the pit wall for the
-# same reason limits is: the pit radios "stay in the green", so green has to
-# mean the same throttle percentage on both screens. Also a module import, so
-# `efficiency.THROTTLE_ECO_MAX_PCT` at the point of use says where the number
-# came from and leaves no local copy to drift.
-import efficiency  # noqa: E402  (same path bootstrap as drivetrain above)
 
 from PySide6.QtCore import (
     Qt, QEasingCurve, QPropertyAnimation, QRectF, QTimer, Slot,
@@ -735,155 +730,120 @@ class CellTile(QWidget):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  EfficiencyBar — "am I driving economically right now?" in one glance
+#  Rule 3.5.6 report — the pack's cell extremes over the last 2 hours
 # ─────────────────────────────────────────────────────────────────────────────
-class EfficiencyBar(QWidget):
-    """Throttle position reduced to the one thing a driver can act on.
+def _clock(wall_ts) -> str:
+    """HH:MM:SS in the car's local time."""
+    return time.strftime("%H:%M:%S", time.localtime(wall_ts))
 
-    A hybrid car's ECO/POWER bar. Three fixed colour bands with a bright fill
-    showing where the pedal currently is, plus the zone name spelled out. The
-    boundaries come from efficiency.py, so the pit wall's throttle tile and this
-    bar cannot disagree about where "green" ends.
 
-    DESIGN NOTES, because a driver's instrument earns its pixels or loses them:
+def _duration(seconds) -> str:
+    """47 min / 1 h 12 min / 2 h."""
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f"{minutes} min"
+    h, m = divmod(minutes, 60)
+    return f"{h} h" if m == 0 else f"{h} h {m:02d} min"
 
-    * The BANDS ARE ALWAYS DRAWN, even in the zone the car is not in, and the
-      two boundaries are re-drawn as ticks ON TOP of the fill. A bar that only
-      showed the current colour would teach the driver nothing about how much
-      pedal travel they have left before leaving Eco — which is the whole
-      coaching value. The ticks matter for the same reason: the fill covers the
-      bands it passes, so without them the green band is invisible at exactly
-      the moment the driver most needs to know how far back it is.
-    * The zone WORD is drawn as well as the colour. Colour alone is unreadable
-      in direct sun through a visor, and roughly 8 % of men have some form of
-      red/green colour deficiency — a green/amber/red-only indicator is exactly
-      the wrong choice for a safety-adjacent instrument.
-    * It does NOT flash, ever. Flashing on this HUD is reserved for
-      limits.CRITICAL, i.e. something is damaging the car. High throttle is not
-      a fault; it is a choice. Making it blink would spend the one attention-
-      grabbing signal the dash has on a coaching hint, and teach the driver to
-      ignore blinking.
-    * No caption ("THROTTLE", "EFFICIENCY"). The words ECO / NORMAL / POWER and
-      a percentage are self-describing, and the request was for something
-      uncluttered.
 
-    Renders _NO_DATA and unlit bands when the pedal has not been reported. As
-    everywhere else on this dash, a missing reading must not look like 0 %.
+class ExtremeTile(QWidget):
+    """One of the four rule-3.5.6 numbers: title, value, and WHICH cell and
+    WHEN — the cell and the time are the point of this screen, they are what
+    lets whoever reads the report confirm the reading is inside the last
+    2 hours. Coloured by limits.classify like every other reading, so a cell
+    that was once too hot stays visibly amber/red here for as long as it is in
+    the window, even after it has cooled down on DS003.
     """
 
-    def __init__(self, parent=None):
+    def __init__(self, title: str, unit: str, limit, decimals: int,
+                 label_of, parent=None):
         super().__init__(parent)
-        # None until the ESC reports the pedal — NOT 0.0. See _NO_DATA.
-        self._pct: float | None = None
-        self.setMinimumHeight(26)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._title = title
+        self._unit = unit
+        self._limit = limit
+        self._decimals = decimals
+        self._label_of = label_of
+        self._reading = None     # (value, cell, wall_ts) or None
+        self._now = None
+        self.setMinimumSize(120, 80)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
-    def set_throttle(self, pct: float | None) -> None:
-        """New throttle percentage, or None for "not reported"."""
-        # Repaint only on a change the eye could see. At 10 Hz an unconditional
-        # update() would repaint the whole bar for a 0.1 % pedal wobble.
-        if pct is None and self._pct is None:
-            return
-        if (pct is not None and self._pct is not None
-                and abs(pct - self._pct) < 0.5):
-            return
-        self._pct = pct
+    def set_reading(self, reading, now_wall: float) -> None:
+        self._reading = reading
+        self._now = now_wall
         self.update()
 
     def paintEvent(self, _) -> None:  # noqa: ANN001
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
 
-        w, h = float(self.width()), float(self.height())
-        unknown = self._pct is None
-        zone_hex = efficiency.zone_colour(self._pct)
-        accent = QColor(zone_hex if zone_hex else _NO_DATA_COLOUR)
+        if self._reading is None:
+            tier = None
+            value_txt, detail = _NO_DATA, "no reading in the last 2 h"
+        else:
+            value, cell, ts = self._reading
+            tier = limits.classify(value, self._limit)
+            value_txt = f"{value:.{self._decimals}f} {self._unit}"
+            age = max(0.0, (self._now or ts) - ts)
+            detail = (f"{self._label_of(cell)}  ·  {_clock(ts)}  ·  "
+                      f"{_duration(age)} ago")
 
-        # ---- geometry: word | bar | percentage ------------------------- #
-        pad = 5.0
-        word_w = max(62.0, w * 0.19)
-        val_w = max(52.0, w * 0.13)
-        bar_x = pad + word_w
-        bar_w = max(10.0, w - bar_x - val_w - pad)
-        bar_h = max(7.0, h * 0.46)
-        bar_y = (h - bar_h) / 2.0
-        radius = bar_h / 2.0
-
-        # ---- the three zone bands ------------------------------------- #
-        # Widths are the thresholds themselves, so moving a boundary in
-        # efficiency.py visibly moves the band. Nothing here hard-codes 40/75.
-        bounds = [
-            (0.0, efficiency.THROTTLE_ECO_MAX_PCT, efficiency.ZONE_ECO),
-            (efficiency.THROTTLE_ECO_MAX_PCT,
-             efficiency.THROTTLE_NORMAL_MAX_PCT, efficiency.ZONE_NORMAL),
-            (efficiency.THROTTLE_NORMAL_MAX_PCT, 100.0, efficiency.ZONE_POWER),
-        ]
-        p.setPen(Qt.NoPen)
-        for lo, hi, zone_key in bounds:
-            band = QColor(efficiency.ZONE_COLOURS[zone_key])
-            # Unlit bands stay visible but recede, so the driver can still read
-            # the pedal's geometry while the signal is missing.
-            band.setAlpha(28 if unknown else 60)
-            p.setBrush(QBrush(band))
-            p.drawRect(QRectF(bar_x + bar_w * lo / 100.0, bar_y,
-                              bar_w * (hi - lo) / 100.0, bar_h))
-
-        # ---- the fill: where the pedal actually is -------------------- #
-        if not unknown:
-            fill = QColor(accent)
-            p.setBrush(QBrush(fill))
-            p.drawRoundedRect(
-                QRectF(bar_x, bar_y, bar_w * min(100.0, self._pct) / 100.0,
-                       bar_h),
-                radius, radius)
-            # A hard white edge at the pedal position. The fill alone is hard
-            # to read at a glance against a band of a similar colour; this is
-            # the thing the eye actually locks onto.
-            edge_x = bar_x + bar_w * min(100.0, self._pct) / 100.0
-            p.setPen(QPen(C_WHITE, 2.0))
-            p.drawLine(QRectF(edge_x, bar_y - 2.0, 0.0, bar_h + 4.0).topLeft(),
-                       QRectF(edge_x, bar_y - 2.0, 0.0, bar_h + 4.0).bottomLeft())
-            p.setPen(Qt.NoPen)
-
-        # ---- zone boundary ticks, drawn LAST so they are never hidden -- #
-        # The fill paints over the bands it passes, so at 80 % throttle the
-        # green band is completely covered and the driver can no longer see
-        # where Eco ended — which defeats the point of drawing the bands at
-        # all. These two ticks are the boundaries themselves, always visible
-        # over fill or empty track, so "how much do I lift to get back into
-        # the green" stays answerable at every pedal position.
-        p.setPen(QPen(QColor(0, 0, 0, 150), 1.0))
-        for boundary in (efficiency.THROTTLE_ECO_MAX_PCT,
-                         efficiency.THROTTLE_NORMAL_MAX_PCT):
-            tick_x = bar_x + bar_w * boundary / 100.0
-            p.drawLine(QRectF(tick_x, bar_y, 0.0, bar_h).topLeft(),
-                       QRectF(tick_x, bar_y, 0.0, bar_h).bottomLeft())
-
-        # ---- outline, so the bar's extent is unambiguous at 0 % -------- #
+        colour = (C_CRITICAL if tier == limits.CRITICAL else
+                  C_WARNING if tier == limits.WARNING else None)
+        p.setPen(QPen(colour or C_BORDER, 2.0))
         p.setBrush(Qt.NoBrush)
-        p.setPen(QPen(C_BORDER, 1.0))
-        p.drawRoundedRect(QRectF(bar_x, bar_y, bar_w, bar_h), radius, radius)
+        p.drawRoundedRect(QRectF(1.0, 1.0, w - 2.0, h - 2.0), 6, 6)
 
-        # ---- the zone word ------------------------------------------- #
-        word = efficiency.zone_label(self._pct) or _NO_DATA
-        font = QFont()
-        font.setBold(True)
-        font.setPixelSize(int(max(11.0, min(h * 0.62, word_w * 0.26))))
-        p.setFont(font)
-        p.setPen(QPen(accent))
-        p.drawText(QRectF(pad, 0.0, word_w, h),
-                   Qt.AlignLeft | Qt.AlignVCenter, word)
+        tf = _fit_font(self._title, h * 0.12, w - 16.0, bold=True)
+        p.setFont(tf)
+        p.setPen(QPen(QColor(_CAPTION)))
+        p.drawText(QRectF(8.0, h * 0.04, w - 16.0, h * 0.22),
+                   Qt.AlignCenter, self._title)
 
-        # ---- the percentage ------------------------------------------ #
-        value = _NO_DATA if unknown else f"{self._pct:.0f}%"
-        font.setPixelSize(int(max(11.0, min(h * 0.58, val_w * 0.34))))
-        p.setFont(font)
-        p.setPen(QPen(C_NO_DATA if unknown else C_WHITE))
-        p.drawText(QRectF(w - val_w - pad, 0.0, val_w, h),
-                   Qt.AlignRight | Qt.AlignVCenter, value)
+        vf = _fit_font(value_txt, h * 0.30, w - 16.0)
+        p.setFont(vf)
+        p.setPen(QPen(C_NO_DATA if self._reading is None else (colour or C_WHITE)))
+        p.drawText(QRectF(8.0, h * 0.24, w - 16.0, h * 0.46),
+                   Qt.AlignCenter, value_txt)
 
+        df = _fit_font(detail, h * 0.11, w - 16.0, bold=False)
+        p.setFont(df)
+        p.setPen(QPen(C_DIM))
+        p.drawText(QRectF(8.0, h * 0.72, w - 16.0, h * 0.22),
+                   Qt.AlignCenter, detail)
         p.end()
 
+
+class ExtremesHeader(QWidget):
+    """'RULE 3.5.6 · LAST 2 H' on the left, the window the numbers really
+    cover on the right. Painted, so it scales with the panel like the tiles."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._left = "RULE 3.5.6  ·  CELL EXTREMES, LAST 2 H"
+        self._right = "no cell readings yet"
+        self._right_colour = C_NO_DATA
+        self.setMinimumHeight(24)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def set_window(self, text: str, colour: QColor) -> None:
+        self._right, self._right_colour = text, colour
+        self.update()
+
+    def paintEvent(self, _) -> None:  # noqa: ANN001
+        p = QPainter(self)
+        w, h = self.width(), self.height()
+        half = (w - 12.0) / 2.0
+        p.setFont(_fit_font(self._left, h * 0.42, half))
+        p.setPen(QPen(C_WHITE))
+        p.drawText(QRectF(4.0, 0.0, half, h), Qt.AlignVCenter | Qt.AlignLeft,
+                   self._left)
+        p.setFont(_fit_font(self._right, h * 0.38, half, bold=False))
+        p.setPen(QPen(self._right_colour))
+        p.drawText(QRectF(w / 2.0, 0.0, half, h), Qt.AlignVCenter | Qt.AlignRight,
+                   self._right)
+        p.end()
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  RacingDashboard — main window (800×480 design size, scales to fullscreen)
@@ -915,7 +875,7 @@ class RacingDashboard(QMainWindow):
     _NAV_BTN_H = 64
     _NAV_BTN_W = 90
 
-    _SCREEN_NAMES = ("DS001", "DS002", "DS003", "DS004")
+    _SCREEN_NAMES = ("DS001", "DS002", "DS003", "DS004", "R3.5.6")
 
     # DS004 of the technical regulations: "Voltage of all battery modules
     # (26 sensors)". Same NAME and count as the pit dashboard's own
@@ -943,13 +903,6 @@ class RacingDashboard(QMainWindow):
     # second copy of the number there would silently start clipping the status
     # the day anyone retunes the margin here.
     _ROOT_MARGIN_PX = 5
-
-    # The efficiency bar is a PERMANENT readout like the target speed, not an
-    # event strip like the turn warning, so it keeps its space. 30 px is enough
-    # for a legible zone word at the 800×480 design size while leaving the
-    # speedometer the dominant object on the screen — the efficiency hint must
-    # never compete with the number the driver steers by.
-    _EFFICIENCY_H = 30
 
     # Within this much of target counts as on-pace (green). Wide enough that a
     # driver holding a steady line is not nagged by a permanently amber readout.
@@ -992,13 +945,9 @@ class RacingDashboard(QMainWindow):
         self._window_w: int = 800
         self._alert_color: str = _LIME
         self._pit_color: str = _CYAN   # pit-to-driver message banner color
-        # Whether the solar badge is currently lit. Kept as state rather than
-        # re-derived from the label text on resize: parsing a rendered string
-        # back into a boolean is how a display ends up disagreeing with itself.
-        self._solar_charging: bool = False
-        # Internet reachability, for the NET badge. Held as state for the same
-        # reason as _solar_charging, and UNKNOWN rather than offline until the
-        # probe has actually run — see note 3 in modules/net_monitor.py.
+        # Internet reachability, for the NET badge. Held as state rather than
+        # re-derived from the label text on resize, and UNKNOWN rather than
+        # offline until the probe has actually run — see note 3 in modules/net_monitor.py.
         self._net_status: str = net_monitor.STATUS_UNKNOWN
         # Whether telemetry is actually LANDING in the pit, for the PIT badge.
         # Named _uplink_*, NOT _pit_*: _pit_lbl is already the pit-to-driver
@@ -1038,6 +987,7 @@ class RacingDashboard(QMainWindow):
         self._screens.addWidget(self._build_screen_ds002())
         self._screens.addWidget(self._build_screen_ds003())
         self._screens.addWidget(self._build_screen_ds004())
+        self._screens.addWidget(self._build_screen_r356())
         vbox.addWidget(self._screens, stretch=1)
 
         vbox.addWidget(self._build_controls_bar())
@@ -1099,27 +1049,6 @@ class RacingDashboard(QMainWindow):
         layout.addWidget(self._map_lbl)
         layout.addSpacing(12)
 
-        # SOLAR CHARGE CURRENT — in the shared bar, like the MAP badge, so it is
-        # visible on BOTH screens without paging.
-        #
-        # Why here and not as a fourth gauge in a DS001 side panel: three
-        # MiniGauges stacked in a side panel already set a 472 px minimum height
-        # on a 480 px screen (see MiniGauge.setMinimumSize), so a fourth would
-        # overflow the panel on the real hardware. A badge in a fixed-height
-        # horizontal bar adds no vertical demand at all.
-        #
-        # And why a badge rather than a gauge: the driver cannot act on this
-        # number. It is not a control input like throttle or a limit like motor
-        # temperature — the sun does what it does. It was asked for so the
-        # driver can confirm the array is producing, which a small number
-        # answers completely. The full gauge lives on DS002 with the rest of the
-        # electrical picture, for when someone wants to study it.
-        self._solar_lbl = QLabel("☀ —")
-        self._solar_lbl.setAlignment(Qt.AlignCenter)
-        self._apply_solar_style(charging=False)
-        layout.addWidget(self._solar_lbl)
-        layout.addSpacing(12)
-
         self._alert_lbl = QLabel("")
         self._alert_lbl.setStyleSheet(
             f"color: {_LIME}; font-size: 11px; font-weight: bold;"
@@ -1127,22 +1056,6 @@ class RacingDashboard(QMainWindow):
         layout.addWidget(self._alert_lbl)
 
         return frame
-
-    def _apply_solar_style(self, charging: bool) -> None:
-        """Style the solar badge: lit while charging, unlit otherwise.
-
-        Lime when current is flowing in, the unlit slate when it is not or when
-        there is no reading. NOT amber or red in any state: nothing about solar
-        current is a warning, and reusing the alert colours for it would spend
-        the driver's alarm vocabulary on the weather.
-        """
-        self._solar_charging = charging
-        colour = _LIME if charging else _OFF
-        self._solar_lbl.setStyleSheet(
-            f"color: {colour}; font-size: {int(13 * self._sc)}px;"
-            f"font-weight: bold; letter-spacing: 1px;"
-            f"border: 2px solid {colour}; border-radius: 4px; padding: 1px 8px;"
-        )
 
     # ── Internet link badge ───────────────────────────────────────────────── #
     @staticmethod
@@ -1168,7 +1081,7 @@ class RacingDashboard(QMainWindow):
     def _apply_net_style(self, status: str) -> None:
         """Colour the link badge. Lime up, red down, unlit until we know.
 
-        UNKNOWN takes _OFF, the same unlit slate the MAP and solar badges use
+        UNKNOWN takes _OFF, the same unlit slate the MAP badge uses
         before their first reading — booting into a red light that only means
         "ask me in five seconds" would spend the driver's alarm response on our
         own startup.
@@ -1313,15 +1226,6 @@ class RacingDashboard(QMainWindow):
         self._target_lbl.setMinimumWidth(1)
         self._apply_target_style()
         vbox.addWidget(self._target_lbl)
-
-        # EFFICIENCY — directly beneath the speed and its target, because that
-        # is the group of three the driver reads as one thought: how fast am I,
-        # how fast should I be, and what is it costing me. Putting it in a side
-        # panel would have made it a gauge to hunt for rather than something
-        # caught in peripheral vision while watching the speedo.
-        self._efficiency_bar = EfficiencyBar()
-        self._efficiency_bar.setFixedHeight(self._EFFICIENCY_H)
-        vbox.addWidget(self._efficiency_bar)
 
         # NOTE: the pit-message banner used to be created here. It now lives in
         # _build_pit_banner(), above the page stack, so it is visible on both
@@ -1616,20 +1520,7 @@ class RacingDashboard(QMainWindow):
         self._ds2_soc = MiniGauge("SOC", "%", C_LIME, limits.SOC, decimals=0)
         self._ds2_voltage = MiniGauge("BATT VOLTS", "V", C_LIME,
                                       limits.PACK_VOLTAGE, decimals=1)
-        # SOLAR IN completes the top row at four gauges, matching the four
-        # below. Added here rather than to the bottom row of currents because
-        # this row is the energy picture — how much is in the pack and what is
-        # going into it — while the bottom row is what is being drawn out of it.
-        # Either way the row count is unchanged, so DS002 gains a gauge without
-        # gaining height, which matters on a 480 px panel.
-        #
-        # Resting colour LIME, like SOC and voltage: a number that is good when
-        # it is high. It never changes colour (limits.SOLAR_CURRENT sets no
-        # thresholds), so the arc alone carries the magnitude.
-        self._ds2_solar_current = MiniGauge("SOLAR IN", "A", C_LIME,
-                                            limits.SOLAR_CURRENT, decimals=2)
-        for g in (self._ds2_speed, self._ds2_soc, self._ds2_voltage,
-                  self._ds2_solar_current):
+        for g in (self._ds2_speed, self._ds2_soc, self._ds2_voltage):
             top.addWidget(g, stretch=1)
         vbox.addLayout(top, stretch=1)
 
@@ -1748,6 +1639,57 @@ class RacingDashboard(QMainWindow):
             self._voltage_tiles[i] = tile
             row, col = divmod(i - 1, cols)
             grid.addWidget(tile, row, col)
+        return page
+
+    def _build_screen_r356(self) -> QWidget:
+        """Rule 3.5.6: every 2 hours the team reports the highest and lowest
+        cell temperature and the highest and lowest cell voltage.
+
+        The numbers are kept by cell_extremes.RollingExtremes on the CAN
+        worker (one-minute buckets, so a new reading is compared against the
+        current minute only) and arrive here once a second. Each tile carries
+        the cell and the time it was measured, and the header states the
+        window actually covered — after a restart or at the start of the race
+        that is less than 2 h, and the screen says so rather than implying a
+        full window.
+        """
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(4)
+        self._r356_header = ExtremesHeader()
+        outer.addWidget(self._r356_header, stretch=1)
+
+        grid = QGridLayout()
+        grid.setSpacing(6)
+        volt_label = lambda cell: f"M{cell}"   # same names as DS004
+        self._r356_tiles = {
+            "temp_max": ExtremeTile("HIGHEST CELL TEMP", "°C", limits.CELL_TEMP,
+                                    1, limits.cell_temp_label),
+            "temp_min": ExtremeTile("LOWEST CELL TEMP", "°C", limits.CELL_TEMP,
+                                    1, limits.cell_temp_label),
+            "volt_max": ExtremeTile("HIGHEST CELL VOLTAGE", "V", limits.CELL_VOLTAGE,
+                                    3, volt_label),
+            "volt_min": ExtremeTile("LOWEST CELL VOLTAGE", "V", limits.CELL_VOLTAGE,
+                                    3, volt_label),
+        }
+        grid.addWidget(self._r356_tiles["temp_max"], 0, 0)
+        grid.addWidget(self._r356_tiles["temp_min"], 1, 0)
+        grid.addWidget(self._r356_tiles["volt_max"], 0, 1)
+        grid.addWidget(self._r356_tiles["volt_min"], 1, 1)
+        outer.addLayout(grid, stretch=7)
+
+        # The two BMS units' own NTC probes, LIVE (not 2 h extremes): one row
+        # per BMS, T1-T3. Same tile and colours as DS003's cell temperatures.
+        probes = QGridLayout()
+        probes.setSpacing(4)
+        self._bms_probe_tiles = {}
+        for row, pack in enumerate(("A", "B")):
+            for col, n in enumerate((1, 2, 3)):
+                tile = CellTile(f"BMS {pack} T{n}", limits.CELL_TEMP, decimals=1)
+                self._bms_probe_tiles[(pack, n)] = tile
+                probes.addWidget(tile, row, col)
+        outer.addLayout(probes, stretch=3)
         return page
 
     # ── Touch pagination ─────────────────────────────────────────────────── #
@@ -1920,8 +1862,6 @@ class RacingDashboard(QMainWindow):
         self._worker.controller_temp_updated.connect(self._on_ctrl_temp)
         self._worker.motor_temp_updated.connect(self._on_motor_temp)
         self._worker.power_updated.connect(self._on_power)
-        self._worker.throttle_updated.connect(self._on_throttle)
-        self._worker.solar_current_updated.connect(self._on_solar_current)
         self._worker.alerts_updated.connect(self._on_alerts)
         self._worker.connection_error.connect(self._on_error)
         self._worker.status_updated.connect(self._on_status)
@@ -1931,6 +1871,8 @@ class RacingDashboard(QMainWindow):
         self._worker.cell_temp_updated.connect(self._on_cell_temp)
         self._worker.cell_temps_updated.connect(self._on_cell_temps)
         self._worker.cell_voltages_updated.connect(self._on_cell_voltages)
+        self._worker.cell_extremes_updated.connect(self._on_cell_extremes)
+        self._worker.bms_probe_temps_updated.connect(self._on_bms_probe_temps)
         self._worker.vehicle_flags_updated.connect(self._on_vehicle_flags)
         self._worker.target_speed_updated.connect(self._on_target_speed)
         self._worker.turn_alert_updated.connect(self._on_turn_alert)
@@ -2326,6 +2268,37 @@ class RacingDashboard(QMainWindow):
             tile.set_value(v)
 
     @Slot(object)
+    def _on_bms_probe_temps(self, probes) -> None:
+        """R3.5.6 screen, bottom rows — {"A": {1: °C, ...}, "B": {...}}.
+        Gated like every cell temperature: a disconnected NTC decodes to a
+        nonsense negative and must read as a dash, not as a cold pack."""
+        probes = probes or {}
+        for (pack, n), tile in self._bms_probe_tiles.items():
+            tile.set_value(limits.plausible_cell_temp((probes.get(pack) or {}).get(n)))
+
+    @Slot(object)
+    def _on_cell_extremes(self, report) -> None:
+        """Rule 3.5.6 screen — cell_extremes.RollingExtremes.result()."""
+        if not report:
+            return
+        now = time.time()
+        for name, tile in self._r356_tiles.items():
+            tile.set_reading(report.get(name), now)
+        covers = float(report.get("covers_s") or 0.0)
+        window = float(report.get("window_s") or 7200.0)
+        if covers <= 0:
+            self._r356_header.set_window("no cell readings yet", C_NO_DATA)
+        elif covers >= window - 60:
+            self._r356_header.set_window(
+                f"{_clock(now - window)} → {_clock(now)}  ·  full 2 h", C_WHITE)
+        else:
+            # Amber: the report is honest but incomplete (race start, or a
+            # restart that lost part of the window).
+            self._r356_header.set_window(
+                f"{_clock(now - covers)} → {_clock(now)}  ·  only {_duration(covers)} of data",
+                C_WARNING)
+
+    @Slot(object)
     def _on_power(self, watts) -> None:
         self._power_gauge.set_value(None if watts is None else float(watts))
         # Fall back to I = P / V only until the BMS reports real current. The
@@ -2334,37 +2307,6 @@ class RacingDashboard(QMainWindow):
         if not self._have_real_current:
             self._ds2_batt_current.set_value(
                 None if watts is None else abs(watts / self._last_voltage))
-
-    def _on_solar_current(self, amps) -> None:
-        """Solar charge current -> the top-bar badge and the DS002 gauge.
-
-        Shows the SIGNED value. A negative reading is not noise to be hidden
-        with abs(): it means current is flowing the other way, which on a
-        charge line means the Yocto-Amp's two terminals are swapped. Displaying
-        it is how that gets noticed in the pit lane instead of being discovered
-        after a night stint of "the array produced nothing".
-        """
-        self._ds2_solar_current.set_value(None if amps is None else float(amps))
-
-        if amps is None:
-            self._solar_lbl.setText(f"☀ {_NO_DATA}")
-            self._apply_solar_style(charging=False)
-            return
-        # A hair above zero, not != 0: the sensor resolves 2 mA, so an
-        # unilluminated array still reads a few milliamps of noise and a strict
-        # comparison would flicker the badge on and off in the dark.
-        self._solar_lbl.setText(f"☀ {amps:.2f} A")
-        self._apply_solar_style(charging=amps > 0.05)
-
-    def _on_throttle(self, pct) -> None:
-        """Throttle percentage -> the efficiency bar.
-
-        No @Slot decorator and no float coercion in the signature, for the same
-        reason the other numeric slots take a bare object: the signal carries
-        None when the pedal has not been reported, and a typed float slot would
-        turn that into a confident 0 %.
-        """
-        self._efficiency_bar.set_throttle(None if pct is None else float(pct))
 
     @Slot(list)
     def _on_alerts(self, alerts: list) -> None:
@@ -2655,7 +2597,6 @@ class RacingDashboard(QMainWindow):
             active=self._map_lbl.text() not in ("", "MAP —"),
             warn="REVERSE" in self._map_lbl.text().upper(),
         )
-        self._apply_solar_style(self._solar_charging)
         self._apply_net_style(self._net_status)
         self._apply_uplink_style(self._uplink_status)
         self._apply_indicator_styles(self._last_flags_shown)

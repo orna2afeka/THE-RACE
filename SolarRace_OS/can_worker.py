@@ -114,22 +114,18 @@ class CANWorker(QThread):
     # is off the throttle". Those are completely different things to tell a
     # driver who is being coached on how they use the pedal.
     throttle_updated        = Signal(object)  # Throttle position   (0-100 %)
-    # Solar charge current, AMPS, from the Yocto-Amp on USB — NOT from CAN.
-    # It lives on this worker anyway because this is the thread that owns the
-    # telemetry cadence and vehicle_state, exactly like the GPIO-sourced
-    # brake/lights indicators. Being off-CAN has one important consequence:
-    # _emit_zeros() must NOT blank it (see the note there).
-    solar_current_updated   = Signal(object)  # Solar charge current (A)
     alerts_updated          = Signal(list)   # Active alerts: [(label, severity), ...]
     # Active power map: (display name, raw byte). Raw travels with the name so
     # an unrecognised value can be identified instead of just looking wrong.
     motor_map_updated       = Signal(str, int)
     motor_current_updated   = Signal(object)  # Motor phase current (A, q axis)
     battery_current_updated = Signal(object)  # Battery current from the BMS (A)
-    cell_temp_updated       = Signal(object)  # Hottest battery cell (°C)
+    # Battery temp: the hottest plausible Orion cell (limits.
+    # battery_temp_from_cells), None when no cell reports. No fallback.
+    cell_temp_updated       = Signal(object)
     # DS003: every individual battery cell's temperature, from the Orion
     # Thermistor Expansion Module's per-sensor broadcast (0x1838F3xx) — NOT
-    # from the BMS's 3 onboard NTC probes cell_temp_updated can fall back to.
+    # from the BMS's 3 onboard NTC probes.
     # (configured: bool, {cell_num: temp_C}). The bool is STICKY -- True
     # forever once the module has been configured (Thermistor Utility) and
     # sent a single real frame, even across a later bus silence -- so the HUD
@@ -154,6 +150,14 @@ class CANWorker(QThread):
     # cell_temps_updated just above -- a plain Signal(dict) silently drops
     # its payload in this PySide6 version.
     cell_voltages_updated   = Signal(object, object)
+    # Rule 3.5.6 report screen: cell_extremes.RollingExtremes.result(), once a
+    # second — {temp_max/temp_min/volt_max/volt_min: (value, cell, wall_ts) or
+    # None, covers_s, window_s}. object for the same PySide6 reason as above.
+    cell_extremes_updated   = Signal(object)
+    # The JBD BMS units' own NTC probes (frame 0x105, 3 per BMS), live:
+    # {"A": {1: °C, 2: °C, 3: °C}, "B": {...}}. A probe that has not reported
+    # is simply absent. object for the same PySide6 reason as above.
+    bms_probe_temps_updated = Signal(object)
     # Boolean dashboard indicators: parking_brake / lights_on / ecu_on / reverse
     # (+ the raw status byte they came from). One dict so the HUD repaints the
     # whole indicator row from a single consistent snapshot.

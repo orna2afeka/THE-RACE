@@ -222,6 +222,13 @@ Same rule as the car: `git pull` alone changes nothing that is already running.
   matrix says which rows are real. Practice laps at Zolder are what turn it
   real — and only laps recorded from this build onward can be attributed,
   because older rows never stored which profile was active.
+- **Rule 3.5.6 report, every 2 hours**: highest/lowest cell temperature and
+  highest/lowest cell voltage. Read it from the pit's **Cell Voltages** tab (top
+  section) or from the HUD's last page, **R3.5.6**. Both show the cell and the
+  time of each reading, and the window they cover. If the header is amber
+  ("only N min of data"), the window is not a full 2 h, so say that in the
+  report. The pit's window ends at the newest stored sample, not at the
+  laptop's clock.
 
 ---
 
@@ -230,6 +237,44 @@ Same rule as the car: `git pull` alone changes nothing that is already running.
 Build them with the profile builder (double-click `Build Speed Profiles.bat`, or
 `streamlit run Pit_Dashboard/profile_builder.py --server.port 8502`). It reads
 `telemetry.db` read-only and cannot disturb the pit wall.
+
+### ☐ Pick the right DRIVE, not just the right lap number
+
+Rows in the table are **drives**, not lap numbers. The car's lap counter restarts
+whenever it is reset — a fresh image, a cleared checkpoint, a new session — so
+the same number comes back later. Where that has happened the table puts the
+date next to the number (`7 · 26 Aug 16:45`), and each drive carries the lap
+time and energy from **its own** run.
+
+This is not theoretical. In the team's own store lap 1 is three separate
+evenings, and before this the builder welded them into one "lap" whose time and
+energy were the maximum across all of them.
+
+### ☐ Never build from a lap that says "This is not one drive"
+
+If two copies of the car software publish at the same time — the Pi plus a
+laptop with the service key — their samples interleave in the store under one
+device id, and lap distance jumps backwards inside a single trace. The builder
+detects that and refuses the lap outright. Nothing about such a trace is usable:
+not the speed, not the energy, not the lap time.
+
+**Prevention: only ONE machine runs the car software during a session.**
+
+### ☐ Read the energy breakdown for what it is
+
+Each lap now shows its energy, Wh/km, average power, regen, and a nine-sector
+split of where the energy went, plus a cumulative-Wh chart around the lap.
+
+* The **total** is the car's own figure, integrated on the car at CAN frame rate.
+* The **split** is integrated here from the stored samples, which arrive about
+  twice a second. It reads a few percent high — measured 1.04-1.21 against the
+  car on real traces — so it is a picture of the SHAPE of the lap, not a second
+  opinion about the total.
+* The green line says the two agree and how much of the lap was covered. If it
+  is an amber **"Breakdown not trusted"** instead, believe the total and ignore
+  the split; the message says which test failed.
+* S4 and S6 are barely 100 m long and get three or four samples each. Read them
+  as indicative.
 
 ### ☐ The car will not pick up a new profile until the HUD restarts
 

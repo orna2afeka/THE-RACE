@@ -39,7 +39,7 @@ FOUR THINGS THIS FILE EXISTS TO GET RIGHT
    safe to show at once.
 
 3. "NOT CHECKED YET" IS NOT "OFFLINE". The status starts UNKNOWN and is shown
-   unlit, exactly like the MAP and solar badges show a dash before their first
+   unlit, exactly like the MAP badge shows a dash before its first
    reading. Booting the HUD into a red warning light that means nothing but
    "give me five seconds" spends the driver's attention on our startup.
 
@@ -68,8 +68,7 @@ import time
 def safe_print(msg):
     """print() that can never raise, whatever stdout's encoding is.
 
-    Same helper and same reason as solar_current.py: this runs headless on the
-    Pi with its output going to a boot log whose encoding we do not control, and
+    This runs headless on the Pi with its output going to a boot log whose encoding we do not control, and
     a diagnostic must never be able to break the thing it is reporting on.
     """
     try:

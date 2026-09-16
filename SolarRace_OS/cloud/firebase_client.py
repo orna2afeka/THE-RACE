@@ -257,7 +257,7 @@ def push_telemetry_to_cloud(vehicle_state):
 #      spectator map is a schematic and does not need better.
 #   3. Size. This is read by every viewer's browser every time it changes, and
 #      RTDB egress is metered. The full payload is a few hundred fields of
-#      cell voltages and thermistors; this is eight numbers.
+#      cell voltages and thermistors; this is seven numbers.
 PUBLIC_PATH = 'public/live'
 
 # Slower than the 0.5 s pit feed on purpose. The pit is making decisions off
@@ -280,7 +280,6 @@ def _public_snapshot(vehicle_state):
     """
     motor = vehicle_state.get("motor") or {}
     battery = vehicle_state.get("battery") or {}
-    solar = vehicle_state.get("solar") or {}
     return {
         # Server-independent: the page compares this against its own clock to
         # decide whether the feed is live, so it must be the moment the car
@@ -292,7 +291,6 @@ def _public_snapshot(vehicle_state):
         "speed_kmh": motor.get("mms_vehicle_speed_kmh"),
         "last_lap_time_s": motor.get("last_lap_time_s"),
         "soc_percent": battery.get("bms_soc_percent"),
-        "solar_current_A": solar.get("solar_current_A"),
     }
 
 

@@ -273,7 +273,6 @@
       <div class="label">Battery</div>
       <div class="value small"><span id="soc">&mdash;</span><span class="unit">%</span></div>
       <div class="bar" id="soc-bar"><i></i></div>
-      <div class="sub">Solar input <span id="solar">&mdash;</span></div>
     </div>
 
     <div class="card">
@@ -739,8 +738,6 @@ function render() {
   const soc = num(s.soc_percent);
   el("soc").textContent = soc == null ? "—" : Math.round(soc);
   el("soc-bar").firstElementChild.style.width = (soc == null ? 0 : soc) + "%";
-  const amps = num(s.solar_current_A);
-  el("solar").textContent = amps == null ? "—" : dash(amps, 1, " A");
 
   // Race clock. Hidden outright when nobody has published a window -- a
   // countdown to a date this page guessed would be worse than no countdown.

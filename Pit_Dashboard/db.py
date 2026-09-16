@@ -25,6 +25,11 @@ import sqlite3
 from constants import (CONTROLLER_SPEED_DIVISOR, CONTROLLER_SPEED_DIVISOR_LEGACY,
                        RPM_REPORT_SCALE)
 from pit_config import SQLITE_PATH, DEVICE_ID
+# Repo-root modules, importable because constants (above) put the root on
+# sys.path. Shared with the car so the pit's rule 3.5.6 report applies the same
+# gates as the HUD's.
+import cell_extremes                                  # noqa: E402
+import limits                                         # noqa: E402
 
 # Hot columns extracted from each record for charting/filtering. The dashboard
 # can name any of these as an exportable/plottable "metric". Anything not listed
@@ -77,10 +82,20 @@ METRIC_COLUMNS = [
     # never coalesced to 0, so an unwired tap cannot be mistaken for a shorted
     # cell. See bms_parser.py's cell-voltage decode for the source.
     *[f"bms_cell_{i:02d}_V" for i in range(1, BMS_CELL_COLUMN_COUNT + 1)],
+    # Battery temp = the hottest plausible Orion cell (limits.
+    # battery_temp_from_cells), derived at ingest from the cell readings in the
+    # record. Rows stored before 2026-09-16 hold the Orion module's AVERAGE
+    # here instead; they were left as they are.
     "battery_temp_C",
+    # The two JBD BMS units' own NTC probes (frame 0x105, three per BMS), shown
+    # live on the Cell Voltages tab and the HUD's R3.5.6 screen. bms_ = BMS A
+    # (can0), bms2_ = BMS B (can1), as main._remap_bms_frame names them. Before
+    # these columns existed the readings were only in raw_json.
+    *[f"bms_temp_{i}_C" for i in (1, 2, 3)],
+    *[f"bms2_temp_{i}_C" for i in (1, 2, 3)],
     # DS003 — individual cell temperatures from the Orion Thermistor
     # Expansion Module's per-sensor round-robin broadcast (0x1838F3xx), NOT
-    # from the BMS's 3 onboard NTC probes battery_temp_C can fall back to.
+    # from the BMS's 3 onboard NTC probes.
     # Absent (None) for any cell not yet loaded/enabled on the module via
     # Orion's own utility software — see temp_controller_parser.py's
     # docstring for why there is no wire signal that means "not configured",
@@ -145,17 +160,6 @@ METRIC_COLUMNS = [
     #     can be RE-DERIVED afterwards once the real span is known, instead of
     #     being permanently stored at whatever the placeholder implied.
     "mms_throttle_mv",
-    # Solar charge current, AMPS, from the Yocto-Amp in series between the MPPT
-    # and the pack. Stored in amps because that is what the car publishes — the
-    # sensor's own mA are converted once, on the car, in
-    # modules/solar_current.py, so there is exactly one place that knows the
-    # wire unit and no chance of a second conversion here.
-    #
-    # Independent of bms_current_A and of mms_current_A, and worth having
-    # alongside both: pack current is net (charge minus draw), so solar input is
-    # not recoverable from it. Having both is what makes "how much did the array
-    # actually contribute over the night" answerable.
-    "solar_current_A",
     # Per-lap analytics, all computed ON THE CAR (see lap_tracker.py). The Pi
     # holds each lap's figures for the whole of the FOLLOWING lap, so the pit
     # only has to receive one sample anywhere in a lap to record that lap
@@ -210,12 +214,6 @@ STATE_COLUMNS = [
     # distinction matters precisely because efficiency.py's boundaries are
     # placeholders and WILL change.
     "mms_throttle_zone",
-    # Why the solar current is missing, when it is: "online" | "offline" |
-    # "searching" | "no_hub" | "no_library" | "implausible" | "error". A blank
-    # solar trace has several very different causes — night, a cloud, a USB
-    # cable shaken loose, a missing udev rule — and this is the column that
-    # tells them apart after the fact.
-    "solar_sensor_status",
     # How the last lap was triggered: gps | odometer | manual | gps_no_can.
     # "odometer" means the GPS trigger MISSED and the distance backstop fired —
     # a visible signal that finish-line detection needs looking at.
@@ -258,7 +256,6 @@ _COL_TYPES = {
     "mms_alerts": "TEXT",
     "mms_motor_map": "TEXT",
     "mms_throttle_zone": "TEXT",
-    "solar_sensor_status": "TEXT",
     "lap_source": "TEXT",
     "active_strategy": "TEXT",
     "pi_uptime_s": "REAL",
@@ -362,6 +359,13 @@ def get_conn_ro(path: str = SQLITE_PATH):
 def fetch_lap_profile_samples(conn: sqlite3.Connection, lap: int,
                               device_id: str = DEVICE_ID):
     """(device_ts, lap_distance_m, mms_vehicle_speed_kmh, lap_source) for one lap.
+
+    ⚠️ SUPERSEDED, AND UNUSED. Use fetch_trace_samples(). This returns every row
+    that ever carried this lap number, across every drive that used it -- and
+    the counter restarts, so in this project's own store that means three
+    separate evenings welded into one "lap 1". Nothing calls this any more;
+    it is left only because the paragraph below is the clearest statement of
+    the off-by-one anywhere in the codebase. Calling it reintroduces the bug.
 
     A SIBLING of fetch_lap_track, not a widening of it. That one is on the 4s
     cached path of the tab the dashboard opens on, and its two-column shape is
@@ -471,6 +475,115 @@ def lap_overview(conn: sqlite3.Connection, device_id: str = DEVICE_ID):
         "WHERE device_id = ? AND calculated_lap IS NOT NULL "
         "GROUP BY trace_lap ORDER BY trace_lap",
         (device_id,),
+    ).fetchall()
+
+
+# --------------------------------------------------------------------------- #
+# Lap TRACES — one row per drive, not one per lap number
+# --------------------------------------------------------------------------- #
+# `calculated_lap` IS NOT UNIQUE. It restarts whenever the car's lap counter is
+# reset -- a fresh image, a cleared checkpoint, a new session -- so the same
+# number comes back days later. lap_overview() above groups by it alone, which
+# welds those drives into one "lap": in this project's own store lap 1 is three
+# separate evenings, and fetch_lap_summary() then hands it the MAX lap time and
+# MAX energy across all of them.
+#
+# Nothing had been built from that yet, but it is not a bench-only problem.
+# Reset the counter between practice and the race at Zolder and every number
+# repeats, with ~4000 m traces that pass every check the builder applies.
+#
+# So a TRACE is (lap number, run): a stretch of one lap number's rows with no
+# gap longer than TRACE_GAP_S. Splitting on a gap WITHIN a lap number -- rather
+# than cutting the whole store into sessions -- is deliberate. A store-wide
+# split has to decide what a session boundary is, and the obvious signal (the
+# lap counter going down) fires 2025 times here for a completely different
+# reason: three copies of the car code were once publishing at the same time
+# under one device_id, so consecutive rows hop between three lap sequences.
+# Per-lap-number splitting does not care, and interleaving is caught separately
+# by profile_build.count_backward_jumps().
+TRACE_GAP_S = 300.0
+
+# How close the next lap's run must start to a trace ending for the two to be
+# the same drive. The car crosses the line and increments in the same sample, so
+# in practice this is well under a second; the slack covers a dropped sample or
+# two at exactly the wrong moment.
+TRACE_JOIN_SLACK_S = 30.0
+
+
+def lap_traces(conn: sqlite3.Connection, device_id: str = DEVICE_ID,
+               gap_s: float = TRACE_GAP_S):
+    """One row per (lap number, run). The session-aware lap_overview.
+
+    Replaces BOTH lap_overview() and fetch_lap_summary() for the builder, which
+    is why it costs about what the two of them did together (measured: 1364 ms
+    against 676 + 552 on a 118k-row store).
+
+    THE `carried_*` COLUMNS ARE NOT THIS TRACE'S FIGURES. `last_lap_*` describes
+    the lap just FINISHED, so the values carried on a trace's own rows belong to
+    the lap BEFORE it. They are returned under `carried_` names so nothing can
+    read them as this lap's time by accident; profile_build.pair_traces() joins
+    each trace to the run that actually follows it and that run's carried values
+    are this trace's real time and energy.
+
+    lap_overview() and fetch_lap_summary() are left exactly as they were: the
+    pit dashboard and the pit wall read them on hot paths and neither cares
+    about drives.
+    """
+    return conn.execute(
+        "WITH seq AS ("
+        "  SELECT device_ts, calculated_lap AS lap, lap_distance_m,"
+        "         mms_vehicle_speed_kmh AS v, mms_power_W AS p, lap_source,"
+        "         last_lap_time_s, last_lap_energy, last_lap_regen_energy,"
+        "         last_lap_distance_m,"
+        "         LAG(device_ts) OVER (PARTITION BY calculated_lap"
+        "                              ORDER BY device_ts) AS prev_ts"
+        "  FROM telemetry"
+        "  WHERE device_id = ? AND calculated_lap IS NOT NULL"
+        "    AND device_ts IS NOT NULL"
+        "), runs AS ("
+        "  SELECT *, SUM(CASE WHEN prev_ts IS NULL OR device_ts - prev_ts > ?"
+        "                     THEN 1 ELSE 0 END)"
+        "            OVER (PARTITION BY lap ORDER BY device_ts"
+        "                  ROWS UNBOUNDED PRECEDING) AS run"
+        "  FROM seq"
+        ") "
+        "SELECT CAST(lap AS INTEGER) AS trace_lap, run, "
+        "       COUNT(*) AS n_samples, "
+        "       SUM(v IS NOT NULL) AS n_speed, "
+        "       SUM(p IS NOT NULL) AS n_power, "
+        "       MAX(lap_distance_m) AS trace_end_m, "
+        "       MIN(device_ts) AS t0, MAX(device_ts) AS t1, "
+        "       MAX(ABS(v)) AS v_max_kmh, "
+        "       MAX(lap_source) AS lap_source, "
+        "       MAX(last_lap_time_s) AS carried_lap_time_s, "
+        "       MAX(last_lap_energy) AS carried_energy_wh, "
+        "       MAX(last_lap_regen_energy) AS carried_regen_wh, "
+        "       MAX(last_lap_distance_m) AS carried_distance_m "
+        "FROM runs GROUP BY CAST(lap AS INTEGER), run "
+        "ORDER BY trace_lap, run",
+        (device_id, float(gap_s)),
+    ).fetchall()
+
+
+def fetch_trace_samples(conn: sqlite3.Connection, lap: int, t0: float, t1: float,
+                        device_id: str = DEVICE_ID):
+    """One TRACE's samples: (device_ts, lap_distance_m, speed, source, power).
+
+    A sibling of fetch_lap_profile_samples bounded by time as well as by lap
+    number, so it returns one drive rather than every drive that ever carried
+    this lap number. Carries mms_power_W as a fifth column for the energy
+    breakdown; clean_samples() reads positions 1 and 2 only, so the extra column
+    costs nothing to everything else that consumes these rows.
+    """
+    return conn.execute(
+        "SELECT device_ts, lap_distance_m, mms_vehicle_speed_kmh, lap_source, "
+        "       mms_power_W "
+        "FROM telemetry "
+        "WHERE device_id = ? AND calculated_lap >= ? AND calculated_lap < ? "
+        "  AND device_ts BETWEEN ? AND ? "
+        "  AND device_ts IS NOT NULL AND lap_distance_m IS NOT NULL "
+        "ORDER BY device_ts ASC",
+        (device_id, float(int(lap)), float(int(lap)) + 1.0, float(t0), float(t1)),
     ).fetchall()
 
 
@@ -652,10 +765,6 @@ def flatten_record(rtdb_key: str, record: dict, device_id: str = DEVICE_ID) -> d
     motor = car.get("motor") or {}
     temp = car.get("temp_controller") or {}
     gps = car.get("gps") or {}
-    # The Yocto-Amp's own block. .get with a default because every build older
-    # than this feature simply has no "solar" key, and those rows must land as
-    # NULL rather than raising on ingest.
-    solar = car.get("solar") or {}
     health = car.get("health") or {}
 
     return {
@@ -672,7 +781,14 @@ def flatten_record(rtdb_key: str, record: dict, device_id: str = DEVICE_ID) -> d
         # a build that predates this column existing) — never a fabricated 0.
         **{f"bms_cell_{i:02d}_V": _num(battery.get(f"bms_cell_{i:02d}_V"))
            for i in range(1, BMS_CELL_COLUMN_COUNT + 1)},
-        "battery_temp_C": _num(temp.get("battery_temp_C")),
+        # Derived here from the record's own cell readings rather than trusted
+        # from the car, so a Pi still running an older build (which sent the
+        # module's average under this name) is stored the same way.
+        "battery_temp_C": limits.battery_temp_from_cells(
+            _num(v) for k, v in temp.items()
+            if k.startswith("bms_cell_temp_") and k.endswith("_C")),
+        **{f"{p}_temp_{i}_C": _num(battery.get(f"{p}_temp_{i}_C"))
+           for p in ("bms", "bms2") for i in (1, 2, 3)},
         # DS003. One key per possible thermistor slot; .get() returns None
         # for anything the module hasn't loaded/enabled (or reported yet) —
         # never a fabricated 0 (see BMS_CELL_COLUMN_COUNT's cell-voltage
@@ -705,11 +821,6 @@ def flatten_record(rtdb_key: str, record: dict, device_id: str = DEVICE_ID) -> d
         "mms_throttle_percent": _num(motor.get("mms_throttle_percent")),
         "mms_throttle_mv": _num(motor.get("mms_throttle_mv")),
         "mms_throttle_zone": _join(motor.get("mms_throttle_zone")),
-        # Solar. _num keeps an absent reading NULL: the car publishes None when
-        # the sensor is offline, and a 0 stored there would be indistinguishable
-        # from a genuine night-time zero.
-        "solar_current_A": _num(solar.get("solar_current_A")),
-        "solar_sensor_status": _join(solar.get("solar_sensor_status")),
         "total_race_energy": _num(motor.get("total_race_energy")),
         "last_lap_energy": _num(motor.get("last_lap_energy")),
         "last_lap_regen_energy": _num(motor.get("last_lap_regen_energy")),
@@ -732,8 +843,7 @@ def flatten_record(rtdb_key: str, record: dict, device_id: str = DEVICE_ID) -> d
         "mms_error_code": _int(motor.get("mms_error_code")),
         "mms_alerts": _join(motor.get("mms_alerts")),
         # The car's own health block. Absent from every build older than the
-        # heartbeat, and .get() lands those rows as NULL rather than raising --
-        # the same rule the solar block follows.
+        # heartbeat, and .get() lands those rows as NULL rather than raising.
         "pi_uptime_s": _num(health.get("pi_uptime_s")),
         "can_state": health.get("can_state"),
         "can_silent_s": _num(health.get("can_silent_s")),
@@ -960,6 +1070,112 @@ def latest_sample(conn: sqlite3.Connection, device_id: str = DEVICE_ID):
         "ORDER BY device_ts DESC LIMIT 1",
         (device_id,),
     ).fetchone()
+
+
+# --------------------------------------------------------------------------- #
+# Rule 3.5.6 — cell extremes over the last 2 hours
+# --------------------------------------------------------------------------- #
+def _extremes_sql():
+    """The one aggregate that finds every gated cell column's MAX and MIN over a
+    time range. Built once: the column lists never change at runtime.
+
+    The gates are the car's (cell_extremes.py), written as SQL so no row has
+    to leave SQLite: a voltage counts only inside the plausible range and only
+    for a tap the BMS says is wired; a temperature counts only above the
+    failed-thermistor floor. Without them an unwired tap's 0.000 V would be the
+    "lowest cell voltage" of every window.
+    """
+    lo, hi = cell_extremes.CELL_V_PLAUSIBLE_MIN, cell_extremes.CELL_V_PLAUSIBLE_MAX
+    floor = limits.CELL_TEMP_IMPLAUSIBLE_BELOW
+    parts, cols = [], []
+    for i in range(1, BMS_CELL_COLUMN_COUNT + 1):
+        c = f"bms_cell_{i:02d}_V"
+        g = (f"CASE WHEN {c} BETWEEN {lo} AND {hi} AND (bms_string_count IS NULL "
+             f"OR {i} <= bms_string_count) THEN {c} END")
+        parts += [f"MAX({g})", f"MIN({g})"]
+        cols.append(("volt", i, c, g))
+    for i in range(1, THERMISTOR_CELL_COLUMN_COUNT + 1):
+        c = f"bms_cell_temp_{i:02d}_C"
+        g = f"CASE WHEN {c} >= {floor} THEN {c} END"
+        parts += [f"MAX({g})", f"MIN({g})"]
+        cols.append(("temp", i, c, g))
+    any_cell = " OR ".join(f"({g}) IS NOT NULL" for _k, _i, _c, g in cols)
+    parts.append(f"MIN(CASE WHEN {any_cell} THEN device_ts END)")
+    sql = ("SELECT " + ", ".join(parts) + " FROM telemetry "
+           "WHERE device_id = ? AND device_ts > ? AND device_ts <= ?")
+    return sql, cols
+
+
+_EXTREMES_SQL = None
+
+
+def cell_extremes_report(conn: sqlite3.Connection,
+                         window_s: float = None, device_id: str = DEVICE_ID,
+                         end_ts: float = None):
+    """Rule 3.5.6 for the pit: the same dict cell_extremes.RollingExtremes
+    .result() gives the car, plus `end_ts`.
+
+    The window ends at the NEWEST STORED SAMPLE (the car's clock), not at the
+    pit laptop's now: if the car has been quiet for ten minutes the report is
+    still about the 2 hours the car actually reported, and end_ts says so.
+
+    Cost: one indexed range aggregate over ~2 h of rows, then one indexed
+    lookup per extreme for its time. Ties go to the EARLIEST reading, as on the
+    car, so the time shown is when the value first occurred in the window.
+    """
+    global _EXTREMES_SQL
+    if _EXTREMES_SQL is None:
+        _EXTREMES_SQL = _extremes_sql()
+    sql, cols = _EXTREMES_SQL
+    window_s = float(window_s or cell_extremes.WINDOW_S)
+    empty = {k: None for k in cell_extremes.KEYS}
+    empty.update(covers_s=0.0, window_s=window_s, end_ts=None)
+
+    if end_ts is None:          # given explicitly only by tests and replays
+        row = conn.execute("SELECT MAX(device_ts) FROM telemetry WHERE device_id = ?",
+                           (device_id,)).fetchone()
+        end_ts = row[0] if row else None
+    if end_ts is None:
+        return empty
+    start_ts = end_ts - window_s
+    agg = conn.execute(sql, (device_id, start_ts, end_ts)).fetchone()
+    if agg is None:
+        return empty
+
+    # Per extreme: the value, then EVERY cell that reached it (a tie across
+    # cells is common at 1 °C / 1 mV resolution).
+    best = {}
+    for n, (kind, cell, col, gate) in enumerate(cols):
+        for name, v in ((f"{kind}_max", agg[2 * n]), (f"{kind}_min", agg[2 * n + 1])):
+            if v is None:
+                continue
+            cur = best.get(name)
+            if cur is None or (v > cur[0] if name.endswith("_max") else v < cur[0]):
+                best[name] = (v, [(cell, gate)])
+            elif v == cur[0]:
+                cur[1].append((cell, gate))
+
+    out = dict(empty, end_ts=end_ts)
+    for name, (v, tied) in best.items():
+        # The EARLIEST row in the window where any tied cell held the value,
+        # and within that row the lowest cell number -- the car's rule too
+        # (cell_extremes keeps the first reading and offers cells in order).
+        # Only the tied columns are tested, so this stays a short scan.
+        where = " OR ".join(f"({g}) = ?" for _c, g in tied)
+        hit = conn.execute(
+            "SELECT device_ts, " + ", ".join(f"({g})" for _c, g in tied) +
+            " FROM telemetry WHERE device_id = ? AND device_ts > ? AND device_ts <= ? "
+            f"AND ({where}) ORDER BY device_ts ASC LIMIT 1",
+            (device_id, start_ts, end_ts, *([v] * len(tied)))).fetchone()
+        if hit is None:
+            out[name] = (float(v), int(tied[0][0]), None)
+            continue
+        cell = next((c for k, (c, _g) in enumerate(tied) if hit[1 + k] == v), tied[0][0])
+        out[name] = (float(v), int(cell), float(hit[0]))
+    first = agg[-1]
+    if first is not None:
+        out["covers_s"] = min(window_s, max(0.0, end_ts - first))
+    return out
 
 
 def count_samples(conn: sqlite3.Connection, device_id: str = DEVICE_ID) -> int:

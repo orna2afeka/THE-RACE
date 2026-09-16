@@ -61,10 +61,6 @@ from constants import (
     CELL_COUNT, cell_temp_label,
     THERMISTOR_GROUP_RANGES, THERMISTOR_GROUP_NAMES,
     THERMISTOR_GROUPED_COUNT, THERMISTOR_ID_MAX,
-    # Uncoloured on purpose (no warn, no crit) — it is imported anyway so the
-    # tile declares a limit like every other numeric tile, and so the gauge
-    # scale stays shared with the driver HUD.
-    SOLAR_CURRENT,
     STRATEGIES, DEFAULT_STRATEGY_KEY,
     # speed_kmh() is deliberately NOT imported: road speed comes from the
     # controller's CAN field only (see build_state), and not importing the
@@ -319,7 +315,7 @@ def _live_snapshot():
     # age) when the newest row is null for them; field_ts records the age of
     # any value that was actually carried forward, keyed by the STATE dict key
     # (not the db column), so read_live_state can hand it straight to a tile.
-    # Fault flags, instant-diagnostics (solar_sensor_status, lap_source) and
+    # Fault flags, instant-diagnostics (lap_source) and
     # position are deliberately excluded below and keep using plain _val — see
     # the plan's carry-forward scope table for why each is excluded.
     field_ts = {}
@@ -345,11 +341,6 @@ def _live_snapshot():
         # unreported pedal and a released pedal are different facts, and the
         # whole point of this feature is telling a driver about the pedal.
         "throttle_pct": None, "throttle_mv": None, "throttle_zone": None,
-        # Solar charge current, amps. None (not 0) when the car sent nothing —
-        # and here the distinction really bites: 0 A is the correct reading for
-        # the whole night stint, so a missing value coalesced to 0 would be
-        # invisible among thousands of legitimate zeros.
-        "solar_current": None, "solar_status": None,
         # car_speed_kmh removed: it was mms_vehicle_speed_kmh under a second
         # name, was never rendered, and is now simply speed_kmh above.
         "target_speed_kmh": None, "soc_ctrl": None,
@@ -411,6 +402,11 @@ def _live_snapshot():
     state["soc_ctrl"] = cf("soc_ctrl", "mms_estimated_soc_percent")
     state["trip_m"] = cf("trip_m", "mms_trip_m")
     state["batt_temp"] = cf("batt_temp", "battery_temp_C")
+    # BMS A / BMS B NTC probes T1-T3, keyed as their columns.
+    for _p in ("bms", "bms2"):
+        for _i in (1, 2, 3):
+            _k = f"{_p}_temp_{_i}_C"
+            state[_k] = cf(_k, _k)
     state["rpm"] = cf("rpm", "mms_rpm")
     state["temp"] = cf("temp", "mms_temperature_C")
     state["power_w"] = cf("power_w", "mms_power_W")
@@ -420,11 +416,6 @@ def _live_snapshot():
     state["motor_map_raw"] = cf("motor_map_raw", "mms_motor_map_raw")
     state["throttle_pct"] = cf("throttle_pct", "mms_throttle_percent")
     state["throttle_mv"] = cf("throttle_mv", "mms_throttle_mv")
-    state["solar_current"] = cf("solar_current", "solar_current_A")
-    # solar_sensor_status is deliberately NOT carried forward — it explains
-    # *why* solar_current is missing right now (night, cloud, unplugged
-    # sensor); a stale reason attached to a live reading would mislead.
-    state["solar_status"] = _val(row, "solar_sensor_status", None)
     # Prefer the zone the CAR classified (what the driver's bar actually showed).
     # Fall back to classifying the percentage here only for rows written before
     # the column existed, so historical samples still colour rather than reading
@@ -680,11 +671,6 @@ HISTORY_CHARTS = [
     # Shares the "%" axis with Battery SoC, so adding it to the default view
     # costs no third axis — see HISTORY_DEFAULT_METRICS and _hist_axis_plan.
     ("Throttle",  "Throttle",        "%",    "#ff4dd2"),
-    # Solar charge current — what the array put into the pack, over time. The
-    # strategy trace for a solar race: overlay it on Total Race Energy and the
-    # night/day balance of a 24-hour run reads straight off the chart. Amber-gold
-    # because it is the sun, and because no other series here uses it.
-    ("SolarCurrent", "Solar Current", "A",  "#ffd166"),
     ("Power",     "Motor Power",     "W",    "#00B3FF"),
     ("RPM",       "Motor RPM",       "rpm",  "#9b59b6"),
     ("SoC",       "Battery SoC",     "%",    "#f1c40f"),
@@ -782,11 +768,11 @@ HISTORY_SQL_TARGET = 8000
 # Exactly the columns the loop in read_history_df reads. The table has 118; the
 # other 102 include raw_json, which is ~1.6 kB per row and 61% of the database
 # file, and which this path fetched off disk, boxed into Python and threw away
-# once per row, every tick. Sixteen columns instead of all of them measured 17x
+# once per row, every tick. Sixteen columns (now fifteen) instead of all of them measured 17x
 # faster on 100k rows (26.9s -> 1.5s).
 _HIST_COLUMNS = [
     "device_ts", "mms_vehicle_speed_kmh", "mms_throttle_percent",
-    "solar_current_A", "mms_power_W", "mms_rpm", "bms_soc_percent",
+    "mms_power_W", "mms_rpm", "bms_soc_percent",
     "mms_measured_voltage_V", "bms_current_A", "battery_temp_C",
     "mms_motor_temp_C", "mms_temperature_C", "mms_motor_ohms",
     "odometer_m", "calculated_lap", "total_race_energy",
@@ -851,10 +837,6 @@ def read_history_df(limit=100000, start_ts=None, stride_target=HISTORY_SQL_TARGE
             # NaN, never 0, wherever the pedal was not reported — the trace
             # draws an honest gap instead of a phantom lift-off.
             "Throttle": r["mms_throttle_percent"],
-            # NaN, never 0, where the sensor reported nothing. A dropout must
-            # not be averaged in as a genuine zero when the crew asks what the
-            # array averaged over a stint.
-            "SolarCurrent": r["solar_current_A"],
             "Power": r["mms_power_W"],
             "RPM": rpm,
             "SoC": r["bms_soc_percent"],
@@ -1557,22 +1539,6 @@ LIVE_METRIC_GROUPS = [
         dict(label="Battery Temp", unit="\u00b0C", spec=".1f", limit=CELL_TEMP,
              field="batt_temp", get=lambda s, c: s["batt_temp"],
              note="hottest cell in the pack"),
-        # ---- Solar input ------------------------------------------------- #
-        # In the Battery group because that is where this current GOES; it is
-        # the only inbound number on the page. Uncoloured (limits.SOLAR_CURRENT
-        # sets no thresholds) — see the reasoning there: there is no bad value.
-        #
-        # The sign is shown, not abs()'d: negative means the Yocto-Amp's
-        # terminals are reversed, and that has to be visible.
-        dict(label="Solar Current", unit="A", spec="+.2f", limit=SOLAR_CURRENT,
-             field="solar_current", get=lambda s, c: s["solar_current"],
-             note="MPPT into the pack; Yocto-Amp, 10 A max"),
-        # The sensor's own health, as text. This is what separates "the array is
-        # making nothing" from "the USB cable fell out" — the same blank
-        # reading, and a completely different thing to do about it.
-        dict(label="Solar Sensor", unit="", text=True,
-             get=lambda s, c: s["solar_status"],
-             note="online / offline / no_hub / searching"),
         # Also shown despite being useless, for the same reason: it reads 0.00 in
         # all 44,088 recorded samples, so an empty tile here is the evidence that
         # the controller never populates the field.
@@ -1897,6 +1863,92 @@ def render_cell_voltages(state):
         _render_cell_row(LIVE_METRICS_PER_ROW, extra, state, lambda i: f"Cell {i}")
 
 
+# The 2 h report is a range aggregate over ~7,000-14,000 wide rows (about half
+# a second on a full window), and it answers a question asked every 2 hours.
+# Recomputing it every 30 s keeps it current without paying that on every 2 s
+# tick of the tab.
+CELL_EXTREMES_CACHE_S = 30
+
+
+@st.cache_data(ttl=CELL_EXTREMES_CACHE_S, show_spinner=False, max_entries=1)
+def read_cell_extremes():
+    """Rule 3.5.6 report from the store — see db.cell_extremes_report."""
+    conn = db.get_conn()
+    try:
+        return db.cell_extremes_report(conn)
+    finally:
+        conn.close()
+
+
+def _short_duration(seconds):
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f"{minutes} min"
+    h, m = divmod(minutes, 60)
+    return f"{h} h" if m == 0 else f"{h} h {m:02d} min"
+
+
+def render_bms_probes(state):
+    """The two BMS units' own NTC probes, LIVE — the same six readings as the
+    bottom rows of the HUD's R3.5.6 screen."""
+    st.markdown("##### :material/device_thermostat: BMS Probe Temperatures (live)")
+    ages = state.get("_field_ages", {})
+    for pack, prefix in (("A", "bms"), ("B", "bms2")):
+        cols = st.columns(3)
+        for col, n in zip(cols, (1, 2, 3)):
+            key = f"{prefix}_temp_{n}_C"
+            v = plausible_cell_temp(state.get(key))
+            render_metric(col, f"BMS {pack} T{n}", fmt(v, ".1f"), "°C",
+                          classify(v, CELL_TEMP), stale_s=ages.get(key))
+    st.divider()
+
+
+def render_cell_extremes(report):
+    """Rule 3.5.6: highest/lowest cell temperature and cell voltage over the
+    last 2 hours, each with its cell and the time it was measured — the same
+    four numbers, cells and gates as the driver HUD's R3.5.6 screen."""
+    st.markdown("##### :material/assignment: Rule 3.5.6 — Cell Extremes, Last 2 Hours")
+    end_ts = report.get("end_ts")
+    if end_ts is None:
+        st.info(":material/info: No telemetry stored yet.")
+        return
+    covers, window = report["covers_s"], report["window_s"]
+    clock = lambda ts: time.strftime("%H:%M:%S", time.localtime(ts))
+    span = (f"{clock(end_ts - window)} → {clock(end_ts)}" if covers >= window - 60
+            else f"{clock(end_ts - covers)} → {clock(end_ts)}")
+    if covers <= 0:
+        st.caption(f"Window ending {clock(end_ts)} (newest sample): no plausible "
+                   "cell reading in it.")
+    elif covers >= window - 60:
+        st.caption(f"Window **{span}** · full 2 h of data · ends at the newest "
+                   f"stored sample · refreshed every {CELL_EXTREMES_CACHE_S} s")
+    else:
+        st.caption(f":orange[Window **{span}** · only {_short_duration(covers)} of "
+                   f"cell data in the last 2 h] · refreshed every "
+                   f"{CELL_EXTREMES_CACHE_S} s")
+
+    tiles = (
+        ("Highest Cell Temp", "temp_max", "°C", ".1f", CELL_TEMP, cell_temp_label),
+        ("Lowest Cell Temp", "temp_min", "°C", ".1f", CELL_TEMP, cell_temp_label),
+        ("Highest Cell Voltage", "volt_max", "V", ".3f", CELL_VOLTAGE,
+         lambda i: f"Module {i}"),
+        ("Lowest Cell Voltage", "volt_min", "V", ".3f", CELL_VOLTAGE,
+         lambda i: f"Module {i}"),
+    )
+    for col, (title, key, unit, spec, limit, label) in zip(st.columns(4), tiles):
+        reading = report.get(key)
+        if reading is None:
+            render_metric(col, title, fmt(None, spec), unit,
+                          note="no reading in the window")
+            continue
+        value, cell, ts = reading
+        when = "time unknown" if ts is None else (
+            f"{clock(ts)} · {_short_duration(max(0.0, end_ts - ts))} before newest")
+        render_metric(col, title, fmt(value, spec), unit, classify(value, limit),
+                      note=f"{label(cell)} · {when}")
+    st.divider()
+
+
 @st.fragment(run_every=2)
 def _cell_voltage_fragment():
     """Cell Voltages tab. Same 2s cadence and shared cached read as the other
@@ -1906,6 +1958,8 @@ def _cell_voltage_fragment():
     if not ctx["fresh"]:
         st.warning(f":material/warning: Not live — every reading below is "
                   f"from the last sample received, {_age_text(ctx['age'])} ago.")
+    render_cell_extremes(read_cell_extremes())
+    render_bms_probes(ctx["state"])
     render_cell_voltages(ctx["state"])
 
 

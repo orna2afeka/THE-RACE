@@ -1123,7 +1123,6 @@ __BASE_CSS__
       <div class="label">Battery</div>
       <div class="value small"><span id="soc">&mdash;</span><span class="unit">%</span></div>
       <div class="bar" id="soc-bar"><i></i></div>
-      <div class="sub">Solar input <span id="solar">&mdash;</span></div>
     </div>
 
     <div class="card">
@@ -1378,8 +1377,6 @@ function render() {
   const soc = num(s.soc_percent);
   el("soc").textContent = soc == null ? "—" : Math.round(soc);
   el("soc-bar").firstElementChild.style.width = (soc == null ? 0 : soc) + "%";
-  const amps = num(s.solar_current_A);
-  el("solar").textContent = amps == null ? "—" : dash(amps, 1, " A");
 
   // Race clock. Hidden outright when nobody has published a window -- a
   // countdown to a date this page guessed would be worse than no countdown.
@@ -1509,7 +1506,7 @@ __BASE_CSS__
   /* A GRID, not a flex column. As a flex column the cards were free to shrink
      below their own content (min-height:0 is what lets the map fit), and the
      overflow then painted straight over the card below -- "Target 65 km/h" and
-     the POWER/SOLAR row disappeared under their neighbours. Explicit rows plus
+     the POWER row disappeared under its neighbours. Explicit rows plus
      overflow:hidden means a card can only ever clip its own content. */
   #rail { display: grid; gap: 0.7vw; min-width: 0; min-height: 0;
           grid-template-rows: auto auto auto auto minmax(0, 1fr); }
@@ -1659,8 +1656,7 @@ __BASE_CSS__
       <div class="quad" style="margin-top:0.6vw">
         <div><div class="label">Pack</div><div class="mid" id="packv">&mdash;</div></div>
         <div><div class="label">Current</div><div class="mid" id="packa">&mdash;</div></div>
-        <div><div class="label">Power</div><div class="mid" id="power">&mdash;</div></div>
-        <div><div class="label">Solar</div><div class="mid" id="solar">&mdash;</div></div>
+        <div style="grid-column: span 2"><div class="label">Power</div><div class="mid" id="power">&mdash;</div></div>
       </div>
     </div>
 
@@ -1776,7 +1772,6 @@ function render() {
   put("packv", s, "bms_voltage_V",    v => v.toFixed(1) + " V");
   put("packa", s, "bms_current_A",    v => v.toFixed(1) + " A");
   put("power", s, "mms_power_W",      v => (v / 1000).toFixed(2) + " kW");
-  put("solar", s, "solar_current_A",  v => v.toFixed(1) + " A");
   put("mtemp", s, "mms_temperature_C", v => Math.round(v) + "°C");
   put("btemp", s, "battery_temp_C",    v => Math.round(v) + "°C");
   put("energy", s, "total_race_energy", v => v.toFixed(2) + " kWh");

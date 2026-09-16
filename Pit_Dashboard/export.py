@@ -58,11 +58,9 @@ METRIC_GROUPS = {
                     # calibration in efficiency.py is replaced by a measured one.
                     "mms_throttle_percent", "mms_throttle_mv",
                     "mms_throttle_zone"],
-    "Temperature": ["battery_temp_C"],
-    # Its own group: the Yocto-Amp is a separate device on a separate bus from
-    # everything else here, and "give me just the solar data" is a question the
-    # strategy team asks on its own.
-    "Solar (MPPT)": ["solar_current_A", "solar_sensor_status"],
+    "Temperature": ["battery_temp_C",
+                    "bms_temp_1_C", "bms_temp_2_C", "bms_temp_3_C",
+                    "bms2_temp_1_C", "bms2_temp_2_C", "bms2_temp_3_C"],
     "Motion / GPS": ["odometer_m", "calculated_lap", "lat", "lon",
                      "target_speed_kmh"],
     "Laps / Energy": ["total_race_energy", "last_lap_energy", "last_lap_time_s",

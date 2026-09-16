@@ -50,7 +50,9 @@ for _p in (_REPO_ROOT, _HERE):
 import db                                                   # noqa: E402
 import profile_build as pb                                  # noqa: E402
 import speed_profile                                        # noqa: E402
-from constants import STRATEGIES, DEFAULT_STRATEGY_KEY      # noqa: E402
+from constants import (STRATEGIES, DEFAULT_STRATEGY_KEY,     # noqa: E402
+                       SECTION_NAMES)
+from strategy_engine import SECTIONS_INFO                    # noqa: E402
 
 try:
     import plotly.graph_objects as go
@@ -62,6 +64,13 @@ PROFILE_DIR = os.path.join(_REPO_ROOT, "profiles")
 SIDECAR_PATH = os.path.join(PROFILE_DIR, "profiles.json")
 BACKUP_DIR = os.path.join(PROFILE_DIR, "_backup")
 BASELINE_KEY = DEFAULT_STRATEGY_KEY
+
+# The nine sectors, exactly as the pit dashboard and the track map draw
+# them: one definition of where S3 ends, or the energy breakdown and the
+# sector timing beside it would disagree about the same piece of road.
+SECTORS = [(sid, SECTION_NAMES.get(sid, f"S{sid}"),
+            float(info["range"][0]), float(info["range"][1]))
+           for sid, info in sorted(SECTIONS_INFO.items())]
 
 
 st.set_page_config(page_title="Speed Profile Builder", layout="wide",
@@ -138,49 +147,50 @@ def _col(row, name, default=None):
 
 @st.cache_data(ttl=60, show_spinner="Reading laps…")
 def load_laps():
-    """The lap table, plus the alignment proof. One grouped pass over the store.
+    """One row per DRIVE, plus the alignment proof. One pass over the store.
 
-    Returns (DataFrame, offset, detail, db_mode). The DataFrame has one row per
-    lap TRACE, already joined to the car's own per-lap figures at the offset the
-    data itself says is right.
+    Returns (DataFrame, offset, detail, db_mode).
+
+    A row is a trace: (lap number, run). The lap number alone is not an
+    identity -- it restarts whenever the car's counter is reset, so the same
+    number comes back days later, and grouping by it welded three separate
+    evenings into one "lap 1" whose time and energy were the MAX across all of
+    them. See db.lap_traces.
+
+    Each drive is then joined to the run that FOLLOWS it in time, because
+    last_lap_* describes the lap just finished. Joined that way the alignment
+    proof scores offset 1 at +1.000 with a median error of 0.6 s; joined by lap
+    number on the same store it cannot tell the two offsets apart.
     """
     conn, mode = db.get_conn_ro()
     try:
-        overview = db.lap_overview(conn)
-        summary = db.fetch_lap_summary(conn)
-        offset, detail = pb.check_lap_alignment(overview, summary)
-        by_lap = {int(r["lap"]): r for r in summary if r["lap"] is not None}
+        traces = pb.pair_traces(db.lap_traces(conn))
+        offset, detail = pb.check_trace_alignment(traces)
 
         recs = []
-        for r in overview:
-            if r["trace_lap"] is None:
-                continue
-            trace_lap = int(r["trace_lap"])
-            s = by_lap.get(trace_lap + (offset or 0))
-            n = int(r["n_samples"] or 0)
-            n_speed = int(r["n_speed"] or 0)
-            end_m = float(r["trace_end_m"] or 0.0)
+        for t in traces:
+            n = t["n_samples"]
             recs.append({
-                "Trace lap": trace_lap,
-                "Lap time (s)": (float(s["lap_time_s"])
-                                 if s and s["lap_time_s"] is not None else None),
-                "Car distance (m)": (float(s["distance_m"])
-                                     if s and s["distance_m"] is not None else None),
-                "Trace distance (m)": end_m,
-                "Energy (Wh)": (float(s["energy_wh"])
-                                if s and s["energy_wh"] is not None else None),
+                "id": t["id"],
+                "Trace lap": t["lap"],
+                "Run": t["run"],
+                "Lap time (s)": t["lap_time_s"],
+                "Car distance (m)": t["distance_m"],
+                "Trace distance (m)": t["trace_end_m"],
+                "Energy (Wh)": t["energy_wh"],
                 "Samples": n,
-                "Speed %": (100.0 * n_speed / n) if n else 0.0,
-                "Spacing (m)": (end_m / n) if n else 0.0,
-                "Max speed": float(r["v_max_kmh"] or 0.0),
-                "When": (datetime.datetime.fromtimestamp(r["t0"]).strftime("%d %b %H:%M")
-                         if r["t0"] else ""),
+                "Speed %": (100.0 * t["n_speed"] / n) if n else 0.0,
+                "Power %": (100.0 * t["n_power"] / n) if n else 0.0,
+                "Spacing (m)": (t["trace_end_m"] / n) if n else 0.0,
+                "Max speed": t["v_max_kmh"],
+                "When": datetime.datetime.fromtimestamp(t["t0"]).strftime("%d %b %H:%M"),
+                "t0": t["t0"], "t1": t["t1"],
                 # How the lap boundary was decided. "gps" is a real finish-line
                 # crossing; "odometer" means the GPS trigger MISSED and the
                 # distance backstop fired, which makes the lap's whole distance
                 # axis an estimate — worth seeing before trusting a profile
                 # built from it.
-                "lap_source": _col(r, "lap_source", "—"),
+                "lap_source": t["lap_source"] or "—",
             })
         return pd.DataFrame(recs), offset, detail, mode
     finally:
@@ -188,15 +198,21 @@ def load_laps():
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def load_lap_samples(trace_lap):
-    """One lap's raw samples, as plain tuples so the cache can hash them."""
+def load_trace_samples(lap, t0, t1):
+    """One DRIVE's raw samples, as plain tuples so the cache can hash them.
+
+    Bounded by time as well as lap number, so it returns the drive that was
+    clicked rather than every drive that ever carried this lap number. The
+    fifth element is motor power, which the energy breakdown integrates;
+    everything else reads positions 1 and 2 only.
+    """
     conn, _mode = db.get_conn_ro()
     try:
-        rows = db.fetch_lap_profile_samples(conn, int(trace_lap))
+        rows = db.fetch_trace_samples(conn, int(lap), float(t0), float(t1))
     finally:
         conn.close()
     return [(r["device_ts"], r["lap_distance_m"], r["mms_vehicle_speed_kmh"],
-             r["lap_source"]) for r in rows]
+             r["lap_source"], r["mms_power_W"]) for r in rows]
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -229,57 +245,163 @@ def installed_profile(key):
 # button — because a synthetic lap in profiles/base_210s.csv would be a lie the
 # car would then drive to.
 DEMO_LAPS = [
-    # (lap_time_s, energy_wh, lap_source, flaw)
-    (208.4, 79.6, "gps", None),
-    (211.9, 82.1, "gps", None),
-    (209.7, 78.9, "gps", None),
-    (213.2, 84.7, "gps", None),
-    (210.6, 81.3, "gps", "gap"),
-    (207.9, 77.8, "gps", None),
-    (231.4, 71.2, "gps", None),
-    (229.8, 69.9, "gps", None),
-    (233.1, 72.6, "gps", None),
-    (190.2, 95.4, "gps", None),
-    (188.7, 97.1, "gps", None),
-    (191.5, 94.2, "odometer", None),
-    (204.3, 80.2, "gps", "short"),
-    (215.0, 83.4, "odometer", None),
-    (198.6, 88.0, "gps", None),
-    (212.4, 81.9, "gps", "legacy"),
+    # (lap number, run, lap_time_s, energy_wh, lap_source, flaw)
+    #
+    # LAP 7 APPEARS TWICE on purpose. A lap number is not an identity -- reset
+    # the counter between practice and the race and the numbers start again --
+    # so the table has to stay readable when two drives both call themselves
+    # lap 7. Everything else here is one drive per number, which is what a
+    # clean race looks like.
+    (1,  0, 208.4, 79.6, "gps", None),
+    (2,  0, 211.9, 82.1, "gps", None),
+    (3,  0, 209.7, 78.9, "gps", None),
+    (4,  0, 213.2, 84.7, "gps", None),
+    (5,  0, 210.6, 81.3, "gps", "gap"),
+    (6,  0, 207.9, 77.8, "gps", None),
+    (7,  0, 231.4, 71.2, "gps", None),
+    (7,  1, 229.8, 69.9, "gps", "interleaved"),
+    (8,  0, 233.1, 72.6, "gps", None),
+    (9,  0, 190.2, 95.4, "gps", None),
+    (10, 0, 188.7, 97.1, "gps", None),
+    (11, 0, 191.5, 94.2, "odometer", None),
+    (12, 0, 204.3, 80.2, "gps", "short"),
+    (13, 0, 215.0, 83.4, "odometer", "nopower"),
+    (14, 0, 198.6, 88.0, "gps", None),
+    (15, 0, 212.4, 81.9, "gps", "legacy"),
 ]
 
+# A plausible car, so the demo's sector split is shaped like a real lap instead
+# of flat. Same road-load model the 210 s baseline spreadsheet uses:
+#     P = v x (mass x a + rolling + aero x v^2)
+# fitted to 210s.xlsx at 250 kg, 11 N and 0.05 N/(m/s)^2 -- that fit reproduces
+# its Power(W) column with a residual of 0.00 N, so it is the spreadsheet's own
+# model rather than an invention.
+DEMO_MASS_KG, DEMO_ROLL_N, DEMO_AERO = 250.0, 11.0, 0.05
 
-def _demo_samples(trace_lap):
-    """One demo lap's samples, in the shape fetch_lap_profile_samples returns."""
-    idx = int(trace_lap)
-    lap_time, _wh, source, flaw = DEMO_LAPS[idx % len(DEMO_LAPS)]
+# A car does not get back everything it sheds -- most braking goes into the
+# friction brakes as heat. On the store's own traces regen came back at roughly
+# a tenth of what the lap consumed (10-19 Wh against 110-160 Wh), and the
+# largest regen ever recorded was about -4 kW. Without these two lines the
+# model treats every deceleration as fully recovered, gross and regen very
+# nearly cancel, and the scaling below then inflates BOTH: the demo showed
+# "regen recovered 142.2 Wh" on a lap that used 79.6 Wh.
+DEMO_REGEN_FRACTION = 0.35
+DEMO_REGEN_MAX_W = -3500.0
+
+# How far the pit integral sits above the car's own figure on real traces
+# (measured: 1.04-1.21 across nine of them). Baked in so the demo shows the
+# self-check reading the state it will read at Zolder, rather than a perfect
+# 1.00 that nobody will ever see.
+DEMO_PIT_BIAS = 1.06
+
+
+def _demo_index():
+    return {pb.trace_id(lap, run): row for row in DEMO_LAPS
+            for lap, run in ((row[0], row[1]),)}
+
+
+def _demo_samples(tid):
+    """One demo drive's samples, shaped like db.fetch_trace_samples rows.
+
+    Timestamps are REAL SECONDS built from the speed trace, not the sample
+    index pb._synthetic_lap hands back. The energy breakdown integrates power
+    over dt, so an index axis would make every demo lap's Wh meaningless while
+    still looking entirely plausible.
+    """
+    lap, run, lap_time, wh, source, flaw = _demo_index()[tid]
     length = 3860.0 if flaw == "short" else 4000.0
-    rows = pb._synthetic_lap(lap_time_s=lap_time, spacing_m=19.0,
-                             length_m=length, jitter=1.4, seed=idx + 1)
+
+    # Shaped from the INSTALLED base profile, not from a periodic synthetic
+    # lap. pb._synthetic_lap repeats every 1000 m, so its corners land at 650,
+    # 1650, 2650 and 3650 m and miss Zolder's sector boundaries completely: the
+    # braking fell inside S1 and S6 and the table showed S1 at 1% and S6 at a
+    # NEGATIVE share. That reads as a broken feature rather than as invented
+    # data, which defeats the point of having a demo at all.
+    rng = np.random.default_rng(lap * 10 + run + 1)
+    _base_src, base = installed_profile(BASELINE_KEY)
+    k = (base.lap_time_s() or lap_time) / lap_time      # faster lap = more speed
+    grid = np.arange(0.0, length, 19.0)
+    speeds = (np.interp(grid, list(base.distances_m),
+                        [v * 3.6 for v in base.speeds_ms]) * k
+              + rng.normal(0.0, 1.4, size=len(grid)))
+    rows = [(float(i), float(dd), float(max(vv, 5.0)), source)
+            for i, (dd, vv) in enumerate(zip(grid, speeds))]
+
+    # distance + speed -> a real time axis
+    timed, t = [], 0.0
+    for i, (_idx, d, v_kmh, _s) in enumerate(rows):
+        if i:
+            v_prev = max(rows[i - 1][2], 1.0) / 3.6
+            v_now = max(v_kmh, 1.0) / 3.6
+            t += (d - rows[i - 1][1]) / max(0.5, 0.5 * (v_prev + v_now))
+        timed.append([t, d, v_kmh])
+
+    powers = []
+    for i, (_ts, _d, v_kmh) in enumerate(timed):
+        v = max(v_kmh, 1.0) / 3.6
+        if 0 < i < len(timed) - 1:
+            dt = timed[i + 1][0] - timed[i - 1][0]
+            a = ((timed[i + 1][2] - timed[i - 1][2]) / 3.6 / dt) if dt > 0 else 0.0
+        else:
+            a = 0.0
+        p = v * (DEMO_MASS_KG * a + DEMO_ROLL_N + DEMO_AERO * v * v)
+        if p < 0:
+            p = max(p * DEMO_REGEN_FRACTION, DEMO_REGEN_MAX_W)
+        powers.append(p)
+
+    raw = 0.0
+    for (ta, _da, _va), (tb, _db, _vb), pa, pbw in zip(timed, timed[1:],
+                                                       powers, powers[1:]):
+        dt = tb - ta
+        if 0 < dt < pb.ENERGY_MAX_DT_S:
+            raw += 0.5 * (pa + pbw) * dt / 3600.0
+    scale = (wh * DEMO_PIT_BIAS / raw) if raw > 0 else 1.0
+    powers = [p * scale for p in powers]
+
+    out = [(ts, d, v, source, p) for (ts, d, v), p in zip(timed, powers)]
+
     if flaw == "gap":
-        rows = [r for r in rows if not (1500.0 < r[1] < 1660.0)]
+        out = [r for r in out if not (1500.0 < r[1] < 1660.0)]
     if flaw == "legacy":
-        rows = [(t, d, v * 50.0, source) for t, d, v, _s in rows]
-    return [(r[0], r[1], r[2], source) for r in rows]
+        out = [(ts, d, v * 50.0, source, p) for ts, d, v, _s, p in out]
+    if flaw == "nopower":
+        # The motor stopped reporting for a third of the lap. The shares would
+        # then describe only the part that WAS reported, which is exactly the
+        # thing the coverage check exists to refuse.
+        out = [(ts, d, v, source, (None if 1200.0 < d < 2600.0 else p))
+               for ts, d, v, _s, p in out]
+    if flaw == "interleaved":
+        # A second publisher: what three copies of the car code running at once
+        # actually looks like in the store.
+        for k in range(6):
+            i = 5 + k * 9
+            out.insert(i, (out[i][0], 40.0 + k, 25.0, source, 400.0))
+    return out
 
 
 def _demo_laps_df():
     """The lap table, built from DEMO_LAPS rather than telemetry.db."""
     recs = []
-    for i, (lap_time, wh, source, flaw) in enumerate(DEMO_LAPS):
-        samples = _demo_samples(i)
-        d, v, diag = pb.clean_samples(samples)
+    for lap, run, lap_time, wh, source, _flaw in DEMO_LAPS:
+        tid = pb.trace_id(lap, run)
+        samples = _demo_samples(tid)
+        _d, _v, diag = pb.clean_samples(samples)
+        n_power = sum(1 for r in samples if r[4] is not None)
         recs.append({
-            "Trace lap": i,
+            "id": tid,
+            "Trace lap": lap,
+            "Run": run,
             "Lap time (s)": lap_time,
             "Car distance (m)": diag["length_m"] + 8.0,
             "Trace distance (m)": diag["length_m"],
             "Energy (Wh)": wh,
             "Samples": diag["n_used"],
             "Speed %": 100.0,
+            "Power %": 100.0 * n_power / max(1, len(samples)),
             "Spacing (m)": diag["mean_spacing_m"],
             "Max speed": diag["max_kmh"],
-            "When": f"demo lap {i}",
+            "When": f"demo {lap}.{run}",
+            "t0": 0.0, "t1": lap_time,
             "lap_source": source,
         })
     return pd.DataFrame(recs)
@@ -356,53 +478,101 @@ def quick_check(row):
 
 
 def lap_meta(laps_df, columns):
-    """{lap: facts} — everything the matrix, the colours and the panel need."""
+    """{trace id: facts} — everything the matrix, the colours and the panel need.
+
+    Keyed by TRACE ID, not by lap number: two drives can both be lap 7.
+    """
     by_key = {c["key"]: c for c in columns}
+    # A lap number more than one drive claims gets a date on it. Unique numbers
+    # -- a clean race -- keep the bare number, so the common case stays plain.
+    counts = {}
+    for _, row in laps_df.iterrows():
+        counts[int(row["Trace lap"])] = counts.get(int(row["Trace lap"]), 0) + 1
+
+    def _num(value):
+        return None if value is None or pd.isna(value) else float(value)
+
     out = {}
     for _, row in laps_df.iterrows():
-        lap = int(row["Trace lap"])
-        t = row["Lap time (s)"]
-        t = None if (t is None or pd.isna(t)) else float(t)
+        tid = row["id"]
+        t = _num(row["Lap time (s)"])
         key = nearest_key(t, columns)
-        out[lap] = {
+        lap_no = int(row["Trace lap"])
+        out[tid] = {
+            "id": tid,
+            "lap": lap_no,
+            "run": int(row["Run"]),
+            "label": (f"{lap_no}" if counts.get(lap_no, 0) < 2
+                      else f"{lap_no} · {row.get('When', '')}"),
             "time": t,
             "key": key,
             "delta": None if (t is None or key is None)
                      else t - by_key[key]["target_s"],
             "rejects": quick_check(row),
             "when": row.get("When", ""),
-            "energy": row.get("Energy (Wh)"),
+            "energy": _num(row.get("Energy (Wh)")),
+            "distance": _num(row.get("Car distance (m)")),
+            "power_pct": float(row.get("Power %", 0.0) or 0.0),
             "source": row.get("lap_source", "—"),
             "samples": int(row["Samples"]),
             "spacing": float(row["Spacing (m)"]),
+            "t0": float(row.get("t0", 0.0) or 0.0),
+            "t1": float(row.get("t1", 0.0) or 0.0),
         }
     return out
+
+
+def efficiency_rank(tid, meta):
+    """(rank, n) of this drive among the drives under the same profile.
+
+    By the CAR's energy figure, never the pit integral — the pit reads a few
+    percent high and the bias is not identical lap to lap, so ranking on it
+    could reorder two laps that are genuinely a whisker apart.
+    """
+    m = meta[tid]
+    if m["key"] is None or m["energy"] is None:
+        return None
+    peers = [x for x in meta.values()
+             if x["key"] == m["key"] and x["energy"] is not None]
+    if len(peers) < 2:
+        return None
+    peers.sort(key=lambda x: x["energy"])
+    return [p["id"] for p in peers].index(tid) + 1, len(peers)
 
 
 def build_matrix(laps_df, columns, meta, chosen):
     """(numeric view, display frame). Rows sorted by lap time, no-time laps last.
 
     Two frames because they do different jobs: the numeric one is the truth the
-    logic reads, the display one carries the tick. They share an index, so a
-    selection's row position means the same row in both.
+    logic reads, the display one carries the tick and the energy. They share an
+    index, so a selection's row position means the same row in both.
+
+    `view` also carries `_id`, which `disp` does not: the row position a click
+    returns has to resolve to a DRIVE, and the visible Lap column is a label
+    that two rows can legitimately share.
     """
-    laps = [int(r["Trace lap"]) for _, r in laps_df.iterrows()]
-    laps.sort(key=lambda l: (meta[l]["time"] is None,
-                             meta[l]["time"] if meta[l]["time"] is not None else 0.0))
+    ids = [r["id"] for _, r in laps_df.iterrows()]
+    ids.sort(key=lambda i: (meta[i]["time"] is None,
+                            meta[i]["time"] if meta[i]["time"] is not None else 0.0))
 
     cols = [c["key"] for c in columns]
-    view = pd.DataFrame({"Lap": laps})
+    view = pd.DataFrame({"_id": ids, "Lap": [meta[i]["label"] for i in ids]})
     for k in cols:
-        view[k] = [meta[l]["time"] if meta[l]["key"] == k else np.nan for l in laps]
+        view[k] = [meta[i]["time"] if meta[i]["key"] == k else np.nan for i in ids]
     view = view.reset_index(drop=True)
 
-    disp = view.copy()
+    disp = view.drop(columns=["_id"]).copy()
     for k in cols:
-        disp[k] = [
-            "" if pd.isna(view.at[i, k])
-            else (f"✓ {view.at[i, k]:.1f}" if chosen.get(k) == int(view.at[i, "Lap"])
-                  else f"{view.at[i, k]:.1f}")
-            for i in view.index]
+        cells = []
+        for i in view.index:
+            tid = view.at[i, "_id"]
+            if pd.isna(view.at[i, k]):
+                cells.append("")
+                continue
+            wh = meta[tid]["energy"]
+            body = f"{view.at[i, k]:.1f} · " + ("—" if wh is None else f"{wh:.0f} Wh")
+            cells.append(f"✓ {body}" if chosen.get(k) == tid else body)
+        disp[k] = cells
     return view, disp
 
 
@@ -412,12 +582,12 @@ def style_matrix(view, disp, columns, meta, chosen):
     def paint(_df):
         css = pd.DataFrame("", index=disp.index, columns=disp.columns)
         for i in view.index:
-            lap = int(view.at[i, "Lap"])
-            m = meta[lap]
+            tid = view.at[i, "_id"]
+            m = meta[tid]
             for k in cols:
                 if pd.isna(view.at[i, k]):
                     continue
-                if chosen.get(k) == lap:
+                if chosen.get(k) == tid:
                     css.at[i, k] = CHOSEN_CSS
                 elif m["rejects"]:
                     css.at[i, k] = REJECT_CSS
@@ -429,7 +599,7 @@ def style_matrix(view, disp, columns, meta, chosen):
 
 
 def resolve_click(cells, view, columns, meta):
-    """(lap, profile_key) from a selection. Never raises, never guesses wrongly.
+    """(trace id, profile_key) from a selection. Never raises, never guesses.
 
     A click anywhere on a row identifies the LAP; which profile it means depends
     on where in the row it landed. Clicking a column the lap does not belong to
@@ -441,7 +611,7 @@ def resolve_click(cells, view, columns, meta):
     row, col = cells[0]
     if row not in view.index:
         return None, None
-    lap = int(view.at[row, "Lap"])
+    lap = view.at[row, "_id"]
     own = meta[lap]["key"]
     keys = {c["key"] for c in columns}
     if col in keys and not pd.isna(view.at[row, col]):
@@ -534,10 +704,13 @@ chosen = st.session_state["pb_chosen"]
 view, disp = build_matrix(laps_df, columns, meta, chosen)
 
 cfg = {c["key"]: st.column_config.Column(
-    width="small",
+    width="medium",
     help=f"{c['label']} — target {c['target_s']:.0f} s · writes "
          f"profiles/{c['key']}.csv") for c in columns}
-cfg["Lap"] = st.column_config.Column(width="small", help="The car's lap number.")
+cfg["Lap"] = st.column_config.Column(
+    width="small",
+    help="The car's lap number. Where one number was used by more than one "
+         "drive — a counter reset between sessions — the date tells them apart.")
 
 event = st.dataframe(style_matrix(view, disp, columns, meta, chosen),
                      key="pb_matrix", on_select="rerun",
@@ -546,8 +719,9 @@ event = st.dataframe(style_matrix(view, disp, columns, meta, chosen),
                      height=min(38 * len(view) + 45, 520))
 
 st.caption(
-    "Each lap sits under the profile its **lap time** is closest to. Click any "
-    "lap to open it below. ✓ marks a lap you have chosen; :orange[amber] means "
+    "Each lap sits under the profile its **lap time** is closest to, and each "
+    "cell reads `lap time · energy`. The energy is the car's own figure for "
+    "that lap, not anything re-derived here. Click any lap to open it below. ✓ marks a lap you have chosen; :orange[amber] means "
     "the lap is more than "
     f"{FAR_S:.0f} s from that profile's target; grey means it cannot be built "
     "(the panel says why). Sorting clears the blue outline — your choices are "
@@ -563,9 +737,96 @@ if clicked_lap is not None:
 # --------------------------------------------------------------------------- #
 # The detail panel
 # --------------------------------------------------------------------------- #
-def lap_detail(lap, key, meta, columns, demo):
+def energy_panel(tid, m, samples, meta):
+    """Where this lap's energy went, and whether that breakdown means anything.
+
+    THE CAR'S NUMBER IS THE TOTAL. The pit integral is here to say WHERE the
+    energy went, not how much there was, and the difference is not academic:
+    the store holds roughly two rows a second where the car integrates every
+    CAN frame, and 34-75% of consecutive rows repeat a held power value. On
+    nine real traces the pit read 4-21% high. So the headline figures are the
+    car's, the sector split is the pit's, and the line between them says
+    whether the two agree closely enough for the split to be believed.
+    """
+    br = pb.sector_energy(samples, SECTORS)
+    # jumps=0: an interleaved trace never reaches this panel, it is refused
+    # above with a louder message than "untrusted breakdown".
+    trusted, ratio, why = pb.energy_trust(br, m["energy"], jumps=0)
+
+    st.markdown("##### :material/bolt: Energy")
+    car_wh = m["energy"]
+    dist_km = (m["distance"] or pb.LAP_M) / 1000.0
+    e1, e2, e3, e4 = st.columns(4)
+    e1.metric("Energy (car)", "—" if car_wh is None else f"{car_wh:.1f} Wh")
+    e2.metric("Per km", "—" if car_wh is None else f"{car_wh / dist_km:.1f} Wh/km")
+    e3.metric("Average power",
+              "—" if (car_wh is None or not m["time"])
+              else f"{car_wh * 3600.0 / m['time']:.0f} W")
+    e4.metric("Regen recovered", f"{br['regen_wh']:.1f} Wh",
+              help="Integrated here from motor power. The car has never "
+                   "populated last_lap_regen_energy — it is 0% of every row in "
+                   "the store — so there is no figure of its own to show.")
+
+    rank = efficiency_rank(tid, meta)
+    if rank:
+        st.caption(f"Energy rank **{rank[0]} of {rank[1]}** among the laps "
+                   f"under `{m['key']}`, lowest Wh first.")
+
+    if trusted:
+        st.caption(
+            f":green[Breakdown checked.] Integrated {br['net_wh']:.1f} Wh here "
+            f"against the car's {car_wh:.1f} Wh (ratio {ratio:.2f}), covering "
+            f"{br['coverage_pct']:.0f}% of the lap. Reading slightly high is "
+            f"expected and does not distort the shares — treat the Wh below as "
+            f"the SHAPE of the lap, and the car's total as the total.")
+    else:
+        st.warning("**Breakdown not trusted** — " + "; ".join(why) + ".",
+                   icon=":material/warning:")
+
+    st.dataframe(
+        pd.DataFrame([{
+            "Sector": f"S{r['id']} {r['name']}",
+            "Wh": round(r["net_wh"], 1),
+            "Wh/km": (round(r["wh_per_km"], 1)
+                      if r["wh_per_km"] is not None else None),
+            "Share %": (round(r["share_pct"], 1)
+                        if r["share_pct"] is not None else None),
+            "Regen (Wh)": round(r["regen_wh"], 1),
+        } for r in br["sectors"]]),
+        hide_index=True, width="stretch",
+        column_config={"Share %": st.column_config.ProgressColumn(
+            "Share", format="%.0f%%", min_value=0.0, max_value=100.0)})
+    st.caption("Sectors are the same nine the pit dashboard and the track map "
+               "use. S4 and S6 are barely 100 m long, so at ~0.5 s between "
+               "samples they get three or four readings each — read those two "
+               "as indicative, not measured.")
+
+    if HAS_PLOTLY and len(br["curve"]) > 1:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=[p[0] for p in br["curve"]],
+                                 y=[p[1] for p in br["curve"]],
+                                 mode="lines", name="cumulative Wh",
+                                 line=dict(color="#FF9900", width=2.5)))
+        for sid, _name, a, _b in SECTORS:
+            fig.add_vline(x=a, line_width=1, line_dash="dot",
+                          line_color="rgba(148,163,184,0.45)")
+            fig.add_annotation(x=a, yref="paper", y=1.0, showarrow=False,
+                               text=f"S{sid}", xanchor="left", yanchor="bottom",
+                               font=dict(size=10, color="#94a3b8"))
+        fig.update_layout(height=260, margin=dict(l=0, r=0, t=22, b=0),
+                          paper_bgcolor="rgba(0,0,0,0)",
+                          plot_bgcolor="rgba(0,0,0,0)",
+                          xaxis_title="distance around the lap (m)",
+                          yaxis_title="Wh used since the line",
+                          showlegend=False)
+        st.plotly_chart(fig, width="stretch", config={"displaylogo": False})
+        st.caption("Cumulative energy since the finish line. Steep is where the "
+                   "lap costs you; flat or falling is regen coming back.")
+
+
+def lap_detail(tid, key, meta, columns, demo):
     by_key = {c["key"]: c for c in columns}
-    m = meta[lap]
+    m = meta[tid]
     with st.container(border=True):
         h1, h2 = st.columns([8, 1])
         with h2:
@@ -574,7 +835,7 @@ def lap_detail(lap, key, meta, columns, demo):
                 st.rerun()
         with h1:
             t = "—" if m["time"] is None else f"{m['time']:.1f} s"
-            st.markdown(f"#### Lap {lap} · {t}"
+            st.markdown(f"#### Lap {m['lap']} · {t}"
                         + (f" · {m['when']}" if m["when"] else "")
                         + (f" · nearest profile `{m['key']}`" if m["key"] else ""))
 
@@ -590,17 +851,38 @@ def lap_detail(lap, key, meta, columns, demo):
         target = by_key[key]["target_s"]
         d = (m["time"] - target) if m["time"] is not None else None
         if key != m["key"]:
-            st.markdown(f":orange[Lap {lap} is a {m['time']:.1f} s lap — that "
-                        f"puts it under `{m['key']}`, not `{key}`.]")
+            st.markdown(f":orange[Lap {m['lap']} is a {m['time']:.1f} s lap — "
+                        f"that puts it under `{m['key']}`, not `{key}`.]")
         word = "slower" if (d or 0) > 0 else "faster"
         line = f"{abs(d):.1f} s {word} than `{key}`'s {target:.0f} s target."
         st.markdown(f":orange[{line}]" if abs(d) > FAR_S else line)
+
+        # Read ONCE, reused by the energy panel, the preview and the write.
+        # Deliberately before the build rejections: a lap the trigger cut short
+        # still burned energy, and where it went is worth seeing even though
+        # that lap can never become a profile.
+        samples = (_demo_samples(tid) if demo
+                   else load_trace_samples(m["lap"], m["t0"], m["t1"]))
+
+        jumps = pb.count_backward_jumps(samples)
+        if jumps >= pb.INTERLEAVE_MIN_JUMPS:
+            st.error(
+                f"**This is not one drive.** Lap distance falls back {jumps} "
+                f"times inside it, which one car cannot do. Two or more copies "
+                f"of the car software were publishing at the same time under "
+                f"one device id, and their samples are interleaved here — "
+                f"nothing about this trace can be trusted, not the speed, not "
+                f"the energy, not the lap time.", icon=":material/error:")
+            return
+
+        energy_panel(tid, m, samples, meta)
 
         if m["rejects"]:
             st.error("Cannot be built: " + "; ".join(m["rejects"]),
                      icon=":material/error:")
             return
 
+        st.markdown("##### :material/tune: Build")
         c1, c2, c3 = st.columns(3)
         smooth_pts = c1.slider(
             "Smoothing window", 1, 11, pb.DEFAULT_SMOOTH_POINTS, 2,
@@ -623,7 +905,6 @@ def lap_detail(lap, key, meta, columns, demo):
                        "take a corner faster than the car has been shown to "
                        "take it.", icon=":material/warning:")
 
-        samples = _demo_samples(lap) if demo else load_lap_samples(lap)
         _src, baseline = installed_profile(key)
         try:
             v_ms, diag = pb.build_profile(samples, baseline,
@@ -658,13 +939,13 @@ def lap_detail(lap, key, meta, columns, demo):
             notes.append(f"{len(diag['clamped_points'])} point(s) clamped to "
                          f"the {pb.MIN_SPEED_MS} m/s floor")
         if notes:
-            st.info("  \n".join(f"· {n}" for n in notes), icon=":material/info:")
+            st.info("  \n".join(f"· {x}" for x in notes), icon=":material/info:")
 
         if HAS_PLOTLY:
             d_raw, v_raw, _ = pb.clean_samples(samples)
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=list(baseline.distances_m),
-                                     y=[s * 3.6 for s in baseline.speeds_ms],
+                                     y=[sp * 3.6 for sp in baseline.speeds_ms],
                                      mode="lines", name=f"installed ({key})",
                                      line=dict(color="#94a3b8", width=2,
                                                dash="dot")))
@@ -693,22 +974,24 @@ def lap_detail(lap, key, meta, columns, demo):
                        "what the corner cap is protecting you from.")
 
         held = st.session_state["pb_chosen"].get(key)
-        if held == lap:
-            if st.button(f":material/close: Unchoose lap {lap}", key="pb_unchoose"):
+        if held == tid:
+            if st.button(f":material/close: Unchoose lap {m['lap']}",
+                         key="pb_unchoose"):
                 st.session_state["pb_chosen"].pop(key, None)
                 st.rerun()
         else:
-            label = (f":material/check: Choose lap {lap} for `{key}`"
-                     + (f" (replaces lap {held})" if held is not None else ""))
+            prev = meta.get(held, {}).get("label", held)
+            label = (f":material/check: Choose lap {m['lap']} for `{key}`"
+                     + (f" (replaces lap {prev})" if held is not None else ""))
             others = [k for k, v in st.session_state["pb_chosen"].items()
-                      if v == lap and k != key]
+                      if v == tid and k != key]
             if others:
-                st.warning(f"Lap {lap} is already chosen for "
+                st.warning(f"Lap {m['lap']} is already chosen for "
                            f"`{', '.join(others)}` — choosing it here as well "
                            f"writes the same lap into two files.",
                            icon=":material/warning:")
             if st.button(label, key="pb_choose", type="primary"):
-                st.session_state["pb_chosen"][key] = lap
+                st.session_state["pb_chosen"][key] = tid
                 st.rerun()
 
 
@@ -743,8 +1026,20 @@ def write_chosen(chosen, cats, offset, meta, demo):
             os.remove(os.path.join(PROFILE_DIR, stale))
 
     staged, failures = {}, []
-    for key, lap in sorted(chosen.items()):
-        samples = load_lap_samples(lap)
+    for key, tid in sorted(chosen.items()):
+        m = meta[tid]
+        samples = load_trace_samples(m["lap"], m["t0"], m["t1"])
+
+        # Re-checked here and not only in the panel. The panel is a UI state a
+        # user can have scrolled past; this is the last point before a file the
+        # car will drive to gets overwritten.
+        jumps = pb.count_backward_jumps(samples)
+        if jumps >= pb.INTERLEAVE_MIN_JUMPS:
+            failures.append((key, m["label"], [("error",
+                f"{jumps} backward distance steps — more than one publisher is "
+                f"interleaved in this trace, so its samples are not one lap")]))
+            continue
+
         _src, baseline = installed_profile(key)
         try:
             v_ms, diag = pb.build_profile(
@@ -754,25 +1049,26 @@ def write_chosen(chosen, cats, offset, meta, demo):
                 corner_cap=st.session_state.get(f"cap_{key}", True),
                 allow_gaps=st.session_state.get(f"gaps_{key}", False))
         except ValueError as exc:
-            failures.append((key, lap, [("error", str(exc))]))
+            failures.append((key, m["label"], [("error", str(exc))]))
             continue
         path = os.path.join(PROFILE_DIR, f"{key}.csv") + ".staged"
         pb.write_rows(path, pb.GRID_M.tolist(), v_ms.tolist(), baseline.sections)
         ok, checks = pb.validate_profile(
-            path, meta[lap]["time"],
+            path, m["time"],
             os.path.join(PROFILE_DIR, f"{BASELINE_KEY}.csv"))
         if ok:
-            staged[key] = (path, lap, diag, checks)
+            staged[key] = (path, tid, diag, checks,
+                           pb.sector_energy(samples, SECTORS))
         else:
-            failures.append((key, lap, checks))
+            failures.append((key, m["label"], checks))
 
     if failures:
         for path, *_ in staged.values():
             os.remove(path)
         st.error(f"Nothing was written. {len(failures)} profile(s) failed "
                  f"validation:", icon=":material/error:")
-        for key, lap, checks in failures:
-            st.markdown(f"**`{key}` (lap {lap})**")
+        for key, label, checks in failures:
+            st.markdown(f"**`{key}` (lap {label})**")
             for level, msg in checks:
                 st.caption(f"· {msg}")
         st.caption("Unchoose the failing lap(s) and write again.")
@@ -782,7 +1078,8 @@ def write_chosen(chosen, cats, offset, meta, demo):
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     replaced, provenance = [], {}
     try:
-        for key, (path, lap, diag, _checks) in staged.items():
+        for key, (path, tid, diag, _checks, br) in staged.items():
+            m = meta[tid]
             final = os.path.join(PROFILE_DIR, f"{key}.csv")
             if os.path.exists(final):
                 with open(final, "rb") as a, \
@@ -791,10 +1088,25 @@ def write_chosen(chosen, cats, offset, meta, demo):
                     b.write(a.read())
             os.replace(path, final)
             replaced.append(key)
+            trusted, ratio, _why = pb.energy_trust(br, m["energy"])
             provenance[key] = {
                 "built_at": datetime.datetime.now().isoformat(timespec="seconds"),
-                "trace_lap": int(lap), "summary_lap": int(lap) + int(offset),
-                "measured_lap_time_s": meta[lap]["time"],
+                # WHICH DRIVE, not just which lap number. Two drives can both
+                # be lap 7, and a year from now the number alone would not say
+                # which one this file came from.
+                "trace_lap": int(m["lap"]), "trace_run": int(m["run"]),
+                "drive_started": (datetime.datetime.fromtimestamp(m["t0"])
+                                  .isoformat(timespec="seconds") if m["t0"] else None),
+                "summary_lap": int(m["lap"]) + int(offset),
+                "measured_lap_time_s": m["time"],
+                "measured_energy_wh": m["energy"],
+                "energy_wh_per_km": (m["energy"] / ((m["distance"] or pb.LAP_M) / 1000.0)
+                                     if m["energy"] is not None else None),
+                "energy_check": {"pit_integral_wh": round(br["net_wh"], 2),
+                                 "ratio_to_car": (round(ratio, 3)
+                                                  if ratio is not None else None),
+                                 "coverage_pct": round(br["coverage_pct"], 1),
+                                 "trusted": bool(trusted)},
                 "n_samples": diag["n_used"], "max_gap_m": diag["max_gap_m"],
                 "mean_spacing_m": diag["mean_spacing_m"],
                 "coverage_pct": diag["coverage_pct"],
@@ -860,17 +1172,19 @@ if chosen:
         st.markdown(f"### :material/save: Write {len(chosen)} profile(s)")
         by_key = {c["key"]: c for c in columns}
         for key in sorted(chosen, key=lambda k: by_key[k]["target_s"]):
-            lap = chosen[key]
-            m = meta.get(lap, {})
+            tid = chosen[key]
+            m = meta.get(tid, {})
             c1, c2 = st.columns([9, 1])
             d = m.get("delta")
             time_txt = "—" if m.get("time") is None else f"{m['time']:.1f} s"
             delta_txt = "" if d is None else f" (Δ {d:+.1f} s)"
+            wh = m.get("energy")
+            wh_txt = "" if wh is None else f" · {wh:.0f} Wh"
             replaces = ("  — **replaces the profile the car follows today**"
                         if os.path.exists(os.path.join(PROFILE_DIR, f"{key}.csv"))
                         else "")
-            c1.markdown(f"`{key}` ← **lap {lap}** · {time_txt}{delta_txt}"
-                        f" → `profiles/{key}.csv`{replaces}")
+            c1.markdown(f"`{key}` ← **lap {m.get('label', tid)}** · {time_txt}"
+                        f"{delta_txt}{wh_txt} → `profiles/{key}.csv`{replaces}")
             if c2.button("✕", key=f"pb_drop_{key}", help=f"Unchoose {key}"):
                 st.session_state["pb_chosen"].pop(key, None)
                 st.rerun()
