@@ -74,7 +74,7 @@ from modules.regen_light import RegenLight
 # --- Cloud Sync Modules ---
 from cloud.firebase_client import (
     initialize_firebase, push_telemetry_to_cloud, listen_driver_command,
-    ack_lap_command, ack_strategy)
+    ack_lap_command, ack_strategy, stop_telemetry_uploader)
 
 # --- Upgraded GUI Modules ---
 from can_worker import CANWorker, _word_to_alerts, _ERROR_BITS, _LIMIT_BITS
@@ -400,6 +400,9 @@ class SmartCANWorker(CANWorker):
             # LAP_CHECKPOINT_INTERVAL_S of distance/energy to the throttle.
             ("lap checkpoint", lambda: self._save_lap_checkpoint(force=True)),
             ("cell extremes", lambda: self.cell_extremes.save(CELL_EXTREMES_PATH)),
+            # Bounded: uploads what fits in a few seconds, the rest stays in
+            # telemetry_outbox.db and goes up at the next start.
+            ("telemetry outbox", stop_telemetry_uploader),
             ("gps", self.gps.stop),
             ("lap inbox", self.lap_inbox.stop),
             ("strategy inbox", self.strategy_inbox.stop),

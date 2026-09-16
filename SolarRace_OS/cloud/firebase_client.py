@@ -1,10 +1,16 @@
 # firebase_client.py
 
+import json
+import os
 import threading
 import time
 import firebase_admin
 from firebase_admin import credentials
 from firebase_admin import db
+from firebase_admin import exceptions as firebase_exceptions
+
+from edge_sync import Client as OutboxClient, RejectedError
+from edge_sync.queue import clean_json
 
 # ==============================================================================
 # FIREBASE CONFIGURATION
@@ -16,11 +22,13 @@ UPDATE_INTERVAL_SECONDS = 0.5
 
 # Append-only history node read by the pit-side SQLite collector.
 # This is ADDITIVE: live_telemetry keeps being overwritten exactly as before;
-# we ALSO push() each throttled sample here so the pit can stream new samples
+# we ALSO write each throttled sample here so the pit can stream new samples
 # incrementally (orderBy="$key") and backfill gaps after its own dropouts.
-# push() generates a chronological, unique key per sample (that key becomes the
-# pit's primary key), so unlike live_telemetry, nothing here is ever overwritten.
+# Every sample's key is chronological and unique (it becomes the pit's primary
+# key), so unlike live_telemetry, nothing here is ever overwritten. The keys
+# come from the outbox below, NOT from push(): see THE OUTBOX.
 HISTORY_PATH = 'telemetry_history'
+LIVE_PATH = 'live_telemetry'
 
 # Seconds any single Firebase request may take before it is abandoned. See the
 # note in initialize_firebase: the alternative is the library's 120 s default,
@@ -108,6 +116,8 @@ def get_upload_status():
         upload_age_s      seconds since the last landed push, None if never
         upload_failures   consecutive failures right now
         upload_error      text of the last failure, or None
+        upload_backlog    samples saved on the Pi, not yet in Firebase
+                          (None when the outbox is not running)
     """
     now = time.time()
     with _health_lock:
@@ -140,6 +150,8 @@ def get_upload_status():
         "upload_failures": failures,
         "upload_error": error,
         "upload_ok_count": count,
+        "upload_backlog": (_outbox.stats()["pending"]
+                           if _outbox is not None else None),
     }
 
 def initialize_firebase(credential_file_path, database_url):
@@ -169,70 +181,249 @@ def initialize_firebase(credential_file_path, database_url):
     except Exception as e:
         print(f"CRITICAL: Failed to initialize Firebase: {e}")
 
+# ==============================================================================
+# THE OUTBOX — a bad link delays telemetry, it never loses it
+# ==============================================================================
+# Every throttled sample is first saved to a SQLite outbox on the Pi, then a
+# background thread uploads it (edge_sync, vendored in SolarRace_OS/edge_sync/).
+# Two things this fixes, both measured on the car's own data:
+#
+#   1. A sample taken while the link was down used to be gone for good: the
+#      write failed and nothing kept it. Now it waits on disk (across reboots
+#      too) and is uploaded when the link returns.
+#   2. The upload used to run ON THE CAN WORKER THREAD. A slow cellular write
+#      stalled frame decoding, and LapTracker drops any energy interval longer
+#      than 2 s — the car's Wh read 5-20% low exactly on the drives with link
+#      trouble. The CAN thread now only does a local disk write.
+#
+# ORDER MATTERS FOR THE PIT. collector.py resumes from the newest key it has
+# (orderBy $key, startAt). A backlog uploaded newest-first, or under keys that
+# sort below what the pit already holds, would be skipped forever. So:
+#   * the outbox drains OLDEST-first, one set() per sample, in order;
+#   * keys are the outbox's own ids — push-key format, strictly increasing
+#     across reboots and wall-clock jumps;
+#   * before the first upload, the outbox is reconciled against the newest key
+#     already in Firebase. A Pi with no battery-backed clock can boot an hour
+#     behind after a hard power-off, and its keys would otherwise sort low.
+#
+# If the outbox cannot be opened at all (disk error), samples go straight to
+# Firebase the old way rather than nowhere.
+OUTBOX_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "telemetry_outbox.db")
+
+# Samples per batch. Each is its own request (see _send_batch_to_firebase), so
+# at ~100 ms a write on cellular a backlog drains at ~10 samples a second, five
+# times faster than the car produces them: a 10-minute outage (1,200 samples)
+# is caught up in about 2.5 minutes. Kept small so the live node, written once
+# per batch, never falls more than a couple of seconds behind while it drains.
+OUTBOX_BATCH_SIZE = 10
+OUTBOX_FLUSH_INTERVAL_S = UPDATE_INTERVAL_SECONDS
+# Longest wait between upload retries while the link is down. edge_sync's own
+# default is 30 s, which would leave the pit blind for up to half a minute
+# after the link comes back. One small request every 5 s costs nothing.
+OUTBOX_MAX_BACKOFF_S = 5.0
+OUTBOX_RETRY_OPEN_S = 30.0
+OUTBOX_CLOSE_TIMEOUT_S = 3.0
+
+_outbox = None
+_outbox_lock = threading.Lock()
+_outbox_failed_at = 0.0
+_outbox_reconciled = False
+
+# The newest sample, for live_telemetry and the spectator node. Those two are
+# "latest wins", so they are written from memory, never from the backlog.
+_latest_payload = None
+_latest_lock = threading.Lock()
+
+
+class _OutboxReconciled(RuntimeError):
+    """Raised by the sender after renumbering or clearing queued samples, so
+    edge_sync fetches the batch again with the corrected keys."""
+
+
+def _get_outbox():
+    """The running outbox, started on first use. None if it cannot open."""
+    global _outbox, _outbox_failed_at
+    if _outbox is not None:
+        return _outbox
+    if _outbox_failed_at and time.monotonic() - _outbox_failed_at < OUTBOX_RETRY_OPEN_S:
+        return None
+    with _outbox_lock:
+        if _outbox is None:
+            try:
+                _outbox = OutboxClient(
+                    "firebase", "", "solar-car",
+                    db_path=OUTBOX_PATH,
+                    batch_size=OUTBOX_BATCH_SIZE,
+                    flush_interval=OUTBOX_FLUSH_INTERVAL_S,
+                    max_backoff=OUTBOX_MAX_BACKOFF_S,
+                    drain="oldest",
+                    sender=_send_batch_to_firebase,
+                )
+                waiting = _outbox.stats()["pending"]
+                print(f"📦 Telemetry outbox open: {OUTBOX_PATH}"
+                      + (f" — {waiting} sample(s) from before still to upload"
+                         if waiting else ""))
+            except Exception as exc:
+                _outbox_failed_at = time.monotonic()
+                print(f"CRITICAL: telemetry outbox unavailable, uploading "
+                      f"directly (no buffering): {exc}")
+    return _outbox
+
+
+def _reconcile_with_firebase():
+    """Once per run: line the outbox up with the newest key in Firebase."""
+    global _outbox_reconciled
+    newest = db.reference(HISTORY_PATH).order_by_key().limit_to_last(1).get()
+    if newest:
+        key = next(iter(newest))
+        try:
+            acked, renumbered = _outbox.reconcile(key)
+        except ValueError:
+            # Not a push-format key, so it cannot be compared; nothing to do.
+            acked = renumbered = 0
+        _outbox_reconciled = True
+        if acked or renumbered:
+            print(f"📦 Outbox reconciled with Firebase: {acked} sample(s) were "
+                  f"already uploaded, {renumbered} renumbered to sort after {key}")
+            raise _OutboxReconciled("outbox reconciled; refetching batch")
+    _outbox_reconciled = True
+
+
+def _send_batch_to_firebase(batch):
+    """edge_sync sender: one set() per sample, in order, then the live node.
+
+    NOT one multi-path update(), although that would be a single request: the
+    pit's stream delivers an update() as a 'patch' event, which collector.py
+    ignores while still counting it as traffic — the pit would silently stop
+    receiving data. A set() on each key arrives as a 'put', exactly like the
+    push() it replaces. Rewriting a key on retry is harmless: same key, same
+    record, and the collector's upsert ignores the repeat.
+
+    Samples go in recorded order, so if the power dies part-way the newest key
+    in Firebase is the last one that landed, which is what
+    _reconcile_with_firebase relies on at the next start.
+
+    Runs on the outbox's own thread, never the CAN worker. Return = delivered;
+    RejectedError = Firebase will never accept this data (it is kept aside on
+    disk and stops blocking the queue); anything else = retry later.
+    """
+    try:
+        if not _outbox_reconciled:
+            _reconcile_with_firebase()
+        for p in batch["points"]:
+            db.reference(f"{HISTORY_PATH}/{p['id']}").set(p["data"])
+        with _latest_lock:
+            latest = _latest_payload
+        if latest is not None:
+            db.reference(LIVE_PATH).set(latest)
+    except _OutboxReconciled:
+        raise
+    except firebase_exceptions.InvalidArgumentError as exc:
+        print(f"[Network Error] Firebase refused telemetry data: {exc}")
+        _record_upload(False, f"refused: {exc}")
+        raise RejectedError(str(exc)) from exc
+    except Exception as exc:
+        print(f"[Network Error] Failed to upload telemetry: {exc}")
+        _record_upload(False, exc)
+        raise
+    _record_upload(True)
+
+    # The spectator feed rides along AFTER the pit's write, so it can never
+    # delay or displace it, and its own failure is caught inside
+    # push_public_snapshot rather than here.
+    if latest is not None:
+        push_public_snapshot(latest.get("car_data") or {})
+
+
+def stop_telemetry_uploader(flush_timeout=OUTBOX_CLOSE_TIMEOUT_S):
+    """Upload what fits in `flush_timeout`, then close the outbox.
+
+    Whatever is left stays in telemetry_outbox.db and uploads at next start,
+    so a big backlog cannot hold up shutting the car down.
+    """
+    global _outbox
+    with _outbox_lock:
+        outbox, _outbox = _outbox, None
+    if outbox is not None:
+        left = outbox.stats()["pending"]
+        outbox.close(flush_timeout=flush_timeout)
+        if left:
+            print(f"📦 Outbox closed; up to {left} sample(s) kept on disk for next start")
+
+
 def push_telemetry_to_cloud(vehicle_state):
     """
-    Pushes the current vehicle state and strategy to the cloud.
-    Includes a throttle mechanism to prevent network flooding.
+    Records the current vehicle state for the pit, throttled to
+    UPDATE_INTERVAL_SECONDS.
+
+    Does NO network I/O: the sample is saved to the outbox and uploaded by its
+    own thread (see THE OUTBOX above). The only cost on the calling thread is
+    one small local disk write.
     """
-    global _last_update_time
+    global _last_update_time, _latest_payload
     current_time = time.time()
 
-    # Check if enough time has passed since the last update
-    if (current_time - _last_update_time) >= UPDATE_INTERVAL_SECONDS:
-        # STAMPED BEFORE THE WRITES, NOT AFTER, and that ordering is the whole
-        # point of this line being here rather than after ref.set().
-        #
-        # It used to be set after the live write succeeded. So a live write that
-        # RAISED never reached it, the elapsed test stayed true forever, and
-        # every subsequent CAN frame -- hundreds a second on a live bus -- went
-        # straight into this block and attempted a full blocking HTTPS write.
-        # The exact moment the link goes bad is the moment the car starts trying
-        # hardest to use it, on the CAN worker thread, which then stops draining
-        # frames. A failure is precisely when a throttle has to hold.
-        #
-        # Stamping the ATTEMPT also fixes the quieter half: the timestamp is now
-        # when this burst began rather than when the previous one did, so the
-        # interval means "0.5 s between attempts" instead of "0.5 s between the
-        # starts of bursts", which on a slow link had collapsed to the duration
-        # of the burst itself.
-        _last_update_time = current_time
+    if (current_time - _last_update_time) < UPDATE_INTERVAL_SECONDS:
+        return
+    # Stamped before anything can fail, for the reason explained in
+    # _push_directly: a failure must never defeat the throttle.
+    _last_update_time = current_time
+    payload = {"timestamp": current_time, "car_data": vehicle_state}
+
+    outbox = _get_outbox()
+    if outbox is None:
+        _push_directly(payload)
+        return
+
+    try:
+        # A deep copy, taken on the thread that owns vehicle_state, so the
+        # uploader thread never reads a dict that is being changed under it.
+        snapshot = json.loads(json.dumps(clean_json(payload), default=str))
+    except Exception as exc:
+        print(f"[Telemetry] could not serialise vehicle state: {exc}")
+        return
+    with _latest_lock:
+        _latest_payload = snapshot
+    if outbox.track_snapshot(snapshot, ts=int(current_time * 1000)) is None:
+        # The outbox could not store it (disk error). Better sent without a
+        # safety net than not sent at all.
+        _push_directly(snapshot)
+
+
+def _push_directly(payload):
+    """The pre-outbox upload path, kept as the fallback. Blocks on the network.
+
+    Only used when the outbox cannot store a sample. The caller has already
+    stamped _last_update_time BEFORE calling this, and that ordering matters:
+    when the stamp came after the write, a write that RAISED never reached it,
+    the throttle stayed open, and every CAN frame -- hundreds a second --
+    attempted a full blocking HTTPS write, exactly when the link was bad.
+    """
+    try:
+        # .set() OVERWRITES the live node: the pit's "now".
+        db.reference(LIVE_PATH).set(payload)
+
+        # Also append an immutable copy to the history node the pit collector
+        # stores. push() keys here, since there is no outbox to assign them.
+        # Wrapped separately so a history hiccup never affects the live snapshot.
         try:
-            # We use a specific node in the database called 'live_telemetry'
-            ref = db.reference('live_telemetry')
-            
-            # Construct the payload
-            payload = {
-                "timestamp": current_time,
-                "car_data": vehicle_state
-            }
-            
-            # .set() OVERWRITES the current data at this node.
-            # This is perfect for a live dashboard (we only care about the NOW).
-            ref.set(payload)
+            db.reference(HISTORY_PATH).push(payload)
+            _record_upload(True)
+        except Exception as hist_err:
+            print(f"[Network Error] Failed to append telemetry history: {hist_err}")
+            # The live snapshot DID land, but the pit's stored record now has a
+            # hole, so this is not a healthy upload. See the header note on why
+            # the badge reports the AND of both writes.
+            _record_upload(False, f"history: {hist_err}")
 
-            # ADDITIVE: also append an immutable, keyed copy to the history node so
-            # the pit wall can store full history locally (.push() never overwrites).
-            # Wrapped separately so a history hiccup never affects the live snapshot.
-            try:
-                db.reference(HISTORY_PATH).push(payload)
-                _record_upload(True)
-            except Exception as hist_err:
-                print(f"[Network Error] Failed to append telemetry history: {hist_err}")
-                # The live snapshot DID land, and the separate try/except above
-                # keeps it that way — but the pit's stored record now has a hole,
-                # so this is not a healthy upload. See the header note on why the
-                # badge reports the AND of both writes.
-                _record_upload(False, f"history: {hist_err}")
+        push_public_snapshot(payload.get("car_data") or {})
 
-            # The spectator feed rides along AFTER both pit writes, so it can
-            # never delay or displace them, and its own failure is caught
-            # inside push_public_snapshot rather than here.
-            push_public_snapshot(vehicle_state)
-
-        except Exception as e:
-            # We don't want a network drop to crash the whole car system
-            print(f"[Network Error] Failed to update Firebase: {e}")
-            _record_upload(False, e)
+    except Exception as e:
+        # We don't want a network drop to crash the whole car system
+        print(f"[Network Error] Failed to update Firebase: {e}")
+        _record_upload(False, e)
 
 
 # ==============================================================================
