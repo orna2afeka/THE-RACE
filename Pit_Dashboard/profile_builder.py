@@ -216,7 +216,6 @@ def load_laps():
                 "Samples": n,
                 "Speed %": (100.0 * t["n_speed"] / n) if n else 0.0,
                 "Power %": (100.0 * t["n_power"] / n) if n else 0.0,
-                "Spacing (m)": (t["trace_end_m"] / n) if n else 0.0,
                 "Max speed": t["v_max_kmh"],
                 "When": datetime.datetime.fromtimestamp(t["t0"]).strftime("%d %b %H:%M"),
                 "t0": t["t0"], "t1": t["t1"],
@@ -433,7 +432,6 @@ def _demo_laps_df():
             "Samples": diag["n_used"],
             "Speed %": 100.0,
             "Power %": 100.0 * n_power / max(1, len(samples)),
-            "Spacing (m)": diag["mean_spacing_m"],
             "Max speed": diag["max_kmh"],
             "When": f"demo {lap}.{run}",
             "t0": 0.0, "t1": lap_time,
@@ -550,7 +548,6 @@ def lap_meta(laps_df, columns):
             "power_pct": float(row.get("Power %", 0.0) or 0.0),
             "source": row.get("lap_source", "—"),
             "samples": int(row["Samples"]),
-            "spacing": float(row["Spacing (m)"]),
             "t0": float(row.get("t0", 0.0) or 0.0),
             "t1": float(row.get("t1", 0.0) or 0.0),
         }
@@ -1204,11 +1201,10 @@ def lap_detail(tid, key, meta, columns, demo):
                      icon=":material/error:")
             return
 
-        m1, m2, m3, m4 = st.columns(4)
+        m1, m2, m3 = st.columns(3)
         m1.metric("Measured lap", f"{m['time']:.1f} s")
         m2.metric("Samples used", f"{diag['n_used']}")
-        m3.metric("Mean spacing", f"{diag['mean_spacing_m']:.1f} m")
-        m4.metric("Coverage", f"{diag['coverage_pct']:.0f} %")
+        m3.metric("Coverage", f"{diag['coverage_pct']:.0f} %")
 
         notes = []
         if diag["n_dropped_nonmonotonic"]:
@@ -1396,7 +1392,6 @@ def write_chosen(chosen, cats, offset, meta, demo):
                                  "coverage_pct": round(br["coverage_pct"], 1),
                                  "trusted": bool(trusted)},
                 "n_samples": diag["n_used"], "max_gap_m": diag["max_gap_m"],
-                "mean_spacing_m": diag["mean_spacing_m"],
                 "coverage_pct": diag["coverage_pct"],
                 "smoothing_window_m": diag["smoothing_window_m"],
                 "corner_cap": diag["corner_cap"],

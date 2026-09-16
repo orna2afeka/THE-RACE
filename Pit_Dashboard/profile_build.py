@@ -505,7 +505,6 @@ def clean_samples(samples):
         "n_dropped_nonmonotonic": dropped,
         "length_m": float(d[-1]) if len(d) else 0.0,
         "max_gap_m": float(gaps.max()) if len(gaps) else 0.0,
-        "mean_spacing_m": float(gaps.mean()) if len(gaps) else 0.0,
         "holes": holes,
         "coverage_pct": 100.0 * covered / LAP_M if len(d) > 1 else 0.0,
         "median_kmh": float(np.median(v)) if len(v) else 0.0,
