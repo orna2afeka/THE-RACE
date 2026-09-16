@@ -141,12 +141,12 @@ def main():
                 " bms_soc_percent, mms_estimated_soc_percent, bms_voltage_V,"
                 " mms_measured_voltage_V, bms_current_A, mms_current_A, mms_power_W,"
                 " mms_rpm, mms_temperature_C, mms_motor_temp_C, battery_temp_C,"
-                " mms_motor_ohms,"
+                " mms_motor_ohms, mms_throttle_percent, mms_throttle_mv,"
                 " target_speed_kmh, total_race_energy, mms_trip_m,"
                 " last_lap_time_s, last_lap_energy,"
                 " pi_uptime_s, can_state, can_silent_s, can_detail, can_frames,"
                 " gps_fix, gps_detail, bms_string_count, " + ",".join(ccols) + ")"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
                 "?,?,?,?,?,?,?" + ",?" * len(ccols) + ")",
                 (time.time(), "solarcar", dist, tag, "base_210s",
                  speed_ms * 3.6, lat, lon, soc, soc - 0.6,
@@ -154,7 +154,7 @@ def main():
                  power / 117.0, power / 117.0 * 0.98, power,
                  speed_ms / (0.278 * 2 * math.pi) * 60.0,
                  34 + 6 * math.sin(dist / 900.0), motor_c, batt_c, 0.081,
-                 68.0,
+                 throttle, 800 + throttle * 31.0, 68.0,
                  energy, tag * LAP_M + dist, lap_last, energy_last,
                  3600.0 + up, health[0], health[1], health[2], frames,
                  health[3], "3D fix, 11 satellites", 26,

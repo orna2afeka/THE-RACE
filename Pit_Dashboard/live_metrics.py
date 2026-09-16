@@ -31,7 +31,7 @@ _KNOWN_LIMITS = {"SOC", "PACK_VOLTAGE", "BATT_CURRENT", "MOTOR_CURRENT"}
 _KNOWN_DERIVED = {
     "delta_to_target", "relative_regen_total",
     "relative_regen_stint", "relative_regen_lap", "active_lap",
-    "lap_source", "controller_odometer_km",
+    "lap_source", "controller_odometer_km", "throttle_zone_label",
 }
 
 LIVE_METRIC_GROUPS = [
@@ -50,6 +50,14 @@ LIVE_METRIC_GROUPS = [
     # Two batteries, each with its own JBD BMS: A on can0, B on can1. One row
     # per battery, then the controller's reading of the voltage both feed.
     # The top strip's SoC is battery A's.
+    ("Driver Input", [
+        dict(label="Throttle", unit="%", spec=".0f", field="state.throttle_pct",
+             note="pedal position from the ESC's GPIO0 (CAN 0x150)"),
+        dict(label="Efficiency Zone", unit="", spec=".0f", derived="throttle_zone_label", text=True,
+             note="eco / normal / power from efficiency.py"),
+        dict(label="Throttle Raw", unit="mV", spec=".0f", field="state.throttle_mv",
+             note="calibrate efficiency.py from this: pedal released, then floored"),
+    ]),
     ("Battery", [
         dict(label="Battery A SoC", unit="%", spec=".0f", limit="SOC", field="state.soc",
              note="battery A's BMS (can0) coulomb count"),
@@ -170,6 +178,12 @@ def resolve(entry, state, ctx):
             return ctx.get("active_lap")
         if d == "lap_source":
             return state.get("lap_source")
+        if d == "throttle_zone_label":
+            # efficiency.py at the repo root is import-free, and its labels are
+            # the ones the car uses — never retyped here.
+            import efficiency
+            z = state.get("throttle_zone")
+            return None if z is None else efficiency.ZONE_LABELS.get(z, z)
         if d == "controller_odometer_km":
             m = state.get("trip_m")
             return None if m is None else m / 1000.0

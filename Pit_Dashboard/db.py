@@ -154,9 +154,19 @@ METRIC_COLUMNS = [
     # Active power map as the raw controller value. Numeric so it can be charted
     # as a step trace across a race; the human name is stored beside it below.
     "mms_motor_map_raw",
-    # (mms_throttle_percent / mms_throttle_mv / mms_throttle_zone were removed
-    # 2026-09-16 with the throttle feature: no sample ever carried them. Older
-    # databases keep the empty columns; nothing reads them.)
+    # Throttle pedal position, 0-100 %, from the ESC's GPIO0 reading. The
+    # pit-wall coaching signal: a trace full of spikes is a driver pumping the
+    # pedal, a flat one is the steady input that wins an endurance race.
+    "mms_throttle_percent",
+    # The RAW millivolts the same reading came from. Stored for two reasons, both
+    # of which the PT1000 pair above already demonstrate the value of:
+    #   * It is what the team reads off the pit wall to replace the placeholder
+    #     pedal calibration in efficiency.py (the released/floored voltages).
+    #   * Until that calibration is measured, every percentage above is only
+    #     approximately right — so keeping the raw value means the whole race
+    #     can be RE-DERIVED afterwards once the real span is known, instead of
+    #     being permanently stored at whatever the placeholder implied.
+    "mms_throttle_mv",
     # Per-lap analytics, all computed ON THE CAR (see lap_tracker.py). The Pi
     # holds each lap's figures for the whole of the FOLLOWING lap, so the pit
     # only has to receive one sample anywhere in a lap to record that lap
@@ -203,6 +213,14 @@ ERROR_COLUMNS = [
 # the two ever run different builds.
 STATE_COLUMNS = [
     "mms_motor_map",
+    # Which efficiency zone the DRIVER was actually shown — "eco" | "normal" |
+    # "power" — as the car classified it. Stored rather than re-derived here for
+    # the same reason mms_motor_map is: after the race, "we radioed them because
+    # they were in the red" has to be answerable from what the HUD displayed,
+    # not from re-running today's thresholds over yesterday's percentages. That
+    # distinction matters precisely because efficiency.py's boundaries are
+    # placeholders and WILL change.
+    "mms_throttle_zone",
     # How the last lap was triggered: gps | odometer | manual | gps_no_can.
     # "odometer" means the GPS trigger MISSED and the distance backstop fired —
     # a visible signal that finish-line detection needs looking at.
@@ -244,6 +262,7 @@ _COL_TYPES = {
     "mms_error_code": "INTEGER",
     "mms_alerts": "TEXT",
     "mms_motor_map": "TEXT",
+    "mms_throttle_zone": "TEXT",
     "lap_source": "TEXT",
     "active_strategy": "TEXT",
     "pi_uptime_s": "REAL",
@@ -805,6 +824,13 @@ def flatten_record(rtdb_key: str, record: dict, device_id: str = DEVICE_ID) -> d
         "mms_motor_temp_C": _num(motor.get("mms_motor_temp_C")),
         "mms_motor_map_raw": _num(motor.get("mms_motor_map_raw")),
         "mms_motor_map": _join(motor.get("mms_motor_map")),
+        # Throttle. _num keeps a missing reading NULL rather than 0: the car
+        # omits mms_throttle_percent entirely when the pedal voltage is
+        # implausible (unplugged sensor), and a stored 0 there would read as a
+        # driver who lifted off.
+        "mms_throttle_percent": _num(motor.get("mms_throttle_percent")),
+        "mms_throttle_mv": _num(motor.get("mms_throttle_mv")),
+        "mms_throttle_zone": _join(motor.get("mms_throttle_zone")),
         "total_race_energy": _num(motor.get("total_race_energy")),
         "last_lap_energy": _num(motor.get("last_lap_energy")),
         "last_lap_regen_energy": _num(motor.get("last_lap_regen_energy")),

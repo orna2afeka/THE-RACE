@@ -57,6 +57,7 @@ from .store import (                                   # noqa: E402
     DRIVER_STINT_UNDO_S, RACE_UNDO_S,
 )
 import constants as C                                  # noqa: E402
+import efficiency                                      # noqa: E402
 import strategy_engine                                 # noqa: E402
 from strategy_engine import (                          # noqa: E402
     calculate_all_strategies, load_velocity_profile,
@@ -176,6 +177,7 @@ _STATE_COLUMNS = {
     "temp": "mms_temperature_C", "power_w": "mms_power_W",
     "motor_temp": "mms_motor_temp_C", "motor_ohms": "mms_motor_ohms",
     "motor_map": "mms_motor_map", "motor_map_raw": "mms_motor_map_raw",
+    "throttle_pct": "mms_throttle_percent", "throttle_mv": "mms_throttle_mv",
     "last_lap_energy": "last_lap_energy",
     "total_race_energy": "total_race_energy",
     "last_lap_regen_energy": "last_lap_regen_energy",
@@ -213,7 +215,7 @@ def read_live_state(conn):
 
     state = {k: None for k in _STATE_COLUMNS}
     state.update({
-        "motor_map": None,
+        "motor_map": None, "throttle_zone": None,
         "batt_temp": None,
         "lap_source": None, "auto_lap": None, "odometer_km": None,
         # lat/lon fall back to the Zolder paddock so the map has somewhere to
@@ -250,6 +252,12 @@ def read_live_state(conn):
     state["motor_map"] = cf("motor_map", "mms_motor_map")
     state["motor_map_raw"] = cf("motor_map_raw", "mms_motor_map_raw")
     state["lap_source"] = _val(row, "lap_source", None)
+
+    # Prefer the zone the CAR classified — what the driver's bar actually
+    # showed. Fall back to classifying here only for rows written before the
+    # column existed; efficiency.zone() is the same function the car ran.
+    zone = cf("throttle_zone", "mms_throttle_zone")
+    state["throttle_zone"] = zone or efficiency.zone(state["throttle_pct"])
 
     # Per-cell thermistor temperatures, however many are configured.
     for i in range(1, db.THERMISTOR_CELL_COLUMN_COUNT + 1):

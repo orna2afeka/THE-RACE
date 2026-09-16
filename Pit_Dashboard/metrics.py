@@ -29,6 +29,11 @@ HISTORY_CHARTS = [
     # Deliberately NO fallback to a value derived from RPM.
     Metric("Speed", "Speed", "km/h", "#00FFCC",
            "mms_vehicle_speed_kmh", None),
+    # The pit wall's driver-coaching signal, read together with Speed: speed is
+    # what the car did, throttle is what the driver asked for, and the gap is
+    # where the energy goes. NaN never 0 — a dropout must not read as lift-off.
+    Metric("Throttle", "Throttle", "%", "#ff4dd2",
+           "mms_throttle_percent", None),
     Metric("Power", "Motor Power", "W", "#00B3FF",
            "mms_power_W", None),
     Metric("RPM", "Motor RPM", "rpm", "#9b59b6",
