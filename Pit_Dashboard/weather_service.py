@@ -1,14 +1,14 @@
 import requests
 import pandas as pd
 
-# Was @st.cache_data. This clone runs the React dashboard only, so it does not
-# install Streamlit; memo keeps the two behaviours this module relies on —
+# Was @st.cache_data. The pit dashboard no longer uses Streamlit, so neither
+# does this module; memo keeps the two behaviours this module relies on —
 # a TTL, and NOT memoising an exception (see _fetch_or_raise's caller).
 from memo import memo
 
 # (connect, read) seconds. requests defaults to NO timeout at all, which meant a
-# hung link to open-meteo blocked indefinitely — and it blocked on the script-run
-# thread, which Streamlit also uses to redraw every live tile on the pit wall.
+# hung link to open-meteo blocked indefinitely — and in the earlier Streamlit
+# dashboard it blocked the script-run thread that redrew every live tile too.
 # The hourly cache made that rare rather than harmless: rare and unbounded is how
 # you get one inexplicable freeze a day that nobody can reproduce.
 _TIMEOUT = (3.05, 10)

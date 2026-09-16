@@ -7,28 +7,27 @@ REM  page and one JSON endpoint, reads telemetry.db READ-ONLY on a
 REM  thread of its own, and cannot slow, lock or crash the dashboard,
 REM  the collector or the profile builder.
 REM
-REM  Port map:  8501 pit dashboard   8502 profile builder   8503 this
+REM  Port map:  8000 pit dashboard   8502 profile builder   8503 this
 REM
 REM  The page itself is Pit_Dashboard\wall.html, written by
 REM  tools\build_zolder_animation.py. It is NOT published to GitHub
 REM  Pages: it carries pack voltage, temperatures and lap deltas, and
 REM  it stays on the pit LAN.
 REM
-REM  Reuses the interpreter run_pit.bat already found and recorded in
-REM  Pit_Dashboard\.deps_stamp, so every pit app runs on the same
-REM  Python. Deliberately does NOT run pip and does NOT touch
-REM  run_pit.bat: the thing that gets the pit wall up must stay
-REM  untouched.
+REM  Reuses the interpreter run_web.bat already found and recorded in
+REM  Pit_Web\.deps_stamp, so every pit app runs on the same Python.
+REM  Deliberately does NOT run pip and does NOT touch run_web.bat: the
+REM  thing that gets the pit dashboard up must stay untouched.
 REM ===================================================================
 setlocal
 cd /d "%~dp0"
 
 set "PYCMD="
-if exist "Pit_Dashboard\.deps_stamp" (
-    for /f "tokens=2*" %%A in (Pit_Dashboard\.deps_stamp) do set "PYCMD=%%B"
+if exist "Pit_Web\.deps_stamp" (
+    for /f "usebackq tokens=1,*" %%A in ("Pit_Web\.deps_stamp") do set "PYCMD="%%B""
 )
 if not defined PYCMD set "PYCMD=py -3"
-if not exist "Pit_Dashboard\.deps_stamp" (
+if not exist "Pit_Web\.deps_stamp" (
     echo No .deps_stamp found - run "Start Pit Dashboard.bat" once first so the
     echo Python environment is set up, then come back here.
     echo.

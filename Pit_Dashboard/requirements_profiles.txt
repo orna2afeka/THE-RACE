@@ -1,0 +1,8 @@
+# requirements_profiles.txt
+#
+# What the speed-profile builder (profile_builder.py, "Build Speed Profiles.bat")
+# needs ON TOP OF Pit_Web/requirements_web.txt, which the pit dashboard's
+# launcher already installs into the same Python (pandas, numpy, openpyxl ...).
+# The builder is the only Streamlit app left in the repo.
+streamlit==1.58.0
+plotly==6.9.0

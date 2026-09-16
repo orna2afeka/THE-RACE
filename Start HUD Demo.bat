@@ -15,7 +15,7 @@ REM     "Start HUD Demo.bat" --fullscreen --no-tour
 REM
 REM  WHY THIS SEARCHES FOR A PYTHON instead of reusing the pit's:
 REM  the HUD needs PySide6, and the interpreter the pit dashboard records
-REM  in Pit_Dashboard\.deps_stamp does not necessarily have it - on the
+REM  in Pit_Web\.deps_stamp does not necessarily have it - on the
 REM  team laptop it is Python 3.12 without PySide6, while 3.11 has it.
 REM  Reusing it blindly would open a console that just says
 REM  "No module named PySide6". So each candidate is tried until one can
@@ -30,8 +30,8 @@ cd /d "%~dp0"
 set "PYCMD="
 
 REM 1. the interpreter the pit dashboard already uses, if it has PySide6
-if exist "Pit_Dashboard\.deps_stamp" (
-    for /f "usebackq tokens=1,*" %%A in ("Pit_Dashboard\.deps_stamp") do set "STAMP=%%B"
+if exist "Pit_Web\.deps_stamp" (
+    for /f "usebackq tokens=1,*" %%A in ("Pit_Web\.deps_stamp") do set "STAMP=%%B"
     if defined STAMP (
         "!STAMP!" -c "import PySide6" >nul 2>&1 && set "PYCMD="!STAMP!""
     )

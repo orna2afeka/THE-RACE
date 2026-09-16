@@ -170,7 +170,7 @@ def write_csv(fileobj, start_ts=None, end_ts=None, metrics=None,
 
 
 def to_csv_bytes(start_ts=None, end_ts=None, metrics=None, device_id=DEVICE_ID) -> bytes:
-    """Return the CSV as UTF-8 bytes — convenient for a Streamlit download button."""
+    """Return the CSV as UTF-8 bytes — convenient for a caller that wants it in memory."""
     buf = io.StringIO()
     write_csv(buf, start_ts=start_ts, end_ts=end_ts, metrics=metrics, device_id=device_id)
     return buf.getvalue().encode("utf-8")
@@ -568,7 +568,7 @@ def write_xlsx(fileobj_or_path, start_ts=None, end_ts=None, metrics=None,
 
 
 def to_xlsx_bytes(start_ts=None, end_ts=None, metrics=None, device_id=DEVICE_ID):
-    """Return (xlsx_bytes, row_count) — for a Streamlit download button."""
+    """Return (xlsx_bytes, row_count) — for a caller that wants the file in memory."""
     buf = io.BytesIO()
     n = write_xlsx(buf, start_ts=start_ts, end_ts=end_ts, metrics=metrics, device_id=device_id)
     return buf.getvalue(), n

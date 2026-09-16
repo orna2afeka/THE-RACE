@@ -190,17 +190,22 @@ holds an exclusive lock for the duration.
 
 ## 3b. After every `git pull` on the pit laptop — restart the apps
 
-**Streamlit does not pick up changed code in imported modules.** It re-runs the
-main script on every interaction, but `db.py`, `constants.py` and friends stay
-in memory as they were when the process started — and `.streamlit/config.toml`
-sets `fileWatcherType = "none"`, so nothing restarts on its own either.
+**A running process does not pick up pulled code.** The dashboard's backend
+(the "Pit Web" uvicorn window) loads `api.py`, `db.py`, `strategy_engine.py` and
+friends once at startup and runs without auto-reload, and the collector and the
+profile builder are the same. A pulled change to any Python file does nothing
+until its process restarts.
 
-A pulled change therefore lands half-applied: the page code is new, the modules
-it calls are old. That shows up as a confusing error naming a column or function
-that plainly does exist on disk.
+The browser side is different: the frontend is the committed
+`Pit_Web/frontend/dist`, read from disk on each request, so a page reload picks
+up a pulled bundle without any restart. The page can therefore be new while the
+backend it talks to is old, which shows up as a confusing error or a blank
+panel for something that plainly exists on disk.
 
-Close the dashboard, collector and profile-builder windows and start them again.
-Same rule as the car: `git pull` alone changes nothing that is already running.
+Close the "Pit Web", "Pit Collector" and profile-builder windows, start them
+again (`Start Pit Dashboard.bat` brings up the first two), then reload the page
+on every device. Same rule as the car: `git pull` alone changes nothing that is
+already running.
 
 ---
 
@@ -310,8 +315,8 @@ Double-click `Start Pit Wall.bat`, or `python tools/pit_wall.py`. It serves
 http://localhost:8503 and prints the LAN addresses a TV can open.
 
 It is a **second screen, not a second dashboard**: no controls, nothing to
-click, and it reads `telemetry.db` read-only on its own thread, so it cannot
-slow the dashboard down the way another Streamlit tab would.
+click, and it reads `telemetry.db` read-only on its own thread in its own
+process, so it cannot slow the dashboard down.
 
 ### ☐ Set the TV up before the car exists
 
@@ -392,7 +397,7 @@ is not evidence of a fault.
 
 | Thing | Where |
 |---|---|
-| Pit dashboard | `Start Pit Dashboard.bat` → http://localhost:8501 |
+| Pit dashboard | `Start Pit Dashboard.bat` → http://localhost:8000 (phones: http://<laptop-ip>:8000) |
 | Profile builder | `Build Speed Profiles.bat` → http://localhost:8502 |
 | Pit wall (big screen) | `python tools/pit_wall.py` → http://localhost:8503 |
 | Spectator page (public) | https://orna2afeka.github.io/THE-RACE/ |

@@ -4,8 +4,8 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
-# Was `import streamlit as st` -- see memo.py. This clone does not install
-# Streamlit; memo() is the same in-process cache st.cache_data degrades to.
+# Was `import streamlit as st` -- see memo.py. The pit dashboard no longer
+# uses Streamlit; memo() is the same in-process cache st.cache_data degrades to.
 from memo import memo
 
 # Default velocity profile lives next to this file, so a no-arg call works no
@@ -146,9 +146,10 @@ def _build_charge_clock(capacity_wh, step=0.1):
     later query into two lookups.
 
     This is not a micro-optimisation. Integrating the curve on every call made
-    the strategy table take 9.6 SECONDS, inside a fragment that reruns every 10
-    on the same Streamlit thread as the rest of the dashboard -- the exact
-    failure that once made the whole pit refresh at 7-10 s instead of 1.
+    the strategy table take 9.6 SECONDS, inside a fragment that reran every 10
+    on the same thread as the rest of the earlier Streamlit dashboard -- the
+    exact failure that once made the whole pit refresh at 7-10 s instead of 1.
+    The web backend polls it every 10 s too, so the cost still matters.
     """
     n = int(round(100.0 / step)) + 1
     clock = [0.0] * n

@@ -59,7 +59,7 @@ SolarRace_OS/cell_extremes.json.tmp
 # ---------------------------------------------------------------------------
 # Launcher / runtime bookkeeping
 # ---------------------------------------------------------------------------
-# Hash of the last requirements file run_pit.bat pip-installed.
+# Hash of the last requirements file run_web.bat pip-installed, plus the Python.
 .deps_stamp
 **/.deps_stamp
 # docs/ is private by default -- the task briefs in it are working notes, not
@@ -69,7 +69,7 @@ SolarRace_OS/cell_extremes.json.tmp
 # whoever last ran the build script.
 docs/*
 !docs/*.html
-# collector stdout/stderr when launched detached by run_pit.bat
+# collector stdout/stderr when launched detached
 collector.out.log
 collector.err.log
 

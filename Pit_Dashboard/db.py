@@ -64,7 +64,7 @@ BMS_CELL_COLUMN_COUNT = 30
 #
 # Not imported from the car-side module: that lives under SolarRace_OS/modules,
 # off this app's sys.path. Kept in sync by hand, the same way
-# DS004_MODULE_COUNT in pit_dashboard.py is its own independent constant.
+# DS004_MODULE_COUNT in Pit_Web/api.py is its own independent constant.
 THERMISTOR_CELL_COLUMN_COUNT = 40
 
 METRIC_COLUMNS = [

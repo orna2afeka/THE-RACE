@@ -2,16 +2,17 @@
 #
 #     pip install -r Pit_Web/requirements_web.txt
 #
-# This clone runs the React/FastAPI pit dashboard ONLY. The Streamlit app and
-# the car software live in ../THE RACE; nothing here imports Streamlit, and it
-# is deliberately absent from this list.
+# The pit dashboard (React/FastAPI) and the collector. Nothing here imports
+# Streamlit; the speed-profile builder adds it on top from
+# Pit_Dashboard/requirements_profiles.txt. The car has its own list in
+# SolarRace_OS/requirements.txt.
 #
 # Two processes:
 #     python Pit_Dashboard/collector.py             # Firebase -> telemetry.db
 #     python -m uvicorn Pit_Web.api:app --port 8000 # the dashboard
 #
-# Pins match Pit_Dashboard/requirements_pit.txt in the original repo, so the two
-# folders resolve the same versions of the modules they share.
+# The pandas/numpy/matplotlib/openpyxl pins are the versions the pit laptop has
+# run on; move them deliberately, not as a side effect.
 
 # --- the web backend --------------------------------------------------------
 fastapi>=0.115
@@ -21,9 +22,8 @@ websockets>=13
 
 # --- shared modules the backend imports -------------------------------------
 # pandas/numpy  : strategy_engine, weather_service, the CSV export frame
-# matplotlib    : imported at the top of strategy_engine.py, which is kept
-#                 identical to the race repo. The web dashboard no longer
-#                 renders a PNG (the chart is drawn in the browser from the
+# matplotlib    : imported at the top of strategy_engine.py. The dashboard
+#                 no longer renders a PNG (the chart is drawn in the browser from the
 #                 served simulation), but the import still has to resolve.
 # openpyxl      : export.py's 3-sheet workbook
 pandas==2.2.1
@@ -35,8 +35,8 @@ openpyxl==3.1.2
 # requests   : the RTDB REST stream, and weather_service
 # google-auth: the collector's OAuth2 token from the service account
 #
-# requests is >= rather than == on purpose. The race repo pins it to 2.31.0, but
-# this environment already has a newer one, and a hard pin would make every
+# requests is >= rather than == on purpose. The Streamlit version pinned 2.31.0,
+# but the pit laptop already has a newer one, and a hard pin would make every
 # launch downgrade a package other things share — for a plain HTTP GET with a
 # timeout, which any recent version does identically. The four pins above stay
 # exact because they shape OUTPUT: the workbook, the CSV and the strategy PNG.

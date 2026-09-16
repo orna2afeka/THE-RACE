@@ -4,7 +4,7 @@
 [![Raspberry Pi](https://img.shields.io/badge/Raspberry%20Pi-Edge-C51A4A.svg)](https://www.raspberrypi.org/)
 [![CAN Bus](https://img.shields.io/badge/CAN%20Bus-SocketCAN-2C3E50.svg)](https://www.kernel.org/doc/html/latest/networking/can.html)
 [![Firebase](https://img.shields.io/badge/Firebase-Realtime%20DB-FFCA28.svg)](https://firebase.google.com/)
-[![Streamlit](https://img.shields.io/badge/Pit%20Wall-Streamlit-FF4B4B.svg)](https://streamlit.io/)
+[![React + FastAPI](https://img.shields.io/badge/Pit%20Wall-React%20%2B%20FastAPI-009688.svg)](Pit_Web/README.md)
 
 Telemetry and race-strategy software for the Afeka Solar & Electric Racing Team,
 built for the **iESC 24-Hour Endurance Race at Circuit Zolder, Belgium**.
@@ -36,7 +36,7 @@ giving engineers live battery, motor, temperature, and strategy data.
 |---|---|
 | Understand how the two halves fit together | [System Overview](#-system-overview) below |
 | Find my way around the files | [Repository Structure](#-repository-structure) |
-| Run the pit dashboard on a laptop | Double-click **`Start Pit Dashboard.bat`**, or [§ B](#b-pit-wall--pit_dashboard-laptop) |
+| Run the pit dashboard on a laptop | Double-click **`Start Pit Dashboard.bat`**, or [§ B](#b-pit-wall--pit_web-laptop) |
 | Run the car software on the Pi | [§ A](#a-car--solarrace_os-raspberry-pi), then [`deploy/README.md`](deploy/README.md) |
 | Get CAN working on the Pi | [`docs/PI_CAN_TASK.md`](docs/PI_CAN_TASK.md) |
 | Change a gear ratio, lap length, or alarm threshold | `drivetrain.py`, `track.py`, `limits.py` at the repo root — **both** subsystems read them |
@@ -45,7 +45,7 @@ giving engineers live battery, motor, temperature, and strategy data.
 | Retune the Eco / Normal / Power zones, or calibrate the throttle pedal | `efficiency.py` at the repo root — **both** subsystems read it |
 
 > **Two things that surprise everyone:**
-> 1. `Pit_Dashboard` never talks to Firebase — only `collector.py` does. The dashboard
+> 1. The pit dashboard never talks to Firebase — only `collector.py` does. The dashboard
 >    reads the local `telemetry.db` SQLite file. Start the collector first.
 > 2. Metrics that were not reported are `NULL` and render as `—`. They are **never** zero;
 >    do not coalesce a missing reading to `0` anywhere in this codebase.
@@ -76,7 +76,7 @@ Two subsystems, synchronised through one Firebase node (`live_telemetry`):
    │   collector.py  ──(RTDB REST stream)──►  telemetry.db (SQLite)    │
    │        the ONLY process that reads Firebase        │              │
    │                                                    ▼              │
-   │   Pit_Dashboard (Streamlit, reads SQLite — never Firebase)        │
+   │   Pit_Web (React + FastAPI, reads SQLite — never Firebase)        │
    │   • Live speed / SoC / battery temp / motor temp / power          │
    │   • Lap / sector tracking + velocity-profile pace guidance        │
    │   • 24h energy-strategy matrix & SoC forecast                     │
@@ -92,14 +92,16 @@ Two subsystems, synchronised through one Firebase node (`live_telemetry`):
 - Pushes a live telemetry snapshot to Firebase ~once per second.
 - Falls back to **replaying a recorded log** when no CAN hardware is present, so the dashboards stay alive for development.
 
-**Pit_Dashboard (pit wall / laptop)**
+**Pit_Dashboard + Pit_Web (pit wall / laptop)**
 - `collector.py` is the **single** Firebase client: it streams the append-only
   `telemetry_history` node (RTDB REST / Server-Sent Events) and stores every
   sample into a local **SQLite** file (`telemetry.db`), the pit's source of truth.
   It is idempotent (the RTDB push key is the primary key) and self-heals after a
   pit dropout by resuming the stream from the last stored key.
-- The Streamlit dashboard reads **only** from SQLite — it never opens its own
-  Firebase connection. History/charts/exports therefore survive page refreshes.
+- The dashboard (`Pit_Web/`: a FastAPI backend serving a prebuilt React
+  frontend) reads **only** from SQLite — it never opens its own Firebase
+  connection. History/charts/exports therefore survive page refreshes, and any
+  phone or laptop on the pit LAN can open it.
 - Computes pace delta vs. the Zolder velocity profile, lap/sector position,
   the 24h energy-strategy matrix and SoC forecast, and the Open-Meteo forecast.
 - `export.py` exports history to CSV, filtered by date/time and subsystem
@@ -160,8 +162,9 @@ overlap, so the parsers can tell the protocols apart regardless of channel:
 
 ## 📂 Repository Structure
 
-The repository root **is** the project root: `SolarRace_OS/` (car) and
-`Pit_Dashboard/` (pit wall) sit side by side, with the physics/geometry modules
+The repository root **is** the project root: `SolarRace_OS/` (car),
+`Pit_Dashboard/` (pit data + shared pit modules) and `Pit_Web/` (the pit
+dashboard) sit side by side, with the physics/geometry modules
 they *both* import directly at the root.
 
 ```text
@@ -177,7 +180,8 @@ THE RACE/                             # ← repo root
 │   #  (as parent-of-their-own-folder), so DO NOT move them into a subfolder
 │   #  — every importer breaks. See "Shared modules" below.
 │
-├── Start Pit Dashboard.bat           # Double-click launcher → Pit_Dashboard/run_pit.bat
+├── Start Pit Dashboard.bat           # Double-click launcher → Pit_Web/run_web.bat (dashboard on port 8000)
+├── Demo Dashboard.bat                # The same dashboard on a synthetic store (port 8010) — never touches telemetry.db
 ├── Build Speed Profiles.bat          # Double-click launcher → the profile builder on port 8502
 ├── Start Pit Wall.bat                # Double-click launcher → the big-screen pit wall on port 8503
 ├── requirements.txt                  # Shared/root-tool dependencies
@@ -205,10 +209,18 @@ THE RACE/                             # ← repo root
 │   └── data/
 │       └── can_dump.txt              # Recorded CAN log, replayed when no CAN hardware is present
 │
-├── Pit_Dashboard/                    # Pit-wall analytics — runs on an engineer's laptop
-│   ├── run_pit.bat                   # Real launcher: finds Python, installs deps, starts both processes
+├── Pit_Web/                          # ⭐ The pit dashboard — React frontend + FastAPI backend
+│   ├── run_web.bat                   # Real launcher: finds Python, installs deps, starts collector + uvicorn
+│   ├── api.py                        # FastAPI backend (reads SQLite ONLY, never Firebase)
+│   ├── store.py                      # The backend's own app_state helpers + driver-stint rule
+│   ├── requirements_web.txt          # Pit dashboard + collector dependencies
+│   ├── check_requirements.py         # Lets the launchers skip pip when nothing is missing
+│   ├── README.md                     # How the dashboard is built — read before changing it
+│   └── frontend/                     # React + Vite source (src/) and the COMMITTED build (dist/).
+│                                     #   Change src/ → `npm run build` → commit dist/ in the same commit
+│
+├── Pit_Dashboard/                    # Pit data + the modules the dashboard and tools share
 │   ├── collector.py                  # ⭐ The ONLY Firebase client: streams telemetry_history → SQLite
-│   ├── pit_dashboard.py              # Streamlit dashboard (reads SQLite ONLY, never Firebase)
 │   ├── db.py                         # SQLite schema + idempotent upsert + query helpers
 │   ├── constants.py                  # Pit constants; re-exports the shared root modules
 │   ├── pit_config.py                 # DB URL, paths, sqlite path, device id
@@ -216,9 +228,10 @@ THE RACE/                             # ← repo root
 │   ├── driver_message.py             # Pit → driver messaging
 │   ├── weather_service.py            # Open-Meteo Zolder forecast
 │   ├── export.py                     # CSV export (date/time + subsystem filters); also a CLI
-│   ├── ui.py                         # Shared Streamlit UI helpers
-│   ├── assets/pit_dashboard.css      # Dashboard styling
-│   ├── .streamlit/config.toml        # Streamlit server/theme settings
+│   ├── metrics.py                    # History chart catalogue (keys, labels, units, colours)
+│   ├── live_metrics.py               # Live Metrics tile catalogue
+│   ├── memo.py                       # Tiny memoiser (replaced st.cache_data in the shared modules)
+│   ├── .streamlit/config.toml        # Streamlit settings — for the profile builder only
 │   ├── 210s.xlsx                     # Baseline 210 s Zolder velocity profile
 │   ├── profile_builder.py            # Speed Profile Builder app (port 8502, reads telemetry.db READ-ONLY).
 │   │                                 #   Rows are DRIVES, not lap numbers — the counter repeats. Shows each
@@ -226,7 +239,7 @@ THE RACE/                             # ← repo root
 │   │                                 #   against the car's own total and says so when it disagrees
 │   ├── wall.html                     # GENERATED big-screen pit page — pit LAN only, NOT published
 │   ├── profile_build.py              # The maths behind it — no Streamlit, self-checks headlessly
-│   ├── requirements_pit.txt          # Pit dependencies
+│   ├── requirements_profiles.txt     # Profile builder's extras (Streamlit, Plotly) on top of requirements_web.txt
 │   ├── serviceAccountKey.json        # 🔒 Firebase admin key — SEE SECURITY NOTE BELOW
 │   └── telemetry.db                  # Local SQLite store (gitignored; created by collector.py)
 │
@@ -242,6 +255,7 @@ THE RACE/                             # ← repo root
 │   ├── replay_limits.py              # Replays telemetry.db: how often each tier would fire
 │   ├── generate_profiles.py          # Builds profiles/*.csv from Pit_Dashboard/210s.xlsx
 │   ├── hud_sim.py                    # Drives the driver HUD without a car, for UI work
+│   ├── demo_seed.py / demo_feed.py   # Build and keep live the synthetic store Demo Dashboard.bat uses
 │   ├── build_zolder_track.py         # Bakes the OSM centreline → zolder_centreline.py
 │   ├── build_zolder_animation.py     # Bakes ALL THREE pages: the presentation map, the
 │   │                                 #   spectator page and Pit_Dashboard/wall.html
@@ -282,7 +296,7 @@ from drivetrain import GEAR_RATIO, WHEEL_CIRCUMFERENCE_METERS, speed_kmh
 ```
 
 That expression means *"the folder containing my folder."* So the invariant is:
-**`Pit_Dashboard/`, `SolarRace_OS/`, and `tools/` must remain exactly one level
+**`Pit_Dashboard/`, `Pit_Web/`, `SolarRace_OS/`, and `tools/` must remain exactly one level
 below the four shared modules.** Nesting the project inside another folder, or
 moving the shared modules into a package, breaks every one of these imports.
 
@@ -439,30 +453,41 @@ candump can0                # raw view (BMS frames appear only once main.py poll
 > **Graceful degradation:** if no CAN connection opens, `main.py` automatically
 > replays `data/can_dump.txt` so the HUD and cloud sync keep working for testing.
 
-### B. Pit wall — Pit_Dashboard (laptop)
+### B. Pit wall — Pit_Web (laptop)
 
-Run from the **repo root** (`THE RACE`), just like `SolarRace_OS` — no need to
-`cd` into the folder (all pit paths resolve relative to the package):
+**One-click (Windows):** double-click **`Start Pit Dashboard.bat`** at the repo
+root. It forwards to `Pit_Web\run_web.bat`, which finds a usable Python,
+installs `Pit_Web/requirements_web.txt` when needed, opens the collector in its
+own window, and serves the dashboard with uvicorn. No Node is needed on the pit
+laptop — the built frontend (`Pit_Web/frontend/dist`) is committed to git.
+
+By hand, from the **repo root**, just like `SolarRace_OS`:
 
 ```bash
-pip install -r Pit_Dashboard/requirements_pit.txt   # streamlit, pandas, matplotlib, requests, google-auth, openpyxl
+pip install -r Pit_Web/requirements_web.txt   # fastapi, uvicorn, pandas, matplotlib, requests, google-auth, openpyxl
 
 # 1. Start the collector FIRST — it ingests Firebase into telemetry.db.
 python Pit_Dashboard/collector.py
 
 # 2. In a second terminal, start the dashboard (reads telemetry.db only).
-streamlit run Pit_Dashboard/pit_dashboard.py
+python -m uvicorn Pit_Web.api:app --host 0.0.0.0 --port 8000
 ```
 
-(You can still `cd Pit_Dashboard` and run `python collector.py` /
-`streamlit run pit_dashboard.py` if you prefer.)
-
-**One-click (Windows):** instead of the two commands above, just run
-`run_pit.bat` — it opens the collector and the dashboard in two windows for you.
 SQLite needs no install or setup: it's built into Python, and `telemetry.db` plus
 its table are created automatically on first run.
-The dashboard opens at `http://localhost:8501`. If it shows *"No data yet — is
-collector.py running?"*, start the collector. The collector backfills all history
+The dashboard opens at `http://localhost:8000`; phones and other laptops on the
+pit LAN use `http://<laptop-ip>:8000`. Tabs: Driver Telemetry, Live Metrics, Cell
+Voltages, History, Weather and Strategy. If the app bar says *"no data —
+collector?"*, start the collector. To see every feature without a car, run
+**`Demo Dashboard.bat`** instead: it uses a synthetic store and never touches
+`telemetry.db`.
+
+Changing the frontend (`Pit_Web/frontend/src`) means running
+`npm ci && npm run build` in `Pit_Web/frontend` and committing `dist` in the
+same commit — see [`Pit_Web/README.md`](Pit_Web/README.md). The speed-profile
+builder is a separate Streamlit app: `Build Speed Profiles.bat`, port 8502.
+
+The collector backfills all history
 on first run and, after any pit-side network drop, resumes from the last stored
 sample (catch-up via `orderBy="$key"&startAt`), so no samples are lost as long as
 the car keeps pushing to `telemetry_history`.
@@ -470,7 +495,7 @@ the car keeps pushing to `telemetry_history`.
 **Export.** The dashboard's Export panel produces a clean, readable **Excel
 workbook** (`.xlsx`): a formatted **Data** sheet (human-friendly columns with
 units, frozen header, filter), a **Charts** sheet of history graphs, and a
-**Faults** sheet. The systems multiselect picks which columns/charts/sheets
+**Faults** sheet. The system chips pick which columns/charts/sheets
 appear. (Internal keys, redundant timestamps, and the raw fault columns from the
 old CSV dump are gone — no more `#NAME?` in Excel.)
 

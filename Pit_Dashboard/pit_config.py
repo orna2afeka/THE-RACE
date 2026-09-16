@@ -9,7 +9,7 @@ local SQLite file, which is the pit's source of truth.
                                                           │
                                           ┌───────────────┼────────────────┐
                                           ▼               ▼                ▼
-                                   pit_dashboard.py    export.py     (anything else)
+                                   Pit_Web/api.py      export.py     (anything else)
 """
 
 import os

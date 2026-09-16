@@ -3,7 +3,7 @@
 # This exists because `pip install -r requirements.txt` from a fresh clone is
 # what everyone tries first. It just includes the real file rather than copying
 # the pins, so there is still only one place to edit them.
--r Pit_Dashboard/requirements_pit.txt
+-r Pit_Web/requirements_web.txt
 
 # The CAR's dependencies are deliberately NOT here — they only install on the
 # Raspberry Pi (python-can needs SocketCAN, PySide6 is a large GUI toolkit) and

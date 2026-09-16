@@ -43,9 +43,9 @@ from track import (                # noqa: E402  (path set up above)
 #
 # These are re-exported through this module rather than imported straight from
 # `limits` by every consumer, because THIS file is what bootstraps the repo root
-# onto sys.path (see the top). Importing `limits` directly from pit_dashboard.py
-# would work only because constants happens to be imported first -- an invisible
-# ordering dependency waiting to bite.
+# onto sys.path (see the top). Importing `limits` directly from a module in
+# this folder would work only because constants happens to be imported first --
+# an invisible ordering dependency waiting to bite.
 #
 # The six loose MOTOR_TEMP_WARN/CRIT-style scalars and temp_condition() are gone.
 # They were replaced by Threshold objects and one classify() call, because

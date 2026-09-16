@@ -16,11 +16,13 @@ opposite — pack voltage, temperatures, the gap to the strategy — and none of
 that may be published. So this is a separate page on a separate server that
 never leaves the LAN.
 
-WHY IT DOES NOT GO THROUGH STREAMLIT
-The pit dashboard runs one ScriptRunner thread per session, and every widget on
-every tab shares it. Hanging a second always-on screen off that thread is how
-the dashboard's own refresh got slow in the first place. This process has its
-own thread, its own read-only connection, and cannot make the dashboard wait.
+WHY IT IS NOT PART OF THE PIT DASHBOARD
+It was written when the pit dashboard was a Streamlit app, which ran one
+ScriptRunner thread per session shared by every widget on every tab. Hanging a
+second always-on screen off that thread is how the dashboard's own refresh got
+slow in the first place. The separation still pays with the React dashboard:
+this process has its own thread, its own read-only connection, and cannot make
+the dashboard wait.
 
 WHY ONE THREAD OWNS THE DATABASE
 Every read happens on the Feed thread and nowhere else. Request handlers copy a
@@ -58,7 +60,7 @@ for _p in (_REPO, os.path.join(_REPO, "Pit_Dashboard")):
 import db  # noqa: E402
 
 PAGE_PATH = os.path.join(_REPO, "Pit_Dashboard", "wall.html")
-DEFAULT_PORT = 8503          # 8501 is the dashboard, 8502 the profile builder
+DEFAULT_PORT = 8503          # 8000 is the dashboard, 8502 the profile builder
 
 # How often the car's current state is re-read. The page polls at 1 Hz; this is
 # a little quicker so a poll rarely waits a whole cycle for fresh numbers.

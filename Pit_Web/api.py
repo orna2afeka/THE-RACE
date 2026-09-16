@@ -10,14 +10,12 @@
 #     position, strategy — is computed here from drivetrain.py / track.py /
 #     speed_profile.py / limits.py and served as a finished value.
 #   * A missing reading is None -> JSON null. Never 0, never coalesced.
-#   * It never imports pit_dashboard.py: that would execute page-level Streamlit
-#     code (st.set_page_config, the CSS read) inside a web worker.
 #
-# It DOES import strategy_engine and weather_service, which carry @st.cache_data
-# decorators. That is deliberate and safe: neither runs page-level code, the
-# decorator degrades to an in-process memory cache outside a Streamlit runtime,
-# and the alternative is forking the strategy maths into a second implementation
-# — which is the one thing the brief forbids outright.
+# It imports strategy_engine and weather_service rather than re-implementing
+# them. Both came from the earlier Streamlit dashboard; their @st.cache_data
+# decorators are now Pit_Dashboard/memo.py, so nothing here pulls in Streamlit.
+# The alternative, forking the strategy maths into a second implementation, is
+# the one thing the brief forbids outright.
 #
 # Run from the repo root:
 #     python -m uvicorn Pit_Web.api:app --host 0.0.0.0 --port 8000
@@ -51,8 +49,8 @@ import limits                                          # noqa: E402
 import live_metrics                                    # noqa: E402
 from metrics import HISTORY_CHARTS, value_from_row     # noqa: E402
 from pit_config import SQLITE_PATH, export_local, export_zone   # noqa: E402
-# Pit_Dashboard/ is byte-identical to the race-day app, so the React migration
-# adds nothing to it; the state helpers and the stint rule live in Pit_Web.
+# The state helpers and the stint rule are the web backend's own, so they live
+# in Pit_Web/store.py rather than in the shared Pit_Dashboard/ modules.
 from .store import (                                   # noqa: E402
     save_app_state, load_app_state,
     DRIVER_STINT_LIMIT_S, DRIVER_STINT_WARN_S, DRIVER_STINT_CRIT_S,
@@ -120,7 +118,7 @@ def rw_conn() -> sqlite3.Connection:
 # a tablet and two laptops each polling the heavy tier, that compounds.
 #
 # So heavy reads are memoised for slightly less than the 10 s heavy-tier poll,
-# which is exactly what read_history_df() does in the Streamlit app with
+# which is exactly what read_history_df() did in the earlier Streamlit app with
 # @st.cache_data(ttl=8). Every viewer within the window shares one read, and the
 # TTL is under the poll interval so nobody ever waits an extra cycle to see a
 # sample that has landed.
@@ -152,7 +150,7 @@ def cached(key, build, ttl=HEAVY_CACHE_TTL_S):
 
 
 # --------------------------------------------------------------------------- #
-# Live state — the same shape read_live_state() builds for Streamlit
+# Live state — the latest sample, with carry-forward
 # --------------------------------------------------------------------------- #
 def _val(row, key, default=None):
     if row is None:
@@ -164,9 +162,8 @@ def _val(row, key, default=None):
     return default if v is None else v
 
 
-# state key -> telemetry.db column, mirroring read_live_state() in
-# pit_dashboard.py. Kept as DATA so the two stay comparable at a glance; the
-# fields with their own rules are handled explicitly below.
+# state key -> telemetry.db column. Kept as DATA so the whole mapping reads at
+# a glance; the fields with their own rules are handled explicitly below.
 _STATE_COLUMNS = {
     "soc": "bms_soc_percent", "voltage": "bms_voltage_V",
     "current": "bms_current_A", "pack_voltage": "mms_measured_voltage_V",
@@ -192,7 +189,7 @@ _STATE_COLUMNS = {
     "active_strategy": "active_strategy",
 }
 
-# Not carried forward, deliberately, matching pit_dashboard.py:
+# Not carried forward, deliberately:
 #   lap_source is only meaningful paired with the lap that just happened.
 _NO_CARRY_FORWARD = {"lap_source"}
 
@@ -200,10 +197,9 @@ _NO_CARRY_FORWARD = {"lap_source"}
 def read_live_state(conn):
     """Latest sample + freshness, as (state, age_seconds).
 
-    Mirrors pit_dashboard.read_live_state(), including its CARRY-FORWARD: a
-    field the newest row does not carry falls back to the last value this
-    device ever reported, via db.latest_known() — the same table the Streamlit
-    app reads. Without it a quiet CAN bus blanks half the tiles a second after
+    Includes CARRY-FORWARD: a field the newest row does not carry falls back
+    to the last value this device ever reported, via db.latest_known(). Without
+    it a quiet CAN bus blanks half the tiles a second after
     they were fine.
 
     `_field_ages` says how old each carried-forward value is, so the UI can say
@@ -265,10 +261,10 @@ def read_live_state(conn):
         col = "bms_cell_temp_%02d_C" % i
         state[col] = cf(col, col)
 
-    # BATTERY TEMP IS THE HOTTEST ORION CELL, a deliberate difference from
-    # pit_dashboard.py, which shows battery_temp_C: the thermistor module's
-    # own AVERAGE. The tile has always said "hottest cell in the pack", and an
-    # average hides the one cell that is running away. Same gate as the Cell
+    # BATTERY TEMP IS THE HOTTEST ORION CELL, a deliberate difference from the
+    # earlier Streamlit dashboard, which showed battery_temp_C: the thermistor
+    # module's own AVERAGE. The tile has always said "hottest cell in the
+    # pack", and an average hides the one cell that is running away. Same gate as the Cell
     # Voltages tab, so a failed thermistor's nonsense negative never counts.
     # Null when no thermistor reports: never the average as a stand-in.
     hottest = None
@@ -509,8 +505,8 @@ def car_health(state):
     every team member still running last week's image would train everyone
     to ignore it by Saturday.
 
-    Ported line for line from pit_dashboard.car_health(); tools/check_health.py
-    holds the nine cases both must agree on.
+    Ported line for line from the earlier Streamlit dashboard's car_health();
+    tools/check_health.py holds the nine cases it must get right.
     """
     if state.get("can_state") is None and state.get("gps_fix") is None:
         return True, []
@@ -555,10 +551,10 @@ def _health_json(state):
 # --------------------------------------------------------------------------- #
 # Cell Voltages tab: DS003 per-cell temperature, DS004 per-module voltage
 # --------------------------------------------------------------------------- #
-# A port of pit_dashboard.render_cell_voltages(). The rulebook asks for 26
-# live module voltages; this is the screen that claims compliance, so it
-# reports the SHORTFALL rather than quietly rendering 26 tiles of which half
-# are dashes. Classification happens here with the same Threshold the driver
+# Ported from the earlier Streamlit dashboard's Cell Voltages tab. The rulebook
+# asks for 26 live module voltages; this is the screen that claims compliance,
+# so it reports the SHORTFALL rather than quietly rendering 26 tiles of which
+# half are dashes. Classification happens here with the same Threshold the driver
 # HUD uses -- the browser never compares a cell against a limit.
 
 # The BMS units' NTC probes, (pack, prefix) as main._remap_bms_frame names them.
@@ -566,7 +562,7 @@ PROBE_PACKS = (("A", "bms"), ("B", "bms2"))
 PROBE_COLUMNS = ["%s_temp_%d_C" % (pre, n) for _pack, pre in PROBE_PACKS
                  for n in (1, 2, 3)]
 
-# DS004's requirement. Mirrors pit_dashboard.DS004_MODULE_COUNT.
+# DS004's requirement. A hand-kept constant, like db.THERMISTOR_CELL_COLUMN_COUNT.
 DS004_MODULE_COUNT = 26
 
 
@@ -704,7 +700,7 @@ def build_cells(state, age, fresh):
 def build_live(conn, manual_lap=-1):
     """The whole fast tier in one payload: tiles, sidebar, sectors, map.
 
-    One SQLite read feeds all of it, the way _live_context() does for Streamlit.
+    One SQLite read feeds all of it.
     """
     state, age = read_live_state(conn)
     race, elapsed_min, left_min = _race_clock(conn)
@@ -921,13 +917,13 @@ def api_cells():
 # --------------------------------------------------------------------------- #
 # Rule 3.5.6 — cell extremes over the last 2 hours
 # --------------------------------------------------------------------------- #
-# Same cadence as pit_dashboard.CELL_EXTREMES_CACHE_S. The report is a range
-# aggregate over ~2 h of rows, so every viewer shares one read per 30 s.
+# The report is a range aggregate over ~2 h of rows, so every viewer shares
+# one read per 30 s.
 CELL_EXTREMES_CACHE_S = 30
 
 
 def _short_duration(seconds):
-    """Mirrors pit_dashboard._short_duration."""
+    """A duration as the tiles print it: "45 min", "2 h", "2 h 05 min"."""
     minutes = int(seconds // 60)
     if minutes < 60:
         return "%d min" % minutes
@@ -950,8 +946,8 @@ _EXTREME_TILES = (
 
 
 def build_cell_extremes(report):
-    """db.cell_extremes_report, labelled and classified the way
-    pit_dashboard.render_cell_extremes() shows it. Every string with a time
+    """db.cell_extremes_report, labelled and classified for the Rule 3.5.6
+    tiles. Every string with a time
     or a threshold in it is made here, so the browser only lays it out."""
     end_ts = report.get("end_ts")
     covers, window = report["covers_s"], report["window_s"]
@@ -1756,7 +1752,7 @@ async def api_weather():
 # Inputs are rounded before planning so the memo actually hits: the strategy
 # tab polls every 10 s and the race clock moves every second, but a plan does
 # not change meaningfully inside a minute or inside 50 Wh. Same numbers the
-# Streamlit app uses.
+# earlier Streamlit app used.
 STRATEGY_TIME_ROUND_MIN = 1.0
 STRATEGY_WH_ROUND = 50.0
 
@@ -1843,8 +1839,8 @@ def _strategy_payload(time_left_min, battery_wh, active_lap, table,
         "capacityWh": strategy_engine.BATTERY_FULL_WH,
         "minStopMin": strategy_engine.MIN_STOP_DURATION_MIN,
         "maxStops": strategy_engine.MAX_STOPS,
-        # Carried across from the engine so the screen shows the same warning
-        # the Streamlit version does: the curve's shape is right, its numbers
+        # Carried across from the engine so the screen shows its warning: the
+        # curve's shape is right, its numbers
         # have never been checked against this charger or pack.
         "chargingCurveIsMeasured": strategy_engine.CHARGING_CURVE_IS_MEASURED,
         "measured": measured_note or {},
@@ -1916,11 +1912,10 @@ def api_export_history_csv(metrics: str = Query("Speed"),
             rec[m.key] = value_from_row(r, m)
         recs.append(rec)
     df = pd.DataFrame(recs, columns=["Time"] + [m.key for m in HISTORY_CHARTS])
-    # export.py is byte-identical to the race-day app, so it unpacks the
-    # ORIGINAL 4-tuple shape (`for _c, lbl, unit, _k in charts`). metrics.py
-    # carries 6-field namedtuples here, which unpack as "too many values" —
-    # invisible until somebody exports a CSV. Hand it the 4-tuples it expects
-    # rather than editing export.py and diverging it.
+    # export.history_csv_bytes unpacks the ORIGINAL 4-tuple shape
+    # (`for _c, lbl, unit, _k in charts`). metrics.py carries 6-field
+    # namedtuples here, which unpack as "too many values" — invisible until
+    # somebody exports a CSV. Hand it the 4-tuples it expects.
     as_tuples = [(m.key, m.label, m.unit, m.color) for m in chosen]
     data = export.history_csv_bytes(df, as_tuples, style=style, session=session)
     stem = "history_" + "-".join(m.label.lower().replace(" ", "")
@@ -2287,9 +2282,9 @@ def api_strategy_ack():
 
 class ClearBody(BaseModel):
     # A typed confirmation phrase, not a boolean. clear_history is irreversible
-    # and sits behind a popover-plus-confirm in Streamlit precisely so it cannot
-    # be hit mid-race; a stray POST from a phone in someone's pocket must not be
-    # able to wipe the store. The UI makes the user type this.
+    # and sat behind a popover-plus-confirm in the Streamlit dashboard precisely
+    # so it could not be hit mid-race; a stray POST from a phone in someone's
+    # pocket must not be able to wipe the store. The UI makes the user type this.
     confirm: str
 
 
@@ -2321,7 +2316,7 @@ LIVE_MIN_PUSH_S = float(os.environ.get("SOLARRACE_LIVE_MIN_PUSH", "0.25"))
 async def ws_live(ws: WebSocket):
     """Pushes the whole fast tier every FAST_TICK_S: tiles, faults, sectors, map.
 
-    2 s is the cadence the Streamlit app arrived at after the page kept
+    2 s is the cadence the earlier Streamlit app arrived at after the page kept
     stalling, and it is what the car reports at. Faster buys nothing.
 
     THE CADENCE IS THE SERVER'S, and no client can talk it out of it. This used

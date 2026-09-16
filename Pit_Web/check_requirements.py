@@ -12,14 +12,14 @@ Reads installed package METADATA only — no network, so it is fast and works on
 an offline pit LAN. And it reads the versions FROM the requirements file, so
 unlike a hardcoded module list it cannot drift out of step with it.
 
-Adapted from Pit_Dashboard/check_requirements.py in the race-day repo, with one
-addition: that version understood `name==version` pins only, and this folder's
-requirements file uses `>=` for the web packages (fastapi, uvicorn, pydantic,
-websockets). A checker that silently ignored those would report "already match"
-on an environment with no fastapi at all.
+Adapted from the checker the earlier Streamlit dashboard's launcher used, with
+one addition: that version understood `name==version` pins only, and this
+folder's requirements file uses `>=` for the web packages (fastapi, uvicorn,
+pydantic, websockets). A checker that silently ignored those would report
+"already match" on an environment with no fastapi at all.
 
 WHY THIS IS ITS OWN FILE AND NOT AN INLINE `python -c "..."` IN THE BATCH SCRIPT
-Taken verbatim from the original's hard-won lesson. It used to be a ~700
+Taken verbatim from that earlier checker's hard-won lesson. It used to be a ~700
 character semicolon-chained one-liner inside the batch file's double quotes. It
 worked for months, then began throwing "SyntaxError: unterminated string
 literal" — not from any Python change, but because CMD.EXE mangled the string

@@ -1,11 +1,12 @@
 # memo.py — the small piece of st.cache_data this folder still needed.
 #
-# This clone runs the React/FastAPI dashboard only; the Streamlit app lives in
-# ../THE RACE. Two modules the web backend imports (strategy_engine,
-# weather_service) used @st.cache_data purely as a memoiser, which meant
-# installing Streamlit into a web worker for a decorator — and, outside a
-# Streamlit runtime, logging "No runtime found, using MemoryCacheStorageManager"
-# on every single call.
+# The pit dashboard is now the React/FastAPI app in Pit_Web/, and nothing it
+# imports uses Streamlit. Two of those modules (strategy_engine,
+# weather_service) came from the earlier Streamlit dashboard, where they used
+# @st.cache_data purely as a memoiser. Keeping that would have meant installing
+# Streamlit into a web worker for a decorator — and, outside a Streamlit
+# runtime, logging "No runtime found, using MemoryCacheStorageManager" on every
+# single call.
 #
 # This is that decorator, with the two behaviours those callers actually rely on:
 #

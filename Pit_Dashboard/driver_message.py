@@ -28,10 +28,11 @@ _TIMEOUT = 5  # seconds
 
 # ACK READS get a much tighter one, because they are a different kind of call.
 # An ack is advisory — it upgrades "sent" to "applied" — so a slow one is worth
-# nothing. And critically it happens on the SCRIPT-RUN THREAD, which Streamlit
-# also uses to redraw every live tile on the wall: fragments are not concurrent,
-# they queue. A five-second ack read therefore does not stall the Strategy tab,
-# it stalls the speed, the SoC and the fault banner along with it.
+# nothing. In the earlier Streamlit dashboard it ran on the SCRIPT-RUN THREAD
+# that also redrew every live tile, so a five-second ack read stalled the speed,
+# the SoC and the fault banner along with the Strategy tab. The web backend
+# serves acks from its threadpool instead, but every open device polls them, and
+# a hung read still ties up a worker for the whole timeout for no gain.
 _ACK_TIMEOUT = 2  # seconds
 
 # Cache the credentials object; it refreshes its own token in place.

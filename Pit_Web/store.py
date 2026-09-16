@@ -1,17 +1,18 @@
 # Pit_Web/store.py — small persistent state the WEB dashboard owns.
 #
-# WHY THIS IS NOT IN db.py. Pit_Dashboard/ is kept byte-identical to the
-# race-day app in ../THE RACE, so the React migration adds nothing to it. These
-# two helpers used to live in db.py; they moved here so that stays true.
+# WHY THIS IS NOT IN db.py. This is the web backend's own state layer: only
+# Pit_Web reads or writes what is here, so it lives beside api.py rather than in
+# the Pit_Dashboard/ modules the collector and the tools share. These two
+# helpers used to live in db.py.
 #
 # They touch app_state ONLY — the tiny key/value table beside the race clock,
 # never the telemetry table. The "no new SQL outside db.py" rule exists so the
-# two dashboards cannot grow divergent readings of the CAR's data; a key/value
-# row that only the web UI writes is not that. The telemetry path still goes
-# through db.py's helpers exclusively.
+# programs reading telemetry.db cannot grow divergent readings of the CAR's
+# data; a key/value row that only the web UI writes is not that. The telemetry
+# path still goes through db.py's helpers exclusively.
 #
-# Also home to the driver-stint rule, which was in pit_config.py for the same
-# reason and moved for the same reason.
+# Also home to the driver-stint rule, which was in pit_config.py and moved here
+# for the same reason.
 
 import json
 import sqlite3

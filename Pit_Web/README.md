@@ -1,19 +1,32 @@
 # Pit_Web — React + FastAPI pit dashboard
 
-The rewrite described in `docs/REACT_MIGRATION_PLAN.md`. All six surfaces are
-built: top strip, sidebar, Driver Telemetry, Live Metrics, History, Weather and
-Strategy, plus the Excel/CSV exports.
+**This is the pit dashboard.** It replaced the earlier Streamlit app
+(`Pit_Dashboard/pit_dashboard.py`, now deleted), following the plan in
+`docs/REACT_MIGRATION_PLAN.md`. It has the same tabs — Driver Telemetry, Live
+Metrics, Cell Voltages, History, Weather and Strategy — plus the top strip, the
+sidebar and the Excel/CSV exports.
 
-**The Streamlit dashboard in `Pit_Dashboard/` is untouched and remains the
-race-day fallback.** It is not being retired. Two dashboards, one known-good.
-They can run at the same time — Streamlit on 8501, this on 8000.
+It still reads the same store through the same shared modules in
+`Pit_Dashboard/` (`db.py`, `strategy_engine.py`, `export.py`, ...), and
+`collector.py` is still the only thing that talks to Firebase. The metric
+catalogues are `Pit_Dashboard/metrics.py` (History charts) and
+`Pit_Dashboard/live_metrics.py` (Live Metrics tiles).
+
+Streamlit survives in the repo only for the speed-profile builder
+(`Build Speed Profiles.bat`, port 8502), which is a separate app.
 
 ## Run it
 
-Double-click `Start React Dashboard.bat` in the repo root. It finds a Python,
-installs the backend deps, starts `collector.py` in its own window, starts
-uvicorn on `0.0.0.0:8000`, waits for the port and opens a browser. It prints the
-LAN URL so a phone can be pointed at it.
+Double-click `Start Pit Dashboard.bat` in the repo root; it forwards to
+`Pit_Web\run_web.bat`. That finds a Python, installs
+`requirements_web.txt` when the environment does not already match (stamped in
+`Pit_Web\.deps_stamp`), starts `collector.py` in its own window, starts uvicorn
+on `0.0.0.0:8000`, waits for the port and opens a browser. It prints the LAN URL
+so a phone can be pointed at it (`http://<laptop-ip>:8000`).
+
+`Demo Dashboard.bat` runs the same dashboard against a synthetic store
+(`tools/demo_seed.py` + `tools/demo_feed.py`) on port 8010. It never touches
+`telemetry.db` and does not start the collector.
 
 By hand:
 
@@ -22,13 +35,21 @@ pip install -r Pit_Web/requirements_web.txt
 python -m uvicorn Pit_Web.api:app --host 0.0.0.0 --port 8000
 ```
 
-**Production needs Python only.** FastAPI static-serves `frontend/dist`, so the
-pit machine has no Node, no `npm install` and no dev server. Rebuild the bundle
-on any machine that has Node and copy `dist` across:
+**Production needs Python only.** FastAPI static-serves `frontend/dist`, which
+is committed to git, so the pit machine has no Node, no `npm install` and no dev
+server.
+
+## Changing the frontend
+
+The pit laptop runs whatever `frontend/dist` is in git, not `frontend/src`. So
+any change under `src` has to be rebuilt and committed together with it:
 
 ```bash
-cd Pit_Web/frontend && npm install && npm run build
+cd Pit_Web/frontend && npm ci && npm run build
 ```
+
+Commit `dist` in the **same commit** as the `src` change. A `src` change without
+its `dist` does nothing on the pit laptop.
 
 For frontend work, `npm run dev` gives hot reload on 5173 and proxies `/api` and
 `/ws` to uvicorn. Use **`localhost:5173`**, not `127.0.0.1:5173` — Vite binds
@@ -54,8 +75,8 @@ thing.
 
 ## How it is put together
 
-**Cadences.** Two tiers, as the Streamlit app arrived at after the page kept
-stalling. `WS /ws/live` pushes the whole fast tier every 2 s (tiles, fault
+**Cadences.** Two tiers, the split the earlier Streamlit app arrived at after
+the page kept stalling. `WS /ws/live` pushes the whole fast tier every 2 s (tiles, fault
 banner, sector card, map position). `WS /ws/history` sends an **incremental
 append** every 10 s — never the whole series. That is the entire performance
 argument for the rewrite.
@@ -63,8 +84,8 @@ argument for the rewrite.
 **Zoom survives appends.** `newPlot` runs once per (metric set, window); every
 sample after that goes in via `extendTraces`. The chart div is a ref, never
 React state, so React cannot re-render it, and the History tab stays mounted
-when you switch tabs. The Streamlit freeze machinery is replaced by a plain
-Pause toggle, which is all it was ever standing in for.
+when you switch tabs. The earlier Streamlit app's freeze machinery became a
+plain Pause toggle, which is all it was ever standing in for.
 
 **History traces are SVG `scatter`, not `scattergl`.** WebGL traces silently
 ignore `rangebreaks`; the axis then fails to autorange and the chart draws empty
@@ -123,7 +144,7 @@ Rules the components follow:
 - **End-labels on the History chart** as a secondary identity channel. The
   validator flags Motor Temp `#ff5e5e` vs Controller Temp `#e74c3c` at ΔE 6.6 —
   hard to tell apart even with full colour vision, and both are °C so they share
-  an axis. The hexes are shared with Streamlit and the workbook, so they stay;
+  an axis. The hexes come from `metrics.py` and are shared with the workbook, so they stay;
   the label at each line's last point means identity never rests on that pair.
 
 ## Offline
@@ -149,7 +170,7 @@ The `.bat` starts `collector.py` in its own window rather than having FastAPI
 supervise it as a subprocess. Supervision couples the two lifetimes: restarting
 the API to pick up a change would kill the collector mid-race, and an API crash
 would orphan it. Separate windows let either be restarted alone, and match what
-`run_pit.bat` already does. A dead collector cannot masquerade as a live
+the earlier Streamlit launcher did. A dead collector cannot masquerade as a live
 dashboard, because the sidebar shows the age of the newest sample and turns
 amber past `DATA_STALE_AFTER_S`.
 
@@ -176,7 +197,7 @@ amber past `DATA_STALE_AFTER_S`.
   countdown sits in the app bar beside the race clock and the sidebar carries
   the reset. Amber at 15 min left, red at 5 min, and once it passes zero it
   counts UP with a full-width banner and the tab title saying OVERDUE. The
-  limit and both thresholds are `DRIVER_STINT_*` in `pit_config.py`.
+  limit and both thresholds are `DRIVER_STINT_*` in `Pit_Web/store.py`.
 
   State lives in SQLite beside the race clock, so every laptop, tablet and
   phone shows the same number and a refresh changes nothing. The server stamps
@@ -220,5 +241,6 @@ amber past `DATA_STALE_AFTER_S`.
   `mms_measured_voltage_V` is `16A085` in the workbook but the screen plots that
   same controller voltage in `2ECC71` (which the workbook gives to the BMS
   voltage); and `58D68D` is shared by "Total Energy" and "Power Map (raw)".
-- The value-filter control from the Streamlit History tab is not ported. The
-  chart is directly zoomable now, which covers most of what it was for.
+- The value-filter control the earlier Streamlit History tab had was not
+  carried over. The chart is directly zoomable now, which covers most of what
+  it was for.

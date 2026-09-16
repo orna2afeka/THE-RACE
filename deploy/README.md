@@ -241,8 +241,11 @@ double-click "Start Pit Dashboard.bat"
 ```
 
 The launcher finds a usable Python, installs dependencies on first run, starts
-the collector and the dashboard, and opens the browser. First run needs
-internet (~300 MB of wheels) — do it in the workshop, not the paddock.
+the collector and the dashboard, and opens the browser at
+http://localhost:8000 (other devices on the pit LAN use
+http://<laptop-ip>:8000). No Node is needed: the built frontend is committed.
+First run needs internet (~300 MB of wheels) — do it in the workshop, not the
+paddock.
 
 **Python 3.9–3.12 only.** The pinned numpy/pandas/matplotlib publish no wheels
 for 3.13+, so pip would try to compile numpy from source and fail. The launcher

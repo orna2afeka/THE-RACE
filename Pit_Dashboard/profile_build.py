@@ -466,7 +466,7 @@ def clean_samples(samples):
     Drops rows with no speed, then keeps only STRICTLY increasing distance. A
     stationary car repeats the same distance, and the last of a repeated run is
     the sample motion resumed from, which is the same straddle rule
-    _crossing_time uses in pit_dashboard.
+    _crossing_time uses in Pit_Web/api.py.
     """
     d_raw, v_raw = [], []
     no_speed = 0
@@ -566,8 +566,9 @@ def smooth(v_kmh, window_points=DEFAULT_SMOOTH_POINTS):
     of road, and edge padding would flatten the fastest part of the lap at
     exactly the point look_ahead() most needs to be right.
 
-    numpy only. pandas' rolling(win_type=...) pulls in scipy, which is not in
-    requirements_pit.txt and would ImportError on the pit laptop.
+    numpy only. pandas' rolling(win_type=...) pulls in scipy, which is in
+    neither Pit_Web/requirements_web.txt nor requirements_profiles.txt and
+    would ImportError on the pit laptop.
     """
     w = int(window_points)
     if w <= 1:

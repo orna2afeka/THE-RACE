@@ -2,15 +2,16 @@
 REM ===========================================================================
 REM  run_web.bat - starts the React + FastAPI pit dashboard.
 REM
-REM  Mirrors Pit_Dashboard\run_pit.bat in the race repo deliberately: same
-REM  Python discovery, same dependency stamp, same "each part in its own
-REM  window" model. The crew already knows how that one behaves.
+REM  Started by "Start Pit Dashboard.bat" at the repo root. It keeps the shape
+REM  of the earlier Streamlit dashboard's launcher: same Python discovery, same
+REM  dependency stamp, same "each part in its own window" model, so the crew
+REM  already knows how it behaves.
 REM
 REM  PRODUCTION NEEDS PYTHON ONLY. FastAPI static-serves Pit_Web\frontend\dist,
 REM  so there is no Node, no npm install and no dev server at the track.
 REM
-REM  STREAMLIT IS NOT INSTALLED AND NOT NEEDED. The Streamlit pit wall lives in
-REM  ..\THE RACE and is launched from there.
+REM  STREAMLIT IS NOT NEEDED. Only the speed-profile builder still uses it, and
+REM  "Build Speed Profiles.bat" installs it on top of this environment itself.
 REM
 REM  COLLECTOR SUPERVISION - decided, not an oversight: collector.py runs in ITS
 REM  OWN WINDOW rather than as a child of the API. Supervision would couple the
@@ -173,14 +174,11 @@ start "" http://localhost:%PORT%
 echo.
 echo   ============================================================
 echo    Dashboard : http://localhost:%PORT%
-REM The LAN URL, printed the way Streamlit does, so a phone can be pointed at it
+REM The LAN URL, so a phone can be pointed at it
 REM without anyone hunting through ipconfig.
 for /f "tokens=2 delims=:" %%A in ('ipconfig ^| findstr /c:"IPv4"') do (
     for /f "tokens=1" %%B in ("%%A") do echo    Network   : http://%%B:%PORT%
 )
-echo.
-echo    Streamlit lives in ..\THE RACE and is started from there. Both can run
-echo    at once - this is on %PORT%, Streamlit on 8501.
 echo.
 echo    Each part runs in its own window - close one to stop it.
 echo.

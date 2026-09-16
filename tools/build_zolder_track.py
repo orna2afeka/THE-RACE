@@ -8,11 +8,11 @@ zolder_centreline.py at the repo root for track_map.py to import.
     python tools/build_zolder_track.py --verify   # fetch + write + full report
 
 WHY THIS IS A BUILD STEP AND NOT A RUNTIME FETCH
-The pit dashboard draws the circuit map inside a fragment that reruns every two
-seconds, on a pit LAN that is deliberately isolated (see the enableCORS /
-enableXsrfProtection note in .streamlit/config.toml). A network call on that path
-is the worst possible place for one. The circuit has not moved since 1963; fetch
-it once, commit the result, and the race-day dashboard needs no network at all.
+The earlier Streamlit pit dashboard drew the circuit map inside a fragment that
+reran every two seconds, on a pit LAN that is deliberately isolated. A network
+call on that path is the worst possible place for one. The circuit has not
+moved since 1963; fetch it once, commit the result, and the race-day dashboard
+needs no network at all.
 
 WHY OSM AND NOT A HAND-DRAWN OUTLINE
 The repo has no track geometry of any kind — only the finish line coordinates and
