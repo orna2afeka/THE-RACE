@@ -12,6 +12,7 @@
 // delta nobody could explain.
 
 import { useState } from 'react';
+import { DateTimeField } from './components';
 import { Icon } from './icons';
 import { hms, localInput, postJSON } from './lib';
 import { toast } from './toast';
@@ -81,9 +82,8 @@ export function StartTimePanel({ race, stint, onDone }: {
   return (
     <div className="starttime">
       <label className="fld" style={{ marginTop: 0 }}>The race actually started at</label>
-      <input type="datetime-local" value={value} autoFocus
-             onChange={(e) => setValue(e.target.value)}
-             onKeyDown={(e) => e.key === 'Enter' && !blocked && submit()} />
+      <DateTimeField label="Start time" value={value} autoFocus onChange={setValue}
+                     onKeyDown={(e) => e.key === 'Enter' && !blocked && submit()} />
 
       {/* The preview is the safety feature: commit only what you can see. */}
       {!valid ? (

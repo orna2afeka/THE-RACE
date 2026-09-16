@@ -4,7 +4,7 @@
 import { useState, type ReactNode } from 'react';
 import { Icon } from './icons';
 import { MISSING, fmt, getJSON, localInput, postJSON, usePoll } from './lib';
-import { Disclosure, Pill } from './components';
+import { DateTimeField, Disclosure, Pill } from './components';
 import { StintPanel } from './DriverStint';
 import { StartTimePanel } from './StartTime';
 import { toast } from './toast';
@@ -255,9 +255,11 @@ function ExportPanel({ config }: { config: Config }) {
         ))}
       </div>
       <label className="fld">From</label>
-      <input type="datetime-local" value={a} disabled={busy} onChange={(e) => setFrom(e.target.value)} />
+      <DateTimeField label="From" value={a} min={localInput(lo)} max={localInput(hi ?? lo)}
+                     disabled={busy} onChange={setFrom} />
       <label className="fld">To</label>
-      <input type="datetime-local" value={b} disabled={busy} onChange={(e) => setTo(e.target.value)} />
+      <DateTimeField label="To" value={b} min={localInput(lo)} max={localInput(hi ?? lo)}
+                     disabled={busy} onChange={setTo} />
       <button className="btn primary block" style={{ marginTop: 10 }}
               disabled={busy || !groups.length} onClick={download}>
         {busy

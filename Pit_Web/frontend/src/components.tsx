@@ -1,6 +1,6 @@
 // Shared presentation pieces.
 
-import type { ReactNode } from 'react';
+import { useRef, type KeyboardEvent, type ReactNode } from 'react';
 import { Icon } from './icons';
 import { MISSING, fmt, lapTime } from './lib';
 import { Sparkline } from './Sparkline';
@@ -180,5 +180,30 @@ export function Disclosure({ icon, title, count, open, children }: {
       </summary>
       <div className="disc-body">{children}</div>
     </details>
+  );
+}
+
+/** A datetime-local input with a calendar button that opens the browser's own
+ *  date/time picker. The native indicator is a faint glyph that is easy to miss
+ *  on the dark theme, so the button makes it obvious, and clicking anywhere in
+ *  the field opens it too. Typing still works where showPicker is missing. */
+export function DateTimeField({ label, value, min, max, disabled, autoFocus, onChange, onKeyDown }: {
+  label: string; value: string; min?: string; max?: string; disabled?: boolean; autoFocus?: boolean;
+  onChange: (v: string) => void; onKeyDown?: (e: KeyboardEvent<HTMLInputElement>) => void;
+}) {
+  const ref = useRef<HTMLInputElement>(null);
+  const open = () => {
+    try { ref.current?.showPicker(); } catch { ref.current?.focus(); }
+  };
+  return (
+    <div className="dtfield">
+      <input ref={ref} type="datetime-local" value={value} min={min} max={max}
+             disabled={disabled} autoFocus={autoFocus} aria-label={label}
+             onClick={open} onKeyDown={onKeyDown} onChange={(e) => onChange(e.target.value)} />
+      <button type="button" className="btn dtbtn" disabled={disabled} onClick={open}
+              title={`Pick ${label.toLowerCase()} date`} aria-label={`Open calendar for ${label}`}>
+        <Icon name="calendar" size={14} />
+      </button>
+    </div>
   );
 }
