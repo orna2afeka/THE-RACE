@@ -11,7 +11,7 @@ import type { CellExtremesResp, CellTileData, CellsResp, Config, Live, StrategyR
 
 /* ------------------------------- Live Metrics ---------------------------- */
 const GROUP_ICON: Record<string, string> = {
-  'Motion': 'gauge', 'Motor': 'zap', 'Controller': 'sliders',
+  'Motion': 'gauge', 'Motor': 'zap',
   'Battery': 'battery', 'Energy': 'bolt', 'Lap & Distance': 'flag',
 };
 
@@ -43,26 +43,70 @@ export function LiveMetrics({ live, config }: { live: Live; config: Config }) {
 /* --------------------------------- Weather ------------------------------- */
 interface WeatherResp {
   available: boolean;
-  rows: { t: string; temp: number; cloud: number; radiation: number }[];
+  rows: {
+    t: string; temp: number | null; cloud: number | null; radiation: number | null;
+    rain: number | null; rainChance: number | null;
+  }[];
 }
+
+const RAIN_BLUE = '#3498db';
 
 export function Weather({ dark }: { dark: boolean }) {
   const { data } = usePoll(() => getJSON<WeatherResp>('/api/weather'), 600000);
-  const ref = useRef<HTMLDivElement | null>(null);
-  useResizePlot(ref);
+  const sunRef = useRef<HTMLDivElement | null>(null);
+  const rainRef = useRef<HTMLDivElement | null>(null);
+  useResizePlot(sunRef);
+  useResizePlot(rainRef);
+
+  // Drag pans by default, as on History and Strategy. One setting for both charts.
+  const [dragmode, setDragmode] = useStored<'pan' | 'zoom'>('pit.weatherDrag', 'pan',
+    (v) => v === 'pan' || v === 'zoom');
+  const dragRef = useRef(dragmode);
+  dragRef.current = dragmode;
+  useEffect(() => {
+    for (const el of [sunRef.current, rainRef.current]) {
+      const g = el as unknown as { data?: unknown[] } | null;
+      if (el && g?.data) void Plotly.relayout(el, { dragmode });
+    }
+  }, [dragmode]);
 
   useEffect(() => {
-    if (!data?.available || !ref.current) return;
+    if (!data?.available || !sunRef.current || !rainRef.current) return;
     const base = layoutBase(dark, 300);
     const t = theme(dark);
-    void Plotly.newPlot(ref.current, [{
+    const x = data.rows.map((r) => r.t);
+    const axisTitle = (text: string) => ({ text, font: { size: 11, color: t.ink3 } });
+
+    void Plotly.newPlot(sunRef.current, [{
       type: 'scatter', mode: 'lines', fill: 'tozeroy',
-      x: data.rows.map((r) => r.t), y: data.rows.map((r) => r.radiation),
+      x, y: data.rows.map((r) => r.radiation),
       line: { color: '#f1c40f', width: 2 }, fillcolor: 'rgba(241,196,15,0.10)',
       hovertemplate: '%{y:.0f} W/m²<extra></extra>',
     }], {
       ...base, margin: { l: 56, r: 16, t: 10, b: 40 }, showlegend: false,
-      yaxis: { ...base.yaxis, title: { text: 'W/m²', font: { size: 11, color: t.ink3 } }, rangemode: 'tozero' },
+      yaxis: { ...base.yaxis, title: axisTitle('W/m²'), rangemode: 'tozero' },
+      dragmode: dragRef.current,
+    }, plotConfig);
+
+    // Amount as bars on the left axis, chance as a line on a fixed 0-100 right axis.
+    // A missing hour stays null: a gap in the chart, never a zero.
+    void Plotly.newPlot(rainRef.current, [{
+      type: 'bar', name: 'Rain', x, y: data.rows.map((r) => r.rain),
+      marker: { color: RAIN_BLUE, opacity: 0.8 },
+      hovertemplate: '%{y:.1f} mm<extra></extra>',
+    }, {
+      type: 'scatter', mode: 'lines', name: 'Chance', x, y: data.rows.map((r) => r.rainChance), yaxis: 'y2',
+      line: { color: t.ink3, width: 2, dash: 'dot' },
+      hovertemplate: '%{y:.0f} %<extra></extra>',
+    }], {
+      ...base, margin: { l: 56, r: 48, t: 10, b: 40 },
+      showlegend: true, legend: { orientation: 'h', x: 0, y: 1.02, yanchor: 'bottom', font: { color: t.ink3 } },
+      // Never auto-scale a dry day up to fill the chart: 1 mm/h stays the minimum top.
+      yaxis: { ...base.yaxis, title: axisTitle('mm'), rangemode: 'tozero',
+               range: [0, Math.max(1, ...data.rows.map((r) => r.rain ?? 0)) * 1.1] },
+      yaxis2: { overlaying: 'y', side: 'right', range: [0, 100], showgrid: false, zeroline: false,
+                title: axisTitle('%'), tickfont: { color: t.ink3 } },
+      dragmode: dragRef.current,
     }, plotConfig);
   }, [data, dark]);
 
@@ -72,21 +116,52 @@ export function Weather({ dark }: { dark: boolean }) {
       Weather API unavailable — this is the one panel that needs the internet, and the pit LAN is usually offline by design.
     </Pill>;
   }
+  const dragChips = (
+    <div className="toolbar">
+      <div className="chips">
+        <span className="lbl">Drag</span>
+        <button className="chip" aria-pressed={dragmode === 'pan'} onClick={() => setDragmode('pan')}>Pan</button>
+        <button className="chip" aria-pressed={dragmode === 'zoom'} onClick={() => setDragmode('zoom')}>Zoom</button>
+      </div>
+    </div>
+  );
+  const time = (t: string) => t.replace('T', ' ').slice(5, 16);
   return (
     <>
       <SectionTitle icon="sun" title="Solar irradiance forecast" right="next 24 h · Open-Meteo · cached 1 h" />
+      {dragChips}
       <div className="split">
-        <div className="chart"><div ref={ref} /></div>
+        <div className="chart"><div ref={sunRef} /></div>
         <div className="scroll" style={{ maxHeight: 320 }}>
           <table className="tbl">
             <thead><tr><th>Time</th><th className="num">Cloud %</th><th className="num">°C</th><th className="num">W/m²</th></tr></thead>
             <tbody>
               {data.rows.map((r) => (
                 <tr key={r.t}>
-                  <td className="mono">{r.t.replace('T', ' ').slice(5, 16)}</td>
-                  <td className="num">{r.cloud}</td>
-                  <td className="num">{r.temp}</td>
-                  <td className="num">{r.radiation}</td>
+                  <td className="mono">{time(r.t)}</td>
+                  <td className="num">{fmt(r.cloud)}</td>
+                  <td className="num">{fmt(r.temp, '.1f')}</td>
+                  <td className="num">{fmt(r.radiation)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <SectionTitle icon="cloud" title="Rain forecast" right="next 24 h · Open-Meteo · cached 1 h" />
+      {dragChips}
+      <div className="split">
+        <div className="chart"><div ref={rainRef} /></div>
+        <div className="scroll" style={{ maxHeight: 320 }}>
+          <table className="tbl">
+            <thead><tr><th>Time</th><th className="num">Chance %</th><th className="num">mm</th></tr></thead>
+            <tbody>
+              {data.rows.map((r) => (
+                <tr key={r.t}>
+                  <td className="mono">{time(r.t)}</td>
+                  <td className="num">{fmt(r.rainChance)}</td>
+                  <td className="num">{fmt(r.rain, '.1f')}</td>
                 </tr>
               ))}
             </tbody>
@@ -466,7 +541,7 @@ export function TripReset() {
         <span className="caption" style={{ margin: 0 }}>
           {sent
             ? (ack?.ack?.applied ? `Car confirmed — trip reset · sent ${sent}` : `Sent ${sent} — awaiting the car's confirmation.`)
-            : "Zeroes the car's own tracked Trip / Odometer total. Does not touch lap count or energy."}
+            : "Zeroes the car's Trip distance. Does not touch the controller's odometer, lap count or energy."}
         </span>
       </div>
     </div>

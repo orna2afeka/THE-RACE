@@ -78,7 +78,6 @@ export interface LiveTile {
   spec: string;
   note: string | null;
   text: boolean;
-  lapTime: boolean;
   value: Num | string;
   tier: Tier;
 }

@@ -63,7 +63,9 @@ import track                                                  # noqa: E402
 import track_map                                              # noqa: E402
 from zolder_centreline import (BUILT_UTC, OSM_ATTRIBUTION,    # noqa: E402
                                OSM_RELATION_ID, OSM_TIMESTAMP)
-from strategy_engine import SECTIONS_INFO, TRACK_LANDMARKS    # noqa: E402
+from strategy_engine import (DOC_TO_TRACK_OFFSET_M,           # noqa: E402
+                             SECTIONS_INFO, TRACK_LANDMARKS,
+                             TURN_START_TRACK_M)
 from constants import SECTION_NAMES                           # noqa: E402
 
 # BOTH generated pages live in docs/, and neither is application code.
@@ -86,8 +88,28 @@ WALL_PATH = os.path.join(_REPO, "Pit_Dashboard", "wall.html")
 PROFILES_DIR = os.path.join(_REPO, "profiles")
 PROFILE_PATH = os.path.join(_REPO, "profiles", "base_210s.csv")
 
-BOUNDARIES = [SECTIONS_INFO[s]["range"][0] for s in sorted(SECTIONS_INFO)]
 SECTOR_IDS = sorted(SECTIONS_INFO)
+
+
+def track_m(doc_m):
+    """A sector-document distance, as metres from the track.py finish line."""
+    return (float(doc_m) - DOC_TO_TRACK_OFFSET_M) % track.TRACK_LENGTH_METERS
+
+
+# Where each sector starts ON THE MAP, in sector order. Shifted by the document
+# offset, so S1 no longer starts on the finish line and wraps across it.
+BOUNDARIES = [track_m(SECTIONS_INFO[s]["range"][0]) for s in SECTOR_IDS]
+
+
+def landmark_track_m(lm):
+    """Where a landmark is drawn: its turn's measured start, else its document
+    distance shifted into the car's frame. None for the finish line, which has
+    its own gate."""
+    if float(lm["dist_m"]) % track.TRACK_LENGTH_METERS == 0.0:
+        return None
+    if lm.get("turn") is not None:
+        return float(TURN_START_TRACK_M[lm["turn"]])
+    return track_m(lm["dist_m"])
 
 # ── The palette ───────────────────────────────────────────────────────────── #
 # Nine distinct hues, one per sector, deliberately NOT the pit dashboard's
@@ -111,32 +133,21 @@ CAR_COLOR = "#00e5ff"
 # metres wide, and a 26 m label is about two car lengths tall. Picking these in
 # ground units instead of pixels is what keeps them in proportion when the page
 # is shown on a phone and on a projector.
-# The drawing is fitted to its own CONTENT, not to the tarmac: the callouts
-# stick out much further than the track does, and a fixed margin big enough for
-# the longest of them ("Chicane (Turns 5,6)", which runs 260 m wide at this
-# scale) wastes that much space on all four sides. So the bounds below are
-# measured from the labels themselves and this is only the breathing room added
-# once they are all accounted for.
+# The drawing is fitted to the tarmac plus the labels and turn badges around
+# it; this is the breathing room added once they are all accounted for.
 PAD_M = 40.0
-# Rough advance width of one character as a fraction of font size, for working
-# out how far a callout actually reaches. It only has to be close: a little
-# generous costs a few metres of margin, a little tight clips a label.
-CHAR_W = 0.56
 TRACK_CASING_M = 17.0
 TRACK_CORE_M = 11.0
 GATE_HALF_M = 17.0
 FINISH_HALF_M = 24.0
 SECTOR_LABEL_OFFSET_M = 46.0
-LANDMARK_LEADER_M = 78.0
 CAR_RADIUS_M = 13.0
 TRAIL_M = 170.0       # how much track the car's tail covers
-# In metres, like everything else here, and known to PYTHON rather than only to
-# the stylesheet because the viewBox is fitted around the text: the bounds
-# maths cannot ask the browser how wide a word came out.
-LANDMARK_FONT_M = 25.0
-LANDMARK_SPEED_FONT_M = 21.0
 SECTOR_FONT_M = 30.0
-LABEL_PAD_M = 12.0
+# Numbered turn badges, one per ETCR turn, like the circles on the ETCR map.
+TURN_BADGE_R_M = 15.0
+TURN_BADGE_FONT_M = 17.0
+TURN_BADGE_OFFSETS_M = (34.0, 62.0, 90.0)   # tried nearest first
 
 
 def _svg_xy(x, y, ox, oy):
@@ -147,7 +158,7 @@ def _svg_xy(x, y, ox, oy):
 def _clearance(px, py):
     """How far a point is from the nearest bit of tarmac, in metres.
 
-    Used to decide which side of the track a turn callout goes on. The obvious
+    Used to decide which side of the track a turn badge goes on. The obvious
     rule — push it away from the middle of the circuit — is wrong at Zolder,
     because the lap doubles back on itself twice: at Turn 7 and at the final
     chicane the "outside" of the local corner is the INSIDE of the circuit as a
@@ -230,7 +241,7 @@ def build_data():
     centre_local = _centroid(track_map.CENTRELINE_XY)
 
     # -- pass 1: everything in local metres, and how far it all reaches ------ #
-    # Bounds start as the tarmac and grow to contain each callout, so the
+    # Bounds start as the tarmac and grow to contain each label, so the
     # finished viewBox is exactly the drawing and no more.
     x0, x1, y0, y1 = track_map.BOUNDS_XY
     lo_x, hi_x, lo_y, hi_y = x0, x1, y0, y1
@@ -240,55 +251,13 @@ def build_data():
         lo_x, hi_x = min(lo_x, px), max(hi_x, px)
         lo_y, hi_y = min(lo_y, py), max(hi_y, py)
 
-    landmarks_local = []
-    for lm in TRACK_LANDMARKS:
-        dist = float(lm["dist_m"]) % track.TRACK_LENGTH_METERS
-        if dist == 0.0:
-            continue          # the finish line already has its own white gate
-        px, py = track_map.position_at_distance(dist)
-        tx, ty = track_map.tangent_at(dist)
-        nx, ny = -ty, tx
-
-        # Which side: whichever end has more room around it. Near-ties (a
-        # straight, with equal space both ways) fall back to pointing away from
-        # the middle of the circuit, which keeps the callouts fanned outwards.
-        cands = []
-        for sign in (1.0, -1.0):
-            ex = px + LANDMARK_LEADER_M * sign * nx
-            ey = py + LANDMARK_LEADER_M * sign * ny
-            cands.append((_clearance(ex, ey), sign, ex, ey))
-        cands.sort(reverse=True)
-        if abs(cands[0][0] - cands[1][0]) < 15.0:
-            outward = ((px - centre_local[0]) * nx + (py - centre_local[1]) * ny)
-            sign = 1.0 if outward >= 0 else -1.0
-            ex = px + LANDMARK_LEADER_M * sign * nx
-            ey = py + LANDMARK_LEADER_M * sign * ny
-        else:
-            _, sign, ex, ey = cands[0]
-
-        speed = lm.get("max_speed")
-        text = str(lm["name"])
-        # How far the text itself reaches past the end of its leader line, so
-        # the bounds below account for the words and not just the line.
-        speed_reach = (len("%s km/h" % speed) * LANDMARK_SPEED_FONT_M * CHAR_W
-                       if speed is not None else 0.0)
-        reach = max(len(text) * LANDMARK_FONT_M * CHAR_W, speed_reach)
-        landmarks_local.append({
-            "name": text, "speed": speed, "dist": dist,
-            "px": px, "py": py, "ex": ex, "ey": ey,
-            "right": ex > px + 1.0, "left": ex < px - 1.0,
-        })
-        grow(px, py)
-        if ex > px + 1.0:
-            grow(ex + reach + LABEL_PAD_M, ey)
-        elif ex < px - 1.0:
-            grow(ex - reach - LABEL_PAD_M, ey)
-        else:
-            grow(ex - reach / 2, ey)
-            grow(ex + reach / 2, ey)
-        # Two lines of text hang below or above the end of the leader.
-        grow(ex, ey + LANDMARK_FONT_M * 2.2)
-        grow(ex, ey - LANDMARK_FONT_M * 2.2)
+    # Turn names and speeds are not drawn on the map (the numbered badges are);
+    # the page still needs them for its "next turn" readout.
+    landmarks = sorted(
+        ({"name": str(lm["name"]), "speed": lm.get("max_speed"), "dist": d}
+         for lm in TRACK_LANDMARKS
+         for d in [landmark_track_m(lm)] if d is not None),
+        key=lambda l: l["dist"])
 
     ticks = track_map.boundary_ticks(BOUNDARIES, GATE_HALF_M)
     slabels_local = []
@@ -299,6 +268,34 @@ def build_data():
         ly = py + SECTOR_LABEL_OFFSET_M * side * normal[1]
         slabels_local.append((sector_id, lx, ly))
         grow(lx, ly)
+
+    # -- turn badges: every ETCR turn gets its number beside the track ------- #
+    # Placed after the sector labels so they can keep clear of them: each badge
+    # takes the spot (either side, a few distances out) furthest from tarmac,
+    # other badges and sector labels.
+    avoid = [(lx, ly) for _sid, lx, ly in slabels_local]
+    turns_local = []
+    for number, start in sorted(TURN_START_TRACK_M.items()):
+        px, py = track_map.position_at_distance(start)
+        tx, ty = track_map.tangent_at(start)
+        nx, ny = -ty, tx
+        best = None
+        for off in TURN_BADGE_OFFSETS_M:
+            for sign in (1.0, -1.0):
+                bx, by = px + off * sign * nx, py + off * sign * ny
+                room = min([_clearance(bx, by) - TURN_BADGE_R_M]
+                           + [math.hypot(bx - ax, by - ay) - TURN_BADGE_R_M
+                              for ax, ay in avoid])
+                # Nearer is better as long as there is real room.
+                score = min(room, 14.0) - off * 0.05
+                if best is None or score > best[0]:
+                    best = (score, bx, by)
+        _, bx, by = best
+        avoid.extend([(bx, by)])
+        turns_local.append({"n": number, "dist": float(start),
+                            "px": px, "py": py, "bx": bx, "by": by})
+        grow(bx - TURN_BADGE_R_M, by - TURN_BADGE_R_M)
+        grow(bx + TURN_BADGE_R_M, by + TURN_BADGE_R_M)
 
     lo_x -= PAD_M
     hi_x += PAD_M
@@ -312,9 +309,13 @@ def build_data():
     line = [_svg_xy(x, y, ox, oy) for x, y in track_map.CENTRELINE_XY]
     cum = [round(c, 2) for c in track_map.CUM_M]
 
+    # split_at returns runs sorted by start distance, and S1 no longer starts
+    # lowest, so name each run by its start rather than by position.
+    id_at = {b: sid for b, sid in zip(BOUNDARIES, SECTOR_IDS)}
     sectors = []
-    for sector_id, (seg_start, seg_end, xs, ys) in zip(
-            SECTOR_IDS, track_map.split_at(BOUNDARIES)):
+    for seg_start, seg_end, xs, ys in sorted(
+            track_map.split_at(BOUNDARIES), key=lambda r: id_at[r[0]]):
+        sector_id = id_at[seg_start]
         pts = [_svg_xy(x, y, ox, oy) for x, y in zip(xs, ys)]
         sectors.append({
             "id": sector_id,
@@ -344,24 +345,19 @@ def build_data():
     fa_x, fa_y = _svg_xy(fa[0], fa[1], ox, oy)
     fb_x, fb_y = _svg_xy(fb[0], fb[1], ox, oy)
 
-    landmarks = []
-    for lm in landmarks_local:
-        sx, sy = _svg_xy(lm["px"], lm["py"], ox, oy)
-        exs, eys = _svg_xy(lm["ex"], lm["ey"], ox, oy)
-        landmarks.append({
-            "name": lm["name"], "speed": lm["speed"], "dist": lm["dist"],
-            "x1": sx, "y1": sy, "x2": exs, "y2": eys,
-            # Anchor away from the track: a callout on the left of the circuit
-            # must run leftwards, or its text crosses back over the tarmac.
-            "anchor": ("start" if lm["right"] else
-                       "end" if lm["left"] else "middle"),
-            "dy": 1 if eys > sy else -1,
-        })
-    landmarks.sort(key=lambda l: l["dist"])
+    turns = []
+    for t in turns_local:
+        x1, y1 = _svg_xy(t["px"], t["py"], ox, oy)
+        bx, by = _svg_xy(t["bx"], t["by"], ox, oy)
+        turns.append({"n": t["n"], "dist": t["dist"],
+                      "x1": x1, "y1": y1, "x": bx, "y": by})
 
     return {
         "viewBox": "0 0 %.0f %.0f" % (width, height),
         "trackLength": track.TRACK_LENGTH_METERS,
+        # Sector-document zero minus the car's zero. Sectors and the profile
+        # are in the document's frame; posAt() and lap distance are not.
+        "docOffset": DOC_TO_TRACK_OFFSET_M,
         "line": line,
         "cum": cum,
         "sectors": sectors,
@@ -369,6 +365,7 @@ def build_data():
         "sectorLabels": labels,
         "finish": {"x1": fa_x, "y1": fa_y, "x2": fb_x, "y2": fb_y},
         "landmarks": landmarks,
+        "turns": turns,
         "profile": [[round(d, 1), round(v, 2)] for d, v in _read_profile()],
         "profileLapSeconds": round(_profile_lap_seconds(), 2),
         "carColor": CAR_COLOR,
@@ -376,8 +373,8 @@ def build_data():
         "style": {
             "casing": TRACK_CASING_M, "core": TRACK_CORE_M,
             "car": CAR_RADIUS_M, "trail": TRAIL_M,
-            "lmFont": LANDMARK_FONT_M, "lmSpeedFont": LANDMARK_SPEED_FONT_M,
             "sFont": SECTOR_FONT_M,
+            "turnR": TURN_BADGE_R_M, "turnFont": TURN_BADGE_FONT_M,
         },
     }
 
@@ -394,7 +391,7 @@ def build_data():
 #                                         says it is not.
 #
 # They share MAP_JS and BASE_CSS. The map is the expensive, fiddly part — the
-# projection, the sector splits, the callout placement — and having it exist
+# projection, the sector splits, the label placement — and having it exist
 # twice is how the two would end up disagreeing about where Turn 12 is.
 # --------------------------------------------------------------------------- #
 
@@ -457,10 +454,10 @@ BASE_CSS = """
   svg { width: 100%; height: 100%; display: block; }
   .gate { stroke: #64748b; stroke-width: 2.6; }
   .finish { stroke: #ffffff; stroke-width: 5; }
-  .leader { stroke: #475569; stroke-width: 2.4; }
-  .lm-dot { fill: var(--accent); }
-  .lm-name { fill: #cbd5e1; font-weight: 600; letter-spacing: 1px; }
-  .lm-speed { fill: #64748b; font-weight: 600; }
+  .turn-tick { stroke: #94a3b8; stroke-width: 2; }
+  .turn-badge { fill: #0f172a; stroke: #94a3b8; stroke-width: 2.2; }
+  .turn-num { fill: #e2e8f0; font-weight: 700; text-anchor: middle;
+              dominant-baseline: central; }
   .s-label { font-weight: 700; letter-spacing: 1px;
              text-anchor: middle; dominant-baseline: middle; }
   /* -- legend ----------------------------------------------------------- */
@@ -503,7 +500,7 @@ MAP_SVG = """
       <g id="g-casing"></g>
       <g id="g-sectors"></g>
       <g id="g-gates"></g>
-      <g id="g-landmarks"></g>
+      <g id="g-turns"></g>
       <g id="g-slabels"></g>
       <path id="trail" fill="none" stroke-linecap="round"></path>
       <circle id="car" r="0" filter="url(#glow)"></circle>
@@ -551,31 +548,17 @@ el("g-gates").appendChild(mk("line", {
   x2: DATA.finish.x2, y2: DATA.finish.y2, class: "finish",
 }));
 
-DATA.landmarks.forEach(lm => {
-  const g = el("g-landmarks");
-  g.appendChild(mk("line", {
-    x1: lm.x1, y1: lm.y1, x2: lm.x2, y2: lm.y2, class: "leader",
-  }));
-  g.appendChild(mk("circle", { cx: lm.x1, cy: lm.y1, r: 5, class: "lm-dot" }));
-
-  const pad = lm.anchor === "start" ? 12 : lm.anchor === "end" ? -12 : 0;
-  const name = mk("text", {
-    x: lm.x2 + pad, y: lm.y2 + (lm.dy > 0 ? 24 : -6),
-    "text-anchor": lm.anchor, class: "lm-name",
-    "font-size": DATA.style.lmFont,
-  });
-  name.textContent = lm.name;
-  g.appendChild(name);
-
-  if (lm.speed != null) {
-    const sp = mk("text", {
-      x: lm.x2 + pad, y: lm.y2 + (lm.dy > 0 ? 48 : 18),
-      "text-anchor": lm.anchor, class: "lm-speed",
-      "font-size": DATA.style.lmSpeedFont,
-    });
-    sp.textContent = lm.speed + " km/h";
-    g.appendChild(sp);
-  }
+// Every ETCR turn by number, as on the ETCR track map.
+(DATA.turns || []).forEach(t => {
+  const g = el("g-turns");
+  g.appendChild(mk("line", { x1: t.x1, y1: t.y1, x2: t.x, y2: t.y,
+                             class: "turn-tick" }));
+  g.appendChild(mk("circle", { cx: t.x, cy: t.y, r: DATA.style.turnR,
+                               class: "turn-badge" }));
+  const n = mk("text", { x: t.x, y: t.y, class: "turn-num",
+                         "font-size": DATA.style.turnFont });
+  n.textContent = t.n;
+  g.appendChild(n);
 });
 
 DATA.sectorLabels.forEach(s => {
@@ -640,7 +623,11 @@ function posAt(d) {
 function sectorAt(d) {
   const L = DATA.trackLength;
   d = ((d % L) + L) % L;
-  for (const s of DATA.sectors) if (d >= s.start && d < s.end) return s;
+  // S1 wraps across the finish line (it starts before it), so start > end.
+  for (const s of DATA.sectors) {
+    if (s.start < s.end ? (d >= s.start && d < s.end)
+                        : (d >= s.start || d < s.end)) return s;
+  }
   return DATA.sectors[DATA.sectors.length - 1];
 }
 
@@ -692,7 +679,10 @@ function paintMap(dist) {
   el("trail").setAttribute("opacity", "0.55");
 
   if (progress) {
-    el("progress-mark").style.left = (dist / DATA.trackLength * 100) + "%";
+    // The bar is laid out S1..S9 from the sector document's zero.
+    const L = DATA.trackLength;
+    el("progress-mark").style.left =
+      (((dist + DATA.docOffset) % L + L) % L / L * 100) + "%";
   }
   if (s.id !== lastSector) {
     DATA.sectors.forEach(o => {
@@ -840,6 +830,7 @@ el("foot").innerHTML =
 
 function speedAt(d) {
   const p = DATA.profile, L = DATA.trackLength;
+  d += DATA.docOffset;                // the profile counts from the document's zero
   d = ((d % L) + L) % L;
   let lo = 0, hi = p.length - 1;
   while (lo < hi - 1) {

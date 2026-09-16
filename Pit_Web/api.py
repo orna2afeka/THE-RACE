@@ -57,7 +57,6 @@ from .store import (                                   # noqa: E402
     DRIVER_STINT_UNDO_S, RACE_UNDO_S,
 )
 import constants as C                                  # noqa: E402
-import efficiency                                      # noqa: E402
 import strategy_engine                                 # noqa: E402
 from strategy_engine import (                          # noqa: E402
     calculate_all_strategies, load_velocity_profile,
@@ -167,6 +166,9 @@ def _val(row, key, default=None):
 _STATE_COLUMNS = {
     "soc": "bms_soc_percent", "voltage": "bms_voltage_V",
     "current": "bms_current_A", "pack_voltage": "mms_measured_voltage_V",
+    # Battery B's BMS (can1). The unprefixed three above are battery A's.
+    "soc_b": "bms2_soc_percent", "voltage_b": "bms2_voltage_V",
+    "current_b": "bms2_current_A",
     "motor_current": "mms_current_A", "regen_energy": "regen_energy",
     "target_speed_kmh": "target_speed_kmh",
     "soc_ctrl": "mms_estimated_soc_percent", "trip_m": "mms_trip_m",
@@ -174,7 +176,6 @@ _STATE_COLUMNS = {
     "temp": "mms_temperature_C", "power_w": "mms_power_W",
     "motor_temp": "mms_motor_temp_C", "motor_ohms": "mms_motor_ohms",
     "motor_map": "mms_motor_map", "motor_map_raw": "mms_motor_map_raw",
-    "throttle_pct": "mms_throttle_percent", "throttle_mv": "mms_throttle_mv",
     "last_lap_energy": "last_lap_energy",
     "total_race_energy": "total_race_energy",
     "last_lap_regen_energy": "last_lap_regen_energy",
@@ -212,7 +213,7 @@ def read_live_state(conn):
 
     state = {k: None for k in _STATE_COLUMNS}
     state.update({
-        "motor_map": None, "throttle_zone": None,
+        "motor_map": None,
         "batt_temp": None,
         "lap_source": None, "auto_lap": None, "odometer_km": None,
         # lat/lon fall back to the Zolder paddock so the map has somewhere to
@@ -249,12 +250,6 @@ def read_live_state(conn):
     state["motor_map"] = cf("motor_map", "mms_motor_map")
     state["motor_map_raw"] = cf("motor_map_raw", "mms_motor_map_raw")
     state["lap_source"] = _val(row, "lap_source", None)
-
-    # Prefer the zone the CAR classified — what the driver's bar actually
-    # showed. Fall back to classifying here only for rows written before the
-    # column existed; efficiency.zone() is the same function the car ran.
-    zone = cf("throttle_zone", "mms_throttle_zone")
-    state["throttle_zone"] = zone or efficiency.zone(state["throttle_pct"])
 
     # Per-cell thermistor temperatures, however many are configured.
     for i in range(1, db.THERMISTOR_CELL_COLUMN_COUNT + 1):
@@ -748,7 +743,7 @@ def build_live(conn, manual_lap=-1):
         "odometer_km": odo_km,
     }
 
-    # The 25 Live Metrics tiles, resolved and CLASSIFIED here. The browser is
+    # The Live Metrics tiles, resolved and CLASSIFIED here. The browser is
     # never handed a threshold to compare against — limits.classify() is the one
     # comparison in the project and both dashboards call it.
     tiles = []
@@ -765,7 +760,6 @@ def build_live(conn, manual_lap=-1):
                 "label": e["label"], "unit": e.get("unit", ""),
                 "spec": e.get("spec", ".0f"), "note": e.get("note"),
                 "text": bool(e.get("text")),
-                "lapTime": e.get("derived") == "last_lap_time_text",
                 "value": value, "tier": tier,
             })
         tiles.append({"group": group, "metrics": out})
@@ -1713,6 +1707,7 @@ async def api_weather():
     with a black-holed default route that call can hang for minutes. The pit
     LAN is offline by design, so "unavailable" must come back fast.
     """
+    import pandas as pd
     from weather_service import fetch_zolder_weather
     try:
         df = await asyncio.wait_for(asyncio.to_thread(fetch_zolder_weather), 8.0)
@@ -1720,9 +1715,15 @@ async def api_weather():
         df = None
     if df is None:
         return {"available": False, "rows": []}
+    # Open-Meteo reports a missing hour as null, which pandas turns into NaN.
+    # Send it back as null (shown as "—"), never as 0 and never as bare NaN,
+    # which is not valid JSON.
+    def val(x):
+        return None if pd.isna(x) else x
     return {"available": True, "rows": [
-        {"t": str(r["Time"]), "temp": r["Temp (°C)"],
-         "cloud": r["Cloud Cover (%)"], "radiation": r["Solar Radiation (W/m²)"]}
+        {"t": str(r["Time"]), "temp": val(r["Temp (°C)"]),
+         "cloud": val(r["Cloud Cover (%)"]), "radiation": val(r["Solar Radiation (W/m²)"]),
+         "rain": val(r["Rain (mm)"]), "rainChance": val(r["Rain Chance (%)"])}
         for _, r in df.iterrows()]}
 
 
@@ -1759,7 +1760,7 @@ STRATEGY_WH_ROUND = 50.0
 # Energy per lap: what the car MEASURED under a profile once it has driven
 # enough laps of it to mean something, otherwise the stored estimate. Per
 # profile, so a profile nobody has driven keeps its original number.
-MIN_LAPS_FOR_MEASURED = 3
+MIN_LAPS_FOR_MEASURED = C.MIN_LAPS_FOR_MEASURED
 # The car finishes a lap about every 3.5 minutes, so nothing here can change
 # faster than that. Measured on the pit's own store the grouped query is
 # ~0.6 s, which must not run on every poll.
@@ -2037,7 +2038,14 @@ def api_race(body: RaceBody):
         # a stoppage does not eat into a driver's two hours.
         if body.isRacing and start is not None:
             existing = load_app_state(conn, DRIVER_STINT_KEY) or {}
-            if not existing.get("started_at"):
+            old_start = before.get("race_start_time")
+            # A stopped race started again at a DIFFERENT time is a new race,
+            # not a resume (Resume passes the stored start back unchanged).
+            # The old stint belongs to the old race: carrying its banked time
+            # over is how a fresh race opens hundreds of hours overdue.
+            new_race = not before.get("is_racing") and (
+                old_start is None or abs(float(start) - float(old_start)) > 1.0)
+            if not existing.get("started_at") or new_race:
                 # Green flag with nobody logged: driver one is in the car, and
                 # has been since the START — so a backdated race backdates the
                 # stint with it. That errs toward the two-hour change reading
@@ -2050,7 +2058,7 @@ def api_race(body: RaceBody):
                     "started_at": start, "stint": 1, "driver": None,
                     "accumulated_s": 0.0, "running_since": start,
                 })
-            elif _stint_follows_race(existing, before.get("race_start_time")):
+            elif _stint_follows_race(existing, old_start):
                 # CORRECTING the start of a race already running. The stint was
                 # auto-started with the race and nothing has happened to it
                 # since, so it began when the race did and has to move with it.
@@ -2061,6 +2069,14 @@ def api_race(body: RaceBody):
                 # _stint_follows_race() is deliberately narrow: once a change
                 # has been logged, the stint began at that change and a
                 # correction to the race start must NOT touch it.
+                save_app_state(conn, DRIVER_STINT_KEY, {
+                    **existing, "started_at": start,
+                    "accumulated_s": 0.0, "running_since": start,
+                })
+            elif float(existing["started_at"]) < start - 1.0:
+                # A correction moved the race start past the moment this driver
+                # got in. Nobody drives before the race begins, so the stint
+                # began no earlier than the new start. Keep the stint number.
                 save_app_state(conn, DRIVER_STINT_KEY, {
                     **existing, "started_at": start,
                     "accumulated_s": 0.0, "running_since": start,

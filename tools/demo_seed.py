@@ -164,8 +164,6 @@ def main():
                     "mms_motor_temp_C": motor_c,
                     "battery_temp_C": batt_c,
                     "mms_motor_ohms": 0.081,
-                    "mms_throttle_percent": throttle,
-                    "mms_throttle_mv": 800 + throttle * 31.0,
                     "target_speed_kmh": 68.0,
                     "regen_energy": regen / 3600.0 / HZ,
                     "total_race_energy": energy,

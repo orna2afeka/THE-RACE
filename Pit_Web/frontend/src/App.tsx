@@ -157,7 +157,7 @@ export default function App() {
 
   if (error) return (
     <main style={{ padding: 32, maxWidth: 560 }}>
-      <h1 style={{ fontSize: 20, marginBottom: 8 }}>Cannot reach the backend</h1>
+      <h1 style={{ fontSize: 'calc(20px * var(--pit-font-scale))', marginBottom: 8 }}>Cannot reach the backend</h1>
       <p className="caption">{error}</p>
       <p className="caption">Is uvicorn running? <code>python -m uvicorn Pit_Web.api:app --port 8000</code></p>
     </main>

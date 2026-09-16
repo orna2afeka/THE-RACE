@@ -536,18 +536,43 @@ Sections = [
 ]
 
 
+# "turn" is the ETCR turn number the landmark is drawn at on the circuit map
+# (see TURN_START_TRACK_M below). Landmarks without one are drawn at dist_m.
 TRACK_LANDMARKS = [
-    {"name": "Turn 1", "dist_m": 600, "max_speed": 75, "desc": "Slow down to 75 km/h"},
-    {"name": "Turn 2", "dist_m": 710, "max_speed": 80, "desc": "Ends at 800 meters, accelerate slowly downhill"},
+    {"name": "Turn 1", "dist_m": 600, "turn": 1, "max_speed": 75, "desc": "Slow down to 75 km/h"},
+    {"name": "Turn 2", "dist_m": 710, "turn": 2, "max_speed": 80, "desc": "Ends at 800 meters, accelerate slowly downhill"},
     {"name": "Start of Uphill", "dist_m": 1010, "max_speed": 110, "desc": "Uphill section, Turn 4 ahead"},
-    {"name": "Chicane (Turns 5,6)", "dist_m": 1860, "max_speed": 60, "desc": "Left turn followed by sharp right"},
-    {"name": "Turn 7", "dist_m": 2400, "max_speed": 78, "desc": "The turn feels almost straight"},
-    {"name": "Turns 8,9", "dist_m": 2500, "max_speed": 45, "desc": "Very slow turns"},
-    {"name": "Turns 10,11", "dist_m": 3000, "max_speed": 78, "desc": "Followed by a slow turn"},
-    {"name": "Turn 12", "dist_m": 3430, "max_speed": 40, "desc": "Slow turn, followed by uphill acceleration"},
-    {"name": "Chicane 15,16", "dist_m": 3900, "max_speed": 54, "desc": "Large chicane near the finish line"},
+    {"name": "Chicane (Turns 5,6)", "dist_m": 1860, "turn": 5, "max_speed": 60, "desc": "Left turn followed by sharp right"},
+    {"name": "Turn 7", "dist_m": 2400, "turn": 7, "max_speed": 78, "desc": "The turn feels almost straight"},
+    {"name": "Turns 8,9", "dist_m": 2500, "turn": 8, "max_speed": 45, "desc": "Very slow turns"},
+    {"name": "Turns 10,11", "dist_m": 3000, "turn": 10, "max_speed": 78, "desc": "Followed by a slow turn"},
+    {"name": "Turn 12", "dist_m": 3430, "turn": 12, "max_speed": 40, "desc": "Slow turn, followed by uphill acceleration"},
+    {"name": "Chicane 15,16", "dist_m": 3900, "turn": 15, "max_speed": 54, "desc": "Large chicane near the finish line"},
     {"name": "Finish Line", "dist_m": 4000, "max_speed": 100, "desc": "End of lap"}
 ]
+
+# Where each ETCR-numbered turn BEGINS on the real circuit, in metres from the
+# track.py finish line (the car's zero). Measured from the OSM centreline in
+# zolder_centreline.py: the point where the heading starts to change. Paired
+# turns (5,6 / 8,9 / 13,14 / 15,16) list where the second half changes
+# direction. tools/check_track.py re-measures every one of these.
+TURN_START_TRACK_M = {
+    1: 280, 2: 580, 3: 765, 4: 1075, 5: 1745, 6: 1780, 7: 2060, 8: 2305,
+    9: 2345, 10: 2390, 11: 2525, 12: 3015, 13: 3125, 14: 3185, 15: 3605, 16: 3655,
+}
+
+# The sector document (and 210s.xlsx) measures its distances from a zero that
+# sits this far BEFORE the car's zero. Evidence: with no offset, turns fall
+# outside the sectors the document puts them in (T5,6 before the 110 m chicane
+# sector S4); every offset from 110 to 130 m puts all of them inside, and the
+# 210s.xlsx slowest points trail the real corners by 65-85 m. 120 is the middle
+# of that window. check_track.py prints the window again.
+#
+# MAP ONLY. The car's lap distance, the target-speed lookup and the pit's sector
+# timing all still count from the track.py line; this only moves where the map
+# DRAWS the sectors. Set it to 0 once profiles measured on the car replace
+# 210s.xlsx and the sector distances are measured in the car's frame.
+DOC_TO_TRACK_OFFSET_M = 120.0
 
 SECTIONS_INFO = {
     1: {"range": (0, 600), "name": "Section 1"},

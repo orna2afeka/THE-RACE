@@ -29,9 +29,9 @@ export class ErrorBoundary extends Component<{ name: string; children: ReactNode
           <span style={{ display: 'flex', alignItems: 'center', gap: 8, fontWeight: 600 }}>
             <Icon name="alert" size={14} />{this.props.name} failed to render
           </span>
-          <code style={{ fontSize: 11, opacity: 0.85 }}>{this.state.error.message}</code>
+          <code style={{ fontSize: 'calc(11px * var(--pit-font-scale))', opacity: 0.85 }}>{this.state.error.message}</code>
           <span>
-            <button className="btn" style={{ padding: '4px 10px', fontSize: 12 }}
+            <button className="btn" style={{ padding: '4px 10px', fontSize: 'calc(12px * var(--pit-font-scale))' }}
                     onClick={() => this.setState({ error: null })}>Retry</button>
           </span>
         </div>

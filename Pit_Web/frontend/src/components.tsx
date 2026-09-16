@@ -2,7 +2,7 @@
 
 import { useRef, type KeyboardEvent, type ReactNode } from 'react';
 import { Icon } from './icons';
-import { MISSING, fmt, lapTime } from './lib';
+import { MISSING, fmt } from './lib';
 import { Sparkline } from './Sparkline';
 import type { Config, Live, LiveTile, Num, Tier } from './types';
 
@@ -50,11 +50,7 @@ export function MetricTile({ title, value, unit, tier, large, note, missing, tex
 
 /** A Live Metrics tile straight from the served catalogue. */
 export function CatalogueTile({ m }: { m: LiveTile }) {
-  const shown = m.lapTime
-    ? lapTime(m.value as Num)
-    : m.text
-      ? ((m.value as string) || MISSING)
-      : fmt(m.value as Num, m.spec);
+  const shown = m.text ? ((m.value as string) || MISSING) : fmt(m.value as Num, m.spec);
   return <MetricTile title={m.label} value={shown} unit={m.unit} tier={m.tier} large note={m.note} text={m.text} />;
 }
 

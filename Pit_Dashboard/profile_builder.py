@@ -49,9 +49,10 @@ for _p in (_REPO_ROOT, _HERE):
 
 import db                                                   # noqa: E402
 import profile_build as pb                                  # noqa: E402
+import profile_manage as pm                                 # noqa: E402
 import speed_profile                                        # noqa: E402
-from constants import (STRATEGIES, DEFAULT_STRATEGY_KEY,     # noqa: E402
-                       SECTION_NAMES)
+from constants import (DEFAULT_STRATEGY_KEY,                # noqa: E402
+                       SECTION_NAMES, MIN_LAPS_FOR_MEASURED)
 from strategy_engine import SECTIONS_INFO                    # noqa: E402
 
 try:
@@ -78,44 +79,78 @@ st.set_page_config(page_title="Speed Profile Builder", layout="wide",
 
 
 # --------------------------------------------------------------------------- #
-# Categories — the five built-ins plus anything the team has added
+# The profile matrix — saved in constants.py, drafted in profiles.json
 # --------------------------------------------------------------------------- #
-def _default_categories():
-    return {s["key"]: {"label": s["label"],
-                       "target_s": round(float(s["lap_time_min"]) * 60.0, 1),
-                       "energy_wh": s.get("energy_wh")}
-            for s in STRATEGIES}
+# SAVED is PROFILE_MATRIX in constants.py: what the pit dashboard reads.
+# DRAFT is what this page shows: one row per CSV on disk, starting from its
+# saved row, with any unsaved edits from profiles.json laid over it. Manage
+# profiles and Build and write change the draft; only the Save button at the top
+# of the page writes the code.
+def load_saved_matrix():
+    try:
+        return pm.read_saved_matrix()
+    except Exception as exc:                      # never let a bad file block work
+        st.error(f"Cannot read PROFILE_MATRIX from constants.py ({exc}). Fix the "
+                 f"file before saving from here.", icon=":material/error:")
+        return None
 
 
 def load_sidecar():
-    """profiles/profiles.json, merged over the five built-ins."""
-    cats = _default_categories()
+    """The DRAFT matrix: {key: {label, target_s, energy_wh}} for every CSV."""
+    saved = load_saved_matrix() or {}
+    edits = {}
     try:
         with open(SIDECAR_PATH, encoding="utf-8") as fh:
-            stored = json.load(fh)
-        for key, meta in (stored.get("categories") or {}).items():
-            cats.setdefault(key, {})
-            cats[key].update(meta)
+            edits = json.load(fh).get("categories") or {}
     except FileNotFoundError:
         pass
-    except Exception as exc:                      # never let a bad file block work
-        st.warning(f"profiles.json unreadable ({exc}) — using the built-in five.",
+    except Exception as exc:
+        st.warning(f"profiles.json unreadable ({exc}) — showing the saved matrix.",
                    icon=":material/warning:")
+
+    cats = {}
+    for key, path in speed_profile.available_profiles(PROFILE_DIR).items():
+        row = dict(saved.get(key) or {})
+        row.update(edits.get(key) or {})
+        if not row.get("label"):
+            row["label"] = key.replace("_", " ").title()
+        if row.get("target_s") is None:
+            try:
+                lap_s = speed_profile.load_csv(path, lap_length_m=pb.LAP_M).lap_time_s()
+                row["target_s"] = round(lap_s, 1)
+            except Exception:
+                row["target_s"] = 0.0
+        row.setdefault("energy_wh", None)
+        cats[key] = pm.normalise_entry(row)
     return cats
 
 
-def save_sidecar(cats, provenance=None):
-    """Write the sidecar atomically. Provenance is merged, never replaced."""
+def save_sidecar(cats, provenance=None, drop_built=()):
+    """Store the draft atomically. Provenance is merged, never replaced.
+
+    Only rows that DIFFER from constants.py are stored as edits, so once Save
+    has written the code the draft is empty again, and a hand edit to
+    constants.py is never silently overridden by an old draft.
+
+    `drop_built` removes provenance for keys whose file no longer came from a
+    measured lap (regenerated or removed), so profiles.json never claims a
+    curve was measured when it is not.
+    """
     existing = {}
     try:
         with open(SIDECAR_PATH, encoding="utf-8") as fh:
             existing = json.load(fh)
     except Exception:
         pass
-    existing["categories"] = cats
+    saved = load_saved_matrix() or {}
+    existing["categories"] = {
+        k: pm.normalise_entry(v) for k, v in cats.items()
+        if pm.normalise_entry(v) != saved.get(k)}
     built = existing.setdefault("built", {})
     if provenance:
         built.update(provenance)
+    for key in drop_built:
+        built.pop(key, None)
     os.makedirs(PROFILE_DIR, exist_ok=True)
     tmp = SIDECAR_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
@@ -626,9 +661,254 @@ def reset_selection():
 
 
 # --------------------------------------------------------------------------- #
+# Manage profiles — add, edit, remove. The file work is in profile_manage.py.
+# --------------------------------------------------------------------------- #
+AFTER_CHANGE = ("Press **Save to constants.py** at the top to put the label and "
+                "Wh/lap into the code, then restart the **Pit Web** window. The "
+                "car loads the curves at startup, so commit `profiles/`, pull on "
+                "the Pi and restart the HUD before sending a new curve to the car.")
+
+
+WH_HELP = ("Estimated energy per lap on this profile. The Strategy tab uses it "
+           "until the car has driven " + str(MIN_LAPS_FOR_MEASURED) + " laps on "
+           "the profile, then switches to what the car measured. Leave empty if "
+           "unknown.")
+
+
+def _measured_keys():
+    """Keys whose current CSV was built from a real lap, per profiles.json."""
+    try:
+        with open(SIDECAR_PATH, encoding="utf-8") as fh:
+            return set((json.load(fh).get("built") or {}).keys())
+    except Exception:
+        return set()
+
+
+def _finish(message):
+    """Close the dialog and say what happened at the top of the page."""
+    load_installed.clear()
+    st.session_state["pm_flash"] = message
+    st.rerun()
+
+
+@st.dialog("Manage profiles", width="large")
+def manage_profiles():
+    cats = load_sidecar()
+    columns = profile_columns(cats)
+    targets = {c["key"]: c["target_s"] for c in columns}
+    labels = {c["key"]: c["label"] for c in columns}
+    measured = _measured_keys()
+
+    def describe(k):
+        tag = "measured" if k in measured else "modelled"
+        return f"{labels[k]} · {targets[k]:.1f} s · {k} ({tag})"
+
+    st.dataframe(pd.DataFrame([{
+        "Key": c["key"], "Label": c["label"], "Target (s)": round(c["target_s"], 1),
+        "Curve": "measured lap" if c["key"] in measured else "scaled baseline",
+        "Wh/lap estimate": cats[c["key"]].get("energy_wh"),
+    } for c in columns]), hide_index=True, width="stretch")
+    st.caption("Curves are written to `profiles/` straight away. Labels and "
+               "Wh/lap reach `constants.py` only when you press **Save to "
+               "constants.py** at the top of the page.")
+
+    add_tab, edit_tab, remove_tab = st.tabs([":material/add: Add",
+                                             ":material/edit: Edit",
+                                             ":material/delete: Remove"])
+
+    with add_tab:
+        a1, a2, a3 = st.columns([2, 1, 1])
+        label = a1.text_input("Label", key="pm_add_label",
+                              placeholder="e.g. Eco Push")
+        target = a2.number_input("Target lap time (s)", pm.MIN_TARGET_S,
+                                 pm.MAX_TARGET_S, 205.0, 0.5, key="pm_add_target")
+        energy = a3.number_input("Wh per lap", 1.0, 500.0, None, 0.5,
+                                 key="pm_add_wh", placeholder="unknown",
+                                 help=WH_HELP)
+        suggested = pm.suggest_key(label or "profile", target)
+        key = st.text_input(
+            "Key", key="pm_add_key", placeholder=suggested,
+            help="The file name and the name the car is sent. It can never be "
+                 "renamed later, because recorded laps point at it. Leave empty "
+                 f"to use `{suggested}`.").strip() or suggested
+        st.caption("The curve is the baseline lap scaled to this time, the same "
+                   "way the original five were made: corners never faster than "
+                   "the baseline, braking never harder. Replace it with a real "
+                   "lap in the builder whenever you have one."
+                   + ("" if energy is not None else
+                      " :orange[Without a Wh/lap estimate the Strategy tab leaves "
+                      "it out until the car has driven "
+                      f"{MIN_LAPS_FOR_MEASURED} laps on it.]"))
+        problem = ((None if label.strip() else "enter a label")
+                   or pm.key_problem(key, cats.keys())
+                   or pm.target_problem(target, targets))
+        if problem and label.strip():
+            st.error(problem, icon=":material/error:")
+        if st.button(f":material/add: Add `{key}`", type="primary",
+                     disabled=problem is not None, key="pm_add_go"):
+            try:
+                with st.spinner("Scaling the baseline…"):
+                    info = pm.write_scaled(key, target)
+            except Exception as exc:
+                st.error(f"Nothing was added: {exc}", icon=":material/error:")
+            else:
+                cats[key] = {"label": label.strip(), "target_s": round(target, 1),
+                             "energy_wh": energy}
+                save_sidecar(cats)
+                _finish(f"Added **{label.strip()}** as `profiles/{key}.csv` "
+                        f"({info['lap_s']:.1f} s, {info['avg_kmh']:.1f} km/h "
+                        f"average, {info['max_kmh']:.0f} km/h max). "
+                        + AFTER_CHANGE)
+
+    with edit_tab:
+        sel = st.selectbox("Profile", [c["key"] for c in columns],
+                           format_func=describe, key="pm_edit_sel")
+        e1, e2, e3 = st.columns([2, 1, 1])
+        new_label = e1.text_input("Label", labels[sel], key=f"pm_edit_label_{sel}")
+        new_target = e2.number_input("Target lap time (s)", pm.MIN_TARGET_S,
+                                     pm.MAX_TARGET_S,
+                                     min(max(float(targets[sel]), pm.MIN_TARGET_S),
+                                         pm.MAX_TARGET_S),
+                                     0.5, key=f"pm_edit_target_{sel}")
+        old_wh = cats[sel].get("energy_wh")
+        new_wh = e3.number_input("Wh per lap", 1.0, 500.0, old_wh, 0.5,
+                                 key=f"pm_edit_wh_{sel}", placeholder="unknown",
+                                 help=WH_HELP)
+        retarget = abs(new_target - targets[sel]) >= 0.05
+        problem = ((None if new_label.strip() else "enter a label")
+                   or (pm.target_problem(new_target,
+                                         {k: t for k, t in targets.items() if k != sel})
+                       if retarget else None))
+        confirmed = True
+        if retarget:
+            st.info(f"A new target regenerates the curve from the baseline. The "
+                    f"key stays `{sel}` even if its name mentions the old time, "
+                    f"because the car and recorded laps know it by that name. The "
+                    f"old file is copied to `profiles/_backup/`.",
+                    icon=":material/info:")
+            if sel in measured:
+                confirmed = st.checkbox(
+                    f"Replace the curve measured from a real lap with a scaled "
+                    f"baseline", key=f"pm_edit_confirm_{sel}")
+        if problem:
+            st.error(problem, icon=":material/error:")
+        rewh = (new_wh is None) != (old_wh is None) or (
+            new_wh is not None and abs(new_wh - old_wh) >= 0.05)
+        changed = retarget or rewh or new_label.strip() != labels[sel]
+        if st.button(":material/save: Save", type="primary", key="pm_edit_go",
+                     disabled=bool(problem) or not changed or not confirmed):
+            info, failed = None, None
+            if retarget:
+                try:
+                    with st.spinner("Scaling the baseline…"):
+                        info = pm.write_scaled(sel, new_target)
+                except Exception as exc:
+                    failed = exc
+            if failed is not None:
+                st.error(f"Nothing was changed: {failed}", icon=":material/error:")
+            else:
+                cats[sel]["label"] = new_label.strip()
+                cats[sel]["energy_wh"] = new_wh
+                if retarget:
+                    cats[sel]["target_s"] = round(new_target, 1)
+                save_sidecar(cats, drop_built=[sel] if retarget else ())
+                _finish(f"Updated `{sel}`"
+                        + (f": new curve laps in {info['lap_s']:.1f} s. "
+                           if info else ". ")
+                        + AFTER_CHANGE)
+
+    with remove_tab:
+        removable = [c["key"] for c in columns if c["key"] not in pm.PROTECTED_KEYS]
+        st.caption(f"`{DEFAULT_STRATEGY_KEY}` cannot be removed: it is the car's "
+                   f"startup profile and the reference every built lap is "
+                   f"checked against.")
+        if not removable:
+            st.info("Nothing to remove.", icon=":material/info:")
+        else:
+            gone = st.selectbox("Profile", removable, format_func=describe,
+                                key="pm_remove_sel")
+            st.warning(f"Deletes `profiles/{gone}.csv` (a copy goes to "
+                       f"`profiles/_backup/`). A car that still has it loaded keeps "
+                       f"driving it until the HUD restarts; after that, sending "
+                       f"`{gone}` is refused by the car.",
+                       icon=":material/warning:")
+            sure = st.checkbox(f"Remove {labels[gone]}", key=f"pm_remove_ok_{gone}")
+            if st.button(":material/delete: Remove", type="primary",
+                         disabled=not sure, key="pm_remove_go"):
+                try:
+                    backup = pm.remove_profile(gone)
+                except Exception as exc:
+                    st.error(f"Nothing was removed: {exc}", icon=":material/error:")
+                else:
+                    cats.pop(gone, None)
+                    save_sidecar(cats, drop_built=[gone])
+                    st.session_state.get("pb_chosen", {}).pop(gone, None)
+                    if st.session_state.get("pb_focus_key") == gone:
+                        st.session_state["pb_focus_key"] = None
+                    _finish(f"Removed `{gone}`"
+                            + (f" (backup: `{os.path.relpath(backup, _REPO_ROOT)}`). "
+                               if backup else ". ")
+                            + AFTER_CHANGE)
+
+
+# --------------------------------------------------------------------------- #
 # UI
 # --------------------------------------------------------------------------- #
 st.title(":material/route: Speed Profile Builder")
+
+
+def _fmt(x):
+    return "—" if x is None else f"{x:g}"
+
+
+def save_matrix_bar():
+    """The Save button: writes the draft matrix into constants.py."""
+    saved = load_saved_matrix()
+    draft = load_sidecar()
+    with st.container(border=True):
+        b1, b2 = st.columns([4, 1], vertical_alignment="center")
+        diff = [] if saved is None else pm.matrix_diff(saved, draft)
+        if saved is None:
+            b1.caption("Save is unavailable until constants.py can be read.")
+        elif not diff:
+            b1.caption(":material/check_circle: Profile matrix saved — "
+                       "`constants.py` matches what this page shows.")
+        else:
+            b1.markdown(f":orange[**{len(diff)} unsaved change(s)** to the profile "
+                        f"matrix.] The pit dashboard keeps the old labels and "
+                        f"Wh/lap until you save.")
+            lines = []
+            for kind, key, d in diff:
+                if kind == "added":
+                    lines.append(f"- **add** `{key}`: {d['label']}, "
+                                 f"{_fmt(d['target_s'])} s, {_fmt(d['energy_wh'])} Wh")
+                elif kind == "removed":
+                    lines.append(f"- **remove** `{key}` ({d['label']})")
+                else:
+                    lines.append(f"- **change** `{key}`: " + ", ".join(
+                        f"{f} {_fmt(a) if f != 'label' else a} → "
+                        f"{_fmt(b) if f != 'label' else b}"
+                        for f, (a, b) in d.items()))
+            with b1.expander("What Save will write"):
+                st.markdown("\n".join(lines))
+        if b2.button(":material/save: Save to constants.py", type="primary",
+                     disabled=not diff, width="stretch", key="pm_save_matrix"):
+            try:
+                pm.write_saved_matrix(draft)
+            except Exception as exc:
+                st.error(f"constants.py was not changed: {exc}",
+                         icon=":material/error:")
+            else:
+                save_sidecar(draft)          # stores no edits: draft == saved now
+                st.session_state["pm_flash"] = (
+                    f"Saved {len(diff)} change(s) to `Pit_Dashboard/constants.py` "
+                    f"(old copy in `profiles/_backup/`). Restart the **Pit Web** "
+                    f"window to use them, and commit `constants.py` together with "
+                    f"`profiles/`.")
+                st.rerun()
+
+
+save_matrix_bar()
 
 st.session_state.setdefault("pb_chosen", {})
 st.session_state.setdefault("pb_focus", None)
@@ -649,6 +929,14 @@ with s2:
                      help="Invented laps, for seeing how this reads before the "
                           "car has run at Zolder. Nothing built from them can "
                           "be written to a real profile.")
+    # Before the alignment and empty-store stops below, so profiles can be
+    # managed on a laptop that has no laps recorded yet.
+    if st.button(":material/tune: Manage profiles", key="pm_open"):
+        manage_profiles()
+
+_flash = st.session_state.pop("pm_flash", None)
+if _flash:
+    st.success(_flash, icon=":material/check_circle:")
 
 if demo:
     laps_df, offset, align_detail = _demo_laps_df(), 1, "demo data — not measured"
@@ -1122,6 +1410,13 @@ def write_chosen(chosen, cats, offset, meta, demo):
                  icon=":material/error:")
         return
 
+    # The lap the curve came from is the best estimate there is of what this
+    # profile costs, so it replaces the stored Wh/lap in the draft. It reaches
+    # constants.py (and the Strategy tab) on Save, like every other change.
+    for key in replaced:
+        wh = meta[staged[key][1]]["energy"]
+        if wh is not None:
+            cats[key]["energy_wh"] = round(float(wh), 1)
     save_sidecar(cats, provenance=provenance)   # one call: it merges `built`
     load_installed.clear()
     # Clear the choices. Leaving them set means the Write button stays armed
@@ -1130,7 +1425,9 @@ def write_chosen(chosen, cats, offset, meta, demo):
     # panel would keep claiming work is outstanding when it is done.
     st.session_state["pb_chosen"] = {}
     st.success(f"Wrote {len(replaced)} profile(s): "
-               + ", ".join(f"`{k}.csv`" for k in replaced),
+               + ", ".join(f"`{k}.csv`" for k in replaced)
+               + ". Their measured Wh/lap is now in the matrix — press **Save to "
+               "constants.py** at the top to put it in the code.",
                icon=":material/check_circle:")
 
     # A ladder that is no longer in order is not an error, but it is not what
