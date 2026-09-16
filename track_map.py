@@ -143,11 +143,15 @@ def split_at(boundaries):
         span_end = end if end > start else end + TRACK_LENGTH_METERS
 
         xs, ys = [pins[start][0]], [pins[start][1]]
+        # Two passes, so a run that wraps across the finish line collects its
+        # vertices in lap order (before the line, then after it). One pass in
+        # index order put the after-the-line vertices first.
         for i, c in enumerate(CUM_M[:-1]):
             if start < c < span_end:
                 xs.append(CENTRELINE_XY[i][0])
                 ys.append(CENTRELINE_XY[i][1])
-            elif start < c + TRACK_LENGTH_METERS < span_end:   # past the wrap
+        for i, c in enumerate(CUM_M[:-1]):
+            if start < c + TRACK_LENGTH_METERS < span_end:     # past the wrap
                 xs.append(CENTRELINE_XY[i][0])
                 ys.append(CENTRELINE_XY[i][1])
         xs.append(pins[end][0])
