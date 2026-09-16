@@ -494,10 +494,14 @@ the car keeps pushing to `telemetry_history`.
 
 **Export.** The dashboard's Export panel produces a clean, readable **Excel
 workbook** (`.xlsx`): a formatted **Data** sheet (human-friendly columns with
-units, frozen header, filter), a **Charts** sheet of history graphs, and a
-**Faults** sheet. The system chips pick which columns/charts/sheets
-appear. (Internal keys, redundant timestamps, and the raw fault columns from the
-old CSV dump are gone — no more `#NAME?` in Excel.)
+units, frozen header, filter, and a **Race Time** column counted from the race
+start), a **Laps** sheet (one row per lap: finish time, lap time, energy,
+regen, distance, average speed, plus best and average), a **Charts** sheet of
+history graphs, and a **Faults** sheet. The system chips pick which
+columns/charts/sheets appear; "Laps / Energy" adds the Laps sheet and "Errors /
+Faults" the Faults sheet. Missing readings are empty cells, never 0. (Internal
+keys, redundant timestamps, per-row "last lap" repeats, the Lap Trigger
+diagnostic and the raw fault columns are left out — no more `#NAME?` in Excel.)
 
 **From the command line** (same filters; output format follows the `--out`
 extension — `.xlsx` → workbook, anything else → raw CSV):
