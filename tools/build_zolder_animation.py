@@ -414,6 +414,15 @@ DRIVER_PATH = "public/driver"      # written by Pit_Dashboard/driver_message.py
 # outage and not a bad moment on a mobile network.
 STALE_AFTER_S = 20
 
+# Past this, the spectator page does not show the car's last reading at all:
+# every number goes to a dash and the car leaves the map. /public/live keeps the
+# last snapshot forever, so without this a page opened days after a test run
+# showed that run's lap, distance and battery. Judged on the CAR's own sample
+# time, so it also catches a snapshot that arrives the moment the page opens.
+# Ten minutes is far beyond any viewer's clock skew or a mid-race outage worth
+# riding out.
+OLD_AFTER_S = 600
+
 BASE_CSS = """
   :root {
     --bg: #06090f;
@@ -1025,6 +1034,8 @@ __BASE_CSS__
   /* The car stops being drawn as a live thing the moment the feed is not. */
   #car, #car-core, #trail { transition: opacity 0.4s ease; }
   body.stale #car, body.stale #car-core, body.stale #trail { opacity: 0.28; }
+  /* A reading too old to show at all (CONFIG.oldAfterS): no car on the map. */
+  body.old #car, body.old #car-core, body.old #trail { opacity: 0; }
   /* Hidden by sliding UP out of view, but the offset is in PIXELS, not a
      percentage of its own height. It was -140%, and an EMPTY banner is only
      about 24px tall (padding, no line box), so -140% lifted it just 34px from a
@@ -1165,6 +1176,16 @@ let race = { start: CONFIG.raceStart, end: CONFIG.raceEnd };
 let sun = null;
 
 const num = (v) => (v == null || v === "" || isNaN(Number(v))) ? null : Number(v);
+
+// Is the last snapshot too old to show (CONFIG.oldAfterS)? Judged on the car's
+// own sample time, not on when this page received it: the stream delivers the
+// retained snapshot the moment the page opens, however old it is. A snapshot
+// with no time at all cannot be shown to be current, so it counts as old.
+function isOld(now) {
+  if (snap == null) return false;
+  const t = num(snap.ts);
+  return t == null || now - t > CONFIG.oldAfterS;
+}
 
 function fmtCountdown(s) {
   s = Math.max(0, Math.floor(s));
@@ -1369,19 +1390,27 @@ function render() {
   // sampleAge is how old the car says its own reading is. A phone with a wrong
   // clock skews the second, so the status is driven by the first.
   const stale = age == null || age > CONFIG.staleAfterS;
+  const old = isOld(now);
 
   const pill = el("status");
-  pill.className = "pill " + (age == null ? "off" : stale ? "stale" : "live");
+  pill.className = "pill " + (age == null || old ? "off" : stale ? "stale" : "live");
   el("status-text").textContent =
-    age == null ? "Waiting for the car" : stale ? "No data" : "Live";
+    age == null ? "Waiting for the car" : old ? "Car not running"
+                : stale ? "No data" : "Live";
+  const sampleTs = snap ? num(snap.ts) : null;
   el("status-sub").textContent =
     age == null ? "Nothing has arrived yet — the car may not be running."
+                : old ? "Last heard from " + (sampleTs == null ? "a while"
+                          : fmtClock(now - sampleTs)) + " ago. Numbers will "
+                          + "appear when the car is back on track."
                 : stale ? "Nothing for " + Math.round(age) + "s. The car is out of "
                           + "contact; the marker below is where it was last seen."
                 : "Updated " + Math.max(0, Math.round(age)) + "s ago";
   document.body.classList.toggle("stale", stale);
+  document.body.classList.toggle("old", old);
 
-  const s = snap || {};
+  // An old reading is not shown at all: every value renders as a dash.
+  const s = old ? {} : (snap || {});
   el("lap").textContent = num(s.lap) == null ? "—" : num(s.lap);
   el("speed").textContent = num(s.speed_kmh) == null ? "—"
                             : Math.round(num(s.speed_kmh));
@@ -1450,7 +1479,10 @@ function frame(t) {
     if (delta > L / 2) delta -= L;
     dist = ((dist + delta * Math.min(1, dt * 2.2)) % L + L) % L;
   }
-  if (everPainted) {
+  if (everPainted && isOld(Date.now() / 1000)) {
+    el("sector-name").textContent = "—";
+    el("next-sub").textContent = "—";
+  } else if (everPainted) {
     const s = paintMap(dist);
     el("sector-name").textContent = "S" + s.id + " · " + s.name;
     const nx = nextLandmark(dist);
@@ -1930,6 +1962,7 @@ def render_spectator(data, race_start, race_end):
         "racePath": RACE_PATH,
         "driverPath": DRIVER_PATH,
         "staleAfterS": STALE_AFTER_S,
+        "oldAfterS": OLD_AFTER_S,
         "raceStart": race_start,
         "raceEnd": race_end,
         "lat": track.FINISH_LINE_LAT,
