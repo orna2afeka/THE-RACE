@@ -185,6 +185,31 @@ def read_strategy_ack():
         return None
 
 
+# ---------------------------------------------------------------------------
+# The driver's name for the public spectator page (docs/index.html).
+#
+# Under /public, so the database rules let anyone READ it; only the service
+# account can write. There is no default name: with nobody typed in, the node
+# is DELETED and the page hides its driver card rather than showing a
+# placeholder.
+# ---------------------------------------------------------------------------
+_PUBLIC_DRIVER_URL = f"{DB_URL}/public/driver.json"
+
+
+def publish_driver_name(name) -> None:
+    """Show `name` on the spectator page, or remove it when name is empty."""
+    name = (name or "").strip()
+    if name:
+        resp = requests.put(_PUBLIC_DRIVER_URL, params={"access_token": _token()},
+                            json={"name": name, "ts": time.time()},
+                            timeout=_TIMEOUT)
+    else:
+        resp = requests.delete(_PUBLIC_DRIVER_URL,
+                               params={"access_token": _token()},
+                               timeout=_TIMEOUT)
+    resp.raise_for_status()
+
+
 def clear_driver_command() -> None:
     """Delete /driver_command so the car HUD hides its banner."""
     resp = requests.delete(_URL, params={"access_token": _token()}, timeout=_TIMEOUT)

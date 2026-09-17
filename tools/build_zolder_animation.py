@@ -407,6 +407,7 @@ def build_data():
 DB_URL = "https://solar-race-telemetry-default-rtdb.europe-west1.firebasedatabase.app"
 PUBLIC_PATH = "public/live"
 RACE_PATH = "public/race"
+DRIVER_PATH = "public/driver"      # written by Pit_Dashboard/driver_message.py
 
 # How long after the car's last sample the page stops claiming to be live. The
 # car publishes once a second; 20 s is twenty missed updates, which is a real
@@ -1075,6 +1076,12 @@ __BASE_CSS__
       </div>
     </div>
 
+    <!-- Hidden until the pit types a name. There is no default driver. -->
+    <div class="card" id="driver-card" style="display:none">
+      <div class="label">Driving now</div>
+      <div class="value small" id="driver-name"></div>
+    </div>
+
     <div class="card">
       <div class="label">Where the car is</div>
       <div class="value small" id="sector-name">&mdash;</div>
@@ -1267,6 +1274,19 @@ function loadRace() {
     }).catch(() => {});
 }
 
+// The driver's name, typed in at the pit (Pit_Web writes /public/driver). Only
+// a real name shows the card; no name, a deleted node or a failed read hides
+// it. textContent, never innerHTML: this is text someone typed.
+function loadDriver() {
+  fetch(CONFIG.dbUrl + "/" + CONFIG.driverPath + ".json", { cache: "no-store" })
+    .then(r => r.ok ? r.json() : null)
+    .then(d => {
+      const name = d && typeof d.name === "string" ? d.name.trim() : "";
+      el("driver-name").textContent = name;
+      el("driver-card").style.display = name ? "" : "none";
+    }).catch(() => {});
+}
+
 // ── weather, straight from Open-Meteo, same source the pit uses ─────────── //
 function loadWeather() {
   const u = "https://api.open-meteo.com/v1/forecast?latitude=" + CONFIG.lat +
@@ -1445,11 +1465,13 @@ function frame(t) {
 render();
 startStream();
 loadRace();
+loadDriver();
 loadWeather();
 setInterval(render, 1000);          // keeps the ages and the race clock moving
 setInterval(loadWeather, 900000);
 setInterval(renderDayNight, 60000);
 setInterval(loadRace, 300000);
+setInterval(loadDriver, 15000);
 requestAnimationFrame(frame);
 </script>
 </body>
@@ -1906,6 +1928,7 @@ def render_spectator(data, race_start, race_end):
         "dbUrl": DB_URL.rstrip("/"),
         "publicPath": PUBLIC_PATH,
         "racePath": RACE_PATH,
+        "driverPath": DRIVER_PATH,
         "staleAfterS": STALE_AFTER_S,
         "raceStart": race_start,
         "raceEnd": race_end,

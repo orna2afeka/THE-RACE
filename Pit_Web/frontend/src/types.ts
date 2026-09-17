@@ -228,6 +228,10 @@ export interface DriverStint {
    *  stopped — which is what makes the countdown hold instead of drain. */
   runningSince: Num;
   running: boolean;
+  /** Does the public spectator page show this driver name (or no name)?
+   *  False while the write is pending or failing; null in the demo, which
+   *  never publishes. */
+  publicSynced: boolean | null;
 }
 
 export interface Live {

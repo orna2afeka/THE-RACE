@@ -27,7 +27,7 @@ import sqlite3
 import sys
 import threading
 import time
-from contextlib import closing
+from contextlib import asynccontextmanager, closing
 from datetime import datetime, timezone
 
 from fastapi import (FastAPI, HTTPException, Query, WebSocket,
@@ -386,8 +386,12 @@ def driver_stint(conn, now=None):
         "warnS": DRIVER_STINT_WARN_S,
         "critS": DRIVER_STINT_CRIT_S,
     }
+    base["publicSynced"] = public_driver_synced(st.get("driver") or None)
     if not started:
-        return {**base, "startedAt": None, "stint": 0, "driver": None,
+        # A name typed before the green flag is kept here and carried into
+        # stint one when the race starts.
+        return {**base, "startedAt": None, "stint": 0,
+                "driver": st.get("driver") or None,
                 "elapsedS": None, "remainingS": None, "tier": limits.NORMAL,
                 "overdue": False, "canUndo": False, "previousStintS": None,
                 "accumulatedS": 0.0, "runningSince": None, "running": False,
@@ -446,6 +450,67 @@ def _set_stint_running(conn, running, now=None):
     st["accumulated_s"] = _stint_elapsed(st, now)
     st["running_since"] = now if running else None
     save_app_state(conn, DRIVER_STINT_KEY, st)
+
+
+# ── The driver's name on the public spectator page ─────────────────────────── #
+# The stint's driver name is mirrored to Firebase /public/driver, which
+# docs/index.html reads. No default: an unnamed stint deletes the node and the
+# page hides its driver card.
+#
+# The write happens on a background thread, never inside the request. The
+# "Driver changed" button is pressed mid pit stop and must not wait on the
+# internet. Endpoints that change the name wake the thread; it also re-checks
+# every PUBLIC_DRIVER_RESYNC_S, so a failed write is retried by itself.
+#
+# Only the REAL store publishes. The demo dashboard (SOLARRACE_DB_PATH pointed
+# at a demo store) must never put a made-up name in front of the public.
+PUBLIC_DRIVER_ENABLED = os.path.abspath(DB_PATH) == os.path.abspath(SQLITE_PATH)
+PUBLIC_DRIVER_RESYNC_S = 15
+PUBLIC_DRIVER_MAX_LEN = 40
+_NOT_SENT = object()
+_public_driver_sent = _NOT_SENT
+_public_driver_lock = threading.Lock()
+_public_driver_wake = threading.Event()
+
+
+def public_driver_synced(name):
+    """True when the public page shows `name` (or no name, for None), False
+    while a write is pending or failing, None when publishing is off."""
+    if not PUBLIC_DRIVER_ENABLED:
+        return None
+    return _public_driver_sent is not _NOT_SENT and _public_driver_sent == name
+
+
+def sync_public_driver():
+    """Make /public/driver match the current stint. Returns True when in sync."""
+    global _public_driver_sent
+    if not PUBLIC_DRIVER_ENABLED:
+        return None
+    with _public_driver_lock:
+        try:
+            with closing(ro_conn()) as conn:
+                st = load_app_state(conn, DRIVER_STINT_KEY) or {}
+            name = st.get("driver") or None
+            if _public_driver_sent is not _NOT_SENT and _public_driver_sent == name:
+                return True
+            import driver_message
+            driver_message.publish_driver_name(name)
+            _public_driver_sent = name
+            return True
+        except Exception as e:
+            print("[public driver] not published, will retry: %s" % e, flush=True)
+            return False
+
+
+def _kick_public_driver():
+    _public_driver_wake.set()
+
+
+def _public_driver_loop():
+    while True:
+        _public_driver_wake.clear()
+        sync_public_driver()
+        _public_driver_wake.wait(PUBLIC_DRIVER_RESYNC_S)
 
 
 def _stint_follows_race(st, old_start):
@@ -819,7 +884,17 @@ def build_live(conn, manual_lap=-1):
 
 
 # --------------------------------------------------------------------------- #
-app = FastAPI(title="Afeka Pit Wall — React backend")
+@asynccontextmanager
+async def _lifespan(_app):
+    # Started here, not at import: the tools/check_*.py scripts import this
+    # module and must not start writing to Firebase.
+    if PUBLIC_DRIVER_ENABLED:
+        threading.Thread(target=_public_driver_loop, name="public-driver",
+                         daemon=True).start()
+    yield
+
+
+app = FastAPI(title="Afeka Pit Wall — React backend", lifespan=_lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -2062,8 +2137,12 @@ def api_race(body: RaceBody):
                 # with "Driver changed", under-counting one loses a mandatory
                 # change. If a swap already happened in the missed window, that
                 # same button fixes it.
+                # A name typed before any stint existed belongs to driver one;
+                # a name left over from a previous race does not.
                 save_app_state(conn, DRIVER_STINT_KEY, {
-                    "started_at": start, "stint": 1, "driver": None,
+                    "started_at": start, "stint": 1,
+                    "driver": (None if existing.get("started_at")
+                               else existing.get("driver") or None),
                     "accumulated_s": 0.0, "running_since": start,
                 })
             elif _stint_follows_race(existing, old_start):
@@ -2094,6 +2173,7 @@ def api_race(body: RaceBody):
                 _set_stint_running(conn, True)
         elif not body.isRacing:
             _set_stint_running(conn, False)
+        _kick_public_driver()
         return {**db.load_race_state(conn), "driverStint": driver_stint(conn)}
 
 
@@ -2122,6 +2202,7 @@ def api_race_reset():
                        {"at": now, "race": race, "stint": stint})
         db.save_race_state(conn, False, None)
         save_app_state(conn, DRIVER_STINT_KEY, {})
+        _kick_public_driver()
         return {
             "ok": True,
             # What was thrown away, so the toast can say it and a mistake is
@@ -2150,6 +2231,7 @@ def api_race_reset_undo():
         save_app_state(conn, RACE_UNDO_KEY, {})
         # The stint clock has to match whatever the race clock now says.
         _set_stint_running(conn, bool(race.get("is_racing")), now)
+        _kick_public_driver()
         return {"ok": True, "race": db.load_race_state(conn),
                 "driverStint": driver_stint(conn, now)}
 
@@ -2182,7 +2264,7 @@ def api_driver_stint(body: StintBody):
         save_app_state(conn, DRIVER_STINT_KEY, {
             "started_at": now,
             "stint": int(st.get("stint", 0)) + 1,
-            "driver": (body.driver or "").strip() or None,
+            "driver": _clean_driver(body.driver),
             "accumulated_s": 0.0,
             "running_since": now if racing else None,
             # Everything needed to put it back exactly as it was.
@@ -2195,6 +2277,29 @@ def api_driver_stint(body: StintBody):
             # reports — wall time would overstate it across a stoppage.
             "previous_stint_s": _stint_elapsed(st, now) if prev_started else None,
         })
+        _kick_public_driver()
+        return driver_stint(conn, now)
+
+
+def _clean_driver(name):
+    return (name or "").strip()[:PUBLIC_DRIVER_MAX_LEN] or None
+
+
+@app.post("/api/driver_stint/name")
+def api_driver_stint_name(body: StintBody):
+    """Name (or un-name, with an empty name) the driver in the car NOW.
+
+    Touches nothing but the name: the countdown keeps running. Without this the
+    only way to name driver one, who is started automatically by the green
+    flag, would be "Driver changed", which restarts their two hours. Allowed
+    before the race too; the name is then carried into stint one.
+    """
+    now = time.time()
+    with closing(rw_conn()) as conn:
+        st = load_app_state(conn, DRIVER_STINT_KEY) or {}
+        st["driver"] = _clean_driver(body.driver)
+        save_app_state(conn, DRIVER_STINT_KEY, st)
+        _kick_public_driver()
         return driver_stint(conn, now)
 
 
@@ -2223,6 +2328,7 @@ def api_driver_stint_undo():
             restored["running_since"] = st.get("previous_running_since")
         save_app_state(conn, DRIVER_STINT_KEY, restored)
         _set_stint_running(conn, bool(db.load_race_state(conn).get("is_racing")), now)
+        _kick_public_driver()
         return driver_stint(conn, now)
 
 
