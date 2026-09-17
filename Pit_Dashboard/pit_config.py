@@ -120,13 +120,26 @@ DATA_SILENCE_TIMEOUT = 120.0
 # initial event. That node grows without bound, so a fresh laptop can stall on a
 # multi-MB first payload and never reach the live tail.
 #
-# A LIVE view needs none of that history — only the latest sample. So a fresh
-# machine grabs just the most recent N samples (orderBy=$key + limitToLast): live
-# is up in ~1s, and the trend charts have a little context instead of being blank.
-# Reconnects afterwards resume incrementally from the stored cursor, so nothing is
-# missed and history keeps growing from here on. Set to 1 for pure live-now (no
-# history), or 0/None for the old unbounded full backfill.
-INITIAL_BACKFILL_LIMIT = 200
+# A LIVE view needs none of that history — only the latest sample, so a fresh
+# machine asks for the most recent N samples (orderBy=$key + limitToLast) and is
+# live in ~1s. Reconnects afterwards resume incrementally from the stored cursor,
+# so nothing is missed and history grows from here on.
+#
+# Set to 1 — pure live-now. An archived database (tools/archive_db.py, run before
+# a practice day or the race) must come back holding that session and nothing
+# else: 200 samples of carry-over would put the END of the previous session at
+# the START of the new one, where it reads as this session's opening lap and
+# poisons the first trend charts and any speed profile measured off them.
+#
+# DO NOT set this to 0 to mean "no backfill". 0 and None are falsy and select the
+# OLD UNBOUNDED FULL BACKFILL — the entire telemetry_history node in one event,
+# which is the very thing this cap exists to prevent. 1 is the floor.
+#
+# One sample still arrives on a fresh DB, and cannot not: RTDB's startAt/
+# limitToLast boundary is inclusive, so the newest existing key is always
+# delivered. It is a single row, and it is the car's current state rather than
+# stale history, which is what a live view wants anyway.
+INITIAL_BACKFILL_LIMIT = 1
 
 # How many samples to pull per request while CATCHING UP after a gap.
 #

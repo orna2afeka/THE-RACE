@@ -104,23 +104,17 @@ def _excel_dt(ts):
     """`ts` as a NAIVE local datetime, for a real Excel date cell.
 
     Naive because openpyxl refuses a timezone-aware datetime outright - Excel
-    has no timezone type. The zone is not lost: it is spelled out in the "Zone"
-    column beside it, which is also the only honest way to show a workbook whose
-    rows are in two different zones.
+    has no timezone type, so the workbook carries no zone of its own: every
+    time cell is pit-local for the moment it was recorded (pit_config
+    .export_local), which is what the team reads a race log in. The CSV export
+    is the one that keeps the offset per row (see `_iso`) for a reader that has
+    to be sure across the mid-season Tel Aviv -> Brussels switch.
 
     A real datetime rather than a string so Excel sorts, filters and charts it
     as a time instead of as text, which the old UTC ISO string could not do.
     """
     local = pit_config.export_local(ts)
     return None if local is None else local.replace(tzinfo=None)
-
-
-def _zone_label(ts):
-    """Short zone for the Zone column, e.g. "IDT +03:00"."""
-    local = pit_config.export_local(ts)
-    if local is None:
-        return ""
-    return f"{local.tzname()} {local.strftime('%z')[:3]}:{local.strftime('%z')[3:]}"
 
 
 def _parse_time(value):
@@ -297,7 +291,6 @@ def history_csv_bytes(df, charts, style="data", session="", device_id=DEVICE_ID)
 # is the display order on the Data sheet.
 _XLSX_COLS = {
     "device_ts_iso":     ("Time (local)",  "yyyy-mm-dd hh:mm:ss", None, None),
-    "tz_label":          ("Zone",                None,        None,  None),
     # Time since the race start (Start race / corrected start time). Blank when
     # no race start is set or the row is before it.
     "race_time":         ("Race Time",           "[h]:mm:ss", None,  None),
@@ -386,19 +379,26 @@ _DERIVED_SOURCE = {
     "speed_kmh": "mms_vehicle_speed_kmh",
     "distance_km": "odometer_m",
 }
-_ALWAYS = ("device_ts_iso", "tz_label")
+_ALWAYS = ("device_ts_iso",)
+# Lap is read out of the second column, where the Zone column used to sit: it
+# is what the team looks for first when reading a row, so it leads the metrics
+# instead of sitting among the Motion/GPS ones. Only when it was selected - an
+# export without the lap metric gets no empty column.
+_LEAD = "calculated_lap"
 
 
 def _data_columns(metrics, race_start=None):
     """Ordered output keys for the Data sheet, derived from the selected raw
-    metrics. Time and Zone always lead; Race Time follows whenever a race start
-    is known."""
+    metrics. Time always leads, then Lap when it was selected; Race Time
+    follows whenever a race start is known."""
     m = set(metrics)
     cols = list(_ALWAYS)
+    if _LEAD in m:
+        cols.append(_LEAD)
     if race_start:
         cols.append("race_time")
     for k in _XLSX_COLS:
-        if k in _ALWAYS or k == "race_time":
+        if k in _ALWAYS or k in (_LEAD, "race_time"):
             continue
         if _DERIVED_SOURCE.get(k, k) in m:
             cols.append(k)
@@ -418,8 +418,6 @@ def _cell_value(key, r, race_start=None):
         return _race_duration(r["device_ts"], race_start)
     if key == "device_ts_iso":
         return _excel_dt(r["device_ts"])
-    if key == "tz_label":
-        return _zone_label(r["device_ts"])
     if key == "speed_kmh":
         # Straight from the controller's decoded speed field. No `or 0`: a row
         # the car never reported speed for stays None -> an empty cell, not a
@@ -507,9 +505,9 @@ def _write_laps_sheet(ls, laps, race_start):
     from openpyxl.styles import Font
     from openpyxl.utils import get_column_letter
 
-    headers = ["Lap", "Finished (local)", "Zone", "Race Time", "Lap Time",
+    headers = ["Lap", "Finished (local)", "Race Time", "Lap Time",
                "Energy (Wh)", "Regen (Wh)", "Distance (m)", "Avg Speed (km/h)"]
-    formats = [None, "yyyy-mm-dd hh:mm:ss", None, "[h]:mm:ss", "[m]:ss.000",
+    formats = [None, "yyyy-mm-dd hh:mm:ss", "[h]:mm:ss", "[m]:ss.000",
                "0.0", "0.0", "0", "0.0"]
     ls.append(headers)
 
@@ -519,7 +517,7 @@ def _write_laps_sheet(ls, laps, race_start):
     for lap in laps:
         t, d = lap["time_s"], lap["distance_m"]
         avg = (d / 1000.0) / (t / 3600.0) if t and d is not None else None
-        ls.append([lap["lap"], _excel_dt(lap["ts"]), _zone_label(lap["ts"]),
+        ls.append([lap["lap"], _excel_dt(lap["ts"]),
                    _race_duration(lap["ts"], race_start), as_duration(t),
                    lap["energy_wh"], lap["regen_wh"], d, avg])
     if not laps:
@@ -527,9 +525,9 @@ def _write_laps_sheet(ls, laps, race_start):
     else:
         times = [l["time_s"] for l in laps if l["time_s"]]
         ls.append([])
-        ls.append(["Best", None, None, None, as_duration(min(times) if times else None),
+        ls.append(["Best", None, None, as_duration(min(times) if times else None),
                    None, None, None, None])
-        ls.append(["Average", None, None, None,
+        ls.append(["Average", None, None,
                    as_duration(_mean(l["time_s"] for l in laps)),
                    _mean(l["energy_wh"] for l in laps),
                    _mean(l["regen_wh"] for l in laps),
@@ -604,7 +602,7 @@ def write_xlsx(fileobj_or_path, start_ts=None, end_ts=None, metrics=None,
 
     # --- Charts sheet (from a hidden, downsampled data block) ------------- #
     chart_keys = [k for k in cols
-                  if k not in ("device_ts_iso", "tz_label", "lat", "lon")
+                  if k not in ("device_ts_iso", "lat", "lon")
                   and _XLSX_COLS[k][3]]
     if nrows and chart_keys:
         step = max(1, math.ceil(nrows / _MAX_CHART_POINTS))
@@ -645,21 +643,20 @@ def write_xlsx(fileobj_or_path, start_ts=None, end_ts=None, metrics=None,
     # --- Faults sheet ----------------------------------------------------- #
     if include_faults:
         fs = wb.create_sheet("Faults")
-        fheaders = ["Time (local)", "Zone", "BMS error code", "BMS protections",
+        fheaders = ["Time (local)", "BMS error code", "BMS protections",
                     "Motor error code", "Motor alerts"]
         fs.append(fheaders)
         if fault_rows:
             for r in fault_rows:
                 fs.append([
                     _excel_dt(r["device_ts"]),
-                    _zone_label(r["device_ts"]),
                     r["bms_error_code"],
                     _safe(r["bms_protections"]),
                     r["mms_error_code"],
                     _safe(r["mms_alerts"]),
                 ])
         else:
-            fs.append(["No faults recorded in this window.", None, None, None, None, None])
+            fs.append(["No faults recorded in this window.", None, None, None, None])
         for i, h in enumerate(fheaders, start=1):
             fs.column_dimensions[get_column_letter(i)].width = max(16, len(h) + 2)
         _style_header(fs, len(fheaders), max(1, len(fault_rows)))

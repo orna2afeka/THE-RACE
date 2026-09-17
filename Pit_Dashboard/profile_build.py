@@ -30,6 +30,7 @@ so apply_corner_cap() exists and the caller is expected to leave it on.
 """
 
 import csv
+import datetime
 import math
 import os
 import sys
@@ -104,6 +105,90 @@ ENERGY_RATIO_MAX = 1.25
 # Below this fraction of the trace's own duration actually integrated, the shape
 # has holes in it and the shares are not a distribution of the whole lap.
 ENERGY_MIN_COVERAGE_PCT = 90.0
+
+# ── Stints, standstills, and what a NET lap is ──────────────────────── #
+# A DRIVER CHANGE DOES NOT LOOK LIKE A GAP IN THE DATA. The Pi stays powered
+# through it and keeps publishing speed-0 samples, and the lap counter only
+# moves when the car crosses the finish line -- so driver A's in-lap, the
+# standstill and driver B's out-lap all arrive as ONE lap record whose reported
+# time includes the whole stop. Confirmed in this project's store: trace L0R53
+# of 26 Aug is a single 1423 s trace holding a 730 s standstill at 3670 m, then
+# driving on across the line. db.TRACE_GAP_S splits on gaps BETWEEN samples and
+# therefore never fires on it.
+#
+# Everything below exists so that lap can never become a profile the car drives.
+DEFAULT_STOP_S = 90.0              # standstill that means "pit stop"; UI default
+DEFAULT_MIN_START_KMH = 25.0       # below this a drive began from rest
+MIN_ROLLING_END_KMH = 5.0          # below this a drive ENDED stationary
+
+# THE SAFETY CONSTANT, AND IT IS DELIBERATELY NOT THE SLIDER. If the NET test
+# reused DEFAULT_STOP_S, then dragging the pit threshold from 90 s to 300 s
+# would silently promote every lap with a four-minute standstill inside it from
+# PIT to selectable profile material -- a slider quietly widening what the car
+# may be told to drive. No slider may do that, so NET has its own hard limit.
+# Self-test 18 pins exactly this.
+NET_MAX_STILL_S = 10.0
+
+# Mirrors db.TRACE_GAP_S. Kept as a default rather than imported for the same
+# reason DEFAULT_JOIN_SLACK_S is: this module stays free of the store.
+DEFAULT_STINT_GAP_S = 300.0
+
+# Below this the car is not moving. NOT zero on purpose: the controller's speed
+# field jitters around standstill, and an "== 0" test shatters one 730 s stop
+# into dozens of two-sample fragments, none of which passes any threshold.
+# Mirrored in db.STOP_MOVING_KMH.
+STOP_MOVING_KMH = 1.0
+# The shortest standstill worth reporting at all.
+STOP_MIN_S = 2.0
+# One lap_distance_m quantum. The store steps distance in 10 m, so a car that
+# really was stationary can still show one step of movement.
+STOP_DISTANCE_QUANTUM_M = 10.0
+
+# What a drive IS, in one word, for the matrix.
+#
+# A BADGE IS PROVISIONAL AND THAT IS THE DESIGN. FIRST is knowable the instant a
+# drive is recorded -- it started from rest. LAST and PIT cannot be known until a
+# standstill has been OBSERVED, which on a driver change is minutes after the lap
+# ended. The badge appearing late is this working correctly; guessing early would
+# be the bug.
+BADGE_NET = "NET"
+BADGE_FIRST = "FIRST"
+BADGE_LAST = "LAST"
+BADGE_PIT = "PIT"
+# A fifth value the data forces on us. 74,341 of 125,771 lap-tagged rows in this
+# store carry no speed at all, and 40-odd whole traces have none whatsoever.
+# With only four badges those fall through to NET -- nothing disproves it -- and
+# get offered as profile material. Nothing can be established about them, so they
+# are never offerable.
+BADGE_UNKNOWN = "?"
+
+
+# --------------------------------------------------------------------------- #
+# Reading store rows tolerantly
+# --------------------------------------------------------------------------- #
+def _get(row, name, default=None):
+    """row[name], or `default` when that column is not there.
+
+    sqlite3.Row raises IndexError for a missing key, and a RUNNING app can ask
+    for one: Streamlit recompiles the main script from disk on every rerun but
+    never re-imports modules, and this project sets fileWatcherType = "none".
+    So profile_builder.py can be the new file while the db module in memory is
+    still the old one. profile_builder._col exists for exactly this and spells
+    the mechanism out at length.
+
+    Also works on the plain dicts _self_check() builds, so the tests need no
+    shim for the columns added here.
+    """
+    try:
+        value = row[name]
+    except (IndexError, KeyError):
+        return default
+    return default if value is None else value
+
+
+def _fnum(value):
+    """float(value), or None. For store columns that are NULL on old rows."""
+    return None if value is None else float(value)
 
 
 # --------------------------------------------------------------------------- #
@@ -212,6 +297,18 @@ def pair_traces(traces, join_slack_s=DEFAULT_JOIN_SLACK_S):
             "trace_end_m": float(r["trace_end_m"] or 0.0),
             "v_max_kmh": float(r["v_max_kmh"] or 0.0),
             "lap_source": r["lap_source"],
+            # Where this drive started and finished, and the longest standstill
+            # INSIDE it -- the three facts that tell an out-lap, an in-lap and a
+            # driver change apart from a flying lap. All None on a store written
+            # before db.lap_traces returned them, hence _get; see its docstring
+            # for why a running app can genuinely be in that state.
+            "v_start_kmh": _fnum(_get(r, "v_start_kmh")),
+            "v_end_kmh": _fnum(_get(r, "v_end_kmh")),
+            "stop_s": _fnum(_get(r, "stop_s")),
+            "stop_at_m": _fnum(_get(r, "stop_at_m")),
+            "stop_rows": int(_get(r, "stop_rows", 0) or 0),
+            "stopped_s_total": _fnum(_get(r, "stopped_s_total")),
+            "n_stops": int(_get(r, "n_stops", 0) or 0),
             # This drive's real figures, off the run that follows it.
             "lap_time_s": (float(nxt["carried_lap_time_s"])
                            if nxt and nxt["carried_lap_time_s"] is not None else None),
@@ -246,6 +343,248 @@ def check_trace_alignment(paired):
         if t["lap_time_s"] is not None:
             series[1].append((t["span_s"], t["lap_time_s"]))
     return _score_offsets(series)
+
+
+def longest_standstill(samples, move_kmh=STOP_MOVING_KMH, min_s=STOP_MIN_S,
+                       quantum_m=STOP_DISTANCE_QUANTUM_M):
+    """(longest_stop_s, stop_at_m, n_stops, stopped_total_s) from raw rows.
+
+    `samples` is an iterable of (device_ts, lap_distance_m, speed_kmh, ...) —
+    db.fetch_trace_samples rows or plain tuples.
+
+    THE PYTHON TWIN OF THE ISLANDS CTE IN db.lap_traces, same rule and the same
+    NULL handling. Two implementations of one rule is a cost paid deliberately:
+    the grouped query has to find stops across the whole store cheaply, while
+    the focused lap's stop should be computed from its OWN samples rather than
+    taken on trust from a GROUP BY — and having both lets self-test 22 hold them
+    against each other instead of hoping they agree.
+
+    Three decisions worth knowing:
+
+    * DURATION IS WALL CLOCK, from the island's own first row to its last. That
+      excludes the unknown interval either side of the stop, so a reported stop
+      is always a LOWER bound and can never be invented. At 1-4 Hz the
+      understatement is under a second, and understating is the safe direction.
+    * A NULL SPEED CONTINUES AN ISLAND BUT NEVER CREATES ONE. One dropped sample
+      mid-stop must not split a 730 s stop into two 365 s halves that then slip
+      under every threshold. But a run of NULLs on its own is not a standstill:
+      59% of this store's lap-tagged rows have no speed and one such run lasts
+      9494 s, which without the `n_still` test below reads as a 2.6-hour stop.
+    * THE DISTANCE TEST IS PHYSICAL, not a flat metre budget. A telemetry
+      dropout AT SPEED also looks like "no moving samples", and what separates
+      it from a real standstill is that its distance keeps climbing. A flat 20 m
+      rule lost a real stop in this store (trace L0R56 read 306 s flat against
+      453 s physical); move_kmh/3.6 * stop_s self-scales instead, plus one 10 m
+      distance quantum of slack.
+    """
+    islands = []
+    cur = None
+    for row in samples:
+        ts = row[0] if len(row) > 0 else None
+        d = row[1] if len(row) > 1 else None
+        v = row[2] if len(row) > 2 else None
+        if ts is None:
+            continue
+        if v is not None and abs(float(v)) >= move_kmh:
+            cur = None                      # moving: this island is over
+            continue
+        if cur is None:
+            cur = {"t0": float(ts), "t1": float(ts), "d": [], "n_still": 0}
+            islands.append(cur)
+        cur["t1"] = float(ts)
+        if d is not None:
+            cur["d"].append(float(d))
+        if v is not None:                   # a REPORTED sub-move_kmh speed
+            cur["n_still"] += 1
+
+    real = []
+    for isl in islands:
+        stop_s = isl["t1"] - isl["t0"]
+        if isl["n_still"] < 1 or stop_s < min_s:
+            continue
+        drift = (max(isl["d"]) - min(isl["d"])) if isl["d"] else 0.0
+        if drift > move_kmh / 3.6 * stop_s + quantum_m:
+            continue                        # a dropout at speed, not a stop
+        real.append((stop_s, min(isl["d"]) if isl["d"] else None))
+
+    if not real:
+        return 0.0, None, 0, 0.0
+    real.sort(key=lambda x: -x[0])
+    return real[0][0], real[0][1], len(real), sum(s for s, _ in real)
+
+
+def _stint_key(t0):
+    """A stint's stable identity: the ISO second its FIRST drive began.
+
+    Stable because stints grow FORWARD — appending laps never moves the first
+    t0 — so a driver's name typed against this key stays put. What it cannot
+    survive is a stint SPLITTING later, when a standstill in the middle of it is
+    finally observed. The stint editor shows each stint's From/To beside the
+    name so a name that has drifted onto the wrong half is visible rather than
+    silent, and no name is ever moved automatically.
+    """
+    return datetime.datetime.fromtimestamp(float(t0 or 0.0)).strftime(
+        "%Y-%m-%dT%H:%M:%S")
+
+
+def classify_traces(paired, stop_s=DEFAULT_STOP_S,
+                    min_start_kmh=DEFAULT_MIN_START_KMH,
+                    end_kmh=MIN_ROLLING_END_KMH,
+                    net_max_still_s=NET_MAX_STILL_S,
+                    stint_gap_s=DEFAULT_STINT_GAP_S):
+    """pair_traces() output -> ({trace id: facts}, [stint, ...]).
+
+    Which drives are usable profile material, and who was driving.
+
+    PURE. No store, no clock, no session state, no Streamlit. That is what makes
+    a PROVISIONAL badge safe: the whole classification is recomputed from
+    scratch on every refresh, so a lap that looked NET becoming PIT once its
+    standstill is finally observed is this function telling the truth about more
+    data — not state drifting out of step with it. classify(x) == classify(x),
+    and appending drives never renumbers an earlier stint (self-test 19).
+
+    A STINT IS THE RUN OF LAPS ONE DRIVER DROVE, and it is bounded by
+    standstills rather than by gaps in the data — see the note on DEFAULT_STOP_S
+    for why no gap appears at a driver change. A PIT drive closes its stint and
+    belongs to NEITHER side: it contains driver A's in-lap and driver B's
+    out-lap, so filing it under one of them would be a lie.
+
+    `stop_s` and `min_start_kmh` are the two UI sliders. They are applied HERE
+    and never in SQL, so dragging one costs nothing — db.lap_traces' ~2 s result
+    stays cached.
+    """
+    # t0 is the only ordering that means anything: a lap NUMBER repeats every
+    # time the car's counter is reset, and welding two evenings together by
+    # number is the bug pair_traces exists to prevent.
+    order = sorted(paired, key=lambda t: t.get("t0") or 0.0)
+
+    # ---- pass 1: what each drive says about itself, no context needed ------ #
+    facts = {}
+    for t in order:
+        stop = t.get("stop_s")
+        v0 = t.get("v_start_kmh")
+        v1 = t.get("v_end_kmh")
+        facts[t["id"]] = {
+            "id": t["id"],
+            "v_start": v0,
+            "v_end": v1,
+            "stop_s": stop,
+            "stop_at_m": t.get("stop_at_m"),
+            "n_stops": int(t.get("n_stops") or 0),
+            "stopped_s": t.get("stopped_s_total"),
+            "is_pit": stop is not None and stop >= stop_s,
+            "started_from_rest": v0 is not None and v0 < min_start_kmh,
+            "ends_stationary": v1 is None or v1 < end_kmh,
+            "no_time": t.get("lap_time_s") is None,
+            # No speed anywhere in the drive: nothing can be established, so it
+            # must not fall through to NET. See BADGE_UNKNOWN.
+            "blind": (v0 is None and v1 is None
+                      and not int(t.get("n_speed") or 0)),
+            "stint": None,
+        }
+
+    # ---- pass 2: stints --------------------------------------------------- #
+    stints = []
+    cur = None
+    prev = None
+    for t in order:
+        f = facts[t["id"]]
+        gap = (prev is not None
+               and (t.get("t0") or 0.0) - (prev.get("t1") or 0.0) > stint_gap_s)
+        if f["is_pit"]:
+            if cur is not None:
+                cur["ended_by"] = "pit"
+                cur = None
+            prev = t
+            continue                        # stint stays None: two drivers
+        if cur is None or gap:
+            if cur is not None:
+                cur["ended_by"] = "gap"     # the car was switched off instead
+            cur = {"index": len(stints) + 1,
+                   "key": _stint_key(t.get("t0")),
+                   "t0": float(t.get("t0") or 0.0),
+                   "t1": float(t.get("t1") or 0.0),
+                   "ids": [], "n_net": 0, "ended_by": "open"}
+            stints.append(cur)
+        cur["ids"].append(t["id"])
+        cur["t1"] = float(t.get("t1") or 0.0)
+        f["stint"] = cur["index"]
+        prev = t
+
+    # ---- pass 3: badges, now stint membership and the NEXT drive are known - #
+    first_of = {s["ids"][0] for s in stints if s["ids"]}
+    closed_last = {s["ids"][-1] for s in stints
+                   if s["ids"] and s["ended_by"] in ("pit", "gap")}
+
+    for i, t in enumerate(order):
+        tid = t["id"]
+        f = facts[tid]
+        nxt = order[i + 1] if i + 1 < len(order) else None
+        next_is_pit = nxt is not None and facts[nxt["id"]]["is_pit"]
+        why = []
+
+        if f["is_pit"]:
+            badge = BADGE_PIT
+            at = "" if f["stop_at_m"] is None else f" at {f['stop_at_m']:.0f} m"
+            t_s = t.get("lap_time_s")
+            why.append(f"stood still for {f['stop_s']:.0f} s{at} — a pit stop "
+                       f"or a driver change"
+                       + ("" if t_s is None else
+                          f", and its {t_s:.0f} s lap time is mostly the stop"))
+            why.append("the samples either side of the stop are two different "
+                       "pieces of driving, so this is not one lap of anything")
+        elif f["blind"]:
+            badge = BADGE_UNKNOWN
+            why.append("the car reported no speed at all in this drive, so "
+                       "nothing about its start, its finish or its standstills "
+                       "can be established")
+        elif tid in first_of or f["started_from_rest"]:
+            badge = BADGE_FIRST
+            if tid in first_of:
+                why.append(f"the first drive of stint {f['stint']}")
+            if f["started_from_rest"]:
+                why.append(f"started at {f['v_start']:.0f} km/h, under the "
+                           f"{min_start_kmh:.0f} km/h minimum — an out-lap from "
+                           f"rest, not a flying lap")
+        elif (f["ends_stationary"] or f["no_time"] or next_is_pit
+              or tid in closed_last):
+            badge = BADGE_LAST
+            if f["ends_stationary"]:
+                why.append("finished at "
+                           + ("no reported speed" if f["v_end"] is None
+                              else f"{f['v_end']:.0f} km/h")
+                           + " — rolled to a stop instead of crossing the line")
+            if f["no_time"]:
+                why.append("the car has not reported a time for this drive; if "
+                           "it is the newest one, this is the lap in progress")
+            if next_is_pit:
+                why.append("the drive after it is a pit stop or driver change")
+            if tid in closed_last and not (next_is_pit or f["no_time"]):
+                why.append(f"the last drive of stint {f['stint']}")
+        else:
+            badge = BADGE_NET
+            why.append(f"started at {f['v_start']:.0f} km/h, finished at "
+                       f"{f['v_end']:.0f} km/h, no standstill inside it")
+
+        # THE PROPERTY NO SLIDER MAY BREAK. Reaching NET already implies is_pit
+        # is False, but that only means the stop is under the PIT threshold —
+        # which the user can raise to 300 s. A lap with this much standstill in
+        # it is not profile material at ANY slider setting. See NET_MAX_STILL_S;
+        # self-test 18 holds this line.
+        if badge == BADGE_NET and (f["stop_s"] or 0.0) >= net_max_still_s:
+            badge = BADGE_LAST
+            why = [f"stood still for {f['stop_s']:.0f} s inside this drive — "
+                   f"under the {stop_s:.0f} s that counts as a pit stop, but far "
+                   f"too long for the samples either side to be one lap"]
+
+        f["badge"] = badge
+        f["reasons"] = why
+        f["net_ok"] = (badge == BADGE_NET)
+
+    for s in stints:
+        s["n_net"] = sum(1 for i in s["ids"] if facts[i]["net_ok"])
+
+    return facts, stints
 
 
 def count_backward_jumps(samples, back_m=INTERLEAVE_BACK_M):
@@ -467,7 +806,18 @@ def clean_samples(samples):
     stationary car repeats the same distance, and the last of a repeated run is
     the sample motion resumed from, which is the same straddle rule
     _crossing_time uses in Pit_Web/api.py.
+
+    THAT DEDUPING IS ALSO A HAZARD, WHICH IS WHY THE STANDSTILL IS MEASURED
+    FIRST. Collapsing a repeated distance is right for a car pausing in a
+    hairpin queue, but a twelve-minute pit stop repeats one distance too — and
+    once collapsed to a single sample the lap looks ~4000 m long with a healthy
+    median speed and no holes, so nothing downstream can tell that the samples
+    either side of it are two different drivers. longest_standstill() runs on the
+    RAW rows, before any of that, and reject_reasons() refuses on what it finds.
     """
+    samples = list(samples)
+    stop_s, stop_at_m, n_stops, stopped_s = longest_standstill(samples)
+
     d_raw, v_raw = [], []
     no_speed = 0
     for row in samples:
@@ -509,6 +859,11 @@ def clean_samples(samples):
         "coverage_pct": 100.0 * covered / LAP_M if len(d) > 1 else 0.0,
         "median_kmh": float(np.median(v)) if len(v) else 0.0,
         "max_kmh": float(v.max()) if len(v) else 0.0,
+        # From the RAW rows above, not from the deduped arrays.
+        "longest_stop_s": stop_s,
+        "stop_at_m": stop_at_m,
+        "n_stops": n_stops,
+        "stopped_s": stopped_s,
     }
     return d, v, diag
 
@@ -523,6 +878,20 @@ def reject_reasons(diag, allow_gaps=False):
                    f"rows, ~50x too high, not rescalable")
     if diag["median_kmh"] < MIN_MEDIAN_KMH:
         out.append(f"median speed {diag['median_kmh']:.1f} km/h — car was parked")
+    # A STOP IS NOT PART OF A LAP. Without this the arithmetic layer accepts a
+    # driver-change trace outright: clean_samples dedupes the standstill down to
+    # one sample, so the length, the median and the gap tests all pass and
+    # build_profile happily splices driver A's in-lap to driver B's out-lap into
+    # one plausible-looking curve the car is then told to drive. Refused here as
+    # well as in the UI and in the write path, for the reason the write path's
+    # own guard gives: this is the last point before a file the car follows.
+    if (diag.get("longest_stop_s") or 0.0) >= NET_MAX_STILL_S:
+        at = diag.get("stop_at_m")
+        out.append(
+            f"the car stood still for {diag['longest_stop_s']:.0f} s"
+            + ("" if at is None else f" at {at:.0f} m")
+            + " inside this drive — a stop is not part of a lap, and the "
+              "samples either side of it are two different pieces of driving")
     if abs(diag["length_m"] - LAP_M) > MAX_LENGTH_ERROR_M:
         out.append(f"lap measured {diag['length_m']:.0f} m, not ~{LAP_M:.0f} m — "
                    f"the lap trigger fired early or late")
@@ -770,8 +1139,19 @@ def write_rows(path, distances_m, speeds_ms, sections):
 # Self-check
 # --------------------------------------------------------------------------- #
 def _synthetic_lap(lap_time_s=210.0, spacing_m=20.0, hole=None, stationary=False,
-                   length_m=4000.0, jitter=0.0, seed=1):
-    """A fake lap shaped like a real one: fast straights, four slow corners."""
+                   length_m=4000.0, jitter=0.0, seed=1, stationary_s=0.0):
+    """A fake lap shaped like a real one: fast straights, four slow corners.
+
+    `stationary` inserts 8 repeated-distance rows that all share ts = 0.0 — a
+    deduping fixture, and test 2 asserts exactly that. Because their clock never
+    advances they are a zero-second standstill, so reject_reasons' stop test
+    correctly ignores them. That is luck rather than design, so it is pinned
+    here: do not "fix" those timestamps or test 2 changes meaning.
+
+    `stationary_s` is the real thing — a stop of that many seconds with the
+    clock advancing through it and every later row shifted along, which is what
+    a pit stop actually looks like. Test 24 uses it.
+    """
     rng = np.random.default_rng(seed)
     d = np.arange(0.0, length_m, spacing_m)
     base = 90.0 - 55.0 * np.exp(-((d % 1000 - 650) / 90.0) ** 2)
@@ -781,6 +1161,15 @@ def _synthetic_lap(lap_time_s=210.0, spacing_m=20.0, hole=None, stationary=False
     rows = [(float(i), float(dd), float(vv), "gps") for i, (dd, vv) in enumerate(zip(d, v))]
     if stationary:
         rows = rows[:50] + [(0.0, rows[50][1], 0.0, "gps")] * 8 + rows[50:]
+    if stationary_s:
+        # Distance frozen, speed 0, clock running — and everything after it
+        # pushed back by the duration, so time stays monotonic.
+        t_at, d_at = rows[50][0], rows[50][1]
+        held = [(float(t_at + k), float(d_at), 0.0, "gps")
+                for k in range(int(stationary_s) + 1)]
+        rest = [(float(t + stationary_s), dd, vv, ss)
+                for t, dd, vv, ss in rows[50:]]
+        rows = rows[:50] + held + rest
     if hole:
         lo, hi = hole
         rows = [r for r in rows if not (lo < r[1] < hi)]
@@ -788,18 +1177,38 @@ def _synthetic_lap(lap_time_s=210.0, spacing_m=20.0, hole=None, stationary=False
 
 
 def _synthetic_trace(power_w=1000.0, seconds=200.0, dt=0.5, lap_m=4000.0,
-                     gap_at=None, gap_s=3.0, interleave=0):
+                     gap_at=None, gap_s=3.0, interleave=0,
+                     stop_at_s=None, stop_len_s=0.0,
+                     null_speed_from=None, null_speed_s=0.0):
     """A drive's worth of samples: (ts, distance, speed, source, power).
 
     Constant power and constant speed on purpose -- the energy is then known in
     closed form, so the test asserts a number rather than whatever the code
     happens to produce.
+
+    `stop_at_s`/`stop_len_s` hold the distance still and the speed at zero while
+    the clock runs: a pit stop. `null_speed_from`/`null_speed_s` report NO speed
+    while the distance keeps climbing: a telemetry dropout at speed, which must
+    NOT be mistaken for a stop. Tests 22 and 23 are those two cases, and with
+    both defaults off the rows are byte-identical to before.
     """
     v_ms = lap_m / seconds
     rows = []
     t = 0.0
-    while t <= seconds + 1e-9:
-        rows.append((t, min(v_ms * t, lap_m), v_ms * 3.6, "gps", power_w))
+    d = 0.0
+    while t <= seconds + stop_len_s + 1e-9:
+        in_stop = (stop_at_s is not None
+                   and stop_at_s <= t < stop_at_s + stop_len_s)
+        in_null = (null_speed_from is not None
+                   and null_speed_from <= t < null_speed_from + null_speed_s)
+        if in_stop:
+            rows.append((t, min(d, lap_m), 0.0, "gps", 0.0))
+        elif in_null:
+            rows.append((t, min(d, lap_m), None, "gps", power_w))
+            d += v_ms * dt
+        else:
+            rows.append((t, min(d, lap_m), v_ms * 3.6, "gps", power_w))
+            d += v_ms * dt
         t += dt
     if gap_at is not None:
         # Drop every sample inside a window, leaving one interval of gap_s.
@@ -881,12 +1290,16 @@ def _self_check():
     # 8. A lap number used by two different drives pairs each with ITS OWN next
     #    run. This is the bug that put a lap driven at 17:20 together with a lap
     #    time recorded at 19:18 and produced an energy figure 28x out.
-    def _row(lap, run, t0, t1, ct=None, ce=None):
+    def _row(lap, run, t0, t1, ct=None, ce=None, v_start=90.0, v_end=90.0,
+             stop=None, stop_at=None):
         return {"trace_lap": lap, "run": run, "t0": t0, "t1": t1,
                 "n_samples": 500, "n_speed": 500, "n_power": 500,
                 "trace_end_m": 4000.0, "v_max_kmh": 90.0, "lap_source": "gps",
                 "carried_lap_time_s": ct, "carried_energy_wh": ce,
-                "carried_regen_wh": None, "carried_distance_m": None}
+                "carried_regen_wh": None, "carried_distance_m": None,
+                "v_start_kmh": v_start, "v_end_kmh": v_end,
+                "stop_s": stop, "stop_at_m": stop_at, "stop_rows": 0,
+                "stopped_s_total": stop, "n_stops": 0 if stop is None else 1}
     morning = [_row(1, 0, 1000.0, 1210.0), _row(2, 0, 1210.0, 1421.0, 210.0, 80.0)]
     evening = [_row(1, 1, 9000.0, 9220.0), _row(2, 1, 9220.0, 9435.0, 220.0, 95.0)]
     paired = pair_traces(morning + evening)
@@ -954,6 +1367,157 @@ def _self_check():
           f"no car figure {no_car[0]}, no power {no_power[0]}")
     ok &= good[0] is True
     ok &= not any(x[0] for x in (bad_ratio, bad_cover, bad_mixed, no_car, no_power))
+
+    # ---- the classifier: stints, badges, and the line no slider may cross -- #
+    def _drive(tid, t0, t1, v0=85.0, v1=85.0, stop=None, stop_at=None,
+               lap_time=210.0, n_speed=500):
+        """One pair_traces()-shaped drive. The classifier's whole input."""
+        return {"id": tid, "lap": int(tid.split("R")[0][1:]), "run": 0,
+                "t0": float(t0), "t1": float(t1), "span_s": float(t1) - float(t0),
+                "n_samples": 500, "n_speed": n_speed, "n_power": 500,
+                "trace_end_m": 4000.0, "v_max_kmh": 90.0, "lap_source": "gps",
+                "lap_time_s": lap_time, "energy_wh": 80.0, "regen_wh": None,
+                "distance_m": 4000.0, "own_lap_time_s": None, "next_id": None,
+                "v_start_kmh": v0, "v_end_kmh": v1, "stop_s": stop,
+                "stop_at_m": stop_at, "stop_rows": 0,
+                "stopped_s_total": stop, "n_stops": 0 if stop is None else 1}
+
+    def _ladder(specs):
+        """Drives back to back in time, so only what a spec overrides differs."""
+        out, t = [], 1000.0
+        for k, kw in enumerate(specs, start=1):
+            kw = dict(kw)
+            span = kw.pop("span", 215.0)
+            out.append(_drive(f"L{k}R0", t, t + span, **kw))
+            t += span + 5.0
+        return out
+
+    PIT_SPEC = {"span": 1420.0, "v0": 0.0, "v1": 66.1, "stop": 730.0,
+                "stop_at": 3670.0, "lap_time": 1310.0}
+
+    # 15. A pit stop is found, and it SPLITS the stint rather than joining one.
+    #     The figures are the real 26 Aug trace L0R53, not invented.
+    specs = [{} for _ in range(8)]
+    specs[3] = dict(PIT_SPEC)
+    b15, s15 = classify_traces(_ladder(specs))
+    print(f"15. pit splits stint -> L4R0 {b15['L4R0']['badge']}, "
+          f"stint {b15['L4R0']['stint']}, {len(s15)} stint(s): "
+          f"{[s['ids'] for s in s15]}")
+    ok &= b15["L4R0"]["badge"] == BADGE_PIT
+    ok &= b15["L4R0"]["stint"] is None
+    ok &= len(s15) == 2
+    ok &= s15[0]["ids"] == ["L1R0", "L2R0", "L3R0"]
+    ok &= s15[1]["ids"] == ["L5R0", "L6R0", "L7R0", "L8R0"]
+    ok &= s15[0]["ended_by"] == "pit"
+
+    # 16. FIRST both ways: from rest mid-stint, and simply being first.
+    specs = [{} for _ in range(6)]
+    specs[4] = {"v0": 0.0}
+    b16, _ = classify_traces(_ladder(specs))
+    print(f"16. first laps    -> L1R0 {b16['L1R0']['badge']} (first of stint), "
+          f"L5R0 {b16['L5R0']['badge']} (from rest), L2R0 {b16['L2R0']['badge']}")
+    ok &= b16["L1R0"]["badge"] == BADGE_FIRST
+    ok &= b16["L5R0"]["badge"] == BADGE_FIRST
+    ok &= b16["L2R0"]["badge"] == BADGE_NET
+
+    # 17. LAST all three ways, independently of each other.
+    specs = [{} for _ in range(7)]
+    specs[1] = {"v1": 0.0}                       # rolled to a stop
+    specs[3] = {"lap_time": None}                # the car never timed it
+    specs[5] = dict(PIT_SPEC)                    # so L5R0 is followed by a pit
+    b17, _ = classify_traces(_ladder(specs))
+    print(f"17. last laps     -> ends at 0: {b17['L2R0']['badge']}, no time: "
+          f"{b17['L4R0']['badge']}, next is pit: {b17['L5R0']['badge']}")
+    ok &= b17["L2R0"]["badge"] == BADGE_LAST
+    ok &= b17["L4R0"]["badge"] == BADGE_LAST
+    ok &= b17["L5R0"]["badge"] == BADGE_LAST
+
+    # 18. THE SAFETY TEST. Raising the pit slider must never turn a lap with a
+    #     standstill in it into profile material. See NET_MAX_STILL_S.
+    specs = [{} for _ in range(5)]
+    specs[2] = {"span": 900.0, "stop": 700.0, "stop_at": 2000.0,
+                "lap_time": 900.0}
+    d18 = _ladder(specs)
+    b_tight, _ = classify_traces(d18, stop_s=90.0)
+    b_loose, _ = classify_traces(d18, stop_s=1200.0)
+    print(f"18. 700 s stop    -> at stop_s=90 {b_tight['L3R0']['badge']}, at "
+          f"stop_s=1200 {b_loose['L3R0']['badge']} "
+          f"(net_ok {b_loose['L3R0']['net_ok']})")
+    ok &= b_tight["L3R0"]["badge"] == BADGE_PIT
+    ok &= b_loose["L3R0"]["badge"] != BADGE_PIT
+    ok &= b_loose["L3R0"]["badge"] != BADGE_NET
+    ok &= b_tight["L3R0"]["net_ok"] is False
+    ok &= b_loose["L3R0"]["net_ok"] is False
+
+    # 19. Pure, and progressive: more data may add a badge but must never
+    #     renumber a stint an earlier call already named.
+    d19 = _ladder([{} for _ in range(6)])
+    full, _ = classify_traces(d19)
+    again, _ = classify_traces(d19)
+    stable = full == again
+    for k in range(1, len(d19) + 1):
+        partial, _ = classify_traces(d19[:k])
+        for tid, f in partial.items():
+            if f["stint"] != full[tid]["stint"]:
+                stable = False
+    print(f"19. pure + progressive -> {stable}")
+    ok &= stable
+
+    # 20. A stint also splits on a real gap in the data, with no pit between --
+    #     the car switched off rather than sat in the pit lane.
+    early = _ladder([{} for _ in range(3)])
+    t = early[-1]["t1"] + 3600.0
+    late = []
+    for k in range(4, 7):
+        late.append(_drive(f"L{k}R0", t, t + 215.0))
+        t += 220.0
+    b20, s20 = classify_traces(early + late)
+    print(f"20. 3600 s gap    -> {len(s20)} stint(s), ended_by "
+          f"{[s['ended_by'] for s in s20]}")
+    ok &= len(s20) == 2
+    ok &= s20[0]["ended_by"] == "gap"
+    ok &= s20[1]["ended_by"] == "open"
+
+    # 21. A drive with no speed at all is never offered. 40-odd traces in the
+    #     real store look like this; with four badges they would read as NET.
+    specs = [{} for _ in range(4)]
+    specs[2] = {"v0": None, "v1": None, "n_speed": 0}
+    b21, _ = classify_traces(_ladder(specs))
+    print(f"21. no speed at all -> {b21['L3R0']['badge']}, net_ok "
+          f"{b21['L3R0']['net_ok']}")
+    ok &= b21["L3R0"]["badge"] == BADGE_UNKNOWN
+    ok &= b21["L3R0"]["net_ok"] is False
+
+    # 22. The standstill rule, against a trace whose stop is known exactly.
+    #     This is the reference implementation db.lap_traces' islands CTE has to
+    #     agree with.
+    stopped = _synthetic_trace(seconds=200.0, stop_at_s=60.0, stop_len_s=730.0)
+    s_len, s_at, s_n, s_tot = longest_standstill(stopped)
+    print(f"22. 730 s stop at 1200 m -> {s_len:.1f}s at "
+          f"{-1.0 if s_at is None else s_at:.0f}m, {s_n} stop(s), "
+          f"{s_tot:.1f}s stopped in total")
+    ok &= abs(s_len - 730.0) <= 1.0
+    ok &= s_at is not None and abs(s_at - 1200.0) <= 20.0
+    ok &= s_n == 1
+
+    # 23. A run of NULL speeds is NOT a standstill. The store's own failure
+    #     mode: 74k of 126k lap-tagged rows have no speed, one run lasting
+    #     9494 s, and without this they all read as multi-hour pit stops.
+    nulled = _synthetic_trace(seconds=600.0, null_speed_from=60.0,
+                              null_speed_s=400.0)
+    print(f"23. 400 s of NULL speed -> {longest_standstill(nulled)}")
+    ok &= longest_standstill(nulled) == (0.0, None, 0, 0.0)
+
+    # 24. A standstill is refused by the ARITHMETIC, not only by the UI. This is
+    #     the hole where clean_samples dedupes a stop away and build_profile
+    #     then accepts driver A's in-lap spliced to driver B's out-lap.
+    try:
+        build_profile(_synthetic_lap(stationary_s=120.0), baseline)
+        print("24. 120 s stop    -> NOT REJECTED  ** FAIL **")
+        ok = False
+    except ValueError as exc:
+        print(f"24. 120 s stop    -> rejected: {exc}")
+        ok &= "stood still" in str(exc)
 
     print("\nSELF-CHECK", "PASSED" if ok else "FAILED")
     return 0 if ok else 1

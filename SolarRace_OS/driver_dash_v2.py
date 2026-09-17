@@ -870,11 +870,13 @@ class RacingDashboard(QMainWindow):
     # keeps its space.
     _TARGET_H = 40
 
-    # Lap stopwatch: plain numbers under the target strip, no box. After a lap
-    # is cut the finished time holds this long, then the display jumps to the
-    # new lap's clock — which has been running since the line, so it shows
-    # ~0:03.0, not zero.
-    _LAP_TIMER_H = 30
+    # Lap stopwatch: plain numbers between the speedo and the target strip, no
+    # box. Sized larger than the target readout below it — it is the number the
+    # driver reads most often, and it is digits only, so it can afford the room.
+    # After a lap is cut the finished time holds this long, then the display
+    # jumps to the new lap's clock — which has been running since the line, so
+    # it shows ~0:03.0, not zero.
+    _LAP_TIMER_H = 42
     _LAP_FREEZE_S = 3.0
 
     # Root layout margin, in px. Named because _status_budget_px has to
@@ -898,8 +900,6 @@ class RacingDashboard(QMainWindow):
         # I = P / V. Latches True on the first genuine reading and never goes
         # back, so an estimate can't overwrite a measurement.
         self._have_real_current: bool = False
-        # Newest indicator snapshot, so a resize repaints them as they were.
-        self._last_flags_shown: dict = {}
         # Target-speed state. None = no profile loaded, shown as a grey dash
         # rather than a target of zero the driver would try to match.
         self._target_kmh = None
@@ -1162,27 +1162,8 @@ class RacingDashboard(QMainWindow):
             "CTRL TEMP", "°C", C_CYAN, limits.CTRL_TEMP, decimals=0,
         )
 
-        # ── VALIDATION READOUT (temporary) ────────────────────────────────── #
-        # Raw motor sensor resistance beside the temperature it converts to, so
-        # the table can be checked against a reference thermometer while the car
-        # is on the bench. Both come from ONE signal carrying ONE frame, so what
-        # is shown here is always a matched pair, never two different samples.
-        # Delete this label and its updates in _on_motor_temp once the
-        # conversion is signed off — the MOTOR TEMP gauge in the right panel is
-        # the race-day display.
-        self._motor_raw_lbl = QLabel("Ω —   |   °C —")
-        self._motor_raw_lbl.setAlignment(Qt.AlignCenter)
-        # 10px, not 13: at 13 this line was wider than the 155 px side panel and
-        # lost its "Ω" off the left edge and its last digit off the right — the
-        # one readout whose whole purpose is being read exactly.
-        self._motor_raw_lbl.setStyleSheet(
-            f"color: {_DIM}; font-size: 10px; font-family: 'Consolas', monospace;"
-            f"border: 1px solid {_BORDER}; border-radius: 3px; padding: 2px;"
-        )
-
         vbox.addWidget(self._soc_gauge, stretch=1)
         vbox.addWidget(self._temp_gauge, stretch=1)
-        vbox.addWidget(self._motor_raw_lbl)
 
         return frame
 
@@ -1196,8 +1177,14 @@ class RacingDashboard(QMainWindow):
         self._tacho = TachometerWidget()
         vbox.addWidget(self._tacho)
 
-        # TARGET SPEED — right under the actual speed, because the only useful
-        # way to read a target is against what you are currently doing.
+        # LAP STOPWATCH — directly under the speed number. It is the reading a
+        # driver glances at most often between corners, so it takes the closest
+        # line to the speedo; the target strip sits below it.
+        vbox.addWidget(self._build_lap_timer())
+
+        # TARGET SPEED — under the lap clock, still within one glance of the
+        # actual speed, because the only useful way to read a target is against
+        # what you are currently doing.
         # Text comes from _apply_target_style() below — it renders "TARGET —"
         # until a profile is loaded, so there is nothing to seed here.
         self._target_lbl = QLabel("")
@@ -1207,8 +1194,6 @@ class RacingDashboard(QMainWindow):
         self._target_lbl.setMinimumWidth(1)
         self._apply_target_style()
         vbox.addWidget(self._target_lbl)
-
-        vbox.addWidget(self._build_lap_timer())
 
         # NOTE: the pit-message banner used to be created here. It now lives in
         # _build_pit_banner(), above the page stack, so it is visible on both
@@ -1253,10 +1238,14 @@ class RacingDashboard(QMainWindow):
         if (text, colour) == self._lap_shown:
             return
         if self._lap_shown is None or colour != self._lap_shown[1]:
+            # Letter-spacing as well as size: m:ss.t is six glyphs, and spacing
+            # them out is what makes the clock read as wide as the strip under
+            # it rather than as a short blob floating in the middle.
             self._lap_lbl.setStyleSheet(
                 f"color: {colour}; background: transparent; border: none;"
                 f"font-family: Consolas; font-weight: bold;"
-                f"font-size: {max(14, int(22 * self._sc))}px;")
+                f"font-size: {max(18, int(32 * self._sc))}px;"
+                f"letter-spacing: {max(1, int(3 * self._sc))}px;")
         self._lap_lbl.setText(text)
         self._lap_shown = (text, colour)
 
@@ -1406,7 +1395,14 @@ class RacingDashboard(QMainWindow):
 
     # ── Screen DS001 — the race screen ───────────────────────────────────── #
     def _build_screen_ds001(self) -> QWidget:
-        """Speed, SOC, power, temperatures, and the boolean indicator row."""
+        """Speed, SOC and temperatures.
+
+        There is no indicator row any more. ECU, BRAKE, LIGHTS and REV were
+        removed: the brake and lights switches were never wired to the Pi, so
+        they could only ever show "?", REV repeats the MAP badge (orange in
+        reverse), and ECU repeats the connection status. The height goes to
+        the gauges.
+        """
         page = QWidget()
         vbox = QVBoxLayout(page)
         vbox.setContentsMargins(0, 0, 0, 0)
@@ -1418,78 +1414,7 @@ class RacingDashboard(QMainWindow):
         row.addWidget(self._build_tacho_panel(), stretch=1)
         row.addWidget(self._build_right_panel())
         vbox.addLayout(row, stretch=1)
-
-        vbox.addWidget(self._build_indicator_row())
         return page
-
-    def _build_indicator_row(self) -> QFrame:
-        """Boolean status lights: parking brake, lights, ECU, reverse.
-
-        Big, flat, always in the same order and always in the same place — a
-        driver checks these by position, not by reading them. Each stays visible
-        when inactive (dimmed) rather than disappearing, so a dark REV light
-        means "not in reverse" and never "the indicator is missing".
-        """
-        frame = QFrame()
-        frame.setObjectName("panel")
-        frame.setFixedHeight(46)
-        layout = QHBoxLayout(frame)
-        layout.setContentsMargins(6, 3, 6, 3)
-        layout.setSpacing(6)
-
-        # (key, short label, colour when active)
-        self._INDICATORS = [
-            ("ecu_on",        "ECU",   _LIME),
-            ("parking_brake", "BRAKE", _RED),
-            ("lights_on",     "LIGHTS", _CYAN),
-            ("reverse",       "REV",   _ORANGE),
-        ]
-        # Start every indicator UNKNOWN. Until a frame or a GPIO read says
-        # otherwise, we genuinely do not know any of these.
-        self._indicator_lbls = {}
-        for key, text, _colour in self._INDICATORS:
-            lbl = QLabel(f"{text} ?")
-            lbl.setAlignment(Qt.AlignCenter)
-            lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-            self._indicator_lbls[key] = lbl
-            layout.addWidget(lbl)
-        # {} yields None for every key -> all four render as UNKNOWN.
-        self._apply_indicator_styles({})
-        return frame
-
-    def _apply_indicator_styles(self, flags: dict) -> None:
-        """Repaint the indicator row. Three states, not two.
-
-        None means "no source" — the switch is not wired to the Pi yet, or the
-        pin could not be read. That is shown as a dashed outline and a "?" and
-        is deliberately NOT drawn the same as OFF: telling a driver the parking
-        brake is released when nobody actually knows is the one mistake this
-        row must not make.
-        """
-        for key, text, colour in self._INDICATORS:
-            value = flags.get(key)
-            lbl = self._indicator_lbls[key]
-
-            if value is None:                       # unknown — no source
-                lbl.setText(f"{text} ?")
-                lbl.setStyleSheet(
-                    f"color: {_OFF}; background: transparent;"
-                    f"border: 2px dashed {_OFF}; border-radius: 4px;"
-                    f"font-size: {int(13 * self._sc)}px; font-weight: bold;"
-                    f"letter-spacing: 1px;"
-                )
-                continue
-
-            on = bool(value)
-            lbl.setText(text)
-            lbl.setStyleSheet(
-                f"color: {colour if on else _OFF};"
-                f"background: {'rgba(255,255,255,0.10)' if on else 'transparent'};"
-                f"border: 2px solid {colour if on else _OFF};"
-                f"border-radius: 4px;"
-                f"font-size: {int(13 * self._sc)}px; font-weight: bold;"
-                f"letter-spacing: 1px;"
-            )
 
     # ── Screen DS002 — the electrical screen ─────────────────────────────── #
     def _build_screen_ds002(self) -> QWidget:
@@ -1861,7 +1786,6 @@ class RacingDashboard(QMainWindow):
         self._worker.cell_voltages_updated.connect(self._on_cell_voltages)
         self._worker.cell_extremes_updated.connect(self._on_cell_extremes)
         self._worker.bms_probe_temps_updated.connect(self._on_bms_probe_temps)
-        self._worker.vehicle_flags_updated.connect(self._on_vehicle_flags)
         self._worker.target_speed_updated.connect(self._on_target_speed)
         self._worker.lap_timer_updated.connect(self._on_lap_timer)
 
@@ -2040,8 +1964,8 @@ class RacingDashboard(QMainWindow):
     def _on_motor_temp(self, ohms: float, celsius: float, status: str) -> None:
         """Motor PT1000 reading: raw resistance + the °C it converts to.
 
-        Both arrive in one signal from one CAN frame, so the validation readout
-        below can never pair an Ω with a °C from a different sample.
+        Only the °C is shown; the resistance and status are still part of the
+        signal for anything that wants to diagnose the sensor.
         `celsius` is -1000.0 when the resistance could not be converted (see
         can_worker._decode_temp) — Qt signals cannot carry None.
         """
@@ -2054,20 +1978,6 @@ class RacingDashboard(QMainWindow):
         shown = celsius if converted else None
         self._motor_temp_gauge.set_value(shown)
         self._ds2_motor_temp.set_value(shown)
-
-        # The validation readout tells the whole truth, including WHY a
-        # resistance did not convert — that is what makes a wiring fault
-        # diagnosable on the bench instead of just looking like a cold motor.
-        if status == pt1000.STATUS_NO_READING:
-            self._motor_raw_lbl.setText("Ω —   |   °C —")
-        elif converted:
-            self._motor_raw_lbl.setText(f"Ω {ohms:.1f}   |   °C {celsius:.1f}")
-        else:
-            reason = {
-                pt1000.STATUS_BELOW_RANGE: "below table",
-                pt1000.STATUS_ABOVE_RANGE: "open circuit?",
-            }.get(status, status or "unconvertible")
-            self._motor_raw_lbl.setText(f"Ω {ohms:.1f}   |   {reason}")
 
     @Slot(str, int)
     def _on_motor_map(self, name: str, raw: int) -> None:
@@ -2179,13 +2089,6 @@ class RacingDashboard(QMainWindow):
         self._target_kmh = target_kmh
         self._target_strategy = strategy
         self._apply_target_style(self._speed_delta())
-
-    @Slot(dict)
-    def _on_vehicle_flags(self, flags: dict) -> None:
-        # Remembered so resizeEvent can re-apply the styles at the new scale
-        # without blanking the indicators back to "all off".
-        self._last_flags_shown = dict(flags)
-        self._apply_indicator_styles(flags)
 
     @Slot(object)
     def _on_motor_current(self, amps) -> None:
@@ -2564,7 +2467,6 @@ class RacingDashboard(QMainWindow):
         )
         self._apply_net_style(self._net_status)
         self._apply_uplink_style(self._uplink_status)
-        self._apply_indicator_styles(self._last_flags_shown)
         self._apply_target_style(self._speed_delta())
         self._lap_shown = None          # re-apply the font size at the new scale
         self._tick_lap_timer()

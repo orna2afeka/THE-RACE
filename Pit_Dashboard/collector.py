@@ -232,7 +232,21 @@ def catch_up(conn, creds, start_key) -> str:
 
     startAt is inclusive, so every page re-delivers its boundary key; the
     idempotent upsert makes that a no-op and it is how we detect the end.
+
+    A FRESH STORE IS NOT A GAP. With no cursor there is no startAt, so the
+    paging below would begin at the oldest key in the node and walk the ENTIRE
+    history forward 5,000 at a time -- the unbounded backfill this whole module
+    works to avoid, just arriving in installments. It is also precisely what
+    someone who has archived the database is trying not to get: observed
+    2026-09-17, an archived store refilling itself immediately on restart.
+    INITIAL_BACKFILL_LIMIT is the empty-database policy and it lives in
+    stream_once, so hand the case straight to it.
     """
+    if not start_key:
+        _log("empty store, no cursor — skipping catch-up "
+             "(stream_once applies INITIAL_BACKFILL_LIMIT instead)")
+        return None
+
     total_new = 0
     pages = 0
     while True:

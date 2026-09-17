@@ -1124,8 +1124,21 @@ def _history(chosen, minutes, start, end, limit, max_points):
     with closing(ro_conn()) as conn:
         lo, hi = db.time_bounds(conn)
         if hi is None:
-            return {"t": [], "series": {}, "cursor": None, "rangebreaks": [],
-                    "bounds": {"lo": None, "hi": None}, "total": 0}
+            # SAME KEYS AS THE POPULATED ANSWER BELOW. The History tab reads
+            # count, sampled and tz unconditionally, so a short payload here is
+            # not a smaller answer, it is a crash: this returned 200 without
+            # them on 2026-09-17 and the tab died on
+            # "Cannot read properties of undefined (reading 'toLocaleString')".
+            # An empty store is the first thing the pit sees after
+            # tools/archive_db.py, i.e. every practice morning and race morning.
+            # Zero ROWS is a true statement here and is not the same as the
+            # forbidden zero READING: nothing is being invented, the series are
+            # simply empty. tools/check_empty_db.py holds these two shapes equal.
+            return {"t": [], "series": {m.key: [] for m in chosen},
+                    "cursor": None, "rangebreaks": [],
+                    "bounds": {"lo": None, "hi": None},
+                    "total": 0, "count": 0, "sampled": 0, "downsampled": False,
+                    "tz": str(export_zone(None))}
         end_ts = end
         if REPLAY and end_ts is None:
             future = db.fetch_samples(conn, start_ts=lo, end_ts=hi,

@@ -217,14 +217,8 @@ def _hz_hot_cell(f):
 
 def _hz_reverse(f):
     f["map"] = (mms_parser.motor_map_name(REVERSE_MAP_RAW), REVERSE_MAP_RAW)
-    f["flags"] = dict(f["flags"], reverse=True)
     f["speed"] = 3.0
     f["power_w"] = 180.0
-    return f
-
-
-def _hz_parking_brake(f):
-    f["flags"] = dict(f["flags"], parking_brake=True)
     return f
 
 
@@ -249,7 +243,6 @@ HAZARDS = [
     ("Low battery / weak cell", _hz_low_battery, None),
     ("Hot cell in module B", _hz_hot_cell, None),
     ("Reverse selected", _hz_reverse, None),
-    ("Parking brake on while moving", _hz_parking_brake, None),
     ("Three faults at once", _hz_multi, None),
     ("CAN bus error", None, "can_error"),
     ("Car silent — no data", None, "silent"),
@@ -470,8 +463,6 @@ def build_sim(hud: RacingDashboard, car: FakeCar, strategy: str,
             "cell_t": car.cell_temps(),
             "cell_v": car.cell_voltages(),
             "map": (mms_parser.motor_map_name(NORMAL_MAP_RAW), NORMAL_MAP_RAW),
-            "flags": {"ecu_on": True, "parking_brake": False,
-                      "lights_on": True, "reverse": False},
             "alerts": None,        # None = derive from state
         }
 
@@ -600,7 +591,6 @@ def build_sim(hud: RacingDashboard, car: FakeCar, strategy: str,
             hud._on_lap_timer(now, finished)
 
         push("map", lambda m: hud._on_motor_map(*m), f["map"])
-        push("flags", hud._on_vehicle_flags, f["flags"])
 
         if special != "can_error":
             alerts = f["alerts"] if f["alerts"] is not None else natural_alerts(f)
@@ -692,7 +682,7 @@ def main() -> int:
     # Fail at startup, not mid-demo, if a hazard names a label the car can't send.
     for _n, fn, _s in HAZARDS:
         if fn is not None:
-            fn({"flags": {}, "cell_t": {}, "cell_v": {}, "motor_c": 0.0,
+            fn({"cell_t": {}, "cell_v": {}, "motor_c": 0.0,
                 "power_w": 0.0, "map": None})
 
     print(f"[sim] profile {name}  ·  lap {profile.lap_length_m:.0f} m  ·  "
