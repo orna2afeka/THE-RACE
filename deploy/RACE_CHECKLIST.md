@@ -113,6 +113,20 @@ Watch for `🛑 regen brake light: GPIO 17 …` in the HUD's boot log. If it say
 **NOT DRIVEN**, the pin was not claimed and no lamp is being switched, however
 good the wiring looks.
 
+**To test it without driving the car**, stop the HUD (`deploy/stop_hud.sh`, so
+it lets go of the pin) and run the simulator from the Pi's own desktop:
+
+```bash
+./"Start HUD Demo.sh"        # then press R to hold the lamp on, R again to release
+```
+
+It drives the real `RegenLight` on GPIO 17 from a fake car, with the same
+thresholds and the same minimum-on hold. The lamp flashes on its own braking
+into every corner, `R` holds it lit while you walk to the back of the car, and
+the HUD's status line reads `🛑 BRAKE LIGHT ON` whenever the pin is being
+driven high. Hazard `Car silent — no data` (press `H` to reach it) shows the
+lamp releasing itself after two quiet seconds rather than sticking on.
+
 > ⚠️ **A GPIO pin cannot drive a lamp.** 3.3 V, ~16 mA. It switches a
 > logic-level MOSFET or an opto-isolated SSR, with a 10k pull-down on the gate
 > so the lamp stays off while the Pi boots. Circuit is in

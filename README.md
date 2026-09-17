@@ -184,6 +184,8 @@ THE RACE/                             # ← repo root
 ├── Demo Dashboard.bat                # The same dashboard on a synthetic store (port 8010) — never touches telemetry.db
 ├── Build Speed Profiles.bat          # Double-click launcher → the profile builder on port 8502
 ├── Start Pit Wall.bat                # Double-click launcher → the big-screen pit wall on port 8503
+├── Start HUD Demo.bat                # Double-click launcher → the driver HUD on a fake car (Windows)
+├── Start HUD Demo.sh                 # The same on the Pi — and there it drives the REAL brake light
 ├── requirements.txt                  # Shared/root-tool dependencies
 │
 ├── SolarRace_OS/                     # Edge code — runs on the Raspberry Pi
@@ -254,7 +256,8 @@ THE RACE/                             # ← repo root
 │   ├── check_limits.py               # Headless checks: gauge tiers, blink edges, no-data
 │   ├── replay_limits.py              # Replays telemetry.db: how often each tier would fire
 │   ├── generate_profiles.py          # Builds profiles/*.csv from Pit_Dashboard/210s.xlsx
-│   ├── hud_sim.py                    # Drives the driver HUD without a car, for UI work
+│   ├── hud_sim.py                    # Drives the driver HUD without a car, for UI work. On a Pi it
+│   │                                 #   also drives the real regen brake light on GPIO 17 (R holds it lit)
 │   ├── demo_seed.py / demo_feed.py   # Build and keep live the synthetic store Demo Dashboard.bat uses
 │   ├── build_zolder_track.py         # Bakes the OSM centreline → zolder_centreline.py
 │   ├── build_zolder_animation.py     # Bakes ALL THREE pages: the presentation map, the
