@@ -164,9 +164,10 @@ class CANWorker(QThread):
     vehicle_flags_updated   = Signal(dict)
     # Target speed from the active profile: (target km/h, strategy name).
     target_speed_updated    = Signal(float, str)
-    # Upcoming corner: (metres ahead, max km/h there, speed drop km/h). All
-    # zeros means "nothing ahead" and clears the alert.
-    turn_alert_updated      = Signal(float, float, float)
+    # Lap stopwatch: (time.monotonic() the current lap started, or None when
+    # unknown; seconds of the lap that just FINISHED, or None when the clock
+    # merely (re)started). Signal(object, object) because both can be None.
+    lap_timer_updated       = Signal(object, object)
     connection_error        = Signal(str)    # Fatal error message
     status_updated          = Signal(str)    # Human-readable status string
 

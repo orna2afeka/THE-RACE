@@ -14,8 +14,8 @@ what you see here is what the driver sees — layout, colours, thresholds and al
     (or double-click "Start HUD Demo.bat" on Windows, ./"Start HUD Demo.sh" on the Pi)
 
 Keys (simulator only — the HUD's own Ctrl+R / Ctrl+T / Alt+F4 still work):
-    M   send a pit message        T   force a turn warning for 6 s
-    N   clear the pit message     P   pause / resume the virtual car
+    M   send a pit message        P   pause / resume the virtual car
+    N   clear the pit message
     H   next hazard (stops tour)  X   clear the hazard
     R   hold hard regen on/off (brake light stays lit while it is on)
 
@@ -28,9 +28,7 @@ already claimed by a running HUD) nothing is driven and the logic still runs:
 the startup line says which of the two you have. --no-regen-light skips it.
 
 The virtual car drives the selected speed profile with a little lag and noise,
-so the TARGET readout genuinely goes green and amber, and the corner warnings
-fire off the same profile.look_ahead() the car uses — same window, same minimum
-drop.
+so the TARGET readout genuinely goes green and amber.
 
 EVERY SCREEN HAS NUMBERS. DS003 (30 cell temperatures) and DS004 (26 cell
 voltages) are fed from the same fake pack as the headline gauges, so the hottest
@@ -75,10 +73,6 @@ import speed_profile                                        # noqa: E402
 from driver_dash_v2 import RacingDashboard, RACING_QSS      # noqa: E402
 from modules import mms_parser, pt1000                      # noqa: E402
 from modules.regen_light import RegenLight, REGEN_LIGHT_PIN  # noqa: E402
-
-# Matches main.py — the sim must warn about the same corners the car does.
-TURN_LOOKAHEAD_M = 175.0
-TURN_MIN_DROP_KMH = 15.0
 
 TICK_MS = 100                      # 10 Hz, the car's profile tick rate
 
@@ -285,7 +279,6 @@ class FakeCar:
         self.t = 0.0                       # simulated seconds since start
         self.paused = False
         self._script_idx = 0
-        self._last_turn_key = None
 
         # Fixed per-cell character, so the grids look like a real pack (the
         # same cells run warm or low every lap) instead of flickering noise.
@@ -377,20 +370,6 @@ class FakeCar:
         self._script_idx += 1
         return payload
 
-    def turn_ahead(self):
-        """(distance, max_kmh, drop) for a corner worth warning about, or None.
-
-        Change-detected exactly like main.py._tick_profile. Returns False when
-        nothing changed since the last call.
-        """
-        ahead = self.profile.look_ahead(self.lap_distance_m, TURN_LOOKAHEAD_M,
-                                        TURN_MIN_DROP_KMH)
-        key = None if ahead is None else (round(ahead[0] / 10), round(ahead[1]))
-        if key == self._last_turn_key:
-            return False
-        self._last_turn_key = key
-        return ahead
-
 
 def natural_alerts(frame) -> list:
     """Alerts the car raises by itself from what it is doing, no hazard needed.
@@ -421,8 +400,9 @@ def build_sim(hud: RacingDashboard, car: FakeCar, strategy: str,
         "hazard": None,            # index into HAZARDS, or None
         "tour": tour,
         "real_s": 0.0,
-        "forced_turn_until": -1.0,
         "last": {},                # last value pushed per slot, to push changes only
+        "lap_idx": None,           # laps completed, to spot a line crossing
+        "lap_start": None,         # time.monotonic() the current lap started
         "extremes_emit_t": -1.0,
         "force_regen": False,      # R key: hold the lamp on for a wiring check
         "lamp": False,             # last lamp state, for the console log
@@ -608,6 +588,17 @@ def build_sim(hud: RacingDashboard, car: FakeCar, strategy: str,
 
         hud._on_target_speed(car.profile.speed_kmh_at(car.lap_distance_m), strategy)
 
+        # Lap stopwatch, on the REAL clock like the car's. The first tick is the
+        # car leaving the line (clock starts, nothing held); every later wrap is
+        # a finished lap. At --speed above 1 the laps are simply shorter.
+        lap_idx = int(car.distance_m // car.profile.lap_length_m)
+        if lap_idx != state["lap_idx"]:
+            now = time.monotonic()
+            finished = (None if state["lap_start"] is None
+                        else now - state["lap_start"])
+            state["lap_idx"], state["lap_start"] = lap_idx, now
+            hud._on_lap_timer(now, finished)
+
         push("map", lambda m: hud._on_motor_map(*m), f["map"])
         push("flags", hud._on_vehicle_flags, f["flags"])
 
@@ -619,15 +610,6 @@ def build_sim(hud: RacingDashboard, car: FakeCar, strategy: str,
             if state["force_regen"]:
                 status = "● SIMULATION — REGEN HELD (R to release)"
             push("status", hud._on_status, status_with_lamp(status))
-
-        # Turn warning — the forced one (T key) wins while it is running.
-        if car.t >= state["forced_turn_until"]:
-            ahead = car.turn_ahead()
-            if ahead is not False:
-                if ahead is None:
-                    hud._on_turn_alert(0.0, 0.0, 0.0)
-                else:
-                    hud._on_turn_alert(*ahead)
 
         payload = car.due_pit_message()
         if payload is not False:
@@ -643,11 +625,6 @@ def build_sim(hud: RacingDashboard, car: FakeCar, strategy: str,
     def send_msg():
         hud.set_pit_message({"category": "TEST", "value":
                              "PIT MESSAGE — PRESS N TO CLEAR"})
-
-    def force_turn():
-        state["forced_turn_until"] = car.t + 6.0
-        hud._on_turn_alert(120.0, 34.0, 48.0)
-        QTimer.singleShot(6000, lambda: hud._on_turn_alert(0.0, 0.0, 0.0))
 
     def toggle_pause():
         car.paused = not car.paused
@@ -678,7 +655,6 @@ def build_sim(hud: RacingDashboard, car: FakeCar, strategy: str,
 
     QShortcut(QKeySequence("M"), hud, activated=send_msg)
     QShortcut(QKeySequence("N"), hud, activated=lambda: hud.set_pit_message(None))
-    QShortcut(QKeySequence("T"), hud, activated=force_turn)
     QShortcut(QKeySequence("P"), hud, activated=toggle_pause)
     QShortcut(QKeySequence("H"), hud, activated=next_hazard)
     QShortcut(QKeySequence("X"), hud, activated=clear_hazard)

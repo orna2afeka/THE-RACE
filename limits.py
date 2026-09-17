@@ -280,6 +280,10 @@ PACK_VOLTAGE = Threshold(warn=CELL_COUNT * CELL_V_WARN,      # 41.6 V, 0.88 %
 # — before this, the car showed a pack at 3 % in exactly the same green as one
 # at 95 %, which is the most dangerous gap the HUD had.
 SOC = Threshold(warn=30.0, crit=20.0, low_side=True, full_scale=100.0)
+# The HUD's SOC gauge is red below 20 % but BLINKS only at or below this. A
+# gauge blinking for the whole last fifth of the pack was noise the driver
+# learned to ignore; the pit wall's red tier is unchanged.
+SOC_BLINK_PCT = 10.0
 
 # Below this, a pack-voltage reading is not a low pack: it is a bad frame.
 # 2.5 V/cell is already under any Li-ion cell's usable floor, and a BMS would

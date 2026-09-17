@@ -118,6 +118,10 @@ _NO_DATA = "—"
 # brightest thing on the panel, for the same reason _OFF exists.
 _NO_DATA_COLOUR = _OFF
 
+# Speed on the HUD has a scale but no tiers: it never turns amber or red and
+# never blinks, on any screen. limits.SPEED still drives the pit wall's tile.
+_HUD_SPEED = limits.Threshold(full_scale=limits.SPEED.full_scale)
+
 
 def _tint(hex_colour: str, alpha: float) -> str:
     """`rgba(...)` string from a #rrggbb accent — a wash of the accent colour.
@@ -289,11 +293,9 @@ class TachometerWidget(QWidget):
     """
     Big, bold digital speed readout painted with QPainter.
     Shows the km/h number large and clear (no dial/needle) so it's readable
-    at a glance. Background flashes red past limits.SPEED's critical level.
-
-    That threshold used to be a bare `_SPEED_ALERT = 120` here, which the pit
-    wall could not see and so could not stay in step with. It had also never
-    once fired: the car's recorded maximum is 100.6 km/h.
+    at a glance. The number is always white (slate when unknown): it never
+    turns red and never blinks. The driver found an over-speed colour change in
+    their eyeline a distraction; the pit wall still flags limits.SPEED.
     """
 
     def __init__(self, parent=None):
@@ -302,13 +304,6 @@ class TachometerWidget(QWidget):
         # the car is moving is worse than one admitting it does not know.
         self._rpm: int | None = None
         self._speed: float | None = None
-        self._flash_on: bool = False
-        self._alert: bool = False
-        self._warning: bool = False
-
-        self._flash_timer = QTimer(self)
-        self._flash_timer.setInterval(500)
-        self._flash_timer.timeout.connect(self._toggle_flash)
 
         # Small minimum, Expanding policy: this widget PAINTS itself from its
         # actual size (see paintEvent), so it does not need floor space to look
@@ -333,33 +328,12 @@ class TachometerWidget(QWidget):
     def set_speed(self, kmh: float | None) -> None:
         """Road speed from the controller (0x610 bytes 4-5), or None.
 
-        None blanks the number to an em dash and clears the over-speed flash.
+        None blanks the number to an em dash.
         Nothing here recomputes a speed from RPM: if the frame that carries
         speed is not arriving, the honest display is "unknown", not a second
         opinion derived from a different field.
         """
-        if kmh is None:
-            self._speed = None
-            self._flash_timer.stop()
-            self._flash_on = False
-            self._alert = False
-            self._warning = False
-            self.update()
-            return
-        self._speed = abs(kmh)
-        tier = limits.classify(self._speed, limits.SPEED)
-        alert = tier == limits.CRITICAL
-        self._warning = tier == limits.WARNING
-        if alert and not self._alert:
-            self._flash_timer.start()
-        elif not alert and self._alert:
-            self._flash_timer.stop()
-            self._flash_on = False
-        self._alert = alert
-        self.update()
-
-    def _toggle_flash(self) -> None:
-        self._flash_on = not self._flash_on
+        self._speed = None if kmh is None else abs(kmh)
         self.update()
 
     def paintEvent(self, _) -> None:  # noqa: ANN001
@@ -368,17 +342,9 @@ class TachometerWidget(QWidget):
 
         w, h = self.width(), self.height()
 
-        if self._flash_on:
-            p.fillRect(0, 0, w, h, QColor(_FLASH))
-
-        # Amber over the warning level, red over critical, otherwise crisp
-        # white, and slate when there is no reading at all. The amber tier is
-        # new: the big number used to jump straight from white to red, which
-        # made it the one readout on the HUD not following the shared rule.
+        # Crisp white, or slate when there is no reading at all.
         unknown = self._speed is None
-        num_color = (C_NO_DATA if unknown else
-                     C_CRITICAL if self._alert else
-                     C_WARNING if self._warning else C_WHITE)
+        num_color = C_NO_DATA if unknown else C_WHITE
         speed_txt = _NO_DATA if unknown else f"{self._speed:.0f}"
 
         # ── Big bold speed number ──────────────────────────────────────── #
@@ -429,6 +395,10 @@ class MiniGauge(QWidget):
     A metric may declare crit=None (see limits.MOTOR_CURRENT), which means
     amber-only: that gauge warns but never turns red and never flashes.
 
+    flash=False keeps the red critical colour but never blinks. flash=<number>
+    blinks only once a    critical low-side reading is at or below that number (SOC blinks from
+    limits.SOC_BLINK_PCT down, while still turning red at limits.SOC.crit).
+
     Low-side metrics work the same way with the comparison inverted, so the SoC
     and pack-voltage gauges colour as they fall rather than as they rise.
     """
@@ -441,6 +411,7 @@ class MiniGauge(QWidget):
         limit,
         decimals: int = 0,
         parent=None,
+        flash: bool | float = True,
     ):
         """`limit` is a limits.Threshold, carrying BOTH thresholds and the scale.
 
@@ -460,6 +431,7 @@ class MiniGauge(QWidget):
         self._color = color
         self._warning: bool = False
         self._decimals = decimals
+        self._flash = flash
         # None until the bus actually reports this metric — see _NO_DATA. It is
         # NOT seeded to 0.0, because "0" and "no reading" are different facts and
         # the driver cannot tell them apart once they look the same.
@@ -491,9 +463,11 @@ class MiniGauge(QWidget):
         tier = limits.classify(value, self._limit)
         alert = tier == limits.CRITICAL
         self._warning = tier == limits.WARNING
-        if alert and not self._alert:
+        blink = alert and (self._flash if isinstance(self._flash, bool)
+                           else value <= self._flash)
+        if blink and not self._flash_timer.isActive():
             self._flash_timer.start()
-        elif not alert and self._alert:
+        elif not blink and self._flash_timer.isActive():
             self._flash_timer.stop()
             self._flash_on = False
         self._alert = alert
@@ -893,10 +867,15 @@ class RacingDashboard(QMainWindow):
     _PIT_BANNER_H = 46
 
     # Target speed is a permanent readout — it always has a value to show, so it
-    # keeps its space. The turn warning, like the pit message, is an EVENT: it
-    # is hidden between corners rather than leaving an empty strip on screen.
+    # keeps its space.
     _TARGET_H = 40
-    _TURN_ALERT_H = 44
+
+    # Lap stopwatch: plain numbers under the target strip, no box. After a lap
+    # is cut the finished time holds this long, then the display jumps to the
+    # new lap's clock — which has been running since the line, so it shows
+    # ~0:03.0, not zero.
+    _LAP_TIMER_H = 30
+    _LAP_FREEZE_S = 3.0
 
     # Root layout margin, in px. Named because _status_budget_px has to
     # subtract it to work out how much room the status text really has, and a
@@ -928,7 +907,11 @@ class RacingDashboard(QMainWindow):
         # None until RPM arrives. Was 0.0, which made the target readout show a
         # confident "Δ -92" before the car had reported any speed at all.
         self._last_speed_kmh: float | None = None
-        self._turn_active: bool = False
+        # Stopwatch state (see _on_lap_timer). None = lap start unknown.
+        self._lap_start: float | None = None
+        self._lap_held_s: float | None = None
+        self._lap_hold_until: float = 0.0
+        self._lap_shown = None
 
         # UI scale factor (1.0 at the 800×480 design size, grows on fullscreen
         # displays) plus the current text colors, so resizeEvent can re-apply
@@ -975,10 +958,6 @@ class RacingDashboard(QMainWindow):
         # Pit-to-driver banner sits OUTSIDE the page stack: both DS001 and DS002
         # must show it, and a message the driver paged away from is a message
         # they didn't get. Same reasoning puts faults in the shared alert bar.
-        # Turn warning above the pit banner: both are shared chrome, visible on
-        # DS001 and DS002 alike. A corner does not stop existing because the
-        # driver paged to the electrical screen.
-        vbox.addWidget(self._build_turn_alert())
         vbox.addWidget(self._build_pit_banner())
 
         # ── Paged screens ────────────────────────────────────────────────── #
@@ -1177,18 +1156,20 @@ class RacingDashboard(QMainWindow):
         vbox.setContentsMargins(6, 8, 6, 8)
         vbox.setSpacing(8)
 
-        self._soc_gauge = MiniGauge("SOC", "%", C_LIME, limits.SOC, decimals=0)
-        self._motor_temp_gauge = MiniGauge(
-            "MOTOR TEMP", "°C", C_CYAN, limits.MOTOR_TEMP, decimals=0,
+        self._soc_gauge = MiniGauge("SOC", "%", C_LIME, limits.SOC, decimals=0,
+                                    flash=limits.SOC_BLINK_PCT)
+        self._temp_gauge = MiniGauge(
+            "CTRL TEMP", "°C", C_CYAN, limits.CTRL_TEMP, decimals=0,
         )
 
         # ── VALIDATION READOUT (temporary) ────────────────────────────────── #
-        # Raw sensor resistance beside the temperature it converts to, so the
-        # table can be checked against a reference thermometer while the car is
-        # on the bench. Both come from ONE signal carrying ONE frame, so what is
-        # shown here is always a matched pair, never two different samples.
+        # Raw motor sensor resistance beside the temperature it converts to, so
+        # the table can be checked against a reference thermometer while the car
+        # is on the bench. Both come from ONE signal carrying ONE frame, so what
+        # is shown here is always a matched pair, never two different samples.
         # Delete this label and its updates in _on_motor_temp once the
-        # conversion is signed off — the gauge above is the race-day display.
+        # conversion is signed off — the MOTOR TEMP gauge in the right panel is
+        # the race-day display.
         self._motor_raw_lbl = QLabel("Ω —   |   °C —")
         self._motor_raw_lbl.setAlignment(Qt.AlignCenter)
         # 10px, not 13: at 13 this line was wider than the 155 px side panel and
@@ -1200,7 +1181,7 @@ class RacingDashboard(QMainWindow):
         )
 
         vbox.addWidget(self._soc_gauge, stretch=1)
-        vbox.addWidget(self._motor_temp_gauge, stretch=1)
+        vbox.addWidget(self._temp_gauge, stretch=1)
         vbox.addWidget(self._motor_raw_lbl)
 
         return frame
@@ -1227,6 +1208,8 @@ class RacingDashboard(QMainWindow):
         self._apply_target_style()
         vbox.addWidget(self._target_lbl)
 
+        vbox.addWidget(self._build_lap_timer())
+
         # NOTE: the pit-message banner used to be created here. It now lives in
         # _build_pit_banner(), above the page stack, so it is visible on both
         # screens. A stray `self._pit_lbl = QLabel("")` was left behind here by
@@ -1235,6 +1218,61 @@ class RacingDashboard(QMainWindow):
         # any layout — Qt then showed it as a floating top-level window. Do not
         # reintroduce a _pit_lbl assignment in this method.
         return frame
+
+    def _build_lap_timer(self) -> QLabel:
+        """The lap stopwatch: just the numbers, no background and no frame."""
+        self._lap_lbl = QLabel(_NO_DATA)
+        self._lap_lbl.setAlignment(Qt.AlignCenter)
+        self._lap_lbl.setFixedHeight(self._LAP_TIMER_H)
+        self._lap_lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self._lap_lbl.setMinimumWidth(1)
+        # 10 Hz, the stopwatch's resolution. Each tick is one monotonic read and
+        # a string compare; the label is only touched when the text changes.
+        self._lap_tick = QTimer(self)
+        self._lap_tick.timeout.connect(self._tick_lap_timer)
+        self._lap_tick.start(100)
+        self._tick_lap_timer()
+        return self._lap_lbl
+
+    @staticmethod
+    def _lap_time_text(seconds: float) -> str:
+        """m:ss.t, truncated like a stopwatch (never rounds up to the next
+        tenth, so 59.96 s reads 0:59.9 rather than an impossible 0:60.0)."""
+        tenths = int(max(0.0, seconds) * 10)
+        minutes, rest = divmod(tenths, 600)
+        return f"{minutes}:{rest // 10:02d}.{rest % 10}"
+
+    def _tick_lap_timer(self) -> None:
+        now = time.monotonic()
+        if now < self._lap_hold_until and self._lap_held_s is not None:
+            text, colour = self._lap_time_text(self._lap_held_s), _LIME
+        elif self._lap_start is None:
+            text, colour = _NO_DATA, _NO_DATA_COLOUR
+        else:
+            text, colour = self._lap_time_text(now - self._lap_start), _WHITE
+        if (text, colour) == self._lap_shown:
+            return
+        if self._lap_shown is None or colour != self._lap_shown[1]:
+            self._lap_lbl.setStyleSheet(
+                f"color: {colour}; background: transparent; border: none;"
+                f"font-family: Consolas; font-weight: bold;"
+                f"font-size: {max(14, int(22 * self._sc))}px;")
+        self._lap_lbl.setText(text)
+        self._lap_shown = (text, colour)
+
+    @Slot(object, object)
+    def _on_lap_timer(self, lap_start, finished_s) -> None:
+        """A new lap clock started at `lap_start` (time.monotonic()), or None
+        when unknown. `finished_s` is the lap just completed, held on screen for
+        _LAP_FREEZE_S; None means the clock only restarted, so nothing is held."""
+        self._lap_start = lap_start
+        if finished_s is not None and lap_start is not None:
+            self._lap_held_s = finished_s
+            self._lap_hold_until = time.monotonic() + self._LAP_FREEZE_S
+        else:
+            self._lap_held_s = None
+            self._lap_hold_until = 0.0
+        self._tick_lap_timer()
 
     # ── Shared chrome (visible on every screen) ──────────────────────────── #
     def _build_pit_banner(self) -> QLabel:
@@ -1274,27 +1312,6 @@ class RacingDashboard(QMainWindow):
         self._pit_val = ""
         self._pit_lbl.setVisible(False)
         return self._pit_lbl
-
-    def _build_turn_alert(self) -> QLabel:
-        """Upcoming-corner warning — shown only while a corner is coming up.
-
-        It is an in-layout strip, never a floating window: an earlier bug made
-        the pit banner a top-level window sitting over the instruments, and that
-        must not be repeated here. Between corners it is simply hidden, so an
-        idle lap shows gauges rather than an empty black band.
-        """
-        self._turn_lbl = QLabel("")
-        self._turn_lbl.setAlignment(Qt.AlignCenter)
-        self._turn_lbl.setFixedHeight(self._TURN_ALERT_H)
-        self._turn_lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-        self._turn_lbl.setMinimumWidth(1)
-        self._turn_active = False
-        # Live corner, kept for the same reason as _pit_cat/_pit_val above.
-        self._turn_dist_m = 0.0
-        self._turn_max_kmh = 0.0
-        self._turn_severity = "none"
-        self._turn_lbl.setVisible(False)
-        return self._turn_lbl
 
     # ── Message-strip presentation ───────────────────────────────────────── #
     # Both strips follow one rule: a small muted CAPTION says what the number
@@ -1386,33 +1403,6 @@ class RacingDashboard(QMainWindow):
         anim.setStartValue(0.0)
         anim.setEndValue(1.0)
         anim.start()
-
-    def _apply_turn_style(self, severity: str = "none") -> None:
-        """Hidden (no corner), amber (soft), or red (hard).
-
-            ⚠  TURN IN  120 m  ·  MAX  34 km/h
-
-        The distance and the limit are the two numbers a driver acts on, so they
-        are the two large ones; the words around them are captions.
-        """
-        if severity == "none":
-            self._turn_lbl.setVisible(False)
-            return
-
-        self._turn_lbl.setVisible(True)
-        accent = _RED if severity == "hard" else _ORANGE
-        caption_px = max(11, int(13 * self._sc))
-        value_px = max(17, int(22 * self._sc))
-        glyph = (f'<span style="font-size:{value_px}px; color:{accent};">'
-                 f'⚠</span>&nbsp;&nbsp;')
-        self._turn_lbl.setText(glyph + self._strip_html(
-            [("turn in", f"{self._turn_dist_m:.0f} m"),
-             ("max", f"{self._turn_max_kmh:.0f} km/h")],
-            caption_px, value_px, _WHITE))
-        # A hard corner gets a stronger wash, not a different shape: severity
-        # should read as intensity at a glance, without re-reading the numbers.
-        self._apply_strip_style(self._turn_lbl, accent,
-                                0.15 if severity == "hard" else 0.10)
 
     # ── Screen DS001 — the race screen ───────────────────────────────────── #
     def _build_screen_ds001(self) -> QWidget:
@@ -1515,9 +1505,10 @@ class RacingDashboard(QMainWindow):
 
         top = QHBoxLayout()
         top.setSpacing(8)
-        self._ds2_speed = MiniGauge("SPEED", "km/h", C_CYAN, limits.SPEED,
+        self._ds2_speed = MiniGauge("SPEED", "km/h", C_CYAN, _HUD_SPEED,
                                     decimals=0)
-        self._ds2_soc = MiniGauge("SOC", "%", C_LIME, limits.SOC, decimals=0)
+        self._ds2_soc = MiniGauge("SOC", "%", C_LIME, limits.SOC, decimals=0,
+                                  flash=limits.SOC_BLINK_PCT)
         self._ds2_voltage = MiniGauge("BATT VOLTS", "V", C_LIME,
                                       limits.PACK_VOLTAGE, decimals=1)
         for g in (self._ds2_speed, self._ds2_soc, self._ds2_voltage):
@@ -1723,14 +1714,12 @@ class RacingDashboard(QMainWindow):
         vbox.setContentsMargins(6, 8, 6, 8)
         vbox.setSpacing(8)
 
-        # DS001 asks for motor power, the ECU temperature and the hottest
-        # battery cell. Battery current moved to DS002, where the full
-        # electrical picture lives — it was the least glanceable of the four.
-        self._power_gauge = MiniGauge(
-            "MOTOR POWER", "W", C_CYAN, limits.POWER, decimals=0
-        )
-        self._temp_gauge = MiniGauge(
-            "CTRL TEMP", "°C", C_CYAN, limits.CTRL_TEMP, decimals=0,
+        # Motor temperature and the hottest battery cell (CTRL TEMP is in the
+        # left panel, under SOC). Motor temp took the slot MOTOR POWER used to
+        # have; battery current moved to DS002, where the full electrical
+        # picture lives.
+        self._motor_temp_gauge = MiniGauge(
+            "MOTOR TEMP", "°C", C_CYAN, limits.MOTOR_TEMP, decimals=0,
         )
         # Hottest cell in the pack — the battery-safety number. Its resting
         # colour is cyan like the others; red is reserved for the alert tier, so
@@ -1739,8 +1728,7 @@ class RacingDashboard(QMainWindow):
             "MAX CELL", "°C", C_CYAN, limits.CELL_TEMP, decimals=0,
         )
 
-        vbox.addWidget(self._power_gauge, stretch=1)
-        vbox.addWidget(self._temp_gauge, stretch=1)
+        vbox.addWidget(self._motor_temp_gauge, stretch=1)
         vbox.addWidget(self._cell_temp_gauge, stretch=1)
 
         return frame
@@ -1875,7 +1863,7 @@ class RacingDashboard(QMainWindow):
         self._worker.bms_probe_temps_updated.connect(self._on_bms_probe_temps)
         self._worker.vehicle_flags_updated.connect(self._on_vehicle_flags)
         self._worker.target_speed_updated.connect(self._on_target_speed)
-        self._worker.turn_alert_updated.connect(self._on_turn_alert)
+        self._worker.lap_timer_updated.connect(self._on_lap_timer)
 
         self._worker.start()
 
@@ -2192,29 +2180,6 @@ class RacingDashboard(QMainWindow):
         self._target_strategy = strategy
         self._apply_target_style(self._speed_delta())
 
-    @Slot(float, float, float)
-    def _on_turn_alert(self, distance_m: float, max_kmh: float,
-                       drop_kmh: float) -> None:
-        """Upcoming corner, or all-zeros to clear."""
-        if distance_m <= 0.0:
-            self._turn_active = False
-            self._turn_severity = "none"
-            self._turn_lbl.setText("")
-            self._apply_turn_style("none")
-            return
-
-        was_active = self._turn_active
-        self._turn_active = True
-        self._turn_dist_m = distance_m
-        self._turn_max_kmh = max_kmh
-        # Red for a big drop: a 60 km/h scrub needs more warning than a 20.
-        self._turn_severity = "hard" if drop_kmh >= 35 else "soft"
-        self._apply_turn_style(self._turn_severity)
-        # Fade in on ARRIVAL only. The distance updates several times a second
-        # on the approach to a corner; fading on every update would flicker.
-        if not was_active:
-            self._fade_in(self._turn_lbl)
-
     @Slot(dict)
     def _on_vehicle_flags(self, flags: dict) -> None:
         # Remembered so resizeEvent can re-apply the styles at the new scale
@@ -2300,8 +2265,8 @@ class RacingDashboard(QMainWindow):
 
     @Slot(object)
     def _on_power(self, watts) -> None:
-        self._power_gauge.set_value(None if watts is None else float(watts))
-        # Fall back to I = P / V only until the BMS reports real current. The
+        # No power gauge on the HUD any more; power is only used here to
+        # fall back to I = P / V only until the BMS reports real current. The
         # derived value is badly wrong at low voltage, so a true reading wins
         # the moment one arrives.
         if not self._have_real_current:
@@ -2573,8 +2538,8 @@ class RacingDashboard(QMainWindow):
         # The message container scales with the screen but stays a FIXED height
         # at any given scale, so it still never shifts the gauges below it.
         self._pit_lbl.setFixedHeight(int(self._PIT_BANNER_H * s))
-        self._turn_lbl.setFixedHeight(int(self._TURN_ALERT_H * s))
         self._target_lbl.setFixedHeight(int(self._TARGET_H * s))
+        self._lap_lbl.setFixedHeight(int(self._LAP_TIMER_H * s))
         nav_h = int(self._NAV_BTN_H * s)
         self._controls_bar.setFixedHeight(nav_h + int(8 * s))
 
@@ -2601,9 +2566,8 @@ class RacingDashboard(QMainWindow):
         self._apply_uplink_style(self._uplink_status)
         self._apply_indicator_styles(self._last_flags_shown)
         self._apply_target_style(self._speed_delta())
-        # The LIVE severity, not a guess: re-applying "soft" here used to demote
-        # a red corner warning to amber for as long as it stayed on screen.
-        self._apply_turn_style(self._turn_severity)
+        self._lap_shown = None          # re-apply the font size at the new scale
+        self._tick_lap_timer()
 
     def closeEvent(self, event) -> None:  # noqa: ANN001
         """Shut down cleanly AND tell the wrapper this was intentional.

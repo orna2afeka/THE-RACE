@@ -145,6 +145,11 @@ class LapTracker:
         self._lap_start_energy_wh = 0.0
         self._lap_start_regen_energy_wh = 0.0
         self._lap_start_ts = None                  # monotonic
+        # Monotonic moment the last COUNTED lap ended. Equal to _lap_start_ts
+        # exactly when the current lap began by finishing one, which is how the
+        # HUD stopwatch tells a finished lap (hold its time) from the first
+        # sighting of the line or a pit correction (just restart the clock).
+        self.last_lap_finished_ts = None
         self._armed = False              # have we seen the line at least once?
 
         # --- GPS crossing state -------------------------------------------- #
@@ -378,6 +383,7 @@ class LapTracker:
             self.last_lap_time_s = (
                 (now - self._lap_start_ts) if self._lap_start_ts is not None else None)
             self.lap_source = source
+            self.last_lap_finished_ts = now
 
         self._lap_start_odometer_m = self.odometer_m
         self._lap_start_energy_wh = self.total_energy_wh
@@ -566,6 +572,7 @@ class LapTracker:
         self._last_power_ts = None
         self._last_power_w = None
         self._lap_start_ts = None
+        self.last_lap_finished_ts = None
         return True
 
 
@@ -614,3 +621,9 @@ if __name__ == "__main__":
     print(f"  last lap dist   {t.last_lap_distance_m:.1f} m")
     print(f"  last lap energy {t.last_lap_energy_wh:.2f} Wh")
     print(f"  last lap time   {t.last_lap_time_s:.1f} s")
+
+    # The HUD stopwatch holds a lap's time only when the lap was FINISHED.
+    assert t.last_lap_finished_ts == t._lap_start_ts, "counted lap not marked"
+    t.set_lap(5, now=clock + 1.0)
+    assert t.last_lap_finished_ts != t._lap_start_ts, "set_lap looked like a lap"
+    print("  stopwatch marks ok")
