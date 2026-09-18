@@ -135,6 +135,8 @@ RESYNC_AFTER_CUT_M = 600.0
 # Stationary this long within the gate corridor means the car is in its box,
 # whatever the lane geometry said on the way in.
 BOX_STOP_S = 20.0
+# ...and it takes this long on the move to end a standstill.
+STILL_RUN_BREAK_S = 3.0
 # A flying lap may contain this much standstill and no more.
 FLYING_MAX_STOPPED_S = 10.0
 
@@ -310,6 +312,7 @@ class LapTracker:
         self._clock = None               # newest `now` any update has seen
         self._stop_ts = None
         self._still_run_s = 0.0
+        self._moving_run_s = 0.0
         self._trail = collections.deque(maxlen=TRAIL_LEN)
         self._trail_ts = None
 
@@ -429,8 +432,13 @@ class LapTracker:
                 if still:
                     self._lap_stopped_s += dt
                     self._still_run_s += dt
+                    self._moving_run_s = 0.0
                 else:
-                    self._still_run_s = 0.0
+                    # One fix with a little speed in it is not the car leaving:
+                    # a parked receiver reports a few km/h now and then.
+                    self._moving_run_s += dt
+                    if self._moving_run_s >= STILL_RUN_BREAK_S:
+                        self._still_run_s = 0.0
         self._stop_ts = now
 
         # Standing still for a while right by the gate: that is the box, even
