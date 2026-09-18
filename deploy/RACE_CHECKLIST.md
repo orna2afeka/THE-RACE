@@ -433,6 +433,7 @@ is not evidence of a fault.
 | Pit dashboard | `Start Pit Dashboard.bat` → http://localhost:8000 (phones: http://<laptop-ip>:8000) |
 | Profile builder | `Build Speed Profiles.bat` → http://localhost:8502 |
 | Pit wall (big screen) | `python tools/pit_wall.py` → http://localhost:8503 |
+| Energy matrix | `Start Energy Matrix.bat` → http://localhost:8504 |
 | Spectator page (public) | https://orna2afeka.github.io/THE-RACE/ |
 | Presentation map | `docs/zolder_animation.html` (self-contained, works offline) |
 | Car logs | `~/hud-logs/hud.log` on the Pi |
