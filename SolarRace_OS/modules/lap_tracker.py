@@ -14,8 +14,11 @@ it, and the two are kept apart on purpose — a wrongly drawn pit lane can cost 
 tag, never a lap.
 
     flying lap      gate on track -> gate on track
-    in-lap          stays open through the stop in the box (which is BEFORE the
-                    line) and closes at the gate in the pit lane on the way out
+    in-lap          closes at the gate IN THE PIT LANE. Our box at Zolder is
+                    ~37 m past the line (surveyed 2026-09-18), so that happens
+                    on the way in and the stop belongs to the out-lap; a box
+                    before the line would put the stop in the in-lap instead.
+                    Nothing here depends on which: the gate decides
     out-lap         starts at that pit-lane passage, so its metres — and the
                     driver's target speed — count from the line like any other
     GPS missed it   a VIRTUAL crossing, cut back at datum + 4000 m and
@@ -1238,9 +1241,12 @@ if __name__ == "__main__":
 
     PIT = _resample(list(track_map.PITLANE_XY))
     PIT_LEN = PIT[-1][0]
-    # where along the pit lane the gate is, and the box 40 m before it
+    # Where along the pit lane the gate is, and our box: 35-40 m PAST the line,
+    # as surveyed at Zolder on 2026-09-18. BOX_BEFORE_D is the other possible
+    # layout (a box short of the line), which must work just as well.
     PIT_GATE_D = next(d for d, xy in PIT if track.gate_coords(xy)[0] >= 0.0)
-    BOX_D = PIT_GATE_D - 40.0
+    BOX_D = PIT_GATE_D + 37.0
+    BOX_BEFORE_D = PIT_GATE_D - 40.0
     import zolder_pitlane
     PIT_ENTRY_S, PIT_EXIT_S = zolder_pitlane.ENTRY_S_M, zolder_pitlane.EXIT_S_M
 
@@ -1352,35 +1358,51 @@ if __name__ == "__main__":
           "publishes the lap being driven AND the lap the figures belong to")
 
     # ------------------------------------------------------------------ #
-    print("\n2. in-lap, stop in the box before the line, out-lap")
+    print("\n2. pit stop, box 37 m PAST the line (ours)")
     c.drive(on_track(PAST, PIT_ENTRY_S), 60.0)
     c.drive(in_pit(0.0, BOX_D), 30.0)
+    check(t.lap_count == 3 and t.last_lap_kind == "in"
+          and "ended_in_pit" in t.last_lap_flags and "stopped" not in t.last_lap_flags,
+          f"the gate in the pit lane closes the in-lap on the way IN ({t.last_lap_kind})")
     check(t.zone == ZONE_PIT and t.profile_distance_m() is None,
           "pit lane recognised at the entry; no target speed in it")
     c.park(300.0)
-    check(t.zone == ZONE_BOX and t.lap_count == 2,
-          "five minutes in the box: zone 'box', no lap from GPS wander")
+    check(t.zone == ZONE_BOX and t.lap_count == 3 and t.resyncs == 0,
+          "five minutes in the box, 37 m from the gate: no lap, no re-sync")
     c.drive(in_pit(BOX_D, PIT_LEN), 30.0)
-    check(t.lap_count == 3 and t.last_lap_kind == "in"
-          and "ended_in_pit" in t.last_lap_flags,
-          f"the gate in the pit lane closes the in-lap ({t.last_lap_kind})")
-    check(near(t.last_lap_stopped_s, 300.0, 15.0),
-          f"... holding the stop: {t.last_lap_stopped_s} s standing")
     out_lap_m = t.lap_distance_m
-    check(near(out_lap_m, PIT_LEN - PIT_GATE_D, 15.0),
+    check(t.lap_count == 3 and near(out_lap_m, PIT_LEN - PIT_GATE_D, 15.0),
           f"out-lap metres count from the line: {out_lap_m:.0f} m at pit exit")
     c.drive(on_track(PIT_EXIT_S, PIT_EXIT_S + 150.0), 60.0)
     check(t.zone == ZONE_TRACK
           and near(t.profile_distance_m(), PIT_EXIT_S + 150.0, 20.0),
           f"back on track: target speed looked up at {t.profile_distance_m():.0f} m")
     c.drive(on_track(PIT_EXIT_S + 150.0, L + PAST), 60.0)
-    check(t.lap_count == 4 and t.last_lap_kind == "out",
-          f"out-lap counted and tagged ({t.last_lap_kind})")
+    check(t.lap_count == 4 and t.last_lap_kind == "out"
+          and near(t.last_lap_stopped_s, 300.0, 15.0),
+          f"out-lap counted, tagged, and holding the stop: "
+          f"{t.last_lap_stopped_s} s standing")
     c.lap()
     check(t.lap_count == 5 and t.last_lap_kind == "flying",
           "and the next lap is flying again")
     check(t.rejected_crossings == 0 and t.resyncs == 0 and t.lap_source == "gps",
           "nothing rejected, nothing re-synced, never fell back to the odometer")
+
+    print("\n2b. the same stop with a box 40 m BEFORE the line")
+    k = Car(seed=9)
+    k.drive(on_track(L - 100.0, L + PAST), 40.0)
+    k.lap()
+    k.drive(on_track(PAST, PIT_ENTRY_S), 60.0)
+    k.drive(in_pit(0.0, BOX_BEFORE_D), 30.0)
+    k.park(300.0)
+    check(k.t.zone == ZONE_BOX and k.t.lap_count == 1,
+          "five minutes in the box: no lap from GPS wander")
+    k.drive(in_pit(BOX_BEFORE_D, PIT_LEN), 30.0)
+    check(k.t.lap_count == 2 and k.t.last_lap_kind == "in"
+          and near(k.t.last_lap_stopped_s, 300.0, 15.0),
+          "the in-lap closes on the way OUT and holds the stop")
+    k.drive(on_track(PIT_EXIT_S, L + PAST), 60.0)
+    check(k.t.lap_count == 3 and k.t.last_lap_kind == "out", "then the out-lap")
 
     # ------------------------------------------------------------------ #
     print("\n3. drive-through")
@@ -1469,7 +1491,8 @@ if __name__ == "__main__":
     r2.xy = r.xy
     r2.park(30.0)
     r2.drive(in_pit(BOX_D, PIT_LEN), 30.0)
-    check(fresh.lap_count == 2 and "interrupted" in fresh.last_lap_flags,
+    r2.drive(on_track(PIT_EXIT_S, L + PAST), 60.0)
+    check(fresh.lap_count == 3 and "interrupted" in fresh.last_lap_flags,
           f"the lap survives the reboot and says so ({fresh.last_lap_flags})")
     check(fresh.last_lap_time_s > elapsed_at_save + 30.0,
           f"its clock carried on: {fresh.last_lap_time_s:.0f} s "

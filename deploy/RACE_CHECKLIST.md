@@ -177,12 +177,11 @@ A lap is one FORWARD passage of the finish gate: a 50 m line across the track
 Proven only in simulation (`python SolarRace_OS/modules/lap_tracker.py`); no lap
 in the store has ever been GPS-triggered, because all testing was in Israel.
 
-**Before the first session — survey the gate.** `FINISH_LINE_LAT/LON` came off a
-map. Stand at each end of the real timing line with a phone (left edge of the
-track, and the far wall of the pit lane), put the two positions into
-`GATE_LEFT_LATLON` / `GATE_RIGHT_LATLON` in `track.py`, then run
-`python tools/check_gate.py`. Our box is a few tens of metres before the line,
-so an error of that size decides whether the pit exit counts a lap.
+**The gate was checked on site on 2026-09-18:** a pin on the painted
+start/finish line at the pit wall lands 0.0 m along the track from the
+coordinate in `track.py`. Nothing to enter. Our box is 35-40 m **past** the
+line, so coming in the car passes the line in the pit lane *before* it stops.
+At a different circuit or box, re-check: `python tools/check_gate.py`.
 
 **On the first laps, watch the console / the pit's Lap Source tile:**
 
@@ -190,14 +189,15 @@ so an error of that size decides whether the pit exit counts a lap.
 |---|---|
 | first passage of the line | `Finish line acquired` — nothing counted |
 | a flying lap | `LAP n [flying] … (gps)` |
-| come in, stop in the box, drive out | **no button pressed**; `LAP n [in]` as the car passes the line in the pit lane, then `LAP n+1 [out]` |
+| come into the pit lane | **no button pressed**; `LAP n [in]` as the car passes the line in the pit lane, just before the box |
+| stop in the box, drive out, complete the lap | nothing while parked; `LAP n+1 [out]` at the line on track — that lap holds the stop, so its time is long |
 | target speed on the HUD | `—` in the pit lane, back within ~150 m of the pit exit |
 
 If `lap_source` reads `odometer` with GPS healthy, the gate is in the wrong
 place: re-survey it. If lane tags are wrong but laps count, set
 `PIT_ZONE_ENABLED = False` in `track_map.py` — counting never depends on it.
 
-**Do not press Cut Lap in the box.** The passage on the way out already counts
+**Do not press Cut Lap in the box.** The passage on the way in already counted
 that lap. Cut Lap is for a count that is genuinely one short; Set Lap corrects
 the number and touches nothing else.
 
