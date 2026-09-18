@@ -268,6 +268,27 @@ attached. `Alt+F4` covers the common case: someone standing at the car.
 
 `~/hud-logs/hud.log`, rotated each boot and capped at 20 MB, keeping 3 files.
 
+### Is the Pi struggling? `deploy/pi_diag.sh`
+
+```bash
+bash ~/Desktop/THE-RACE-main/deploy/pi_diag.sh          # read-only snapshot
+bash ~/Desktop/THE-RACE-main/deploy/pi_diag.sh --spy    # + 10 stack dumps of the HUD
+```
+
+Prints, and saves to `~/hud-logs/pi_diag_<date>.txt`: throttling and
+under-voltage flags decoded, per-thread CPU of the HUD process, the camera
+player's cost, CAN RX overruns (frames the kernel dropped because nobody read
+the socket), upload-error counts from `hud.log`, and HTTPS round-trip times to
+the database. It changes nothing and is safe during a drive.
+
+`--spy` is opt-in because it attaches py-spy to the HUD, which pauses it for a
+few milliseconds per dump (and may `pip install py-spy` into the venv the first
+time). Its tally says, per dump, whether the CAN thread was inside a Firebase
+upload, reading the bus, or idle, and whether the GUI thread was painting.
+Most dumps in the upload = the freeze-then-jump the driver sees. The pit-side
+half of the same question is `python tools/car_stall_report.py`, which reads
+the freezes out of the pit's own telemetry store.
+
 ---
 
 ## Pit — Windows laptop
