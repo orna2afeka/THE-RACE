@@ -60,7 +60,7 @@ for _p in (_REPO, os.path.join(_REPO, "Pit_Dashboard")):
 import db  # noqa: E402
 
 PAGE_PATH = os.path.join(_REPO, "Pit_Dashboard", "wall.html")
-DEFAULT_PORT = 8503          # 8000 is the dashboard, 8502 the profile builder
+DEFAULT_PORT = 8503          # 8000 dashboard, 8502 builder, 8504 energy matrix
 
 # How often the car's current state is re-read. The page polls at 1 Hz; this is
 # a little quicker so a poll rarely waits a whole cycle for fresh numbers.

@@ -252,6 +252,14 @@ export interface Live {
   activeLap: Num;
   lapDelta: Num;
   odometerKm: Num;
+  /** Wh used since this lap's trigger, net of regen — the same basis as
+   *  last_lap_energy, so the two tiles compare directly. Null until the car
+   *  has reported both a lap and an energy total. */
+  currentLapEnergy: Num;
+  /** How far into the lap the pit's earliest sample sits. Near 0 the figure
+   *  above covers the whole lap; a large value means the start of the lap was
+   *  never received and it understates. */
+  currentLapEnergyFromM: Num;
   lapDistanceM: number;
   sectorId: number;
   sectorName: string;

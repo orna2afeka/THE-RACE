@@ -119,6 +119,31 @@ def send_lap_cut() -> dict:
     return send_lap_command("cut_lap")
 
 
+def send_lap_set(lap_number: int) -> dict:
+    """Start a FRESH lap without counting one, keeping the lap number given.
+
+    What a pit exit needs. send_lap_cut() re-datums too, but it counts a lap
+    on the way past: the partial the car did before it came in is filed as a
+    real lap, with its part-lap time and part-lap energy, and the count gains
+    one the car never drove. Those figures then feed the per-lap history and
+    the strategy matrix, which is exactly where a fabricated lap does damage.
+
+    LapTracker.set_lap() goes through _trigger_lap(count_it=False): distance,
+    energy and the lap clock all re-datum, nothing is recorded as a lap, and
+    the count becomes `lap_number`. Pass the count the car is ALREADY on to
+    keep it where it is.
+
+    ALWAYS SEND A NUMBER. The car reads this as `cmd.get("value") or 0`, so a
+    None -- or an omitted value -- silently resets the race lap count to zero.
+    That is why this takes a required argument and coerces it here rather than
+    defaulting anything.
+
+    Shares /lap_command and /lap_command_ack with send_lap_cut(), so the ack
+    comes back with action="set_lap" and the pit can tell the two apart.
+    """
+    return send_lap_command("set_lap", max(0, int(lap_number)))
+
+
 def send_trip_reset() -> dict:
     """Ask the car to zero its OWN tracked distance total (state["trip_m"] /
     lap_tracker.odometer_m) -- not lap count, not energy, and not the

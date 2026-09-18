@@ -461,6 +461,74 @@ def lap_energy_by_strategy(conn: sqlite3.Connection, recent_laps: int = 60,
     return out
 
 
+def laps_measured(conn: sqlite3.Connection, recent_laps: int = 60,
+                  device_id: str = DEVICE_ID):
+    """Every recent lap as {lap, energy_wh, lap_time_s, distance_m, strategy}.
+
+    lap_energy_by_strategy() answers "what did a lap on profile X cost", which
+    is the right question ONLY when the lap really was flown at X's pace. This
+    answers the more careful version — what a lap cost AND how fast and how far
+    it actually was — so a caller can check that for itself.
+
+    That check is not academic. A lap cut by the ODOMETER fallback rather than
+    the GPS line is 4200 m, not 4000 (track.ODOMETER_FORCE_LAP_M), and carries
+    whatever pace the car happened to be doing; `active_strategy` still names
+    the profile the pit last SENT. Costing such a lap as though it were a lap
+    of that profile is how a bench session at 50 km/h ends up setting the
+    energy budget for a race at 68.
+
+    MINDS THE SAME OFF-BY-ONE as lap_energy_by_strategy, for the same reason:
+    rows tagged N carry lap N's figures in last_lap_*, while their
+    active_strategy is the profile being followed during lap N+1. So the
+    strategy for lap N comes from the rows tagged N-1.
+
+    Bounded to the most recent `recent_laps` laps, as that function is.
+    """
+    top = conn.execute(
+        "SELECT MAX(calculated_lap) AS m FROM telemetry WHERE device_id = ?",
+        (device_id,)).fetchone()
+    if not top or top["m"] is None:
+        return []
+    floor = max(0.0, float(top["m"]) - float(recent_laps))
+
+    rows = conn.execute(
+        "SELECT CAST(calculated_lap AS INTEGER) AS lap, "
+        "       MAX(last_lap_energy)     AS energy_wh, "
+        "       MAX(last_lap_time_s)     AS lap_time_s, "
+        "       MAX(last_lap_distance_m) AS distance_m, "
+        "       MAX(lap_source)          AS lap_source, "
+        "       active_strategy          AS strat, COUNT(*) AS n "
+        "FROM telemetry "
+        "WHERE device_id = ? AND calculated_lap >= ? "
+        "GROUP BY lap, strat",
+        (device_id, floor)).fetchall()
+
+    facts, modal = {}, {}
+    for r in rows:
+        lap = r["lap"]
+        cur = facts.setdefault(lap, {"lap": lap, "energy_wh": None,
+                                     "lap_time_s": None, "distance_m": None,
+                                     "lap_source": None, "strategy": None})
+        for col in ("energy_wh", "lap_time_s", "distance_m"):
+            if r[col] is not None:
+                v = float(r[col])
+                cur[col] = v if cur[col] is None else max(cur[col], v)
+        if r["lap_source"] and not cur["lap_source"]:
+            cur["lap_source"] = r["lap_source"]
+        if r["strat"]:
+            best = modal.get(lap)
+            if best is None or r["n"] > best[1]:
+                modal[lap] = (r["strat"], r["n"])
+
+    out = []
+    for lap in sorted(facts):
+        f = facts[lap]
+        driven_under = modal.get(lap - 1)          # the trace of THIS lap
+        f["strategy"] = driven_under[0] if driven_under else None
+        out.append(f)
+    return out
+
+
 def lap_overview(conn: sqlite3.Connection, device_id: str = DEVICE_ID):
     """One grouped pass over every lap TRACE: cheap enough to run on a 300 MB
     store, and the only query the builder's lap table needs before a human has
@@ -1208,6 +1276,45 @@ def fetch_lap_track(conn: sqlite3.Connection, lap: int, device_id: str = DEVICE_
         "ORDER BY device_ts ASC",
         (device_id, float(int(lap)), float(int(lap)) + 1.0),
     ).fetchall()
+
+
+def lap_start_energy(conn: sqlite3.Connection, lap: int,
+                     device_id: str = DEVICE_ID):
+    """The energy baseline of one lap: (total_race_energy, lap_distance_m) of
+    its EARLIEST sample, or None when no sample of it carries energy.
+
+    "Energy used so far this lap" is the one per-lap figure the car does not
+    publish. lap_tracker.snapshot() sends lap_distance_m -- metres since the
+    trigger -- but has no energy counterpart, so the pit subtracts this
+    baseline from the live total_race_energy instead. NET of regen, like every
+    energy column here, which is exactly what makes the result comparable with
+    the last_lap_energy tile beside it.
+
+    lap_distance_m comes back with it so the caller can tell whether this
+    baseline really is the start of the lap. If the link was down when the lap
+    began, the earliest sample the pit HAS may be hundreds of metres in, and
+    the subtraction then understates the lap by whatever was missed. Saying so
+    is the point of returning it — see the tile note in the dashboard.
+
+    MATCHED AS A HALF-OPEN RANGE, not with a CAST, for the reason spelled out
+    in fetch_lap_track's docstring. `ORDER BY device_ts ASC LIMIT 1` keeps the
+    plan on idx_telemetry_lap (verified with EXPLAIN QUERY PLAN) and sorts only
+    the one lap's rows rather than walking the table in device_ts order.
+
+    COST SCALES WITH THE LAP, so the caller must not run this every frame. A
+    normal 210 s lap is ~400 rows and 0.2 ms. A lap whose counter STALLED is
+    not: the same _runs() failure the sector code guards against leaves hours
+    of driving under one lap tag, and this measured 200 ms over a 49k-row lap
+    in a bench store. build_live() runs every 2 s for every viewer, so api.py
+    caches the result per lap.
+    """
+    return conn.execute(
+        "SELECT total_race_energy, lap_distance_m FROM telemetry "
+        "WHERE device_id = ? AND calculated_lap >= ? AND calculated_lap < ? "
+        "  AND total_race_energy IS NOT NULL "
+        "ORDER BY device_ts ASC LIMIT 1",
+        (device_id, float(int(lap)), float(int(lap)) + 1.0),
+    ).fetchone()
 
 
 def recent_laps(conn: sqlite3.Connection, count: int = 2,

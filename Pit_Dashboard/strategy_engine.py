@@ -110,6 +110,12 @@ BATTERY_FLOOR_WH = 450.0       # never plan to go below this
 # Race rules, confirmed by the team. These are the reason the merged model is
 # not simply her optimiser: hers has none of them, so its lap counts are
 # optimistic and its "many short stops" plans are not actually cheap.
+# How long the race runs. Named here, with the other race rules, because two
+# places need it and they must not drift: the pit's race clock counts down
+# from it, and the Energy Matrix tool plans a whole race against it. It was
+# a bare 1440.0 inside api.py's _race_clock() until the second caller wanted
+# it.
+RACE_DURATION_MIN = 1440.0     # 24 hours
 MIN_STOP_DURATION_MIN = 30.0   # a stop costs this even if charging is quicker
 DRIVER_STINT_LIMIT_MIN = 120.0 # continuous driving before a driver must change
 DRIVER_CHANGE_TIME_MIN = 5.0   # cost of that change

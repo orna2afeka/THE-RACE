@@ -8,6 +8,7 @@ REM  thread of its own, and cannot slow, lock or crash the dashboard,
 REM  the collector or the profile builder.
 REM
 REM  Port map:  8000 pit dashboard   8502 profile builder   8503 this
+REM             8010 demo dashboard   8504 energy matrix
 REM
 REM  The page itself is Pit_Dashboard\wall.html, written by
 REM  tools\build_zolder_animation.py. It is NOT published to GitHub

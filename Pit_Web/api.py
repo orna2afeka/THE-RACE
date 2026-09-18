@@ -327,7 +327,8 @@ def _race_clock(conn):
     elapsed_min = 0.0
     if r["is_racing"] and r["race_start_time"]:
         elapsed_min = (time.time() - r["race_start_time"]) / 60.0
-    return r, elapsed_min, max(0.0, 1440.0 - elapsed_min)
+    return r, elapsed_min, max(0.0, strategy_engine.RACE_DURATION_MIN
+                               - elapsed_min)
 
 
 DRIVER_STINT_KEY = "driver_stint"
@@ -766,6 +767,60 @@ def build_cells(state, age, fresh):
     }
 
 
+# --------------------------------------------------------------------------- #
+# Energy used so far this lap
+# --------------------------------------------------------------------------- #
+# The car publishes last_lap_energy and total_race_energy, never "this lap so
+# far", so the pit subtracts: live total minus the total at the lap's first
+# sample. Net of regen on both sides, which is what makes the Current-lap tile
+# comparable with the Last-lap tile next to it.
+#
+# CACHED PER LAP, and that is not a micro-optimisation. db.lap_start_energy()
+# costs what the lap is big -- 0.2 ms for a normal lap, 200 ms for one whose
+# counter stalled and swallowed hours of samples -- and build_live() runs every
+# 2 s for every viewer on the pit LAN. Uncached, one stalled lap counter would
+# put the dashboard into exactly the read storm fetch_lap_track was rewritten to
+# escape.
+#
+# The TTL is what makes a late baseline self-correct. A lap's first sample is
+# normally the real start of it, but if the link was down at the trigger the
+# earliest sample the pit holds is further in, and the collector's catch-up
+# backfills the missing ones minutes later. Re-reading every 15 s picks the real
+# start up when it arrives instead of holding the understated figure all lap.
+_LAP_BASELINE_TTL_S = 15.0
+# No lap can end this far BELOW where it started. Scaled off what a lap
+# actually costs (the strategy matrix spends 72-88 Wh on one), so it stays
+# right if the profiles are rebuilt: net regen over a lap is a fraction of the
+# spend, never a multiple of it. Only an energy reset can clear this bar.
+LAP_ENERGY_IMPLAUSIBLE_WH = max(
+    [m.get("energy_wh") or 0.0 for m in C.PROFILE_MATRIX.values()] or [100.0])
+_lap_baseline = {}                       # lap -> (read_at, energy_wh, at_m)
+_lap_baseline_lock = threading.Lock()
+
+
+def _lap_energy_baseline(conn, lap):
+    """(energy_wh, metres_into_the_lap) for the start of `lap`, or (None, None).
+
+    The second value is how far into the lap the pit's earliest sample sits.
+    Near 0 it is the real start; a large number means the beginning of the lap
+    was never received and the subtraction understates it, which the tile says
+    out loud rather than quietly reporting a low number.
+    """
+    now = time.time()
+    with _lap_baseline_lock:
+        hit = _lap_baseline.get(lap)
+        if hit is not None and (now - hit[0]) < _LAP_BASELINE_TTL_S:
+            return hit[1], hit[2]
+    row = db.lap_start_energy(conn, lap)
+    energy = at_m = None
+    if row is not None:
+        energy, at_m = row["total_race_energy"], row["lap_distance_m"]
+    with _lap_baseline_lock:
+        _lap_baseline.clear()            # only the current lap is ever asked
+        _lap_baseline[lap] = (now, energy, at_m)
+    return energy, at_m
+
+
 def build_live(conn, manual_lap=-1):
     """The whole fast tier in one payload: tiles, sidebar, sectors, map.
 
@@ -777,6 +832,27 @@ def build_live(conn, manual_lap=-1):
 
     active_lap = manual_lap if manual_lap >= 0 else state["auto_lap"]
     expected = elapsed_min / C.TARGET_LAP_TIME_MIN if C.TARGET_LAP_TIME_MIN else 0
+
+    # Energy used so far this lap. Keyed on the CAR's lap, never on active_lap:
+    # a manual lap number typed in the pit is a correction to the COUNT, and
+    # using it here would look up stored rows that belong to a different lap.
+    lap_energy = lap_energy_from_m = None
+    car_lap, total_energy = state["auto_lap"], state["total_race_energy"]
+    if car_lap is not None and total_energy is not None:
+        base, lap_energy_from_m = _lap_energy_baseline(conn, car_lap)
+        if base is not None:
+            lap_energy = float(total_energy) - float(base)
+            # A baseline from BEFORE an energy reset. The pit can send
+            # reset_energy (lap_command.py), which zeroes total_race_energy on
+            # the car mid-lap while the stored first sample of that lap still
+            # holds the pre-reset total — subtracting gives a large negative
+            # that would sit on the tile for the rest of the lap. A mildly
+            # negative lap is REAL (energy is net of regen and may legitimately
+            # decrease; see LapTracker.update_energy), so only a difference
+            # bigger than any lap could physically regen is treated as the
+            # reset it is, and reported as unknown rather than as a number.
+            if lap_energy < -LAP_ENERGY_IMPLAUSIBLE_WH:
+                lap_energy = lap_energy_from_m = None
 
     # Prefer the car's own "metres since the last lap trigger". Once laps are
     # cut at the GPS finish line, odometer % 4000 no longer lines up with the
@@ -862,6 +938,12 @@ def build_live(conn, manual_lap=-1):
         # looks like the car is losing the race.
         "lapDelta": None if active_lap is None else active_lap - expected,
         "odometerKm": odo_km,
+        # Wh used since this lap's trigger, net of regen — null until the car
+        # has reported both a lap and an energy total. `FromM` is how far into
+        # the lap the baseline sample sits, so the tile can flag a figure that
+        # is missing the start of the lap.
+        "currentLapEnergy": lap_energy,
+        "currentLapEnergyFromM": lap_energy_from_m,
         "lapDistanceM": lap_dist,
         "sectorId": sector_id,
         "sectorName": C.SECTION_NAMES.get(sector_id, "Section %d" % sector_id),
@@ -2400,6 +2482,37 @@ def api_cut_lap():
     except Exception as e:
         raise HTTPException(502, "cut lap failed: %s" % e)
     return {"ok": True, "sentAt": time.strftime("%H:%M:%S")}
+
+
+class LapSetBody(BaseModel):
+    # REQUIRED, and no default. The car reads this as `cmd.get("value") or 0`,
+    # so anything falsy zeroes the race lap count. A pit-exit button that can
+    # wipe the lap count by omitting a field is not one to have on a race
+    # dashboard, so the number has to be stated.
+    lap: int
+
+
+@app.post("/api/lap/set")
+def api_lap_set(body: LapSetBody):
+    """Start a FRESH lap on the car without counting one.
+
+    The pit-exit command. /api/cut_lap re-datums as well, but it records the
+    partial as a real lap -- part-lap time, part-lap energy, and one more on
+    the counter -- and those go on to feed the per-lap history and the
+    strategy matrix. This re-datums distance, energy and the lap clock and
+    records nothing.
+
+    `lap` is what the count should READ afterwards, not an increment. The UI
+    sends the count the car is already on, so a pit exit leaves it alone.
+    """
+    if body.lap < 0:
+        raise HTTPException(400, "lap must be 0 or more")
+    import driver_message
+    try:
+        driver_message.send_lap_set(body.lap)
+    except Exception as e:
+        raise HTTPException(502, "set lap failed: %s" % e)
+    return {"ok": True, "lap": body.lap, "sentAt": time.strftime("%H:%M:%S")}
 
 
 @app.get("/api/cut_lap/ack")
