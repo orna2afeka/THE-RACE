@@ -289,6 +289,38 @@ Most dumps in the upload = the freeze-then-jump the driver sees. The pit-side
 half of the same question is `python tools/car_stall_report.py`, which reads
 the freezes out of the pit's own telemetry store.
 
+### DNS: fixed resolvers on every connection (not in git — redo after a reflash)
+
+```bash
+nmcli -t -f NAME,TYPE,DEVICE con show --active
+# for the wifi connection AND the gsm/modem connection:
+nmcli con mod "<name>" ipv4.ignore-auto-dns yes \
+    ipv4.dns "1.1.1.1 8.8.8.8" ipv4.dns-options "timeout:1,attempts:2"
+nmcli con up "<name>"
+cat /etc/resolv.conf          # must list only 1.1.1.1 and 8.8.8.8
+```
+
+Found on 2026-09-18. The modem's DHCP hands out the carrier's own resolvers
+(Orange Belgium, 212.224.129.x), which answer only over the modem link. With a
+hotspot connected as well, lookups leave over wifi, never reach them, and
+every fresh name resolution took **8.0 s** (two dead servers, 4 s each) before
+the working one was tried. Two things followed from that one fault:
+
+- The Firebase upload runs on the CAN worker thread, and its `httpTimeout`
+  cannot bound `getaddrinfo`, so each cold lookup froze the driver's screen
+  for 8 s and the kernel dropped CAN frames nobody was reading.
+- The boot-time `timeout 20 git pull` in `start_hud.sh` was killed mid-unpack,
+  leaving zero-length loose objects in `.git/objects`. Those then broke every
+  later pull, so the Pi silently stopped updating itself. If that ever
+  recurs: `find .git/objects -type f -size 0 -delete`, then fetch; if the
+  fetch does not backfill, copy the pack from a fresh `--bare` clone into
+  `.git/objects/pack/`.
+
+Public resolvers answer over either uplink, `ignore-auto-dns` stops a carrier
+injecting its own, and `timeout:1,attempts:2` caps the worst case at 2 s.
+Measured after the change: ~55 ms per lookup, on both links and on the modem
+alone.
+
 ---
 
 ## Pit — Windows laptop
