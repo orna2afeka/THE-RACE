@@ -184,6 +184,7 @@ THE RACE/                             # ← repo root
 ├── Demo Dashboard.bat                # The same dashboard on a synthetic store (port 8010) — never touches telemetry.db
 ├── Build Speed Profiles.bat          # Double-click launcher → the profile builder on port 8502
 ├── Start Pit Wall.bat                # Double-click launcher → the big-screen pit wall on port 8503
+├── Start Energy Matrix.bat           # Double-click launcher → what each speed profile COSTS, on port 8504
 ├── Start HUD Demo.bat                # Double-click launcher → the driver HUD on a fake car (Windows)
 ├── Start HUD Demo.sh                 # The same on the Pi — and there it drives the REAL brake light
 ├── requirements.txt                  # Shared/root-tool dependencies
