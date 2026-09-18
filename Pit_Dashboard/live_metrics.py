@@ -106,7 +106,9 @@ LIVE_METRIC_GROUPS = [
         dict(label="Odometer", unit="km", spec=".1f", derived="controller_odometer_km",
              note="motor controller's own counter (CAN 0x620) - not resettable from the pit"),
         dict(label="Lap Source", unit="", spec=".0f", derived="lap_source", text=True,
-             note="gps = finish line, gps_no_can, odometer = distance fallback, manual = pit cut"),
+             note="how the last lap was cut - gps = finish line, gps_no_can, "
+                  "odometer = distance fallback, manual = pit cut. Survives a "
+                  "Pi reboot with the lap count; - until the first lap"),
     ]),
 ]
 
