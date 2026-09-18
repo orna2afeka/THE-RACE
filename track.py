@@ -84,6 +84,50 @@ FINISH_EXIT_RADIUS_M = 60.0
 # counting continues, and tag it so the pit can see the GPS trigger missed.
 ODOMETER_FORCE_LAP_M = 4400.0
 
+# --------------------------------------------------------------------------- #
+# The finish GATE
+# --------------------------------------------------------------------------- #
+# A lap is one FORWARD passage of a line across the circuit, not a visit to a
+# point. The line spans the racing surface AND the pit lane, because that is
+# what the organisers' timing loop does: a car that leaves its box and drives
+# down the pit lane past the line has completed a lap.
+#
+# Measured against the OSM geometry (tools/check_gate.py re-measures it):
+#
+#     pit lane centre     12-14 m to the RIGHT of the track centreline here
+#     opposing track      79 m to the RIGHT, running the other way (s ~ 1640 m)
+#
+# so the gate reaches 30 m right (pit lane + its width + GPS error) and stops
+# 49 m short of the opposing section. A gate long enough to touch that section
+# would be crossed BACKWARDS once a lap. 20 m left covers half the track width
+# plus GPS error; there is nothing but grandstand on that side.
+#
+# Direction of travel across the line, degrees clockwise from north. Baked
+# rather than imported because track_map imports this module; check_gate.py
+# fails if it drifts from the centreline's own tangent at s = 0.
+FINISH_HEADING_DEG = 236.713
+GATE_LEFT_M = 20.0
+GATE_RIGHT_M = 30.0
+
+# Surveyed gate ends, (lat, lon), LEFT end then RIGHT end as the driver sees
+# them. None = derive the gate from FINISH_LINE_LAT/LON and the numbers above.
+# ⚠️ Walk these on site. FINISH_LINE_LAT/LON came off a map, and with the box a
+# few tens of metres before the line, an error of that size decides whether the
+# pit exit crosses the gate or starts beyond it.
+GATE_LEFT_LATLON = None
+GATE_RIGHT_LATLON = None
+
+# No car laps 4 km in a minute (240 km/h), so two counted crossings closer
+# together than this are one crossing seen twice.
+MIN_LAP_TIME_S = 60.0
+
+# With a live odometer a counted crossing also needs this much distance behind
+# it. Deliberately HALF a lap and not the 3800 m window: the gate's direction
+# test is what rejects false crossings now, so this only has to stop a car that
+# shuffles around the line, and must never reject a real lap because the tire
+# constant is a few percent out.
+MIN_LAP_DISTANCE_M = 2000.0
+
 _EARTH_RADIUS_M = 6371008.8
 
 
@@ -143,6 +187,68 @@ def distance_to_finish(lat, lon):
     return math.hypot(*to_local_xy(lat, lon))
 
 
+def _gate_frame():
+    """(right_end_xy, left_unit, forward_unit, length_m, finish_offset_m).
+
+    `left_unit` points along the gate from its right end to its left end;
+    `forward_unit` is the direction a racing car crosses it. `finish_offset_m`
+    is where the finish point sits along the gate, so a crossing's lateral can
+    be reported relative to the track centreline rather than to a gate end.
+    """
+    if GATE_LEFT_LATLON and GATE_RIGHT_LATLON:
+        ax, ay = to_local_xy(*GATE_LEFT_LATLON)
+        bx, by = to_local_xy(*GATE_RIGHT_LATLON)
+        length = math.hypot(ax - bx, ay - by)
+        ex, ey = (ax - bx) / length, (ay - by) / length
+        fx, fy = ey, -ex                  # left rotated -90 deg = forward
+        return (bx, by), (ex, ey), (fx, fy), length, -(bx * ex + by * ey)
+    h = math.radians(FINISH_HEADING_DEG)
+    fx, fy = math.sin(h), math.cos(h)     # heading is clockwise from north
+    ex, ey = -fy, fx                      # forward rotated +90 deg = left
+    b = (-GATE_RIGHT_M * ex, -GATE_RIGHT_M * ey)
+    return b, (ex, ey), (fx, fy), GATE_LEFT_M + GATE_RIGHT_M, GATE_RIGHT_M
+
+
+_GATE = _gate_frame()
+
+
+def gate_coords(p):
+    """(along_m, lateral_m) of a local-xy point in the gate's own frame.
+
+    along_m   > 0 past the line, < 0 before it, in the racing direction
+    lateral_m > 0 left of the finish point, < 0 right of it (the pit side)
+    """
+    (bx, by), (ex, ey), (fx, fy), _length, finish_w = _GATE
+    dx, dy = p[0] - bx, p[1] - by
+    return dx * fx + dy * fy, dx * ex + dy * ey - finish_w
+
+
+def segment_gate_intersection(p1, p2):
+    """Does the path p1->p2 cross the finish gate?
+
+    Returns None, or (t, lateral_m, sign):
+
+    t          fraction along p1->p2 where it meets the line, so the moment,
+               the odometer and the energy AT the line can be interpolated
+               instead of being taken from whichever fix came after it
+    lateral_m  where across the gate, left-positive from the finish point
+    sign       +1 crossed in the racing direction, -1 crossed backwards
+
+    A point exactly on the line belongs to the far side, so a path that ends on
+    the line and the next one that starts on it cannot both report a crossing.
+    """
+    u1, v1 = gate_coords(p1)
+    u2, v2 = gate_coords(p2)
+    if (u1 < 0.0) == (u2 < 0.0):
+        return None
+    t = u1 / (u1 - u2)
+    lateral = v1 + t * (v2 - v1)
+    _b, _e, _f, length, finish_w = _GATE
+    if not (-finish_w <= lateral <= length - finish_w):
+        return None
+    return t, lateral, (1 if u2 >= 0.0 else -1)
+
+
 # --------------------------------------------------------------------------- #
 # Self-check:  python3 track.py
 # --------------------------------------------------------------------------- #
@@ -190,3 +296,31 @@ if __name__ == "__main__":
     c, s = _pass(55.6, "100 km/h with ONE DROPPED FIX (2 s gap)")
     print(f"\n    the dropped fix is the real failure: circle={c} (lap lost), "
           f"segment={s} (lap caught)")
+
+    # The gate. Paths are built in the gate's own frame and mapped back, so
+    # these hold for a surveyed gate as well as the derived one.
+    (_bx, _by), (_ex, _ey), (_fx, _fy), _len, _fw = _GATE
+
+    def _xy(along, lateral):
+        w = lateral + _fw
+        return (_bx + w * _ex + along * _fx, _by + w * _ey + along * _fy)
+
+    print(f"\n  gate: {_len:.0f} m long, finish point {_fw:.0f} m from its "
+          f"right end, heading {FINISH_HEADING_DEG:.1f} deg")
+    cases = [
+        ("racing line, forward",      (-30, 3),   (25, 3),    +1),
+        ("pit lane, forward",         (-10, -14), (8, -14),   +1),
+        ("pushed backwards",          (6, -14),   (-6, -14),  -1),
+        ("stops short of the line",   (-40, 0),   (-2, 0),    None),
+        ("opposing track, 79 m right", (30, -79),  (-30, -79), None),
+        ("grandstand side, 35 m left", (-30, 35),  (30, 35),   None),
+    ]
+    for label, a, b, want in cases:
+        hit = segment_gate_intersection(_xy(*a), _xy(*b))
+        got = hit[2] if hit else None
+        assert got == want, (label, hit)
+        detail = (f"t={hit[0]:.3f} lateral={hit[1]:+.1f} m" if hit else "no crossing")
+        print(f"    {label:28s} -> {detail}")
+    t, lateral, _sign = segment_gate_intersection(_xy(-30, 3), _xy(10, 3))
+    assert abs(t - 0.75) < 1e-9 and abs(lateral - 3.0) < 1e-9
+    print("    gate OK")
