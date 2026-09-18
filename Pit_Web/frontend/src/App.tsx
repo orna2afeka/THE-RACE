@@ -230,7 +230,8 @@ export default function App() {
           {tab === 'Live Metrics' && live && <ErrorBoundary name="Live Metrics"><LiveMetrics live={live} config={config} /></ErrorBoundary>}
           {tab === 'Cell Voltages' && <ErrorBoundary name="Cell Voltages"><Cells /></ErrorBoundary>}
           {tab === 'Weather' && <ErrorBoundary name="Weather"><Weather dark={dark} /></ErrorBoundary>}
-          {tab === 'Strategy' && <ErrorBoundary name="Strategy"><Strategy config={config} manualLap={manualLap} dark={dark} /></ErrorBoundary>}
+          {tab === 'Strategy' && <ErrorBoundary name="Strategy"><Strategy config={config} manualLap={manualLap} dark={dark}
+                     selected={live?.activeProfile?.source === 'pit' ? live.activeProfile.key : undefined} /></ErrorBoundary>}
         </main>
       </div>
       <ToastHost />

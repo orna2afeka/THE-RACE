@@ -332,6 +332,7 @@ def _race_clock(conn):
 
 DRIVER_STINT_KEY = "driver_stint"
 RACE_UNDO_KEY = "race_undo"
+STRATEGY_CHOICE_KEY = "strategy_choice"
 
 
 def race_undo_available(conn, now=None):
@@ -1326,22 +1327,33 @@ def api_faults(limit_rows: int = Query(3000, ge=1, le=20000),
 
 
 # --------------------------------------------------------------------------- #
-# The profile the CAR is running
+# The profile the PIT selected
 # --------------------------------------------------------------------------- #
-# The pit's target speed must come from the profile the car is ACTUALLY flying,
-# not from whichever file this module was pinned to. Before this, api.py loaded
-# 210s.xlsx unconditionally, so selecting the 189 s strategy moved the driver's
-# HUD target and left the strategist reading the 210 s baseline: two numbers
-# called "target speed", disagreeing, on the two screens the crew compares.
+# The pit's target speed is the profile chosen in the Strategy section. Full
+# stop. The strategist picks a profile, sends it to the car, and every target
+# readout on this dashboard is then the curve they picked -- there is no second
+# source that can quietly move it underneath them.
 #
-# strategy_engine.profile_to_df() already existed for exactly this and was
-# never called from here. It loads through speed_profile.load_csv -- the CAR's
-# own loader -- so the pit and the car cannot interpret the same file
+# WHAT THIS REPLACED, and why it had to go. The selection used to be ignored on
+# purpose: the target came from the car's `active_strategy` column, falling back
+# to the Firebase acknowledgement, on the reasoning that "the message left the
+# pit" is not "the car changed profile". Sound in theory. In practice the ack
+# has no expiry, so with the car off and the store empty the dashboard served
+# whatever profile was last acknowledged -- a fast_189s ack from three weeks
+# earlier was still driving the target speed. A number nobody in the pit chose
+# and nobody could see the age of is worse than an assumption they made
+# themselves.
+#
+# The car's own report is NOT consulted here. That is deliberate and it is the
+# trade: if the car rejects a profile or has not applied it yet, this dashboard
+# shows what the pit asked for, not what the car is flying. The honest reading
+# of the car's answer lives in the Strategy section, which polls
+# /api/strategy/ack and says "Car confirmed it is running X" in as many words.
+# That is where a disagreement surfaces.
+#
+# strategy_engine.profile_to_df() loads through speed_profile.load_csv -- the
+# CAR's own loader -- so the pit and the car cannot read the same file
 # differently.
-#
-# THE SELECTION IS NEVER THE ANSWER. /api/strategy/select sends a name over the
-# radio and stores nothing, deliberately: "the message left the pit" is not
-# "the car changed profile". Only the car's own report counts.
 
 
 @memo(ttl=30)
@@ -1355,55 +1367,62 @@ def _profile_frame(key, path, mtime):
     return profile_to_df(path)
 
 
-@memo(ttl=20)
-def _acked_key():
-    """The profile key the car acknowledged over Firebase, or None.
+# The selection, cached in process. build_live() runs every 2 s per socket and
+# app_state is one tiny row, but this is also what makes a new selection appear
+# on the NEXT live frame rather than after a cache expiry: /api/strategy/select
+# updates this global in the same breath as it writes the row.
+_CHOICE_UNLOADED = object()
+_pit_choice = _CHOICE_UNLOADED
 
-    Memoised because this is a network call and build_live() runs every 2 s per
-    socket. read_strategy_ack() already swallows every exception and returns
-    None, and memo() deliberately does not cache a raised exception, so a
-    flapping link retries rather than latching a failure.
+
+def pit_strategy_choice():
+    """The profile key the pit last selected, or None if nobody has yet.
+
+    A key that is no longer on disk (the profile was renamed or deleted in the
+    Profile Builder) counts as no selection, so the caller falls back to the
+    default rather than to a curve that cannot be loaded.
     """
-    try:
-        import driver_message
-        ack = driver_message.read_strategy_ack()
-    except Exception:
-        return None
-    if not isinstance(ack, dict) or not ack.get("applied"):
-        return None
-    # The CAR writes "strategy". Not "key" -- see firebase_client.ack_strategy.
-    key = ack.get("strategy")
-    return key if isinstance(key, str) else None
+    global _pit_choice
+    if _pit_choice is _CHOICE_UNLOADED:
+        try:
+            with closing(ro_conn()) as conn:
+                stored = load_app_state(conn, STRATEGY_CHOICE_KEY)
+        except Exception:
+            return None                  # never CACHE a failed read; retry next
+        _pit_choice = stored if isinstance(stored, str) else None
+    return _pit_choice
+
+
+def set_pit_strategy_choice(key):
+    """Persist the pit's selection and make it live immediately."""
+    global _pit_choice
+    with closing(rw_conn()) as conn:
+        save_app_state(conn, STRATEGY_CHOICE_KEY, key)
+    _pit_choice = key
 
 
 def _active_profile(state):
-    """(frame, {key, source, ageS}) for the curve the car is running.
+    """(frame, {key, source}) for the curve the PIT selected.
 
-    Source order, best first:
+      "pit"     -- chosen in the Strategy section and sent to the car.
+      "default" -- nobody has chosen this race yet, so the target speed is an
+                   assumption. Flagged so the UI can SAY so: a target from an
+                   assumed profile must never look like one from a chosen
+                   profile, the same rule as has_gps versus the paddock
+                   fallback.
 
-      1. "car"  -- the telemetry column `active_strategy`. The car sets it in
-         the same block that sends the radio ack, so it is the same fact
-         arriving over a better path: it survives the radio being down, it
-         works in replay, and it costs nothing extra because the live read
-         already fetches it.
-      2. "ack"  -- the Firebase acknowledgement, for a car build that predates
-         the column.
-      3. "default" -- nothing has been reported. Flagged so the UI can SAY the
-         target speed is assumed. A target from an assumed profile must never
-         look like one from a confirmed profile; that is the same rule as
-         has_gps versus the paddock fallback.
+    `state` is accepted and unused. It is the live telemetry row, which carries
+    the car's own `active_strategy`; see the section comment for why that is
+    deliberately not read here.
     """
     try:
         available = speed_profile.available_profiles()
     except Exception:
         available = {}
 
-    key = state.get("active_strategy") if isinstance(state, dict) else None
-    source = "car"
+    key, source = pit_strategy_choice(), "pit"
     if not (isinstance(key, str) and key in available):
-        key, source = _acked_key(), "ack"
-        if not (isinstance(key, str) and key in available):
-            key, source = C.DEFAULT_STRATEGY_KEY, "default"
+        key, source = C.DEFAULT_STRATEGY_KEY, "default"
 
     path = available.get(key)
     frame = None
@@ -1416,8 +1435,7 @@ def _active_profile(state):
         # Last ditch. A target readout that vanishes is worse than a generic
         # one, and the label already says the profile is not confirmed.
         frame = load_velocity_profile(VELOCITY_PROFILE_PATH)
-        if source != "car":
-            source = "default"
+        source = "default"
     return frame, {"key": key, "source": source}
 
 
@@ -2403,9 +2421,21 @@ class StrategyBody(BaseModel):
 def api_strategy_select(body: StrategyBody):
     """Only the strategy NAME goes over the link: the car already holds all
     five generated profiles, so this is a few bytes rather than a 400-row
-    table, and the profile it flies is the one committed to git."""
+    table, and the profile it flies is the one committed to git.
+
+    This is also the moment the PIT's own target speed changes -- see "The
+    profile the PIT selected". The choice is stored BEFORE the radio send and
+    stays stored if that send fails: a dead link does not unmake the pit's
+    decision, and the caller is told the send failed either way. Storing it
+    after would mean a radio glitch silently left every target readout on the
+    previous profile.
+
+    Moving the dropdown alone changes nothing; pressing Send does. A target
+    speed that followed a stray scroll wheel would be a different kind of bug.
+    """
     if not any(s["key"] == body.key for s in C.STRATEGIES):
         raise HTTPException(400, "unknown strategy %r" % body.key)
+    set_pit_strategy_choice(body.key)
     import driver_message
     try:
         driver_message.send_strategy(body.key)

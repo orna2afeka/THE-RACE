@@ -116,12 +116,12 @@ export function SectorCard({ live, config }: { live: Live; config: Config }) {
           </div>
           <div className="sector-dist">{live.lapDistanceM.toFixed(0)} m / {config.trackLengthM} m</div>
           {/* A target speed from an ASSUMED profile must never look like one
-              from a profile the car confirmed. Same rule as has_gps versus the
-              paddock fallback. */}
+              the pit actually chose. Same rule as has_gps versus the paddock
+              fallback. */}
           <div className={`sector-profile ${live.activeProfile?.source ?? 'default'}`}>
             {live.activeProfile?.source === 'default'
-              ? `assuming ${live.activeProfile?.key ?? '—'} · car has not reported`
-              : `from ${live.activeProfile?.key}${live.activeProfile?.source === 'ack' ? ' · via radio' : ''}`}
+              ? `assuming ${live.activeProfile?.key ?? '—'} · no profile sent yet`
+              : `from ${live.activeProfile?.key} · pit selection`}
           </div>
         </div>
       </div>

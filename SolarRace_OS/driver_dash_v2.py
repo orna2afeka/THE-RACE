@@ -253,6 +253,19 @@ QPushButton#navBtn:pressed {{
     background-color: {_CYAN};
     color: #06121a;
 }}
+QPushButton#lapResetBtn {{
+    background-color: transparent;
+    color: #5b6b78;
+    border: 1px solid #33424e;
+    border-radius: 6px;
+    font-size: 20px;
+    font-weight: bold;
+}}
+QPushButton#lapResetBtn:pressed {{
+    background-color: {_CYAN};
+    color: #06121a;
+    border-color: {_CYAN};
+}}
 QPushButton#startBtn {{
     background-color: #0a3518;
     color: {_LIME};
@@ -879,6 +892,18 @@ class RacingDashboard(QMainWindow):
     _LAP_TIMER_H = 42
     _LAP_FREEZE_S = 3.0
 
+    # Width of the stopwatch's reset button. Small on purpose: it sits beside a
+    # number the driver reads at speed, and it must not compete with it. Wide
+    # enough to stay a usable touch target with gloves on.
+    _LAP_RESET_W = 46
+
+    # The same button does both jobs, so it says which one it is about to do.
+    # Off -> a start arrow; running -> a reset loop. One control, because there
+    # is no room beside the clock for two and no reason for the driver to
+    # choose between them: there is only ever one sensible action.
+    _LAP_BTN_START = "▶"
+    _LAP_BTN_RESET = "⟲"
+
     # Root layout margin, in px. Named because _status_budget_px has to
     # subtract it to work out how much room the status text really has, and a
     # second copy of the number there would silently start clipping the status
@@ -912,6 +937,9 @@ class RacingDashboard(QMainWindow):
         self._lap_held_s: float | None = None
         self._lap_hold_until: float = 0.0
         self._lap_shown = None
+        # Matches the button's initial text, set in _build_lap_timer. The clock
+        # starts off, so the button starts as a start arrow.
+        self._lap_btn_glyph = self._LAP_BTN_START
 
         # UI scale factor (1.0 at the 800×480 design size, grows on fullscreen
         # displays) plus the current text colors, so resizeEvent can re-apply
@@ -1204,8 +1232,8 @@ class RacingDashboard(QMainWindow):
         # reintroduce a _pit_lbl assignment in this method.
         return frame
 
-    def _build_lap_timer(self) -> QLabel:
-        """The lap stopwatch: just the numbers, no background and no frame."""
+    def _build_lap_timer(self) -> QWidget:
+        """The lap stopwatch: just the numbers, with a small reset beside them."""
         self._lap_lbl = QLabel(_NO_DATA)
         self._lap_lbl.setAlignment(Qt.AlignCenter)
         self._lap_lbl.setFixedHeight(self._LAP_TIMER_H)
@@ -1216,8 +1244,50 @@ class RacingDashboard(QMainWindow):
         self._lap_tick = QTimer(self)
         self._lap_tick.timeout.connect(self._tick_lap_timer)
         self._lap_tick.start(100)
+
+        # The clock stays centred on the SCREEN, not on the space left over
+        # beside the button: an equal spacer on the left cancels the button's
+        # width. A stopwatch that shifts sideways when a button appears next to
+        # it is the kind of thing a driver notices at 60 km/h and nothing else.
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(0)
+        btn_w = max(30, int(self._LAP_RESET_W * self._sc))
+        h.addSpacing(btn_w)
+        h.addWidget(self._lap_lbl, 1)
+        self._lap_reset_btn = QPushButton(self._LAP_BTN_START)
+        self._lap_reset_btn.setObjectName("lapResetBtn")
+        self._lap_reset_btn.setFixedSize(btn_w, self._LAP_TIMER_H)
+        # Never take focus: the HUD has no keyboard, and a focus ring left on a
+        # button after a touch is just noise on the instrument panel.
+        self._lap_reset_btn.setFocusPolicy(Qt.NoFocus)
+        self._lap_reset_btn.clicked.connect(self._reset_lap_timer)
+        h.addWidget(self._lap_reset_btn)
+        row.setFixedHeight(self._LAP_TIMER_H)
+        # First paint only now: _tick_lap_timer touches the button, so it must
+        # not run before the button exists.
         self._tick_lap_timer()
-        return self._lap_lbl
+        return row
+
+    def _reset_lap_timer(self) -> None:
+        """Restart the DISPLAYED clock from now.
+
+        Display only. It does not cut a lap, does not move calculated_lap, does
+        not touch the odometer or the energy totals, and tells the pit nothing:
+        the lap count is scrutineering evidence and a driver's thumb must not be
+        able to change it. This is for when the clock is counting from a datum
+        that no longer means anything -- after a pit stop, or after a restart --
+        and the driver wants a number they can actually use.
+
+        The next real line crossing calls _on_lap_timer and takes the clock
+        back over, so this cannot leave the stopwatch permanently out of step
+        with the car's own lap timing.
+        """
+        self._lap_start = time.monotonic()
+        self._lap_held_s = None
+        self._lap_hold_until = 0.0
+        self._tick_lap_timer()
 
     @staticmethod
     def _lap_time_text(seconds: float) -> str:
@@ -1248,6 +1318,15 @@ class RacingDashboard(QMainWindow):
                 f"letter-spacing: {max(1, int(3 * self._sc))}px;")
         self._lap_lbl.setText(text)
         self._lap_shown = (text, colour)
+
+        # Only touched when it actually changes: this runs at 10 Hz and a
+        # setText on every tick would restyle the button 600 times a minute for
+        # nothing.
+        glyph = (self._LAP_BTN_START if self._lap_start is None
+                 else self._LAP_BTN_RESET)
+        if glyph != self._lap_btn_glyph:
+            self._lap_reset_btn.setText(glyph)
+            self._lap_btn_glyph = glyph
 
     @Slot(object, object)
     def _on_lap_timer(self, lap_start, finished_s) -> None:

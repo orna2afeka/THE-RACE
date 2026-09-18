@@ -82,12 +82,14 @@ export interface LiveTile {
   tier: Tier;
 }
 
-/** Which speed profile the car is running, and how well we know it.
- *  "car" is the telemetry column, "ack" the radio acknowledgement, "default"
- *  means nothing has been reported and the target speed is an assumption. */
+/** Which speed profile the PIT selected, and whether anyone selected one.
+ *  "pit" is the profile chosen in the Strategy section and sent to the car;
+ *  "default" means nobody has chosen yet and the target speed is an
+ *  assumption. The CAR's own report is not a source here — the Strategy
+ *  section shows that separately, via /api/strategy/ack. */
 export interface ActiveProfile {
   key: string;
-  source: 'car' | 'ack' | 'default';
+  source: 'pit' | 'default';
 }
 
 /** Purple, green, yellow. Decided server-side in api.py's _row(); the browser

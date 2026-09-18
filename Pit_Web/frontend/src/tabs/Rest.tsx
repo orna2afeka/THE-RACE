@@ -321,9 +321,21 @@ function BatteryChart({ data, dark }: { data: StrategyResp; dark: boolean }) {
   );
 }
 
-export function Strategy({ config, manualLap, dark }: { config: Config; manualLap: number; dark: boolean }) {
+export function Strategy({ config, manualLap, dark, selected }:
+  { config: Config; manualLap: number; dark: boolean;
+    /** The profile the pit has already chosen, from the live feed, or
+     *  undefined while nobody has chosen and the target is assumed. */
+    selected?: string }) {
   const { data } = usePoll(() => getJSON<StrategyResp>(`/api/strategy?manual_lap=${manualLap}`), 10000, [manualLap]);
-  const [choice, setChoice] = useState(config.defaultStrategyKey);
+  const [choice, setChoice] = useState(selected ?? config.defaultStrategyKey);
+  // Adopt the stored selection ONCE, when the live feed first carries one. Not
+  // on every poll: this tab can be open with the dropdown half-changed, and
+  // resetting it under the strategist's hand two seconds before they press Send
+  // is how the wrong profile gets sent.
+  const adopted = useRef(selected != null);
+  useEffect(() => {
+    if (!adopted.current && selected) { adopted.current = true; setChoice(selected); }
+  }, [selected]);
   const [sent, setSent] = useState<string | null>(null);
   const { data: ack } = usePoll(
     () => getJSON<{ ack: { strategy?: string; applied?: boolean } | null }>('/api/strategy/ack'), 5000, [sent ?? '']);
@@ -349,12 +361,15 @@ export function Strategy({ config, manualLap, dark }: { config: Config; manualLa
           </select>
           <button className="btn primary" onClick={send}><Icon name="send" size={13} />Send to car</button>
         </div>
+        {/* The ack line is the ONLY place the car's own answer is shown. Every
+            target readout on this dashboard follows the selection above, so if
+            the car disagrees, this caption is where the crew sees it. */}
         <div className="caption">
           {sent
             ? (ack?.ack?.applied
                 ? `Car confirmed it is running ${ack.ack.strategy ?? '(profile not named)'} · sent ${sent}`
                 : `Sent ${sent} — awaiting the car's confirmation. This changes the driver's target speed and corner warnings.`)
-            : 'Only the profile name is sent; the car holds all five profiles.'}
+            : `Only the profile name is sent; the car holds all five profiles. Sending also sets the pit's own target speed${selected ? ` — now ${selected}` : ', which is assumed until you send one'}.`}
         </div>
       </div>
 
