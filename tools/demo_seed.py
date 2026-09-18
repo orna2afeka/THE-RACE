@@ -63,6 +63,15 @@ DST = sys.argv[1] if len(sys.argv) > 1 else os.path.join(_ROOT, "demo_telemetry.
 LAP_M = 4000.0
 HZ = 2.0
 NLAPS = 20
+
+# DEMO ONLY - the battery the synthetic car carries. START_SOC is both the
+# charge it sets off with and the reference the pack and cell voltages are
+# derived from, so moving it keeps the whole battery picture consistent.
+# SOC_DRAIN is the charge lost per sample; 0.0 pins the demo at a full pack,
+# which is what a stand-and-watch demo wants. Put it back to 0.00055 (about
+# 0.23 % a lap at HZ = 2) for a demo that shows the battery going down.
+START_SOC = 100.0
+SOC_DRAIN = 0.0
 BOUNDS = [(1, 0, 600), (2, 600, 1000), (3, 1000, 1800), (4, 1800, 1910),
           (5, 1910, 2400), (6, 2400, 2500), (7, 2500, 3000), (8, 3000, 3430),
           (9, 3430, 4000)]
@@ -122,7 +131,7 @@ def main():
 
     rows = []
     tag = 1
-    soc, motor_c, batt_c, energy = 96.0, 42.0, 28.0, 0.0
+    soc, motor_c, batt_c, energy = START_SOC, 42.0, 28.0, 0.0
     prev_lap_energy = 0.0
     for li, lap in enumerate(laps):
         partial = (li == NLAPS - 1)
@@ -140,7 +149,7 @@ def main():
                 throttle = max(0.0, min(100.0, 58 + 26 * math.sin(d / 300.0)))
                 power = 900 + 520 * math.sin(d / 260.0) + random.uniform(-40, 40)
                 regen = max(0.0, -power)
-                soc -= 0.00055
+                soc -= SOC_DRAIN
                 motor_c += (0.0009 if throttle > 60 else -0.0006)
                 batt_c += (0.0004 if power > 1100 else -0.0003)
                 energy += max(power, 0.0) / 3600.0 / HZ
@@ -154,8 +163,8 @@ def main():
                     "lat": lat, "lon": lon,
                     "bms_soc_percent": soc,
                     "mms_estimated_soc_percent": soc - 0.6,
-                    "bms_voltage_V": 117.4 - (96.0 - soc) * 0.21,
-                    "mms_measured_voltage_V": 117.0 - (96.0 - soc) * 0.21,
+                    "bms_voltage_V": 117.4 - (START_SOC - soc) * 0.21,
+                    "mms_measured_voltage_V": 117.0 - (START_SOC - soc) * 0.21,
                     "bms_current_A": power / 117.0,
                     "mms_current_A": power / 117.0 * 0.98,
                     "mms_power_W": power,
@@ -179,14 +188,14 @@ def main():
                     # DS004: 26 modules wired and reporting, one running low so
                     # the compliance screen has a coloured tile to show.
                     "bms_string_count": 26,
-                    **{"bms_cell_%02d_V" % i: (3.71 - (96.0 - soc) * 0.004
+                    **{"bms_cell_%02d_V" % i: (3.71 - (START_SOC - soc) * 0.004
                                                - (0.55 if i == 9 else 0.0)
                                                + 0.01 * math.sin(i))
                        for i in range(1, 27)},
                     # DS003: modules A (ids 1-13) and B (ids 21-33) enabled;
                     # id 14 is a failed thermistor reporting the Orion module's
                     # nonsense negative, which the pit must gate out.
-                    **{"bms_cell_temp_%02d_C" % i: 29.0 + 4.0 * math.sin(i / 3.0) + (98.0 - soc)
+                    **{"bms_cell_temp_%02d_C" % i: 29.0 + 4.0 * math.sin(i / 3.0) + (START_SOC - soc)
                        for i in list(range(1, 14)) + list(range(21, 34))},
                     "bms_cell_temp_14_C": -41.0,
                 })

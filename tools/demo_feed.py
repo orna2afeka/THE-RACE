@@ -29,7 +29,8 @@ import time
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_ROOT, "tools"))
 
-from demo_seed import BOUNDS, BASE, HZ, LAP_M, gps          # noqa: E402
+from demo_seed import (BOUNDS, BASE, HZ, LAP_M, SOC_DRAIN,      # noqa: E402
+                       START_SOC, gps)
 
 REAL = os.path.join(_ROOT, "Pit_Dashboard", "telemetry.db")
 DST = sys.argv[1] if len(sys.argv) > 1 else os.path.join(_ROOT, "demo_telemetry.db")
@@ -64,7 +65,7 @@ def main():
         "FROM telemetry ORDER BY device_ts DESC LIMIT 1").fetchone()
     tag = float(row["calculated_lap"])
     dist = float(row["lap_distance_m"] or 0.0)
-    soc = float(row["bms_soc_percent"] or 90.0)
+    soc = float(row["bms_soc_percent"] or START_SOC)
     energy = float(row["total_race_energy"] or 0.0)
     motor_c = float(row["mms_motor_temp_C"] or 43.0)
     batt_c = float(row["battery_temp_C"] or 28.0)
@@ -110,7 +111,7 @@ def main():
 
             throttle = max(0.0, min(100.0, 58 + 26 * math.sin(dist / 300.0)))
             power = 900 + 520 * math.sin(dist / 260.0) + random.uniform(-40, 40)
-            soc = max(5.0, soc - 0.00055)
+            soc = max(5.0, soc - SOC_DRAIN)
             motor_c += (0.0009 if throttle > 60 else -0.0006)
             batt_c += (0.0004 if power > 1100 else -0.0003)
             energy += max(power, 0.0) / 3600.0 / HZ
@@ -126,11 +127,11 @@ def main():
             frames += 0 if quiet else 40
             health = ("live", 0.4, "can1 silent %ds" % int(up % 240.0 - 200.0) if quiet else "", 1)
 
-            cells = {"bms_cell_%02d_V" % i: (3.71 - (96.0 - soc) * 0.004
+            cells = {"bms_cell_%02d_V" % i: (3.71 - (START_SOC - soc) * 0.004
                                             - (0.55 if i == 9 else 0.0)
                                             + 0.01 * math.sin(i))
                      for i in range(1, 27)}
-            cells.update({"bms_cell_temp_%02d_C" % i: 29.0 + 4.0 * math.sin(i / 3.0) + (98.0 - soc)
+            cells.update({"bms_cell_temp_%02d_C" % i: 29.0 + 4.0 * math.sin(i / 3.0) + (START_SOC - soc)
                           for i in list(range(1, 14)) + list(range(21, 34))})
             cells["bms_cell_temp_14_C"] = -41.0       # the failed thermistor
             ccols = sorted(cells)
@@ -150,7 +151,7 @@ def main():
                 "?,?,?,?,?,?,?" + ",?" * len(ccols) + ")",
                 (time.time(), "solarcar", dist, tag, "base_210s",
                  speed_ms * 3.6, lat, lon, soc, soc - 0.6,
-                 117.4 - (96.0 - soc) * 0.21, 117.0 - (96.0 - soc) * 0.21,
+                 117.4 - (START_SOC - soc) * 0.21, 117.0 - (START_SOC - soc) * 0.21,
                  power / 117.0, power / 117.0 * 0.98, power,
                  speed_ms / (0.278 * 2 * math.pi) * 60.0,
                  34 + 6 * math.sin(dist / 900.0), motor_c, batt_c, 0.081,

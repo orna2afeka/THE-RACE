@@ -21,7 +21,7 @@ import { useEffect, useRef, useState } from 'react';
 import * as Plotly from 'plotly.js-dist-min';
 import { Disclosure, Pill, SectionTitle } from '../components';
 import { Icon } from '../icons';
-import { MISSING, ageText, fmtStat, getJSON, lapTime, usePoll, useResizePlot, useStored } from '../lib';
+import { MISSING, ageText, fmtStat, getJSON, lapTime, lapTimeShort, usePoll, useResizePlot, useStored } from '../lib';
 import { config as plotConfig, layoutBase, theme } from '../plotly-theme';
 import type { Config, HistoryResponse, Num, StatRow } from '../types';
 
@@ -424,15 +424,37 @@ function LapCharts({ dark, visible }: { dark: boolean; visible: boolean }) {
     }], { ...base, margin: { l: 50, r: 12, t: 8, b: 36 }, bargap: 0.4,
           xaxis: { ...base.xaxis, title: { text: 'lap', font: { size: 11, color: t.ink3 } }, dtick },
           showlegend: false }, plotConfig);
+    // Lap time is plotted in SECONDS and labelled m:ss, never decimal minutes.
+    // "4.45 min" is not a figure anyone on a pit wall thinks in; 4:27 is the
+    // same number in the form the lap tiles, the header clock and the driver's
+    // own stopwatch all use. Plotly has no duration axis, so the ticks are
+    // placed by hand rather than left to it.
+    const secs = laps.map((l) => l.lapTimeS)
+                     .filter((v): v is number => v !== null && Number.isFinite(v));
+    const lo = secs.length ? Math.min(...secs) : 0;
+    const hi = secs.length ? Math.max(...secs) : 0;
+    // A step that lands on round seconds and leaves at most ~8 labels, so the
+    // axis stays legible whether the laps differ by 3 s or by 3 minutes.
+    const tStep = [1, 2, 5, 10, 15, 20, 30, 60, 120, 300, 600]
+      .find((s) => (hi - lo) / s <= 8) ?? 900;
+    const tickvals: number[] = [];
+    for (let v = Math.floor(lo / tStep) * tStep;
+         v <= Math.ceil(hi / tStep) * tStep + tStep / 2; v += tStep) tickvals.push(v);
+    // One lap, or every lap to the second identical: a lone tick reads like a
+    // broken axis, so give it a second one to sit against.
+    if (tickvals.length < 2) tickvals.push(tickvals[0] + tStep);
     void Plotly.newPlot(tRef.current, [{
       type: 'scatter', mode: 'lines+markers', x: lapX,
-      y: laps.map((l) => (l.lapTimeS === null ? null : l.lapTimeS / 60)),
+      y: laps.map((l) => l.lapTimeS),
       connectgaps: false, line: { color: '#00e0b4', width: 2 },
       marker: { size: 8, color: laps.map((l) => (counts(l.kind) ? '#00e0b4' : MUTED)),
                 line: { width: 2, color: t.card } },
-      customdata: note, hovertemplate: '%{y:.2f} min<extra>%{customdata}</extra>',
+      customdata: laps.map((l, i) => [note[i], lapTimeShort(l.lapTimeS)]),
+      hovertemplate: '%{customdata[1]}<extra>%{customdata[0]}</extra>',
     }], { ...base, margin: { l: 50, r: 12, t: 8, b: 36 },
           xaxis: { ...base.xaxis, title: { text: 'lap', font: { size: 11, color: t.ink3 } }, dtick },
+          yaxis: { ...base.yaxis, tickmode: 'array', tickvals,
+                   ticktext: tickvals.map((v) => lapTimeShort(v)) },
           showlegend: false }, plotConfig);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sig, dark]);
@@ -445,7 +467,7 @@ function LapCharts({ dark, visible }: { dark: boolean; visible: boolean }) {
           <>
             <div className="grid g2">
               <div><div className="caption">Energy per lap (Wh)</div><div ref={eRef} /></div>
-              <div><div className="caption">Lap time (minutes)</div><div ref={tRef} /></div>
+              <div><div className="caption">Lap time (m:ss)</div><div ref={tRef} /></div>
             </div>
             <div className="kv" style={{ gridTemplateColumns: 'repeat(4, 1fr)', marginTop: 10 }}>
               <div><div className="k">Laps recorded</div><div className="v">{summary?.count ?? laps.length}

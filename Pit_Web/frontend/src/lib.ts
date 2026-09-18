@@ -44,6 +44,17 @@ export function lapTime(seconds: Num): string {
   return `${m}:${(seconds - m * 60).toFixed(3).padStart(6, '0')}`;
 }
 
+/** Seconds -> M:SS, whole seconds, no fraction. The form the charts use: an
+ *  axis label and a hover must read the same, and a tick reading "4:27.404" is
+ *  noise at that size. Rounds rather than truncates, so 4:26.8 reads 4:27 like
+ *  it does everywhere else. lapTime() keeps the precise figure for the tiles. */
+export function lapTimeShort(seconds: Num): string {
+  if (seconds === null || seconds === undefined || !Number.isFinite(seconds) || seconds < 0)
+    return MISSING;
+  const whole = Math.round(seconds);
+  return `${Math.floor(whole / 60)}:${String(whole % 60).padStart(2, '0')}`;
+}
+
 /** Data age in units a human reads at a glance. */
 export function ageText(seconds: Num): string {
   if (seconds === null) return MISSING;

@@ -97,11 +97,11 @@ TARGET_LAP_TIME_MIN = 3.5
 # fine — keep it a plain literal, and keep the two marker lines.
 # >>> PROFILE MATRIX >>>
 PROFILE_MATRIX = {
-    "fast_189s": {"label": "Fast", "energy_wh": 127.2, "target_s": 270.0},
-    "med_fast_199s": {"label": "Med-Fast", "energy_wh": 122.2, "target_s": 285.1},
-    "base_210s": {"label": "Base", "energy_wh": 118.0, "target_s": 300.0},
-    "med_slow_220s": {"label": "Med-Slow", "energy_wh": 114.4, "target_s": 314.9},
-    "slow_231s": {"label": "Slow", "energy_wh": 111.2, "target_s": 330.1},
+    "fast_189s": {"label": "Fast", "energy_wh": 138.6, "target_s": 252.9},
+    "med_fast_199s": {"label": "Med-Fast", "energy_wh": 133.5, "target_s": 267.0},
+    "base_210s": {"label": "Base", "energy_wh": 129.2, "target_s": 280.9},
+    "med_slow_220s": {"label": "Med-Slow", "energy_wh": 125.5, "target_s": 294.9},
+    "slow_231s": {"label": "Slow", "energy_wh": 122.2, "target_s": 309.1},
 }
 # <<< PROFILE MATRIX <<<
 DEFAULT_STRATEGY_KEY = "base_210s"
