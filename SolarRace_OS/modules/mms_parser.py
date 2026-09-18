@@ -565,9 +565,16 @@ def parse_throttle_frame(arb_id, data_bytes, input_id=THROTTLE_INPUT_ID):
     report covering other GPIOs never blanks a good reading.
 
         mms_throttle_mv        the raw millivolts, ALWAYS published when present
-        mms_throttle_percent   0-100, or absent when the raw value is implausible
-        mms_throttle_status    efficiency.THROTTLE_* — why the percent is missing
+        mms_throttle_percent   ACCELERATION 0-100 (0 at and below neutral)
+        mms_regen_percent      REGENERATION 0-100 (0 at and above neutral)
+        mms_throttle_status    efficiency.THROTTLE_* — why the percents are missing
         mms_throttle_zone      "eco" | "normal" | "power" (absent with no percent)
+
+    Two percentages because the pedal is a one-pedal control: below neutral it
+    commands regen, above it commands power (see efficiency.py's diagram). Both
+    are published on every frame so a dashboard never has to work out which
+    half of the pedal a raw voltage fell in — that comparison lives in
+    efficiency.py and nowhere else.
 
     The raw mV is published even when it converts to nothing, for exactly the
     reason mms_motor_ohms is: an out-of-range raw value is what diagnoses a
@@ -580,6 +587,7 @@ def parse_throttle_frame(arb_id, data_bytes, input_id=THROTTLE_INPUT_ID):
 
     millivolts = values[input_id]
     percent, status = efficiency.throttle_percent(millivolts)
+    regen, _ = efficiency.regen_percent(millivolts)
 
     parsed = {
         "mms_throttle_mv": millivolts,
@@ -588,6 +596,8 @@ def parse_throttle_frame(arb_id, data_bytes, input_id=THROTTLE_INPUT_ID):
     if percent is not None:
         parsed["mms_throttle_percent"] = percent
         parsed["mms_throttle_zone"] = efficiency.zone(percent)
+    if regen is not None:
+        parsed["mms_regen_percent"] = regen
     return parsed
 
 

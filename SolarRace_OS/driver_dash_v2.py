@@ -30,9 +30,13 @@ import drivetrain  # noqa: E402  (path set up immediately above)
 # It has to be imported HERE, above the palette, because the tier colours below
 # are built from limits.TIER_COLOURS.
 import limits      # noqa: E402  (same path bootstrap as drivetrain above)
+# The pedal calibration and its neutral point, shared with the pit for the same
+# reason limits is: the millivolts at which this car stops regenerating and
+# starts accelerating must be one number, not one per screen.
+import efficiency  # noqa: E402  (same path bootstrap as drivetrain above)
 
 from PySide6.QtCore import (
-    Qt, QEasingCurve, QPropertyAnimation, QRectF, QTimer, Slot,
+    Qt, QEasingCurve, QPointF, QPropertyAnimation, QRectF, QTimer, Slot,
 )
 from PySide6.QtGui import (
     QBrush, QColor, QFont, QFontMetricsF, QKeySequence, QPainter, QPen,
@@ -107,6 +111,16 @@ _FLASH  = "#3a0606"
 # legible without competing with the value it labels, which is why it is neither
 # the neon accent nor the same white as the value itself.
 _CAPTION = "#7d95ad"
+
+# The two halves of the pedal (PedalBar). Blue for regeneration, red for
+# acceleration, as the team asked for and as the pit wall paints the same bar.
+#
+# The red is NOT _RED (#ff2020): that is the alert colour, and an accelerating
+# car is not in trouble. This one is a deeper, calmer red that reads as "power"
+# beside the blue rather than as a fault — the same reason C_WARNING and
+# C_CRITICAL were kept separate from _ORANGE and _RED.
+_PEDAL_REGEN = "#2e86de"
+_PEDAL_ACCEL = "#d63447"
 
 # Shown when the CAN bus has told us NOTHING about a metric. A gauge reading "0"
 # is a lie the driver acts on: 0 °C looks like a cold motor and 0 A looks like a
@@ -627,6 +641,152 @@ class MiniGauge(QWidget):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  PedalBar — the one-pedal control, regen on the left, acceleration on the right
+# ─────────────────────────────────────────────────────────────────────────────
+class PedalBar(QWidget):
+    """A horizontal bar showing where the pedal sits on its travel.
+
+    The pedal is a ONE-PEDAL control (see efficiency.py): below the neutral
+    point it commands regeneration, above it commands power. So the bar is
+    drawn as a scale of RAW MILLIVOLTS with the neutral point marked on it, and
+    the fill grows OUT FROM NEUTRAL — left and blue into regen, right and red
+    into acceleration.
+
+        0 mV |========[blue regen]|[red accel]========| full
+                                  ^ neutral
+
+    Growing from neutral rather than from the left end is the whole point of
+    the widget. Fill-from-zero would leave the entire regen half lit whenever
+    the driver was accelerating hard, which reads as "regenerating AND
+    accelerating" — the one thing a one-pedal control can never be doing. What
+    the driver needs at a glance is WHICH SIDE OF NEUTRAL they are on and how
+    far, and that is exactly the distance this fill draws.
+
+    The track behind the fill is tinted both colours at low alpha, so the two
+    territories are readable even with the pedal exactly at neutral and nothing
+    filled at all.
+
+    A missing reading paints an empty track and "—", never a bar at zero: at
+    neutral the driver is coasting, which is a real and different thing from a
+    throttle that has stopped reporting.
+    """
+
+    # Scale runs from 0 mV, not from the pedal's released voltage. The released
+    # pedal sits at efficiency.THROTTLE_MV_IDLE (720 mV on this car), so the far
+    # left of the bar is a small stretch the pedal cannot physically reach. That
+    # is deliberate: the axis is then honest raw millivolts, the same numbers
+    # that appear on the pit's "Throttle Raw" tile and in candump, rather than a
+    # rescaling that would have to be re-derived every time the pedal is
+    # recalibrated.
+    _MV_MIN = 0.0
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._mv = None          # raw millivolts, or None for no reading
+        self._accel = None       # % above neutral, from efficiency.py
+        self._regen = None       # % below neutral, from efficiency.py
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+    def set_pedal(self, millivolts, accel_pct, regen_pct) -> None:
+        """Feed one reading. All three may be None — see the class docstring.
+
+        The percentages are passed in rather than computed here: efficiency.py
+        owns every millivolt-to-percent conversion in this project, and the pit
+        wall must colour the same pedal position the same way. A widget that
+        did its own arithmetic is how the two screens drift apart.
+        """
+        self._mv, self._accel, self._regen = millivolts, accel_pct, regen_pct
+        self.update()
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+
+        w, h = float(self.width()), float(self.height())
+        if w < 20.0 or h < 10.0:
+            p.end()
+            return
+
+        # Geometry: a label strip on the left, the track filling the rest.
+        label_w = min(w * 0.22, 118.0)
+        track_x = label_w
+        track_w = w - label_w - 6.0
+        track_h = max(10.0, h * 0.52)
+        track_y = (h - track_h) / 2.0
+        radius = track_h * 0.25
+
+        mv_full = float(efficiency.THROTTLE_MV_FULL)
+        mv_neutral = float(efficiency.THROTTLE_MV_NEUTRAL)
+        span = mv_full - self._MV_MIN
+
+        def x_for(mv: float) -> float:
+            """Millivolts -> a pixel on the track, clamped to its ends."""
+            frac = (float(mv) - self._MV_MIN) / span
+            return track_x + max(0.0, min(1.0, frac)) * track_w
+
+        neutral_x = x_for(mv_neutral)
+
+        # ---- Track: the two territories, washed at low alpha ---------------- #
+        p.setPen(Qt.NoPen)
+        regen_bg = QColor(_PEDAL_REGEN)
+        regen_bg.setAlpha(40)
+        accel_bg = QColor(_PEDAL_ACCEL)
+        accel_bg.setAlpha(40)
+        p.setBrush(regen_bg)
+        p.drawRoundedRect(
+            QRectF(track_x, track_y, neutral_x - track_x, track_h),
+            radius, radius,
+        )
+        p.setBrush(accel_bg)
+        p.drawRoundedRect(
+            QRectF(neutral_x, track_y, track_x + track_w - neutral_x, track_h),
+            radius, radius,
+        )
+
+        # ---- Fill: out from neutral, toward wherever the pedal is ---------- #
+        if self._mv is not None:
+            pedal_x = x_for(self._mv)
+            if pedal_x < neutral_x:
+                fill = QRectF(pedal_x, track_y, neutral_x - pedal_x, track_h)
+                colour = QColor(_PEDAL_REGEN)
+            else:
+                fill = QRectF(neutral_x, track_y, pedal_x - neutral_x, track_h)
+                colour = QColor(_PEDAL_ACCEL)
+            if fill.width() >= 1.0:
+                p.setBrush(colour)
+                p.drawRoundedRect(fill, radius, radius)
+
+        # ---- The neutral mark, drawn last so the fill never hides it ------- #
+        p.setPen(QPen(C_WHITE, 2.0))
+        p.drawLine(
+            QPointF(neutral_x, track_y - 2.0),
+            QPointF(neutral_x, track_y + track_h + 2.0),
+        )
+
+        # ---- Label: which side of neutral, and by how much ------------------ #
+        if self._mv is None:
+            text, text_colour = "—", C_NO_DATA
+        elif self._regen:                       # non-zero regen wins the label
+            text, text_colour = f"REGEN {self._regen:.0f}%", QColor(_PEDAL_REGEN)
+        elif self._accel:
+            text, text_colour = f"ACCEL {self._accel:.0f}%", QColor(_PEDAL_ACCEL)
+        else:
+            # Inside the deadband either side of neutral: neither command is
+            # being given, and saying "0 %" of one of them would pick a side.
+            text, text_colour = "COAST", C_DIM
+
+        p.setFont(_fit_font(text, min(track_h * 0.80, 20.0), label_w - 6.0))
+        p.setPen(QPen(text_colour))
+        p.drawText(
+            QRectF(2.0, 0.0, label_w - 6.0, h),
+            Qt.AlignVCenter | Qt.AlignLeft,
+            text,
+        )
+
+        p.end()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  CellTile — one compact reading in a DS003-style 30-tile grid
 # ─────────────────────────────────────────────────────────────────────────────
 class CellTile(QWidget):
@@ -891,6 +1051,11 @@ class RacingDashboard(QMainWindow):
     # it shows ~0:03.0, not zero.
     _LAP_TIMER_H = 42
     _LAP_FREEZE_S = 3.0
+
+    # The pedal bar under the DS001 gauges. Slim on purpose: it is a glance
+    # readout ("which side of neutral am I on"), and every pixel it takes comes
+    # straight off the speedometer above it on a 480 px screen.
+    _PEDAL_H = 30
 
     # Empty space kept under the clock, between it and the target strip. The
     # two used to sit flush and read as one crowded block; this lifts the
@@ -1519,6 +1684,15 @@ class RacingDashboard(QMainWindow):
         row.addWidget(self._build_tacho_panel(), stretch=1)
         row.addWidget(self._build_right_panel())
         vbox.addLayout(row, stretch=1)
+
+        # PEDAL — full width under the gauges. It goes on the main screen
+        # because it is a DRIVING readout, not a diagnostic one: on a solar car
+        # the difference between coasting and dragging the motor is most of the
+        # energy budget, and the driver cannot feel it through a one-pedal
+        # control the way they would through a brake.
+        self._pedal_bar = PedalBar()
+        self._pedal_bar.setFixedHeight(self._PEDAL_H)
+        vbox.addWidget(self._pedal_bar)
         return page
 
     # ── Screen DS002 — the electrical screen ─────────────────────────────── #
@@ -1885,6 +2059,7 @@ class RacingDashboard(QMainWindow):
         self._worker.status_updated.connect(self._on_status)
         self._worker.motor_map_updated.connect(self._on_motor_map)
         self._worker.motor_current_updated.connect(self._on_motor_current)
+        self._worker.throttle_updated.connect(self._on_pedal)
         self._worker.battery_current_updated.connect(self._on_battery_current)
         self._worker.cell_temp_updated.connect(self._on_cell_temp)
         self._worker.cell_temps_updated.connect(self._on_cell_temps)
@@ -2195,6 +2370,18 @@ class RacingDashboard(QMainWindow):
         self._target_kmh = target_kmh
         self._target_strategy = strategy
         self._apply_target_style(self._speed_delta())
+
+    @Slot(object, object, object)
+    def _on_pedal(self, millivolts, accel_pct, regen_pct) -> None:
+        """The one-pedal control's position, straight onto the DS001 bar.
+
+        All three arguments come from the parser already converted: the raw
+        millivolts the ESC reported, and the two percentages efficiency.py made
+        of them. The percentages are None when the raw voltage is outside the
+        plausible pedal range — a disconnected pedal, which the bar draws as a
+        dash rather than as a coasting car.
+        """
+        self._pedal_bar.set_pedal(millivolts, accel_pct, regen_pct)
 
     @Slot(object)
     def _on_motor_current(self, amps) -> None:
@@ -2548,6 +2735,7 @@ class RacingDashboard(QMainWindow):
         # at any given scale, so it still never shifts the gauges below it.
         self._pit_lbl.setFixedHeight(int(self._PIT_BANNER_H * s))
         self._target_lbl.setFixedHeight(int(self._TARGET_H * s))
+        self._pedal_bar.setFixedHeight(int(self._PEDAL_H * s))
         self._scale_lap_timer()
         nav_h = int(self._NAV_BTN_H * s)
         self._controls_bar.setFixedHeight(nav_h + int(8 * s))

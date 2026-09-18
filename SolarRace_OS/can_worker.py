@@ -109,11 +109,20 @@ class CANWorker(QThread):
     #   (resistance Ω, temperature °C or -1000.0 if unconvertible, status)
     motor_temp_updated      = Signal(float, float, str)
     power_updated           = Signal(object)  # Instant power       (Watts)
-    # Throttle pedal position, 0-100 %. object (not float) for the usual reason:
-    # None means "the ESC has not reported the pedal", and 0 % means "the driver
-    # is off the throttle". Those are completely different things to tell a
-    # driver who is being coached on how they use the pedal.
-    throttle_updated        = Signal(object)  # Throttle position   (0-100 %)
+    # The one-pedal control, sent as one atomic reading:
+    #   (raw millivolts, acceleration 0-100 %, regeneration 0-100 %)
+    #
+    # All three are object (not float) for the usual reason: None means "the ESC
+    # has not reported the pedal", and 0 % means "the driver is not asking for
+    # this". Those are completely different things to tell a driver who is being
+    # coached on how they use the pedal.
+    #
+    # Three values rather than one percentage because the pedal commands regen
+    # below its neutral point and power above it (efficiency.py), so a single
+    # number cannot say which the driver is doing. The raw millivolts travel
+    # with them so the HUD's bar can be drawn on a true voltage scale — the same
+    # numbers the pit's "Throttle Raw" tile shows.
+    throttle_updated        = Signal(object, object, object)
     alerts_updated          = Signal(list)   # Active alerts: [(label, severity), ...]
     # Active power map: (display name, raw byte). Raw travels with the name so
     # an unrecognised value can be identified instead of just looking wrong.
@@ -444,23 +453,32 @@ class CANWorker(QThread):
             )
 
     def _decode_throttle(self, arb_id: int, data: bytes) -> None:
-        """GPIO bank report -> the throttle percentage on the efficiency bar.
+        """GPIO bank report -> the pedal bar's position.
 
         Decoding lives in mms_parser.parse_throttle_frame so the HUD bar and
         the pit's throttle trace are the same conversion of the same bytes —
         the driver must not be coached against a percentage the pit computed
         differently.
 
-        Emits NOTHING when the frame carries no throttle value (a report
-        covering other GPIOs, an error-flagged frame, or a raw voltage outside
-        the plausible pedal range). Staying silent leaves the last good reading
-        on screen for a frame or two, which is right for a 10 Hz signal;
-        emitting None here would make the bar strobe blank on every unrelated
-        GPIO frame. Real loss of signal is handled by _emit_zeros().
+        Emits NOTHING when the frame carries no pedal reading at all (a report
+        covering other GPIOs, or a truncated frame). Staying silent leaves the
+        last good reading on screen for a frame or two, which is right for a
+        10 Hz signal; emitting None here would make the bar strobe blank on
+        every unrelated GPIO frame. Real loss of signal is handled by
+        _emit_zeros().
+
+        A frame that DOES carry the pedal is always emitted, even when the
+        voltage is implausible and both percentages come back None. That is the
+        disconnected-pedal case, and the bar must show it as a dash rather than
+        keep painting the last position the pedal was in before the wire broke.
         """
         fields = parse_throttle_frame(arb_id, data)
-        if "mms_throttle_percent" in fields:
-            self.throttle_updated.emit(float(fields["mms_throttle_percent"]))
+        if "mms_throttle_mv" in fields:
+            self.throttle_updated.emit(
+                fields["mms_throttle_mv"],
+                fields.get("mms_throttle_percent"),
+                fields.get("mms_regen_percent"),
+            )
 
     # ================================================================== #
     # Lifecycle helpers                                                    #

@@ -620,6 +620,10 @@ class SmartCANWorker(CANWorker):
         self.controller_temp_updated.emit(None)
         self.motor_current_updated.emit(None)
         self.battery_current_updated.emit(None)
+        # The pedal blanks to a dash like every gauge. It must NOT fall back to
+        # the neutral point: "coasting" is a thing the driver is doing, and a
+        # dead bus is not evidence that they are doing it.
+        self.throttle_updated.emit(None, None, None)
         self.cell_temp_updated.emit(None)
         # Values blank like every other gauge; _thermistor_configured does
         # NOT reset -- a module that has already proven it's configured stays
