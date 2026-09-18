@@ -50,6 +50,20 @@ NEVER pass a zone to limits.classify() or a limits tier to ZONE_COLOURS.
 # sensor driven from a reference rail, so it swings between two voltages that
 # are properties of THIS pedal and THIS wiring loom — not of the protocol.
 #
+# ⚠️ THIS PEDAL IS NOT AN ACCELERATOR. It is a ONE-PEDAL control: the ESC
+# regenerates below a neutral point and accelerates above it, so the single
+# millivolt reading carries two different commands and the number that matters
+# is the DISTANCE FROM NEUTRAL, not the distance from zero.
+#
+#     720 mV ........ 2000 mV ........ 4200 mV
+#     released         neutral          floored
+#     max regen        coasting         max acceleration
+#     <------ regen     |     accelerate ------>
+#
+# A released pedal is therefore NOT "no throttle" — it is maximum regeneration,
+# and reporting it as 0 % of anything would be the same class of lie as
+# reporting a disconnected sensor as 0 %.
+#
 # MEASURED ON THE CAR 2026-09-18, replacing the placeholders that shipped here.
 # Read off GPIO0 (input ID 0x08) on can0 with the pedal worked by hand:
 #
@@ -59,9 +73,14 @@ NEVER pass a zone to limits.classify() or a limits tier to ZONE_COLOURS.
 # FULL is set to 4200 rather than the 4247 peak on purpose. The top of the
 # travel wanders by ~45 mV between presses, and a driver who floors the pedal
 # must see 100 %, not 99 %. Percentages clamp at 100, so aiming slightly low
-# costs nothing and guarantees the bar reaches the top. The same logic in
-# reverse is why IDLE is the measured 720 and not something lower: with
-# THROTTLE_MV_DEADBAND below it, a parked car reads a clean 0 %.
+# costs nothing and guarantees the bar reaches the top.
+#
+# ⚠️ NEUTRAL IS NOT MEASURED. 2000 mV is where the team says the controller's
+# neutral sits; unlike the two ends, nobody has watched the motor stop pulling
+# and start regenerating as the pedal crosses it. It is the one number here
+# that is still somebody's word rather than a reading, and everything on both
+# dashboards pivots around it. To measure it: roll the car, ease the pedal up
+# until motor power (CAN 0x618) crosses zero, and read the millivolts there.
 #
 # TO RE-MEASURE (five minutes, car stationary, wheels off the ground):
 #   1. Bring the throttle report up (config.THROTTLE_GPIO_* on the car).
@@ -73,12 +92,14 @@ NEVER pass a zone to limits.classify() or a limits tier to ZONE_COLOURS.
 #   4. Pedal fully FLOORED                 -> that mV is THROTTLE_MV_FULL,
 #      less a small margin as above.
 #   5. Put both numbers below. Nothing else changes.
-THROTTLE_MV_IDLE = 720.0      # measured, pedal released
+THROTTLE_MV_IDLE = 720.0      # measured, pedal released = FULL REGEN
+THROTTLE_MV_NEUTRAL = 2000.0  # ⚠️ team's figure, not measured — see above
 THROTTLE_MV_FULL = 4200.0     # measured 4247 peak; set low so floored = 100 %
 
-# Noise band just above idle that still reads 0 %. A pedal at rest jitters by a
-# few mV, and without this the driver's zone bar would sit at 1-2 % — a car
-# that looks like it is being fed throttle while parked.
+# Noise band on BOTH SIDES of neutral that still reads 0 %. A pedal held near
+# coasting jitters by a few mV, and without this the driver's bar would flicker
+# between a few percent of regen and a few percent of acceleration — the one
+# place on the scale where a wobble reads as a change of direction.
 THROTTLE_MV_DEADBAND = 50.0
 
 # Plausibility window. OUTSIDE this, the reading is not a throttle position at
@@ -105,12 +126,12 @@ THROTTLE_LOW = "implausible_low"     # below the window: broken wire / no supply
 THROTTLE_HIGH = "implausible_high"   # above the window: short to the rail
 
 
-def throttle_percent(millivolts):
-    """Raw GPIO millivolts -> (percent 0-100, status), or (None, status).
+def _checked_mv(millivolts):
+    """Raw reading -> (float mV, None) or (None, status) if it is not a pedal.
 
-    Returns None for the percentage — never 0.0 — whenever the reading cannot
-    be trusted as a pedal position. A missing throttle and a released throttle
-    are different facts and both dashboards render them differently.
+    One gate for every conversion below, so "is this a plausible pedal
+    reading?" is answered in exactly one place and the three functions cannot
+    drift apart about it.
     """
     if millivolts is None:
         return None, THROTTLE_LOW
@@ -118,23 +139,70 @@ def throttle_percent(millivolts):
         mv = float(millivolts)
     except (TypeError, ValueError):
         return None, THROTTLE_LOW
-
     if mv < THROTTLE_MV_MIN_VALID:
         return None, THROTTLE_LOW
     if mv > THROTTLE_MV_MAX_VALID:
         return None, THROTTLE_HIGH
+    return mv, None
 
-    span = THROTTLE_MV_FULL - (THROTTLE_MV_IDLE + THROTTLE_MV_DEADBAND)
+
+def throttle_percent(millivolts):
+    """Raw GPIO millivolts -> (ACCELERATION percent 0-100, status).
+
+    0 % is the neutral point, not the bottom of the pedal's travel: below
+    neutral the driver is regenerating, and that is reported as 0 %
+    acceleration plus a regen percentage of its own (regen_percent below).
+
+    Keeps its name because every caller on both dashboards already reads this
+    one function, and because "throttle" on a driver's screen means "how hard
+    am I asking for power" — which is exactly what this still is.
+
+    Returns None for the percentage — never 0.0 — whenever the reading cannot
+    be trusted as a pedal position. A missing throttle and a released throttle
+    are different facts and both dashboards render them differently.
+    """
+    mv, status = _checked_mv(millivolts)
+    if mv is None:
+        return None, status
+
+    floor = THROTTLE_MV_NEUTRAL + THROTTLE_MV_DEADBAND
+    span = THROTTLE_MV_FULL - floor
     if span <= 0:
-        # A miscalibration (FULL below IDLE, or a deadband that swallows the
-        # whole span) would otherwise divide by zero or invert the pedal. Say
-        # nothing rather than report a backwards throttle.
+        # A miscalibration (FULL at or below neutral, or a deadband that
+        # swallows the whole span) would otherwise divide by zero or invert the
+        # pedal. Say nothing rather than report a backwards throttle.
         return None, THROTTLE_LOW
 
-    pct = (mv - (THROTTLE_MV_IDLE + THROTTLE_MV_DEADBAND)) / span * 100.0
+    pct = (mv - floor) / span * 100.0
     # Clamped, because the plausibility window above is intentionally wider
     # than the calibrated span: a pedal 100 mV past its measured full travel is
-    # 100 %, not 103 %.
+    # 100 %, not 103 %. And everything below neutral is 0 % acceleration — true,
+    # not a fallback: a regenerating car is asking for no power at all.
+    return round(min(100.0, max(0.0, pct)), 1), THROTTLE_OK
+
+
+def regen_percent(millivolts):
+    """Raw GPIO millivolts -> (REGEN percent 0-100, status).
+
+    The mirror of throttle_percent around the neutral point: 0 % at neutral,
+    100 % with the pedal fully released. Above neutral it is 0 % — the driver
+    is accelerating and regenerating nothing.
+
+    Deliberately a separate function rather than a signed percentage. A signed
+    number invites a dashboard to draw one bar from -100 to +100 and a reader to
+    miss the sign; two named quantities cannot be misread, and the one place
+    that wants them together (the pedal bar on both screens) asks for both.
+    """
+    mv, status = _checked_mv(millivolts)
+    if mv is None:
+        return None, status
+
+    ceiling = THROTTLE_MV_NEUTRAL - THROTTLE_MV_DEADBAND
+    span = ceiling - THROTTLE_MV_IDLE
+    if span <= 0:
+        return None, THROTTLE_LOW
+
+    pct = (ceiling - mv) / span * 100.0
     return round(min(100.0, max(0.0, pct)), 1), THROTTLE_OK
 
 
@@ -240,6 +308,20 @@ def _validate():
             "efficiency.py: THROTTLE_MV_FULL must be above THROTTLE_MV_IDLE "
             f"(got {THROTTLE_MV_FULL} <= {THROTTLE_MV_IDLE}). A pedal wired "
             "backwards is a wiring fix, not a calibration one."
+        )
+    # Neutral must sit strictly inside the travel, with room for the deadband on
+    # both sides. Outside that, one half of the pedal silently ceases to exist:
+    # neutral at or below IDLE and the car can never show regen, neutral at or
+    # above FULL and it can never show acceleration. Either would be a screen
+    # that looks fine and is simply missing half the driver's input.
+    if not (THROTTLE_MV_IDLE + THROTTLE_MV_DEADBAND
+            < THROTTLE_MV_NEUTRAL
+            < THROTTLE_MV_FULL - THROTTLE_MV_DEADBAND):
+        raise ValueError(
+            "efficiency.py: THROTTLE_MV_NEUTRAL must lie between IDLE and FULL "
+            f"with the deadband clear of both (got neutral "
+            f"{THROTTLE_MV_NEUTRAL} in {THROTTLE_MV_IDLE}..{THROTTLE_MV_FULL} "
+            f"with deadband {THROTTLE_MV_DEADBAND})."
         )
     if not (THROTTLE_MV_MIN_VALID <= THROTTLE_MV_IDLE
             and THROTTLE_MV_FULL <= THROTTLE_MV_MAX_VALID):
