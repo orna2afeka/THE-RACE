@@ -892,6 +892,13 @@ class RacingDashboard(QMainWindow):
     _LAP_TIMER_H = 42
     _LAP_FREEZE_S = 3.0
 
+    # Empty space kept under the clock, between it and the target strip. The
+    # two used to sit flush and read as one crowded block; this lifts the
+    # stopwatch clear of the target and up towards the speed number it belongs
+    # with. It is part of the stopwatch row, not a layout spacing, so it scales
+    # with everything else in _scale_lap_timer.
+    _LAP_TARGET_GAP = 10
+
     # Width of the stopwatch's reset button. Small on purpose: it sits beside a
     # number the driver reads at speed, and it must not compete with it. Wide
     # enough to stay a usable touch target with gloves on.
@@ -1245,30 +1252,49 @@ class RacingDashboard(QMainWindow):
         self._lap_tick.timeout.connect(self._tick_lap_timer)
         self._lap_tick.start(100)
 
-        # The clock stays centred on the SCREEN, not on the space left over
-        # beside the button: an equal spacer on the left cancels the button's
-        # width. A stopwatch that shifts sideways when a button appears next to
-        # it is the kind of thing a driver notices at 60 km/h and nothing else.
+        # Clock and button on one row; _scale_lap_timer does the sizing.
         row = QWidget()
+        self._lap_row = row
         h = QHBoxLayout(row)
-        h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(0)
-        btn_w = max(30, int(self._LAP_RESET_W * self._sc))
-        h.addSpacing(btn_w)
         h.addWidget(self._lap_lbl, 1)
         self._lap_reset_btn = QPushButton(self._LAP_BTN_START)
         self._lap_reset_btn.setObjectName("lapResetBtn")
-        self._lap_reset_btn.setFixedSize(btn_w, self._LAP_TIMER_H)
         # Never take focus: the HUD has no keyboard, and a focus ring left on a
         # button after a touch is just noise on the instrument panel.
         self._lap_reset_btn.setFocusPolicy(Qt.NoFocus)
         self._lap_reset_btn.clicked.connect(self._reset_lap_timer)
         h.addWidget(self._lap_reset_btn)
-        row.setFixedHeight(self._LAP_TIMER_H)
+        # Heights, the button and the margins all come from here, so the row is
+        # built at whatever scale we are already running at.
+        self._scale_lap_timer()
         # First paint only now: _tick_lap_timer touches the button, so it must
         # not run before the button exists.
         self._tick_lap_timer()
         return row
+
+    def _scale_lap_timer(self) -> None:
+        """Size the stopwatch row for the current UI scale.
+
+        The clock, its button, the spacing that keeps it centred and the gap
+        below it all have to move together. Only the LABEL used to be rescaled
+        on resize: on any screen bigger than the car's 800x480 it asked for a
+        height its row -- left at a hard 42 px -- would not give it, so the
+        digits were squeezed and ran straight into the target readout.
+        """
+        s = self._sc
+        clock_h = int(self._LAP_TIMER_H * s)
+        gap = int(self._LAP_TARGET_GAP * s)
+        btn_w = max(30, int(self._LAP_RESET_W * s))
+        self._lap_lbl.setFixedHeight(clock_h)
+        self._lap_reset_btn.setFixedSize(btn_w, clock_h)
+        # Left margin cancels the button's width, so the clock stays centred on
+        # the SCREEN rather than on the space left over beside the button -- a
+        # stopwatch that shifts sideways when the button changes is the kind of
+        # thing a driver notices at 60 km/h and nothing else. The bottom margin
+        # is the gap that holds the target strip off.
+        self._lap_row.layout().setContentsMargins(btn_w, 0, 0, gap)
+        self._lap_row.setFixedHeight(clock_h + gap)
 
     def _reset_lap_timer(self) -> None:
         """Restart the DISPLAYED clock from now.
@@ -2522,7 +2548,7 @@ class RacingDashboard(QMainWindow):
         # at any given scale, so it still never shifts the gauges below it.
         self._pit_lbl.setFixedHeight(int(self._PIT_BANNER_H * s))
         self._target_lbl.setFixedHeight(int(self._TARGET_H * s))
-        self._lap_lbl.setFixedHeight(int(self._LAP_TIMER_H * s))
+        self._scale_lap_timer()
         nav_h = int(self._NAV_BTN_H * s)
         self._controls_bar.setFixedHeight(nav_h + int(8 * s))
 
