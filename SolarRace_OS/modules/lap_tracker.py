@@ -86,6 +86,22 @@ GPS_HEALTH_TIMEOUT_S = 5.0
 CAN_DEAD_AFTER_S = 30.0
 GPS_ONLY_MIN_LAP_S = 60.0
 
+# How a lap was cut. Every one of these is passed to _trigger_lap by exactly one
+# route, and the pit's "Lap Source" tile names them in its caption — keep the two
+# in step (Pit_Dashboard/live_metrics.py).
+#
+#   gps         the finish-line crossing test fired
+#   gps_no_can  same crossing, with the motor controller silent, so the lap is
+#               timed by GPS alone and its distance is not to be trusted
+#   odometer    the distance fallback forced a lap the GPS trigger missed
+#   manual      the pit cut it from the Cut Lap button
+LAP_SOURCES = ("gps", "gps_no_can", "odometer", "manual")
+
+# Before the first lap of a run there is no trigger to name. This is a sentinel,
+# never a source: it is kept out of the telemetry snapshot (see snapshot()) so
+# the pit shows an unreported field rather than a fifth kind of lap.
+LAP_SOURCE_NONE = "none"
+
 
 class LapTracker:
     """Distance, energy, lap count and lap timing for one race.
@@ -130,7 +146,9 @@ class LapTracker:
 
         # --- laps ---------------------------------------------------------- #
         self.lap_count = 0
-        self.lap_source = "none"         # gps | odometer | manual | none
+        # gps | gps_no_can | odometer | manual, or LAP_SOURCE_NONE until a lap
+        # has actually been cut. Survives a restart — see state_dict/restore.
+        self.lap_source = LAP_SOURCE_NONE
         self.gps_lap_count = 0
         self.rejected_crossings = 0
         self.last_rejected_distance_m = None
@@ -481,7 +499,12 @@ class LapTracker:
         return {
             "odometer_m": self.odometer_m if have_d else None,
             "calculated_lap": self.lap_count if have_d else None,
-            "lap_source": self.lap_source,
+            # The sentinel is not a trigger, so it goes out as null and the pit
+            # renders it as "—" like every other unreported field. Sending the
+            # string "none" put a fifth, meaningless value in a tile whose whole
+            # job is to name which of the four triggers cut the lap.
+            "lap_source": (self.lap_source
+                           if self.lap_source != LAP_SOURCE_NONE else None),
             "lap_distance_m": (self.odometer_m - self._lap_start_odometer_m
                                if have_d else None),
             "lap_started_ts": self.lap_started_ts,
@@ -520,6 +543,10 @@ class LapTracker:
             "total_energy_wh": self.total_energy_wh,
             "regen_energy_wh": self.regen_energy_wh,
             "lap_count": self.lap_count,
+            # Persisted with the lap it describes: lap_count comes back from the
+            # checkpoint after a reboot, so the trigger that cut that lap has to
+            # come back with it or the pit shows a restored lap with no source.
+            "lap_source": self.lap_source,
             "gps_lap_count": self.gps_lap_count,
             "lap_start_odometer_m": self._lap_start_odometer_m,
             "lap_start_energy_wh": self._lap_start_energy_wh,
@@ -544,6 +571,12 @@ class LapTracker:
             self.total_energy_wh = float(data.get("total_energy_wh", 0.0))
             self.regen_energy_wh = float(data.get("regen_energy_wh", 0.0))
             self.lap_count = int(data.get("lap_count", 0))
+            # A value from an older checkpoint, or a hand-edited file, must not
+            # be able to invent a trigger: anything not in LAP_SOURCES falls
+            # back to the sentinel.
+            restored_source = data.get("lap_source")
+            self.lap_source = (restored_source if restored_source in LAP_SOURCES
+                               else LAP_SOURCE_NONE)
             self.gps_lap_count = int(data.get("gps_lap_count", 0))
             self._lap_start_odometer_m = float(
                 data.get("lap_start_odometer_m", self.odometer_m))
