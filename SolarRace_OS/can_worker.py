@@ -163,7 +163,8 @@ class CANWorker(QThread):
     # whole indicator row from a single consistent snapshot.
     vehicle_flags_updated   = Signal(dict)
     # Target speed from the active profile: (target km/h, strategy name).
-    target_speed_updated    = Signal(float, str)
+    # Signal(object, ...) because the target is None in the pit lane.
+    target_speed_updated    = Signal(object, str)
     # Lap stopwatch: (time.monotonic() the current lap started, or None when
     # unknown; seconds of the lap that just FINISHED, or None when the clock
     # merely (re)started). Signal(object, object) because both can be None.
