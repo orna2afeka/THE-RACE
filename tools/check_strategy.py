@@ -23,12 +23,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from Pit_Web import api                                          # noqa: E402
 import strategy_engine as se                                     # noqa: E402
 
+# A FIXTURE, deliberately fixed: this file checks the SHAPE of what the
+# endpoint serves, so it must not move when the matrix is re-measured. Kept in
+# step with constants.PROFILE_MATRIX anyway, because a fixture describing a car
+# that does not exist is how the old 210 s / 80 Wh ladder outlived the profiles
+# it came from.
 TABLE = [
-    {"label": "Fast (-10%)",    "lap_time_min": 3.15, "energy_wh": 88.0},
-    {"label": "Med-Fast (-5%)", "lap_time_min": 3.33, "energy_wh": 84.0},
-    {"label": "Base (210s)",    "lap_time_min": 3.50, "energy_wh": 80.0},
-    {"label": "Med-Slow (+5%)", "lap_time_min": 3.67, "energy_wh": 76.0},
-    {"label": "Slow (+10%)",    "lap_time_min": 3.85, "energy_wh": 72.0},
+    {"label": "Fast (-10%)",    "lap_time_min": 256.50 / 60.0, "energy_wh": 159.5},
+    {"label": "Med-Fast (-5%)", "lap_time_min": 270.75 / 60.0, "energy_wh": 152.25},
+    {"label": "Base (285s)",    "lap_time_min": 285.00 / 60.0, "energy_wh": 145.0},
+    {"label": "Med-Slow (+5%)", "lap_time_min": 299.25 / 60.0, "energy_wh": 137.75},
+    {"label": "Slow (+10%)",    "lap_time_min": 313.50 / 60.0, "energy_wh": 130.5},
 ]
 SCENARIOS = [
     ("24 h, full pack",        24 * 60.0, se.BATTERY_FULL_WH),
@@ -57,10 +62,20 @@ want(se.charging_time_min(5, 55) < se.charging_time_min(5, 70)
      "charge time is not monotonic in target SoC")
 want(se.charging_time_min(70, 70) == 0.0, "charging to where we are costs time")
 want(se.charging_time_min(90, 70) == 0.0, "charging DOWN returns a time")
-want(se.charging_time_min(90, 100) > se.charging_time_min(5, 55),
-     "no taper: 90-100% should cost more than 5-55%")
-print("    5->55%%: %.1f min   90->100%%: %.1f min" % (
-    se.charging_time_min(5, 55), se.charging_time_min(90, 100)))
+# Per WATT-HOUR, not per minute: 10 % of a pack is a tenth of the energy of
+# 50 % of it, so a real tapering curve can still finish the top slice sooner.
+# What a taper claims is that the last watt-hours go in slower.
+def wh_per_min(a, b):
+    t = se.charging_time_min(a, b)
+    return (se.BATTERY_FULL_WH * (b - a) / 100.0) / t if t else float("inf")
+
+
+want(wh_per_min(90, 100) < wh_per_min(5, 55),
+     "no taper: the last 10%% takes %.0f Wh/min against %.0f Wh/min for the "
+     "first 50%%" % (wh_per_min(90, 100), wh_per_min(5, 55)))
+print("    5->55%%: %.1f min (%.0f Wh/min)   90->100%%: %.1f min (%.0f Wh/min)" % (
+    se.charging_time_min(5, 55), wh_per_min(5, 55),
+    se.charging_time_min(90, 100), wh_per_min(90, 100)))
 
 for name, left, start_wh in SCENARIOS:
     print("\n%s:" % name)
@@ -139,6 +154,80 @@ for name, left, start_wh in SCENARIOS:
 
         print("    %-16s %3d laps | %-26s | pit %5.1f | %d swaps | %d points"
               % (nm, row["Total Laps"], row["Pit Strategy"], pit, tr["swaps"], len(pts)))
+
+# --------------------------------------------------------------------------- #
+# The matrix editor's arithmetic, which is now a thing the crew presses mid-race
+# --------------------------------------------------------------------------- #
+# Only the FILL is checked here, never the save: writing constants.py is not
+# something a check should do to a machine it is run on. The save's own
+# guards -- the range refusals and the readback -- are exercised by calling the
+# validator with nonsense, which writes nothing because it raises first.
+print("\nmatrix fill (energy_model.ladder_from_anchor, via /api/strategy/matrix/fill):")
+base_rows = api._matrix_rows()
+for anchor in (base_rows[0], base_rows[len(base_rows) // 2], base_rows[-1]):
+    filled = api.api_strategy_matrix_fill(api.MatrixFillBody(
+        key=anchor["key"], target_s=anchor["target_s"],
+        energy_wh=anchor["energy_wh"]))["rows"]
+    by_key = {r["key"]: r for r in filled}
+
+    # 1: the anchor reproduces itself. A fill that moves the row somebody just
+    # typed is the fastest way to lose the crew's trust in the button.
+    a = by_key[anchor["key"]]
+    want(abs(a["target_s"] - anchor["target_s"]) < 0.05,
+         "%s: the anchor's own lap time moved" % anchor["label"])
+    want(abs(a["energy_wh"] - anchor["energy_wh"]) < 0.05,
+         "%s: the anchor's own Wh moved" % anchor["label"])
+
+    # 2: the pace ladder keeps its spacing, whichever row was the anchor
+    for r in base_rows:
+        ratio_was = r["target_s"] / anchor["target_s"]
+        ratio_now = by_key[r["key"]]["target_s"] / a["target_s"]
+        want(abs(ratio_was - ratio_now) < 1e-3,
+             "%s: spacing changed at %s" % (anchor["label"], r["label"]))
+
+    # 3: faster costs more, always. This is the one direction the whole tab
+    # exists to judge, and a flat percentage on a ladder that was edited by
+    # hand can invert it.
+    ordered = sorted(filled, key=lambda r: r["target_s"])
+    for x, y in zip(ordered, ordered[1:]):
+        want(y["energy_wh"] < x["energy_wh"],
+             "%s: %s (%.0f s) costs more than the slower %s (%.0f s)"
+             % (anchor["label"], x["key"], x["target_s"], y["key"], y["target_s"]))
+
+    # 4: and it costs more than a flat percentage says, because rolling loss
+    # does not get cheaper when the driver slows down
+    slowest = ordered[-1]
+    # a flat ladder mirrors the pace change: +10 % slower -> -10 % energy
+    flat = anchor["energy_wh"] * (2.0 - slowest["target_s"] / anchor["target_s"])
+    if slowest["key"] != anchor["key"]:
+        want(slowest["energy_wh"] > flat,
+             "%s: the slow end is not dearer than a flat ladder (%.1f vs %.1f)"
+             % (anchor["label"], slowest["energy_wh"], flat))
+
+    print("    anchored on %-16s -> %s" % (
+        anchor["label"],
+        "  ".join("%.0f Wh" % r["energy_wh"] for r in ordered)))
+
+# 5: the editor refuses what a slipped decimal point looks like
+for bad, why in ((0.0, "zero Wh"), (-5.0, "negative Wh"), (99999.0, "99 kWh a lap")):
+    try:
+        api.api_strategy_matrix_save(api.MatrixBody(rows=[api.MatrixRow(
+            key=base_rows[0]["key"], target_s=base_rows[0]["target_s"],
+            energy_wh=bad)]))
+    except Exception:
+        pass                       # HTTPException, which is the point
+    else:
+        want(False, "the editor accepted %s" % why)
+for bad, why in ((0.0, "a zero lap time"), (2.0, "a 2 s lap")):
+    try:
+        api.api_strategy_matrix_save(api.MatrixBody(rows=[api.MatrixRow(
+            key=base_rows[0]["key"], target_s=bad,
+            energy_wh=base_rows[0]["energy_wh"])]))
+    except Exception:
+        pass
+    else:
+        want(False, "the editor accepted %s" % why)
+print("    refuses zero, negative and absurd values without writing")
 
 print()
 if failures:

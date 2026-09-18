@@ -189,9 +189,14 @@ export interface StrategyResp {
   traces: (StrategyTrace | null)[];
   floorWh: number; capacityWh: number; minStopMin: number; maxStops: number;
   chargingCurveIsMeasured: boolean;
-  /** Label -> laps measured, for the rows whose energy the car actually paid for. */
-  measured: Record<string, number>;
+  /** Label -> what the car actually paid on that profile, BESIDE the matrix
+   *  and never inside it: the table always shows `storedWh`. Absent for a
+   *  profile with fewer than `minLapsForMeasured` completed laps. */
+  measured: Record<string, { laps: number; wh: number; storedWh: number }>;
   minLapsForMeasured: number;
+  /** The live profile list (key, label, lap time, Wh) — fresher than
+   *  `config.strategies`, which the page fetched once on load. */
+  matrix?: MatrixRow[];
   timeLeftMin: number;
   assumedFullPack: boolean;
   missing: string[];
@@ -283,6 +288,12 @@ export interface Live {
     canUndo: boolean;
   };
   activeLap: Num;
+  /** The clock the driver is reading: when the current lap began, in wall
+   *  time. `source` is 'car' when it is the car's own datum (the HUD counts
+   *  from the same one), 'store' when the pit estimated it from the earliest
+   *  sample it holds — that reads short. `atSampleS` is the elapsed time at
+   *  the newest sample, which is what to show once the car goes quiet. */
+  lapClock: { startedAt: Num; atSampleS: Num; source: 'car' | 'store' | null };
   lapDelta: Num;
   odometerKm: Num;
   /** Wh used since this lap's trigger, net of regen — the same basis as
@@ -322,4 +333,20 @@ export interface StatRow {
   key: string; label: string; unit: string; color: string;
   min: Num; avg: Num; max: Num; now: Num;
   samples: number; missing: number;
+}
+
+/** One row of the editable consumption matrix. `target_s` is the lap time the
+ *  pit plans on; it is NOT what the car flies, which is the speed profile
+ *  behind `key`. */
+export interface MatrixRow {
+  key: string;
+  label: string;
+  target_s: number;
+  energy_wh: number;
+}
+
+export interface MatrixResp {
+  rows: MatrixRow[];
+  /** The drag share a single-row fill has to assume. */
+  aeroShare: number;
 }

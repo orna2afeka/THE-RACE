@@ -97,11 +97,11 @@ TARGET_LAP_TIME_MIN = 3.5
 # fine — keep it a plain literal, and keep the two marker lines.
 # >>> PROFILE MATRIX >>>
 PROFILE_MATRIX = {
-    "fast_189s": {"label": "Fast (-10%)", "energy_wh": 88.0, "target_s": 189.0},
-    "med_fast_199s": {"label": "Med-Fast (-5%)", "energy_wh": 84.0, "target_s": 199.5},
-    "base_210s": {"label": "Base (210s)", "energy_wh": 80.0, "target_s": 210.0},
-    "med_slow_220s": {"label": "Med-Slow (+5%)", "energy_wh": 76.0, "target_s": 220.5},
-    "slow_231s": {"label": "Slow (+10%)", "energy_wh": 72.0, "target_s": 231.0},
+    "fast_189s": {"label": "Fast", "energy_wh": 127.2, "target_s": 270.0},
+    "med_fast_199s": {"label": "Med-Fast", "energy_wh": 122.2, "target_s": 285.1},
+    "base_210s": {"label": "Base", "energy_wh": 118.0, "target_s": 300.0},
+    "med_slow_220s": {"label": "Med-Slow", "energy_wh": 114.4, "target_s": 314.9},
+    "slow_231s": {"label": "Slow", "energy_wh": 111.2, "target_s": 330.1},
 }
 # <<< PROFILE MATRIX <<<
 DEFAULT_STRATEGY_KEY = "base_210s"
@@ -116,42 +116,90 @@ _FALLBACK_STRATEGIES = [
 ]
 
 
-def load_strategies():
-    """Every speed profile on disk, newest information first.
+# How far a profile's lap time must sit from the base before the label says so
+# at all. Under this it is the base pace by another name, and "(+0%)" is noise.
+LABEL_PCT_FLOOR = 0.5
 
-    lap_time_min is ALWAYS integrated from the curve (SpeedProfile.lap_time_s),
-    never a stored claim, so the Strategy tab's consumption matrix tells the
-    truth the moment a profile is replaced by a measured lap.
 
-    Never raises. On any problem the five original entries are returned
-    unchanged, which is also exactly what this produces when the five original
-    CSVs are the only ones present.
+def display_label(name, target_s, base_s):
+    """"Fast" at 256.5 s against a 285 s base -> "Fast (-10%)".
+
+    THE SUFFIX IS DERIVED, EVERY TIME, and the store holds only the name. It
+    used to be part of the stored label -- "Base (285s)", "Fast (-10%)" -- text
+    that was true when somebody typed it and silently wrong afterwards: the
+    matrix carried a row reading "Base (285s)" while the profiles behind it
+    lapped in 210, and now that the crew can edit lap times mid-race from the
+    Strategy tab a baked-in number would go stale the moment they did.
+
+    Percent, not the lap time itself: the lap time is already a column of its
+    own in the matrix, and what the label is for is saying where this row sits
+    relative to the pace the strategy is built around.
     """
+    if not target_s or not base_s:
+        return name
+    pct = (float(target_s) / float(base_s) - 1.0) * 100.0
+    return name if abs(pct) < LABEL_PCT_FLOOR else "%s (%+.0f%%)" % (name, pct)
+
+
+def load_strategies():
+    """The consumption matrix: one row per profile, fastest first.
+
+    TWO NUMBERS MAKE A ROW -- a lap time and a Wh -- and both are read from
+    PROFILE_MATRIX above. No speed curve is opened to build this list.
+
+    That is a reversal, and the reason is the car. lap_time_min used to be
+    integrated from the profile's own CSV and the stored `target_s` ignored on
+    principle ("never a stored claim"), which is right while the curves
+    describe what the car does. They no longer do: the CSVs command 189-231 s
+    laps and the car is lapping near 285. Integrating them made the Strategy
+    tab plan a race at a pace nothing was going to run, and no amount of
+    measured energy could fix a row whose lap time was wrong.
+
+    A profile on disk that is NOT in the matrix still gets its lap time from
+    its curve -- that is the Profile Builder's output, whose CSV is the only
+    thing anybody has said about it. So the builder keeps working, and the
+    curves stay useful for the driver's target speed (speed_profile is still
+    what the car flies, and 210s.xlsx still drives the live track readout).
+
+    Never raises. On any problem the matrix's own five rows are returned.
+    """
+    base_s = (PROFILE_MATRIX.get(DEFAULT_STRATEGY_KEY) or {}).get("target_s")
+    out = []
+    for key, meta in PROFILE_MATRIX.items():
+        target = meta.get("target_s")
+        if not target:
+            continue
+        energy = meta.get("energy_wh")
+        out.append({"key": key,
+                    "label": display_label(
+                        meta.get("label") or key.replace("_", " ").title(),
+                        target, base_s),
+                    # The stored name, without the derived suffix: what the
+                    # matrix editor writes back, so a "(-10%)" is never baked
+                    # into the store and re-derived from itself.
+                    "name": meta.get("label") or key.replace("_", " ").title(),
+                    "lap_time_min": float(target) / 60.0,
+                    "energy_wh": energy,
+                    # True when nobody has said what this profile costs, so
+                    # the matrix can mark the number as unknown rather than
+                    # printing a confident dash-free zero.
+                    "energy_estimated": energy is None})
     try:
         import speed_profile
         import track
-        found = speed_profile.available_profiles()
-        if not found:
-            return list(_FALLBACK_STRATEGIES)
-        out = []
-        for key, path in found.items():
+        for key, path in speed_profile.available_profiles().items():
+            if key in PROFILE_MATRIX:
+                continue
             prof = speed_profile.load_csv(path, name=key,
                                           lap_length_m=track.TRACK_LENGTH_METERS)
-            meta = PROFILE_MATRIX.get(key) or {}
-            label = meta.get("label") or key.replace("_", " ").title()
-            energy = meta.get("energy_wh")
-            out.append({"key": key, "label": label,
+            name = key.replace("_", " ").title()
+            out.append({"key": key, "label": name, "name": name,
                         "lap_time_min": prof.lap_time_s() / 60.0,
-                        "energy_wh": energy,
-                        # True when nobody has said what this profile costs, so
-                        # the matrix can mark the number as unknown rather than
-                        # printing a confident dash-free zero.
-                        "energy_estimated": energy is None})
-        out.sort(key=lambda s: s["lap_time_min"])
-        return out or list(_FALLBACK_STRATEGIES)
+                        "energy_wh": None, "energy_estimated": True})
     except Exception as exc:     # noqa: BLE001 - importable above all else
-        print(f"⚠️ speed profiles unreadable ({exc}); using the built-in five")
-        return list(_FALLBACK_STRATEGIES)
+        print(f"⚠️ speed profiles unreadable ({exc}); matrix rows only")
+    out.sort(key=lambda s: s["lap_time_min"])
+    return out or list(_FALLBACK_STRATEGIES)
 
 
 # Laps the car must drive on a profile before the Strategy tab uses their
@@ -160,6 +208,28 @@ MIN_LAPS_FOR_MEASURED = 2
 
 STRATEGIES = load_strategies()
 STRATEGY_BY_LABEL = {s["label"]: s for s in STRATEGIES}
+
+
+def set_profile_matrix(matrix):
+    """Adopt a new matrix IN THIS PROCESS, after it has been written to disk.
+
+    profile_manage.write_saved_matrix() puts the new numbers in constants.py,
+    where they are read at import -- which used to mean the pit web server kept
+    serving the old matrix until somebody restarted it. Mid-race that is not a
+    delay, it is a wrong plan on the screen while the crew believes they have
+    changed it.
+
+    EVERYTHING IS MUTATED IN PLACE, never rebound, so a module that did
+    `from constants import STRATEGIES` still sees the change.
+
+    This does not write anything. Call it after the write succeeds.
+    """
+    PROFILE_MATRIX.clear()
+    PROFILE_MATRIX.update({str(k): dict(v) for k, v in matrix.items()})
+    STRATEGIES[:] = load_strategies()
+    STRATEGY_BY_LABEL.clear()
+    STRATEGY_BY_LABEL.update({s["label"]: s for s in STRATEGIES})
+    return STRATEGIES
 DATA_STALE_AFTER_S = 10.0   # latest sample older than this => collector likely down
 
 # =========================

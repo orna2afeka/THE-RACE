@@ -164,6 +164,39 @@ def send_trip_reset() -> dict:
     return send_lap_command("reset_trip")
 
 
+def send_stopwatch_reset() -> dict:
+    """Restart the DRIVER's stopwatch from now. Display only.
+
+    The HUD clock the driver glances at between corners, which they can already
+    restart with the button beside it (driver_dash_v2._reset_lap_timer). This is
+    the pit's copy of that button, for the times the driver has both hands full:
+    coming out of the box, after a restart, or when the clock is counting from a
+    datum that stopped meaning anything.
+
+    IT CHANGES NOTHING THE CAR RECORDS. No lap is cut, the lap count does not
+    move, the energy totals and the odometer are untouched, and nothing is
+    written to the lap checkpoint -- the car routes it straight to the HUD
+    signal (main._apply_lap_commands). The next real line crossing takes the
+    clock back over, so this cannot leave the driver's stopwatch permanently
+    out of step with the car's own lap timing.
+
+    Shares /lap_command and its ack node with the other lap commands, so it
+    inherits the same id and age gates: a Firebase reconnect replay cannot make
+    the driver's clock jump.
+    """
+    return send_lap_command("reset_stopwatch")
+
+
+def send_stopwatch_clear() -> dict:
+    """Blank the driver's stopwatch (it reads "--" until it starts again).
+
+    The other half of the HUD button, which shows START when the clock is
+    cleared and RESET while it runs. Same display-only contract as
+    send_stopwatch_reset().
+    """
+    return send_lap_command("clear_stopwatch")
+
+
 def read_lap_ack():
     """The car's acknowledgement of the last lap command, or None.
 

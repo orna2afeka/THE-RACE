@@ -96,14 +96,12 @@ def get_track_section(profile_df, current_dist_m):
 # Replacing it is a one-place edit: measure a real charge, put the kW readings
 # in CHARGING_CURVE, and every table, graph and plan follows.
 CHARGING_CURVE = {          # SoC % -> charging power, kW
-    5: 9.0,   10: 9.0,  15: 9.0,  20: 9.0,  25: 9.0,
-    30: 9.0,  35: 9.0,  40: 9.0,  45: 9.0,  50: 9.0,
-    55: 8.8,  60: 8.5,  65: 8.0,  70: 7.0,  75: 6.0,
-    80: 4.5,  85: 3.5,  90: 2.5,  95: 1.5, 100: 0.5,
+    5: 9.2,   10: 9.2,  15: 9.2,  20: 9.2,  25: 9.2,
+    30: 9.2,  35: 9.1,  40: 9.1,  45: 9.0,  50: 9.0,
+    55: 8.9,  60: 8.9,  65: 8.9,  70: 8.8,  75: 8.8,
+    80: 7.6,  85: 5.6,  90: 3.9,  95: 3.4,  100: 2.5,
 }
-CHARGING_CURVE_IS_MEASURED = False     # flip when the curve is real; the
-                                       # dashboard captions read this.
-
+CHARGING_CURVE_IS_MEASURED = True     # flip when the curve is replaced
 BATTERY_FULL_WH = 8550.0
 BATTERY_FLOOR_WH = 450.0       # never plan to go below this
 
@@ -644,13 +642,43 @@ def get_live_track_status(current_dist_m, profile_df=None):
 # obey, and -- the part that actually went wrong before the merge -- the trace
 # the GRAPH draws is checked against the numbers in the TABLE.
 if __name__ == "__main__":
-    _TABLE = [
-        {"label": "Fast (-10%)",    "lap_time_min": 3.15, "energy_wh": 88.0},
-        {"label": "Med-Fast (-5%)", "lap_time_min": 3.33, "energy_wh": 84.0},
-        {"label": "Base (210s)",    "lap_time_min": 3.50, "energy_wh": 80.0},
-        {"label": "Med-Slow (+5%)", "lap_time_min": 3.67, "energy_wh": 76.0},
-        {"label": "Slow (+10%)",    "lap_time_min": 3.85, "energy_wh": 72.0},
+    # THE MATRIX THE PIT ACTUALLY PLANS ON, not a copy of it. Both numbers a
+    # row needs come from constants.PROFILE_MATRIX -- the lap time and the
+    # Wh/lap -- and that same list is what /api/strategy builds its table from.
+    # No speed curve is read here or there.
+    #
+    # It is a copy that made this check worth little: the literal that used to
+    # sit here was a 210 s base at 80 Wh, from the generated profiles, while
+    # the car laps near 285 s and pays about 126 Wh for it. Every plan verified
+    # here was a race nobody was going to drive.
+    #
+    # A profile with no stated Wh/lap is skipped, the same rule api.py applies:
+    # an unknown consumption is not a zero one. If nothing is left (or
+    # constants cannot be read at all) the matrix below stands in -- keep it in
+    # step with constants.PROFILE_MATRIX if that is re-measured.
+    _FALLBACK_TABLE = [
+        {'label': 'Fast (-10%)', 'lap_time_min': 256.5 / 60.0, 'energy_wh': 159.5},
+        {'label': 'Med-Fast (-5%)', 'lap_time_min': 270.75 / 60.0, 'energy_wh': 152.25},
+        {'label': 'Base (285s)', 'lap_time_min': 285.0 / 60.0, 'energy_wh': 145.0},
+        {'label': 'Med-Slow (+5%)', 'lap_time_min': 299.25 / 60.0, 'energy_wh': 137.75},
+        {'label': 'Slow (+10%)', 'lap_time_min': 313.5 / 60.0, 'energy_wh': 130.5},
     ]
+    try:
+        import constants as _C
+        _TABLE = [{'label': _s['label'], 'lap_time_min': float(_s['lap_time_min']),
+                   'energy_wh': float(_s['energy_wh'])}
+                  for _s in _C.STRATEGIES if _s.get('energy_wh') is not None]
+        _SOURCE = "constants.STRATEGIES"
+    except Exception as _exc:          # noqa: BLE001 - the check must still run
+        print("constants unreadable (%s)" % _exc)
+        _TABLE, _SOURCE = [], "built-in five"
+    if not _TABLE:
+        _TABLE, _SOURCE = list(_FALLBACK_TABLE), "built-in five"
+
+    print("consumption matrix (%s):" % _SOURCE)
+    for _r in _TABLE:
+        print("    %-18s %6.2f min/lap   %5.1f Wh/lap"
+              % (_r['label'], _r['lap_time_min'], _r['energy_wh']))
     _ok = True
 
     def _fail(msg):
@@ -673,9 +701,21 @@ if __name__ == "__main__":
           "charge time is not monotonic in target SoC")
     _want(charging_time_min(70, 70) == 0.0, "charging to where we already are costs time")
     _want(charging_time_min(90, 70) == 0.0, "charging DOWN returns a time")
-    # The taper is the whole point: the last 10% must cost more than the first 50%.
-    _want(charging_time_min(90, 100) > charging_time_min(5, 55),
-          "the curve does not taper -- 90-100% should cost more than 5-55%")
+    # THE TAPER, MEASURED PER WATT-HOUR. It used to compare wall-clock minutes:
+    # "90-100% must take longer than 5-55%". That held for the example curve the
+    # charging branch shipped, and broke the moment a real pack was measured --
+    # not because the taper went away, but because 10% of a pack is a tenth of
+    # the energy of 50% of it, so the top slice can taper hard and still finish
+    # sooner. What a taper actually claims is that the last watt-hours come in
+    # SLOWER, and that is what this asks.
+    def _wh_per_min(a, b):
+        t = charging_time_min(a, b)
+        return (BATTERY_FULL_WH * (b - a) / 100.0) / t if t else float("inf")
+
+    _want(_wh_per_min(90, 100) < _wh_per_min(5, 55),
+          "the curve does not taper -- the last 10%% goes in at %.0f Wh/min "
+          "against %.0f Wh/min for the first 50%%"
+          % (_wh_per_min(90, 100), _wh_per_min(5, 55)))
 
     for _label, _left, _start in (("full 24 h, full pack", 24 * 60.0, BATTERY_FULL_WH),
                                   ("6 h left, part charged", 360.0, 3000.0),

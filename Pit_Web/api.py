@@ -59,6 +59,7 @@ from .store import (                                   # noqa: E402
 import constants as C                                  # noqa: E402
 import efficiency                                      # noqa: E402
 import strategy_engine                                 # noqa: E402
+import energy_model                                    # noqa: E402
 from strategy_engine import (                          # noqa: E402
     calculate_all_strategies, load_velocity_profile,
     get_live_track_status, profile_to_df, SECTIONS_INFO,
@@ -188,6 +189,10 @@ _STATE_COLUMNS = {
     # the row is, so they carry forward. current_lap too.
     "last_lap_kind": "last_lap_kind", "last_lap_flags": "last_lap_flags",
     "last_lap_stopped_s": "last_lap_stopped_s", "current_lap": "current_lap",
+    # Wall clock the lap being driven began, from the car. Carries forward for
+    # the same reason current_lap does: it stays true for the whole lap, and a
+    # lap clock that blanked between samples would be unreadable.
+    "lap_started_ts": "lap_started_ts",
     # Road speed comes from ONE place: the controller's own field on 0x610, the
     # same one the driver HUD reads. NO fallback to a value derived from RPM.
     "speed_kmh": "mms_vehicle_speed_kmh",
@@ -872,6 +877,36 @@ def _lap_energy_baseline(conn, lap):
         _lap_baseline[lap] = (now, energy, at_m)
     return energy, at_m
 
+def _lap_clock(conn, state, active_lap, age):
+    """{startedAt, atSampleS, source} for the lap being driven.
+
+    The car's own figure first; the store's estimate only if the car has not
+    sent one (a car on older code, or rows recorded before the pit kept the
+    column). Never invents a datum: with neither, the dashboard shows a dash
+    instead of counting from the start of the session.
+
+    `atSampleS` is how long the lap had been running AT THE NEWEST SAMPLE, and
+    it is what the screen freezes on once the car goes quiet. A clock that
+    keeps counting through a dead link does not report a long lap, it reports a
+    dead link -- and it says so in the one font on the wall that people trust
+    to be live.
+    """
+    started = state.get("lap_started_ts")
+    source = "car"
+    if not started:
+        started = db.lap_started_estimate(conn, active_lap)
+        source = "store" if started else None
+    if not started:
+        return {"startedAt": None, "atSampleS": None, "source": None}
+    started = float(started)
+    # The newest sample's own clock: time.time() - age is how read_live_state
+    # measured it, so this stays in step with the age every tile is labelled
+    # with.
+    at_sample = (time.time() - age - started) if age is not None else None
+    return {"startedAt": started, "source": source,
+            "atSampleS": None if at_sample is None else max(0.0, at_sample)}
+
+
 
 def build_live(conn, manual_lap=-1):
     """The whole fast tier in one payload: tiles, sidebar, sectors, map.
@@ -1024,6 +1059,18 @@ def build_live(conn, manual_lap=-1):
         },
         "liveMetrics": tiles,
         "driverStint": driver_stint(conn),
+        # THE CLOCK THE DRIVER IS READING. One number: the wall-clock instant
+        # the current lap began, so the browser counts up from it exactly as it
+        # does for the race clock, and a lap clock does not freeze between the
+        # car's 0.5 s pushes.
+        #
+        # `source` is "car" when it came from the car's own lap_started_ts --
+        # the same datum the HUD stopwatch counts from, set in the same call
+        # that re-datums the lap (lap_tracker._trigger_lap), so the two screens
+        # agree to the millisecond. "store" means it was estimated from the
+        # earliest sample the pit holds for this lap and can read short; the
+        # caption says so rather than presenting a guess as a measurement.
+        "lapClock": _lap_clock(conn, state, active_lap, age),
     }
 
 
@@ -1225,10 +1272,10 @@ def api_trip_reset():
     """
     import driver_message
     try:
-        driver_message.send_trip_reset()
+        sent = driver_message.send_trip_reset()
     except Exception as e:
         raise HTTPException(502, "trip reset failed: %s" % e)
-    return {"ok": True, "sentAt": time.strftime("%H:%M:%S")}
+    return {"ok": True, "id": sent["id"], "sentAt": time.strftime("%H:%M:%S")}
 
 
 @app.get("/api/trip_reset/ack")
@@ -2029,10 +2076,27 @@ async def api_weather():
 STRATEGY_TIME_ROUND_MIN = 1.0
 STRATEGY_WH_ROUND = 50.0
 
-# Energy per lap: what the car MEASURED under a profile once it has driven
-# enough laps of it to mean something, otherwise the stored estimate. Per
-# profile, so a profile nobody has driven keeps its original number.
+# Energy per lap: THE MATRIX IS THE PLAN. constants.PROFILE_MATRIX holds a lap
+# time and a Wh/lap for each profile, both put there by the crew, and both are
+# served exactly as written. Nothing here recomputes them.
+#
+# The car's own laps are served BESIDE that column, never over it. They used to
+# replace it -- a profile with enough laps got their median while the rest kept
+# their stored figure -- and that mixed two different claims in one column: the
+# crew read "Base 130.6" and "Fast 88" as a comparison of two profiles when it
+# was really a comparison of a measurement with a guess. A matrix is a decision
+# about how to drive. It should change when the crew changes it, not quietly
+# when a stint happens to be logged.
+#
+# So the table says 145 Wh at 285 s because that is what the matrix says, and
+# the caption says what the car actually paid, and the difference between them
+# is the crew's to act on.
 MIN_LAPS_FOR_MEASURED = C.MIN_LAPS_FOR_MEASURED
+# What the matrix editor will accept. Wide enough for a car being nursed home
+# on one motor, narrow enough that a slipped decimal point is refused rather
+# than planned around.
+MATRIX_MIN_LAP_S, MATRIX_MAX_LAP_S = 60.0, 1800.0
+MATRIX_MIN_WH, MATRIX_MAX_WH = 1.0, 2000.0
 # The car finishes a lap about every 3.5 minutes, so nothing here can change
 # faster than that. Measured on the pit's own store the grouped query is
 # ~0.6 s, which must not run on every poll.
@@ -2135,21 +2199,31 @@ def api_strategy(manual_lap: int = Query(-1)):
     battery_wh = (strategy_engine.BATTERY_FULL_WH if not soc
                   else (soc / 100.0) * strategy_engine.BATTERY_FULL_WH)
 
+    # The matrix, verbatim. A row with no stored Wh/lap (a profile the Builder
+    # wrote and nobody has costed) is left out rather than planned at zero.
+    table = [{"label": s["label"], "lap_time_min": s["lap_time_min"],
+              "energy_wh": s["energy_wh"]}
+             for s in C.STRATEGIES if s.get("energy_wh") is not None]
+
+    # What the car paid, for the caption and the per-row tooltip. Never
+    # substituted into the table above.
     measured = _measured_energy_wh()
-    table, measured_note = [], {}
-    for s in C.STRATEGIES:
-        wh, n = measured.get(s["key"], (None, 0))
-        if wh is None:
-            wh = s.get("energy_wh")
-        else:
-            measured_note[s["label"]] = n
-        if wh is not None:
-            table.append({"label": s["label"], "lap_time_min": s["lap_time_min"],
-                          "energy_wh": wh})
+    measured_note, stored = {}, {s["key"]: s for s in C.STRATEGIES}
+    for key, (wh, n) in measured.items():
+        s = stored.get(key)
+        if s is None:
+            continue
+        measured_note[s["label"]] = {"laps": n, "wh": round(wh, 1),
+                                     "storedWh": s["energy_wh"]}
 
     out = _strategy_payload(left_min, battery_wh, active_lap, table, measured_note)
     out.update({
         "assumedFullPack": not soc,
+        # The profile list as it stands RIGHT NOW, so the selector beside this
+        # table tracks a matrix edit on the next poll. /api/config carries the
+        # same list, but the browser fetched that once when the page loaded --
+        # before the crew changed a lap time from the editor ten feet away.
+        "matrix": _matrix_rows(),
         "missing": [n for n, v in (("battery SoC", soc), ("lap count", active_lap))
                     if v is None],
     })
@@ -2554,10 +2628,10 @@ def api_cut_lap():
     change the manual lap override."""
     import driver_message
     try:
-        driver_message.send_lap_cut()
+        sent = driver_message.send_lap_cut()
     except Exception as e:
         raise HTTPException(502, "cut lap failed: %s" % e)
-    return {"ok": True, "sentAt": time.strftime("%H:%M:%S")}
+    return {"ok": True, "id": sent["id"], "sentAt": time.strftime("%H:%M:%S")}
 
 
 class LapSetBody(BaseModel):
@@ -2580,10 +2654,11 @@ def api_lap_set(body: LapSetBody):
         raise HTTPException(400, "lap must be 0 or more")
     import driver_message
     try:
-        driver_message.send_lap_set(body.lap)
+        sent = driver_message.send_lap_set(body.lap)
     except Exception as e:
         raise HTTPException(502, "set lap failed: %s" % e)
-    return {"ok": True, "lap": body.lap, "sentAt": time.strftime("%H:%M:%S")}
+    return {"ok": True, "id": sent["id"], "lap": body.lap,
+            "sentAt": time.strftime("%H:%M:%S")}
 
 
 @app.post("/api/lap/restart")
@@ -2596,16 +2671,52 @@ def api_lap_restart():
     """
     import driver_message
     try:
-        driver_message.send_lap_restart()
+        sent = driver_message.send_lap_restart()
     except Exception as e:
         raise HTTPException(502, "restart lap failed: %s" % e)
-    return {"ok": True, "sentAt": time.strftime("%H:%M:%S")}
+    return {"ok": True, "id": sent["id"], "sentAt": time.strftime("%H:%M:%S")}
+
+
+class StopwatchBody(BaseModel):
+    # "reset" starts the driver's clock from now, "clear" blanks it. No default:
+    # the two do different things on the driver's instrument panel and the
+    # caller should say which one it means.
+    action: str
+
+
+@app.post("/api/lap/stopwatch")
+def api_lap_stopwatch(body: StopwatchBody):
+    """Move the DRIVER's stopwatch from the pit. Display only.
+
+    Nothing the car records changes -- not the lap count, not a lap time, not
+    the energy totals, not the odometer. It is the pit's copy of the button
+    beside the clock on the HUD, and the car's next real lap cut takes the
+    clock back over. See driver_message.send_stopwatch_reset().
+    """
+    import driver_message
+    if body.action not in ("reset", "clear"):
+        raise HTTPException(400, "action must be 'reset' or 'clear'")
+    try:
+        sent = (driver_message.send_stopwatch_reset() if body.action == "reset"
+                else driver_message.send_stopwatch_clear())
+    except Exception as e:
+        raise HTTPException(502, "stopwatch %s failed: %s" % (body.action, e))
+    return {"ok": True, "id": sent["id"], "action": body.action,
+            "sentAt": time.strftime("%H:%M:%S")}
 
 
 @app.get("/api/cut_lap/ack")
 def api_cut_lap_ack():
     """The car's acknowledgement. "Sent" and "the car is running it" are not
-    the same thing, so the pit sees which one it has."""
+    the same thing, so the pit sees which one it has.
+
+    THE ACK NODE IS RETAINED, and it is the LAST ack the car ever wrote -- not
+    the ack to whatever was just pressed. With the car off it can be hours old:
+    reading it as a confirmation of the press you just made is how a dashboard
+    tells the crew a command landed on a car that is not even powered. So every
+    send returns the command's `id` and the caller must match it against
+    `ack.id` before it says the word "confirmed". Action alone is not enough --
+    the same button pressed yesterday has the same action."""
     import driver_message
     try:
         return {"ack": driver_message.read_lap_ack()}
@@ -2615,6 +2726,113 @@ def api_cut_lap_ack():
 
 class StrategyBody(BaseModel):
     key: str
+
+
+# --------------------------------------------------------------------------- #
+# Editing the matrix, mid-race
+# --------------------------------------------------------------------------- #
+# THE STORE IS STILL constants.PROFILE_MATRIX, and the writer is still
+# profile_manage.write_saved_matrix() -- the same one the Speed Profile Builder
+# uses. It re-parses the whole file before replacing it and copies the old one
+# into profiles/_backup/, so a matrix typed in at 3 a.m. cannot leave a
+# constants.py that will not import. One store, one validator, one backup
+# trail, whichever screen the edit came from.
+#
+# What is new here is that the change lands WITHOUT A RESTART: the Builder's
+# own Save tells you to restart the Pit Web window, which is fine between
+# sessions and useless with the car on track. constants.set_profile_matrix()
+# adopts the new numbers in this process, and the plan cache is keyed on the
+# table itself, so the next 10 s poll is already planning on them.
+#
+# Labels are NOT editable here. They are what /api/config handed the browser
+# when the page loaded and what the strategy dropdown is built from; changing
+# one mid-race would leave two names for the same profile on one screen. Rename
+# in the Builder, where a reload comes with the territory.
+class MatrixRow(BaseModel):
+    key: str
+    target_s: float
+    energy_wh: float
+
+
+class MatrixBody(BaseModel):
+    rows: list[MatrixRow]
+
+
+class MatrixFillBody(BaseModel):
+    """One row the crew typed, and the ladder to rebuild around it."""
+    key: str
+    target_s: float
+    energy_wh: float
+    # The one assumption a single row cannot avoid; see energy_model.
+    aero_share: float | None = None
+
+
+def _matrix_rows():
+    """The matrix as the editor shows it, in the order the table uses."""
+    return [{"key": s["key"], "label": s["label"],
+             "target_s": round(s["lap_time_min"] * 60.0, 2),
+             "energy_wh": s["energy_wh"]}
+            for s in C.STRATEGIES]
+
+
+@app.get("/api/strategy/matrix")
+def api_strategy_matrix():
+    return {"rows": _matrix_rows(),
+            "aeroShare": energy_model.DEFAULT_AERO_SHARE}
+
+
+@app.post("/api/strategy/matrix/fill")
+def api_strategy_matrix_fill(body: MatrixFillBody):
+    """The other rows, derived from this one. Writes nothing."""
+    try:
+        rows = energy_model.ladder_from_anchor(
+            _matrix_rows(), body.key, body.target_s, body.energy_wh,
+            body.aero_share if body.aero_share is not None
+            else energy_model.DEFAULT_AERO_SHARE)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    by_key = {r["key"]: r for r in rows}
+    return {"rows": [dict(r, **by_key.get(r["key"], {})) for r in _matrix_rows()]}
+
+
+@app.post("/api/strategy/matrix")
+def api_strategy_matrix_save(body: MatrixBody):
+    """Write the edited matrix and adopt it here. Labels come from the store."""
+    import profile_manage as pm
+    current = {s["key"]: s for s in C.STRATEGIES}
+    draft = {}
+    for r in body.rows:
+        s = current.get(r.key)
+        if s is None:
+            raise HTTPException(400, "unknown profile %r" % r.key)
+        # A lap time or a consumption of zero is not a slow car, it is a typo,
+        # and the engine would plan an infinite number of free laps on it.
+        if not (MATRIX_MIN_LAP_S <= r.target_s <= MATRIX_MAX_LAP_S):
+            raise HTTPException(400, "%s: a lap time of %.1f s is outside %.0f-%.0f s"
+                                % (s["label"], r.target_s, MATRIX_MIN_LAP_S,
+                                   MATRIX_MAX_LAP_S))
+        if not (MATRIX_MIN_WH <= r.energy_wh <= MATRIX_MAX_WH):
+            raise HTTPException(400, "%s: %.1f Wh a lap is outside %.0f-%.0f Wh"
+                                % (s["label"], r.energy_wh, MATRIX_MIN_WH,
+                                   MATRIX_MAX_WH))
+        # The STORED name ("Base"), never the displayed one ("Base (+0%)"):
+        # constants.display_label() adds the percentage on the way out, and
+        # writing the decorated string back would bake one edit's spacing into
+        # the store and then decorate it again on the next read.
+        draft[r.key] = {"label": (C.PROFILE_MATRIX.get(r.key) or {}).get("label")
+                                 or s.get("name") or s["label"],
+                        "target_s": r.target_s, "energy_wh": r.energy_wh}
+    # Rows the caller did not send keep what they have: an editor that dropped
+    # a profile because the browser was showing a stale list would be a silent
+    # deletion, and PROFILE_MATRIX is also what the car is sent by key.
+    for key, meta in C.PROFILE_MATRIX.items():
+        draft.setdefault(key, dict(meta))
+    try:
+        pm.write_saved_matrix(draft)
+    except Exception as e:                                  # noqa: BLE001
+        raise HTTPException(500, "constants.py was not changed: %s" % e)
+    C.set_profile_matrix(draft)
+    return {"ok": True, "rows": _matrix_rows()}
 
 
 @app.post("/api/strategy/select")
@@ -2638,10 +2856,10 @@ def api_strategy_select(body: StrategyBody):
     set_pit_strategy_choice(body.key)
     import driver_message
     try:
-        driver_message.send_strategy(body.key)
+        sent = driver_message.send_strategy(body.key)
     except Exception as e:
         raise HTTPException(502, "send failed: %s" % e)
-    return {"ok": True, "key": body.key}
+    return {"ok": True, "key": body.key, "id": sent["id"]}
 
 
 @app.get("/api/strategy/ack")

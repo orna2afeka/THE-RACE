@@ -251,6 +251,126 @@ def aero_for_lap_time(lap_time_s, profiles, law=None):
     return C * float(lap_time_s) ** (-n)
 
 
+# ── Drag from LAP TIME ALONE, with no speed curve at all ──────────────────── #
+# Everything above needs a CSV: aero_integral() walks a profile's own v(d).
+# The pit's strategy endpoint has no business reading those files -- and the
+# car reports exactly two numbers per lap, how long it took and what it cost,
+# which is enough on their own.
+#
+# Take the lap as driven at a steady v = L/t. Then A = integral of v^2 ds is
+# just L^3/t^2, and the whole matrix follows from lap times.
+#
+# THIS IS A COARSER SHAPE THAN THE CURVES, AND IT BARELY MATTERS. Against the
+# five CSVs the steady figure is 26-34 % low in absolute terms -- but the
+# absolute scale is what the measurement fixes (b is fitted, not assumed), so
+# only the SPREAD across profiles survives into the answer. The curves' drag
+# rises as t^-2.31, the steady lap's as t^-2.00, and anchoring both at the same
+# measured base lap (130.6 Wh at 210 s) the two matrices differ by:
+#
+#     fast_189s  144.0 -> 140.8 Wh      med_slow_220s  126.4 -> 126.6 Wh
+#     base_210s  130.6 -> 130.6 Wh      slow_231s      122.9 -> 123.0 Wh
+#
+# 2 % at the fast end and nothing at the slow end, against a measurement whose
+# own laps scatter by more than that. The CSV path stays for the offline tool,
+# where the curves are there to be read anyway.
+def aero_from_lap_time(lap_time_s, lap_length_m=LAP_M):
+    """The drag integral a STEADY lap at this pace implies, in m^3/s^2."""
+    t = float(lap_time_s)
+    if t <= 0:
+        raise ValueError("lap time must be positive")
+    return lap_length_m ** 3 / (t * t)
+
+
+def profiles_from_lap_times(entries, lap_length_m=LAP_M):
+    """{key: {label, lap_time_s, aero}} from lap times only -- no CSV read.
+
+    The same shape load_profiles() returns, so measurements_from_db(),
+    fit_from_measurements() and matrix() take it unchanged. `entries` is any
+    iterable of dicts carrying `key`, `label` and `lap_time_s` or
+    `lap_time_min` -- constants.STRATEGIES is one.
+
+    Entries without a usable lap time are dropped rather than guessed at: a
+    profile whose pace nobody knows cannot be costed by a model that knows
+    only pace.
+    """
+    out = {}
+    for e in entries:
+        key = e.get("key")
+        secs = e.get("lap_time_s")
+        if secs is None and e.get("lap_time_min") is not None:
+            secs = float(e["lap_time_min"]) * 60.0
+        if not key or not secs or secs <= 0:
+            continue
+        out[key] = {"label": e.get("label") or _label_for(key),
+                    "lap_time_s": float(secs),
+                    "aero": aero_from_lap_time(secs, lap_length_m)}
+    return dict(sorted(out.items(), key=lambda kv: kv[1]["lap_time_s"]))
+
+
+def ladder_from_anchor(rows, anchor_key, target_s, energy_wh,
+                       aero_share=DEFAULT_AERO_SHARE, lap_length_m=LAP_M):
+    """The whole matrix regenerated from ONE row somebody typed.
+
+    `rows` is the matrix as it stands -- dicts carrying `key` and `target_s` --
+    and it supplies the PACE LADDER, each row's lap time as a ratio of the
+    anchor's. So a matrix spaced -10/-5/0/+5/+10 % stays spaced that way, and
+    one spaced some other way keeps ITS spacing. Nothing here parses a label
+    for a percentage.
+
+    LAP TIMES SCALE BY THAT RATIO. Wh DOES NOT. Pace is a decision and scales
+    however the crew spaced it; energy is physics and comes from the model this
+    module exists for --
+
+        E = a.L + b.A,  A = L^3/t^2   (aero_from_lap_time)
+
+    -- with a and b fixed by the anchor row alone, which means the anchor
+    reproduces exactly what was typed and every other row follows from it.
+    A flat percentage on Wh instead would say rolling drag, bearings and
+    drivetrain losses get cheaper when the driver slows down. They do not; they
+    are paid per metre and simply take longer. Anchored on 285 s / 145 Wh at a
+    1/3 drag share, a +10 % pace costs 136.6 Wh by this model against the
+    130.5 Wh a flat ladder claims -- 4 race laps, in the direction that
+    matters, since slowing down is the lever the crew actually pulls.
+
+    ONE ROW CANNOT SEPARATE a and b, so `aero_share` supplies the second
+    equation (see DEFAULT_AERO_SHARE). Anything measured across two real paces
+    belongs in fit_from_measurements() instead, which assumes nothing.
+
+    Returns [{key, target_s, energy_wh}] in the order given. Raises ValueError
+    on an anchor that is not in the matrix, or numbers that cannot be a lap.
+    """
+    rows = list(rows)
+    target_s, energy_wh = float(target_s), float(energy_wh)
+    if target_s <= 0:
+        raise ValueError("lap time must be positive")
+    if energy_wh <= 0:
+        raise ValueError("energy per lap must be positive")
+    share = float(aero_share)
+    if not 0.0 < share < 1.0:
+        raise ValueError("aero share must be between 0 and 1, got %r" % aero_share)
+    anchor = next((r for r in rows if r.get("key") == anchor_key), None)
+    if anchor is None:
+        raise ValueError("%r is not in the matrix" % (anchor_key,))
+    base = anchor.get("target_s")
+    if not base or float(base) <= 0:
+        raise ValueError("the anchor row has no lap time to scale from")
+
+    a_aero = aero_from_lap_time(target_s, lap_length_m)
+    b = share * energy_wh / a_aero
+    a = (1.0 - share) * energy_wh / lap_length_m
+    out = []
+    for r in rows:
+        t = r.get("target_s")
+        if not t or float(t) <= 0:
+            continue
+        new_t = target_s * (float(t) / float(base))
+        out.append({"key": r["key"],
+                    "target_s": round(new_t, 2),
+                    "energy_wh": round(a * lap_length_m
+                                       + b * aero_from_lap_time(new_t, lap_length_m), 1)})
+    return out
+
+
 def profile_pace_range(profiles):
     """(fastest, slowest) lap time on disk — outside it, the law extrapolates."""
     times = [p["lap_time_s"] for p in profiles.values()]
@@ -725,13 +845,30 @@ def _cli(argv=None):
                     help="take the measurements from telemetry.db instead — "
                          "assumes nothing, needs laps actually driven")
     ap.add_argument("--db", help="path to telemetry.db for --from-db")
+    ap.add_argument("--from-matrix", action="store_true",
+                    help="cost the profiles from constants.PROFILE_MATRIX lap "
+                         "times instead of reading their CSVs (a steady lap at "
+                         "that pace) - the pit's own basis, and the only one "
+                         "available when the curves no longer describe the car")
     ap.add_argument("--self-check", action="store_true")
     args = ap.parse_args(argv)
 
     if args.self_check:
         return _self_check()
 
-    profiles = load_profiles()
+    profiles = {} if args.from_matrix else load_profiles()
+    if not profiles:
+        # No CSVs (or --from-matrix): lap time and Wh are enough. See
+        # aero_from_lap_time() for what is given up, which is about 2 %.
+        try:
+            import constants as C
+            profiles = profiles_from_lap_times(C.STRATEGIES)
+        except Exception as exc:                 # noqa: BLE001
+            print("no profiles on disk and no matrix to fall back on (%s)" % exc)
+            return 1
+        if profiles:
+            print("costed from LAP TIMES, no speed curves read "
+                  "(constants.PROFILE_MATRIX)")
     if not profiles:
         print("no profiles on disk — nothing to cost")
         return 1

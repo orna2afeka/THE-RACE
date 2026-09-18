@@ -215,6 +215,13 @@ METRIC_COLUMNS = [
     "lap_seq",
     # Seconds the car stood still during the last lap. A pit stop lives here.
     "last_lap_stopped_s",
+    # WALL CLOCK (time.time() on the car) of the moment the lap being driven
+    # began -- lap_tracker sets it at the same instant as the HUD's own
+    # stopwatch datum, and its comment says it "exists to be compared against
+    # the pit's clock". The car has sent it all along and the pit dropped it on
+    # the floor, so the dashboard had no way to show the clock the driver is
+    # reading. Wall clock, not monotonic, so it IS comparable with device_ts.
+    "lap_started_ts",
     # Lap distance from GPS, NULL in the pit lane or without a fresh fix.
     # Unlike lap_distance_m it cannot be out of phase with the track.
     "track_pos_m",
@@ -876,6 +883,36 @@ def fetch_trace_samples(conn: sqlite3.Connection, lap: int, t0: float, t1: float
     ).fetchall()
 
 
+def lap_started_estimate(conn: sqlite3.Connection, lap,
+                         device_id: str = DEVICE_ID):
+    """When the car crossed into `lap`, from the samples we happen to hold.
+
+    THE FALLBACK, not the answer. The car reports lap_started_ts (a wall clock
+    set at the moment of the cut), and that is what the dashboard shows. This
+    covers the two cases where it is absent: rows recorded before the pit
+    stored that column, and a car running older code.
+
+    Accurate to one push interval (~0.5 s) at best, and it reads SHORT when the
+    pit missed the first samples of the lap -- it can only see the earliest
+    sample it has. Index-backed by idx_telemetry_lap, so the cost does not grow
+    with the race.
+
+    None when the lap is unknown or nothing is stored for it, which the caller
+    shows as a dash rather than counting up from an invented datum.
+    """
+    if lap is None:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT MIN(device_ts) FROM telemetry "
+            "WHERE device_id = ? AND CAST(calculated_lap AS INTEGER) = ?",
+            (device_id, int(lap)),
+        ).fetchone()
+    except Exception:                                    # noqa: BLE001
+        return None
+    return row[0] if row and row[0] else None
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
     # Migrate older DBs in place: add any data columns the table is missing
@@ -1129,6 +1166,7 @@ def flatten_record(rtdb_key: str, record: dict, device_id: str = DEVICE_ID) -> d
         "last_lap_number": _num(motor.get("last_lap_number")),
         "lap_seq": _num(motor.get("lap_seq")),
         "last_lap_stopped_s": _num(motor.get("last_lap_stopped_s")),
+        "lap_started_ts": _num(motor.get("lap_started_ts")),
         "track_pos_m": _num(motor.get("track_pos_m")),
         "active_strategy": _join(motor.get("active_strategy")),
         "odometer_m": _num(motor.get("odometer_m")),

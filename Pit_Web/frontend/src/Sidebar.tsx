@@ -129,19 +129,29 @@ function CutLap({ carLap }: { carLap: number | null }) {
   const [freshSent, setFreshSent] = useState<string | null>(null);
   const [setSentAt, setSetSentAt] = useState<string | null>(null);
   const [wanted, setWanted] = useState('');
+  const [watchSent, setWatchSent] = useState<string | null>(null);
+  // The id of the command each button last sent, so an ack can be matched to
+  // the press it belongs to.
+  const [sentIds, setSentIds] = useState<Record<string, number>>({});
   const { data: ack } = usePoll(
-    () => getJSON<{ ack: { applied?: boolean; lap?: number; action?: string } | null }>('/api/cut_lap/ack'),
-    5000, [sent ?? '', freshSent ?? '', setSentAt ?? '']);
+    () => getJSON<{ ack: { applied?: boolean; lap?: number; action?: string; id?: number } | null }>('/api/cut_lap/ack'),
+    5000, [sent ?? '', freshSent ?? '', setSentAt ?? '', watchSent ?? '']);
 
-  // Both commands share /lap_command and come back on the same ack node, so
-  // the ack's own `action` is what says which one landed. Without that, a Cut
-  // Lap ack arriving after a Fresh Lap press would read as confirmation of the
-  // press that had not landed yet.
-  const applied = (what: string) => ack?.ack?.applied && ack.ack.action === what;
+  // CONFIRMED MEANS THIS PRESS, NOT THIS BUTTON. The ack node is retained and
+  // holds the last ack the car ever wrote, so with the car off it can be hours
+  // old — matching on `action` alone made the sidebar answer "Car confirmed —
+  // now on lap 9" to a Cut Lap press while the car had been dark for eight
+  // hours, quoting a lap number from the morning. The id is the one the send
+  // returned, so it can only match the command that press actually created.
+  const applied = (what: string) =>
+    !!ack?.ack?.applied && ack.ack.action === what
+    && ack.ack.id != null && ack.ack.id === sentIds[what];
 
   const freshLap = async () => {
     try {
-      setFreshSent((await postJSON<{ sentAt: string }>('/api/lap/restart', {})).sentAt);
+      const r = await postJSON<{ sentAt: string; id: number }>('/api/lap/restart', {});
+      setSentIds((m) => ({ ...m, restart_lap: r.id }));
+      setFreshSent(r.sentAt);
       toast('Restart lap sent — nothing will be counted');
     } catch (e) { toast(`Restart lap failed: ${e}`, "err"); }
   };
@@ -152,16 +162,38 @@ function CutLap({ carLap }: { carLap: number | null }) {
       toast('Type the lap count the car should show', 'err'); return;
     }
     try {
-      setSetSentAt((await postJSON<{ sentAt: string }>('/api/lap/set', { lap })).sentAt);
-      toast(`Lap number ${lap} sent to the car`);
+      const r = await postJSON<{ sentAt: string; id: number }>('/api/lap/set', { lap });
+      setSentIds((m) => ({ ...m, set_lap: r.id }));
+      setSetSentAt(r.sentAt);
+      toast(`Lap number ${lap} sent — the tile moves when the car reports it`);
     } catch (e) { toast(`Set lap failed: ${e}`, "err"); }
+  };
+
+  // The DRIVER's stopwatch, not the pit's clock and not the lap count. Shares
+  // the lap-command node, so it lands on the same ack and `action` is again
+  // what says which press came back.
+  // NO "restart" BUTTON HERE. Cut lap and Restart lap already re-datum the
+  // driver's clock on the car (lap_tracker._trigger_lap sets the HUD's own
+  // stopwatch datum), so a third button that only restarts it would be a
+  // second way to do what the two above already did. Clearing it -- blanking
+  // the clock to "--" until the next crossing -- is the one thing neither of
+  // them does.
+  const clearStopwatch = async () => {
+    try {
+      const r = await postJSON<{ sentAt: string; id: number }>('/api/lap/stopwatch', { action: 'clear' });
+      setSentIds((m) => ({ ...m, clear_stopwatch: r.id }));
+      setWatchSent(r.sentAt);
+      toast("Clear stopwatch sent to the car");
+    } catch (e) { toast(`Clear stopwatch failed: ${e}`, 'err'); }
   };
 
   return (
     <Sec icon="timer" title="Lap control">
       <button className="btn block" onClick={async () => {
         try {
-          setSent((await postJSON<{ sentAt: string }>('/api/cut_lap', {})).sentAt);
+          const r = await postJSON<{ sentAt: string; id: number }>('/api/cut_lap', {});
+          setSentIds((m) => ({ ...m, cut_lap: r.id }));
+          setSent(r.sentAt);
           toast('Cut Lap sent to the car');
         } catch (e) { toast(`Cut Lap failed: ${e}`, "err"); }
       }}><Icon name="flag" size={13} />Cut lap now</button>
@@ -199,6 +231,21 @@ function CutLap({ carLap }: { carLap: number | null }) {
               ? `Car confirmed — now on lap ${ack?.ack?.lap} · sent ${setSentAt}`
               : `Sent ${setSentAt} — awaiting the car's confirmation.`)
           : 'Laps COMPLETED, to match the officials. Changes the number only; the lap in progress carries on.'}
+      </div>
+
+      {/* The driver's own clock. Kept at the bottom of this section because it
+          is the one control here that records NOTHING — it moves a number on
+          the driver's screen and leaves the lap count, the lap times, the
+          energy and the odometer exactly where they were. */}
+      <button className="btn block" style={{ marginTop: 8 }} onClick={clearStopwatch}>
+        <Icon name="timer" size={13} />Clear driver’s stopwatch
+      </button>
+      <div className="caption">
+        {watchSent
+          ? (applied('clear_stopwatch')
+              ? `Car confirmed — driver's clock blanked · sent ${watchSent}`
+              : `Sent ${watchSent} — awaiting the car's confirmation. (A car on the old HUD code never answers this.)`)
+          : 'Blanks the clock on the driver’s screen until the next pass of the line. Display only: counts no lap, moves no number the car records. Cutting or restarting a lap already restarts it, so there is no button for that.'}
       </div>
     </Sec>
   );

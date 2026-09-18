@@ -7,7 +7,7 @@ import { Icon } from '../icons';
 import { MISSING, ageText, fmt, getJSON, postJSON, usePoll, useResizePlot, useStored } from '../lib';
 import { config as plotConfig, layoutBase, theme } from '../plotly-theme';
 import { toast } from '../toast';
-import type { CellExtremesResp, CellTileData, CellsResp, Config, Live, StrategyResp } from '../types';
+import type { CellExtremesResp, CellTileData, CellsResp, Config, Live, MatrixResp, MatrixRow, StrategyResp } from '../types';
 
 /* ------------------------------- Live Metrics ---------------------------- */
 const GROUP_ICON: Record<string, string> = {
@@ -395,12 +395,181 @@ function BatteryChart({ data, dark }: { data: StrategyResp; dark: boolean }) {
   );
 }
 
+/* ----------------------------- Matrix editor ----------------------------- */
+// The matrix is the plan, so this is the one place on the dashboard that
+// CHANGES the plan. Three rules it is built around:
+//
+//   1. Nothing is written until Apply. Typing, and filling from a row, move a
+//      draft the server has never seen.
+//   2. What Apply will change is listed in words first. A matrix edited at
+//      3 a.m. with the car on track is not the moment to discover that the
+//      anchor was the wrong row.
+//   3. The arithmetic is the SERVER's (energy_model.ladder_from_anchor). The
+//      browser sends the row somebody typed and draws what comes back — there
+//      is no second copy of the energy model in here to drift from the one the
+//      strategy engine plans with.
+
+/** "4:45" or "285" -> 285. Returns null for anything that is not a lap time. */
+function parseLap(text: string): number | null {
+  const t = text.trim();
+  if (!t) return null;
+  const parts = t.split(':');
+  if (parts.length > 2) return null;
+  const nums = parts.map((p) => Number(p));
+  if (nums.some((n) => !Number.isFinite(n) || n < 0)) return null;
+  const secs = parts.length === 2 ? nums[0] * 60 + nums[1] : nums[0];
+  return secs > 0 ? secs : null;
+}
+
+function lapText(seconds: number): string {
+  const m = Math.floor(seconds / 60);
+  const s = seconds - m * 60;
+  return m + ':' + (s < 10 ? '0' : '') + s.toFixed(s % 1 ? 1 : 0);
+}
+
+function MatrixEditor({ onSaved, onCancel }:
+  { onSaved: () => void; onCancel: () => void }) {
+  const [saved, setSaved] = useState<MatrixRow[] | null>(null);
+  const [draft, setDraft] = useState<Record<string, { lap: string; wh: string }>>({});
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    getJSON<MatrixResp>('/api/strategy/matrix').then((m) => {
+      setSaved(m.rows);
+      setDraft(Object.fromEntries(m.rows.map((r) =>
+        [r.key, { lap: lapText(r.target_s), wh: String(r.energy_wh) }])));
+    }).catch((e) => toast('Matrix unavailable: ' + e, 'err'));
+  }, []);
+
+  const set = (key: string, field: 'lap' | 'wh', value: string) =>
+    setDraft((d) => ({ ...d, [key]: { ...d[key], [field]: value } }));
+
+  const parsed = (r: MatrixRow) => ({
+    lap: parseLap(draft[r.key]?.lap ?? ''),
+    wh: Number(draft[r.key]?.wh),
+  });
+  const rowBad = (r: MatrixRow) => {
+    const p = parsed(r);
+    return p.lap == null || !Number.isFinite(p.wh) || p.wh <= 0;
+  };
+  const anyBad = (saved ?? []).some(rowBad);
+
+  // What Apply will write, in words. Same idea as the Profile Builder's diff:
+  // the crew reads the change, not the resulting table.
+  const changes = (saved ?? []).flatMap((r) => {
+    const p = parsed(r);
+    const out: string[] = [];
+    if (p.lap != null && Math.abs(p.lap - r.target_s) > 0.05)
+      out.push(r.label + ' lap ' + lapText(r.target_s) + ' → ' + lapText(p.lap));
+    if (Number.isFinite(p.wh) && Math.abs(p.wh - r.energy_wh) > 0.05)
+      out.push(r.label + ' ' + r.energy_wh.toFixed(1) + ' → ' + p.wh.toFixed(1) + ' Wh');
+    return out;
+  });
+
+  const fill = async (r: MatrixRow) => {
+    const p = parsed(r);
+    if (p.lap == null || !Number.isFinite(p.wh) || p.wh <= 0) {
+      toast('Give this row a lap time and a Wh first', 'err');
+      return;
+    }
+    setBusy(true);
+    try {
+      const out = await postJSON<{ rows: MatrixRow[] }>(
+        '/api/strategy/matrix/fill', { key: r.key, target_s: p.lap, energy_wh: p.wh });
+      setDraft(Object.fromEntries(out.rows.map((x) =>
+        [x.key, { lap: lapText(x.target_s), wh: String(x.energy_wh) }])));
+      toast('Filled the other rows from ' + r.label);
+    } catch (e) { toast('Fill failed: ' + e, 'err'); }
+    setBusy(false);
+  };
+
+  const apply = async () => {
+    if (!saved || anyBad) return;
+    setBusy(true);
+    try {
+      await postJSON('/api/strategy/matrix', {
+        rows: saved.map((r) => {
+          const p = parsed(r);
+          return { key: r.key, target_s: p.lap, energy_wh: p.wh };
+        }),
+      });
+      toast('Matrix updated — ' + changes.length + ' change(s), no restart needed');
+      onSaved();
+    } catch (e) { toast('Not saved: ' + e, 'err'); }
+    setBusy(false);
+  };
+
+  if (!saved) return <div className="card pad"><span className="muted">Loading the matrix…</span></div>;
+  return (
+    <div className="card pad">
+      <table className="tbl">
+        <thead><tr>
+          <th>Profile</th><th className="num">Lap time</th><th className="num">Wh / lap</th><th></th>
+        </tr></thead>
+        <tbody>
+          {saved.map((r) => (
+            <tr key={r.key}>
+              <td>{r.label}</td>
+              <td className="num">
+                <input value={draft[r.key]?.lap ?? ''} size={7} inputMode="decimal"
+                       onChange={(e) => set(r.key, 'lap', e.target.value)}
+                       style={{ width: 80, textAlign: 'right',
+                                borderColor: parsed(r).lap == null ? 'var(--pit-warning)' : undefined }} />
+              </td>
+              <td className="num">
+                <input value={draft[r.key]?.wh ?? ''} size={7} inputMode="decimal"
+                       onChange={(e) => set(r.key, 'wh', e.target.value)}
+                       style={{ width: 80, textAlign: 'right',
+                                borderColor: !(Number(draft[r.key]?.wh) > 0) ? 'var(--pit-warning)' : undefined }} />
+              </td>
+              <td>
+                <button className="btn" disabled={busy} onClick={() => fill(r)}
+                        title="Keep this row and rebuild the other four around it: lap times at the spacing the matrix already has, Wh from the rolling+drag model anchored here.">
+                  <Icon name="target" size={12} />Fill from this row
+                </button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <div className="caption" style={{ marginTop: 8 }}>
+        Lap time takes <code>4:45</code> or <code>285</code>. <b>Fill from this row</b> keeps the row you
+        typed and derives the rest: lap times keep the spacing this matrix already has, and Wh comes from
+        rolling + drag (<code>E = a·L + b·L³/t²</code>), not a flat percentage — slowing down saves less
+        than a percentage ladder claims, because rolling loss is paid per metre. One row cannot separate
+        the two terms, so drag is taken as ⅓ of that lap; two measured paces remove the assumption
+        (<code>energy_model.py --from-db</code>).
+      </div>
+      {changes.length > 0 && (
+        <div className="caption" style={{ marginTop: 6 }}>
+          <b>Apply will write:</b> {changes.join(' · ')}.
+        </div>
+      )}
+      <div className="btnrow" style={{ marginTop: 10 }}>
+        <button className="btn primary" onClick={apply} disabled={busy || anyBad || !changes.length}>
+          <Icon name="check" size={13} />Apply{changes.length ? ' (' + changes.length + ')' : ''}
+        </button>
+        <button className="btn" onClick={onCancel} disabled={busy}>Cancel</button>
+        <span className="caption">
+          {anyBad ? 'Every row needs a lap time and a Wh.'
+            : 'Writes Pit_Dashboard/constants.py (old copy kept in profiles/_backup/) and takes effect at the next poll. The car is not touched — it keeps flying the speed profile behind each key.'}
+        </span>
+      </div>
+    </div>
+  );
+}
+
 export function Strategy({ config, manualLap, dark, selected }:
   { config: Config; manualLap: number; dark: boolean;
     /** The profile the pit has already chosen, from the live feed, or
      *  undefined while nobody has chosen and the target is assumed. */
     selected?: string }) {
-  const { data } = usePoll(() => getJSON<StrategyResp>(`/api/strategy?manual_lap=${manualLap}`), 10000, [manualLap]);
+  // Bumped when the matrix is edited, so the plan is re-fetched at once
+  // instead of on the next 10 s tick — the edit is the one moment the crew is
+  // watching for the table to move.
+  const [matrixVersion, setMatrixVersion] = useState(0);
+  const [editing, setEditing] = useState(false);
+  const { data } = usePoll(() => getJSON<StrategyResp>(`/api/strategy?manual_lap=${manualLap}`), 10000, [manualLap, matrixVersion]);
   const [choice, setChoice] = useState(selected ?? config.defaultStrategyKey);
   // Adopt the stored selection ONCE, when the live feed first carries one. Not
   // on every poll: this tab can be open with the dropdown half-changed, and
@@ -411,16 +580,27 @@ export function Strategy({ config, manualLap, dark, selected }:
     if (!adopted.current && selected) { adopted.current = true; setChoice(selected); }
   }, [selected]);
   const [sent, setSent] = useState<string | null>(null);
+  const [sentId, setSentId] = useState<number | null>(null);
   const { data: ack } = usePoll(
-    () => getJSON<{ ack: { strategy?: string; applied?: boolean } | null }>('/api/strategy/ack'), 5000, [sent ?? '']);
+    () => getJSON<{ ack: { strategy?: string; applied?: boolean; id?: number } | null }>('/api/strategy/ack'), 5000, [sent ?? '']);
+  // Retained node: without the id this said "Car confirmed it is running X"
+  // from an ack the car wrote in a previous session.
+  const confirmed = !!ack?.ack?.applied && ack.ack.id != null && ack.ack.id === sentId;
 
   const send = async () => {
     try {
-      await postJSON('/api/strategy/select', { key: choice });
+      const r = await postJSON<{ id: number }>('/api/strategy/select', { key: choice });
+      setSentId(r.id);
       setSent(new Date().toLocaleTimeString());
-      toast(`Strategy sent: ${config.strategies.find((s) => s.key === choice)?.label ?? choice}`);
+      toast(`Strategy sent: ${profiles.find((s) => s.key === choice)?.label ?? choice}`);
     } catch (e) { toast(`Send failed: ${e}`, 'err'); }
   };
+
+  // The selector follows the matrix, not the page-load config: edit a lap
+  // time and the name beside it stops being true within one poll.
+  const profiles = (data?.matrix ?? config.strategies.map((s) => ({
+    key: s.key, label: s.label, target_s: s.lap_time_min * 60, energy_wh: s.energy_wh,
+  }))).map((s) => ({ key: s.key, label: s.label, lap: lapText(s.target_s) }));
 
   const cols = data?.rows.length ? Object.keys(data.rows[0]) : [];
   const isNum = (v: unknown) => typeof v === 'number';
@@ -431,7 +611,7 @@ export function Strategy({ config, manualLap, dark, selected }:
       <div className="card pad">
         <div className="btnrow">
           <select value={choice} onChange={(e) => setChoice(e.target.value)} style={{ maxWidth: 300 }}>
-            {config.strategies.map((s) => <option key={s.key} value={s.key}>{s.label}</option>)}
+            {profiles.map((s) => <option key={s.key} value={s.key}>{s.label} · {s.lap}</option>)}
           </select>
           <button className="btn primary" onClick={send}><Icon name="send" size={13} />Send to car</button>
         </div>
@@ -440,8 +620,8 @@ export function Strategy({ config, manualLap, dark, selected }:
             the car disagrees, this caption is where the crew sees it. */}
         <div className="caption">
           {sent
-            ? (ack?.ack?.applied
-                ? `Car confirmed it is running ${ack.ack.strategy ?? '(profile not named)'} · sent ${sent}`
+            ? (confirmed
+                ? `Car confirmed it is running ${ack?.ack?.strategy ?? '(profile not named)'} · sent ${sent}`
                 : `Sent ${sent} — awaiting the car's confirmation. This changes the driver's target speed and corner warnings.`)
             : `Only the profile name is sent; the car holds all five profiles. Sending also sets the pit's own target speed${selected ? ` — now ${selected}` : ', which is assumed until you send one'}.`}
         </div>
@@ -449,6 +629,17 @@ export function Strategy({ config, manualLap, dark, selected }:
 
       <SectionTitle icon="table" title="Strategy matrix"
                     right={data ? `${data.timeLeftMin.toFixed(0)} min remaining · max ${data.maxStops} charges (regulation) · each at least ${data.minStopMin.toFixed(0)} min` : undefined} />
+      <div className="btnrow" style={{ marginBottom: 8 }}>
+        <button className="btn" onClick={() => setEditing((v) => !v)}>
+          <Icon name="sliders" size={13} />{editing ? 'Close editor' : 'Edit matrix'}
+        </button>
+        {!editing && <span className="caption">Lap time and Wh per lap, edited here and live at the next poll — no restart.</span>}
+      </div>
+      {editing && (
+        <MatrixEditor
+          onSaved={() => { setEditing(false); setMatrixVersion((v) => v + 1); }}
+          onCancel={() => setEditing(false)} />
+      )}
       {data?.assumedFullPack && (
         <Pill kind="warn">
           Assuming a full pack / lap 0{data.missing.length ? ` — no ${data.missing.join(' or ')} from the car yet` : ''}.
@@ -465,7 +656,13 @@ export function Strategy({ config, manualLap, dark, selected }:
                   <td key={c} className={isNum(r[c]) ? 'num' : ''}>
                     {String(r[c])}
                     {c === 'Energy/Lap (Wh)' && data?.measured[String(r.Label)] != null
-                      ? <span className="measured-tag" title={`median of ${data.measured[String(r.Label)]} laps the car drove on this profile`}>measured</span>
+                      ? <span className={Math.abs(data.measured[String(r.Label)].wh - data.measured[String(r.Label)].storedWh)
+                                         > 0.1 * data.measured[String(r.Label)].storedWh ? 'limit-tag' : 'measured-tag'}
+                              title={`the matrix plans ${data.measured[String(r.Label)].storedWh.toFixed(1)} Wh here; `
+                                   + `${data.measured[String(r.Label)].laps} laps the car drove on this profile cost `
+                                   + `${data.measured[String(r.Label)].wh.toFixed(1)} Wh (median). The table shows the matrix.`}>
+                          car: {data.measured[String(r.Label)].wh.toFixed(0)}
+                        </span>
                       : null}
                     {c === 'Pit Strategy' && String(r[c]).includes('limit')
                       ? <span className="limit-tag" title="All 3 charges the regulations allow were used and the car then sat idle long enough that another would have fitted. A 4th charge is not an option: it ranks the car behind every car that charged 3 times.">stop-limited</span>
@@ -483,9 +680,13 @@ export function Strategy({ config, manualLap, dark, selected }:
           stints". */}
       {data && (
         <div className="caption" style={{ marginTop: 8 }}>
-          {measuredLabels.length
-            ? <><span className="ok-text">Energy per lap measured from the car</span> for {measuredLabels.map((l) => `${l} (${data.measured[l]} laps)`).join(', ')}. The rest are estimates.</>
-            : <><span className="warn-text">Energy per lap is estimated</span> — no profile has {data.minLapsForMeasured} completed laps yet. These become measurements once one does.</>}
+          <>Energy per lap is <b>the matrix as the crew set it</b> — it changes when someone changes it, not when a stint is logged.{' '}
+            {measuredLabels.length
+              ? <>What the car actually paid: {measuredLabels.map((l) => `${l} ${data.measured[l].wh.toFixed(1)} Wh over ${data.measured[l].laps} laps (matrix: ${data.measured[l].storedWh.toFixed(1)})`).join('; ')}.{' '}
+                  {measuredLabels.some((l) => Math.abs(data.measured[l].wh - data.measured[l].storedWh) > 0.1 * data.measured[l].storedWh)
+                    ? <span className="warn-text">That is more than 10% off the plan — worth re-costing the matrix.</span>
+                    : <span className="ok-text">Within 10% of the plan.</span>}</>
+              : <>No profile has {data.minLapsForMeasured} completed laps yet, so there is nothing to compare it against.</>}</>
         </div>
       )}
       {data && (
@@ -616,20 +817,28 @@ export function Cells() {
 
 export function TripReset() {
   const [sent, setSent] = useState<string | null>(null);
+  const [sentId, setSentId] = useState<number | null>(null);
   const { data: ack } = usePoll(
-    () => getJSON<{ ack: { applied?: boolean; action?: string } | null }>('/api/trip_reset/ack'), 5000, [sent ?? '']);
+    () => getJSON<{ ack: { applied?: boolean; action?: string; id?: number } | null }>('/api/trip_reset/ack'), 5000, [sent ?? '']);
+  // The ack node is shared with the lap commands AND retained, so this used to
+  // read a Cut Lap ack from hours earlier as "trip reset confirmed". Match the
+  // id the send returned, and the action.
+  const confirmed = !!ack?.ack?.applied && ack.ack.action === 'reset_trip'
+    && ack.ack.id != null && ack.ack.id === sentId;
   return (
     <div className="card pad" style={{ marginTop: 8 }}>
       <div className="btnrow">
         <button className="btn" onClick={async () => {
           try {
-            setSent((await postJSON<{ sentAt: string }>('/api/trip_reset', {})).sentAt);
+            const r = await postJSON<{ sentAt: string; id: number }>('/api/trip_reset', {});
+            setSentId(r.id);
+            setSent(r.sentAt);
             toast('Trip reset sent to the car');
           } catch (e) { toast(`Trip reset failed: ${e}`, 'err'); }
         }}><Icon name="history" size={13} />Reset trip</button>
         <span className="caption" style={{ margin: 0 }}>
           {sent
-            ? (ack?.ack?.applied ? `Car confirmed — trip reset · sent ${sent}` : `Sent ${sent} — awaiting the car's confirmation.`)
+            ? (confirmed ? `Car confirmed — trip reset · sent ${sent}` : `Sent ${sent} — awaiting the car's confirmation.`)
             : "Zeroes the car's Trip distance. Does not touch the controller's odometer, lap count or energy."}
         </span>
       </div>

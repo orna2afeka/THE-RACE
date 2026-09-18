@@ -135,6 +135,31 @@ function RaceClock({ race, clockOffsetMs }: { race: Live['race'] | undefined; cl
   );
 }
 
+/** The driver's lap clock, on the pit wall.
+ *
+ *  Counts from the instant the car says the lap began, so it matches the
+ *  stopwatch on the HUD rather than being a second, slightly different
+ *  measurement of the same thing. It FREEZES when the car goes quiet: a clock
+ *  still running through a dead link reports a long lap, which is not what has
+ *  happened. */
+function LapClock({ live, clockOffsetMs }: { live: Live | null | undefined; clockOffsetMs: number }) {
+  const lc = live?.lapClock;
+  const started = lc?.startedAt ?? null;
+  const serverNowS = useAlignedServerNow(clockOffsetMs, live?.fresh ? started : null);
+  const elapsed = started === null ? null
+    : (live?.fresh ? serverNowS - started : lc?.atSampleS ?? null);
+  const held = !!started && !live?.fresh;
+  return (
+    <div className={`clock lap${held ? ' held' : ''}`}
+         title={lc?.source === 'store'
+           ? 'Estimated from the earliest sample the pit holds for this lap — it can read short. The car itself reports the exact datum once it is running code that sends lap_started_ts.'
+           : "The car's own lap datum — the same one the driver's stopwatch counts from."}>
+      <span className="k">{held ? 'Lap clock · held' : 'Lap clock'}</span>
+      <span className="v">{elapsed === null ? '--:--' : hms(Math.max(0, Math.floor(elapsed)))}</span>
+    </div>
+  );
+}
+
 export default function App() {
   const { config, error } = useConfig();
   const [tab, setTab] = useStored<Tab>('pit.tab', 'Driver Telemetry', (v) => TAB_NAMES.includes(v));
@@ -207,6 +232,8 @@ export default function App() {
           <RaceClock race={race} clockOffsetMs={clockOffsetMs} />
           <span className="clock-sep" />
           <StintClock stint={live?.driverStint} clockOffsetMs={clockOffsetMs} />
+          <span className="clock-sep" />
+          <LapClock live={live} clockOffsetMs={clockOffsetMs} />
         </div>
         <div className="bar-right">
           <StatusPill link={link} live={live} silentS={silentS} />
