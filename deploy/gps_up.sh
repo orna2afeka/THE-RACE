@@ -53,19 +53,7 @@ fi
 index=${modem##*/}
 log "modem $index found"
 
-# ── 2. Start the GNSS engine ─────────────────────────────────────────────── #
-if "$MMCLI" -m "$index" --location-status 2>/dev/null | grep -q "gps-unmanaged"; then
-    if "$MMCLI" -m "$index" --location-status 2>/dev/null |
-            grep -A1 "enabled:" | grep -q "gps-unmanaged"; then
-        log "GNSS already enabled"
-    else
-        "$MMCLI" -m "$index" --location-enable-gps-unmanaged 2>&1 | sed 's/^/[gps-up] /'
-    fi
-else
-    log "modem reports no gps-unmanaged capability — skipping GNSS enable"
-fi
-
-# ── 3. Find the NMEA port and give it to gpsd ────────────────────────────── #
+# ── 2. Find the NMEA port ────────────────────────────────────────────────── #
 # Asked, not assumed: the node is ttyUSB1 on this module today, but the index
 # depends on enumeration order, and a wrong path fails exactly like a dead
 # receiver. ModemManager already knows which port is the GPS one.
@@ -73,8 +61,8 @@ port=$("$MMCLI" -m "$index" -K 2>/dev/null |
        awk -F': ' '/ports.value/ && /\(gps\)/ {print $2}' |
        awk '{print $1}' | head -1)
 if [ -z "$port" ]; then
-    log "ModemManager reports no (gps) port — leaving gpsd alone"
-    exit 0
+    log "ModemManager reports no (gps) port — cannot continue"
+    exit 1
 fi
 dev="/dev/$port"
 log "GNSS NMEA port is $dev"
@@ -85,9 +73,62 @@ for _ in $(seq 1 10); do
 done
 if [ ! -c "$dev" ]; then
     log "$dev never appeared"
-    exit 0
+    exit 1
 fi
 
-# gpsdctl add is idempotent — gpsd ignores a device it already holds.
+# ── 3. Start the GNSS engine, and VERIFY IT BY ITS OUTPUT ────────────────── #
+#
+# Not by what ModemManager reports. MM's location-status is its own bookkeeping
+# and it goes out of step with the module in both directions:
+#
+#   • Restart MM and its record resets to "disabled" while the module's GNSS
+#     engine is still running — the module keeps its GNSS session across an MM
+#     restart, and answers the next start command with a plain ERROR, which MM
+#     surfaces as a bare "Unknown error".
+#   • So a FAILED enable does not mean GNSS is off, and a successful one would
+#     not prove bytes are moving either.
+#
+# The wire settles it. Attempt the enable, ignore what it claims, then look for
+# an NMEA sentence. If the port is silent, resync MM with the module (disable,
+# pause, enable) and look again — and if it is still silent, exit non-zero so
+# systemd retries and `systemctl status` says so, instead of showing green over
+# a GPS that will never fix.
+#
+# gpsd is taken OFF the port first: it reads in a tight loop and would starve
+# this check of the very bytes it is looking for. It gets the port back at the
+# end — which is also the step that registers it in the first place.
+"$GPSDCTL" remove "$dev" >/dev/null 2>&1 || true
+
+nmea_flowing() {
+    # A live receiver emits a sentence about once a second; 8 s is generous
+    # even for a module that has only just been told to start.
+    timeout 8 grep -m1 -q '^\$G' "$dev" 2>/dev/null
+}
+
+"$MMCLI" -m "$index" --location-enable-gps-unmanaged 2>&1 | sed 's/^/[gps-up] /'
+
+status=0
+if nmea_flowing; then
+    log "NMEA confirmed on $dev"
+else
+    log "no NMEA after enable — resyncing ModemManager with the module"
+    "$MMCLI" -m "$index" --location-disable-gps-unmanaged 2>&1 | sed 's/^/[gps-up] /'
+    sleep 3
+    "$MMCLI" -m "$index" --location-enable-gps-unmanaged 2>&1 | sed 's/^/[gps-up] /'
+    if nmea_flowing; then
+        log "NMEA confirmed on $dev after resync"
+    else
+        log "FAILED: $dev is silent — the GNSS engine did not start"
+        status=1
+    fi
+fi
+
+# ── 4. Give the port to gpsd ─────────────────────────────────────────────── #
+# This is the step gpsd cannot do for itself: it starts at boot, fails to open
+# its configured DEVICES= because the modem has not enumerated yet, and frees
+# it; its hot-add udev rule only matches known GPS vendor IDs, and a SimTech
+# modem is not one. Done even when the check above failed — if the engine comes
+# up later, gpsd is then already listening. gpsdctl add is idempotent.
 "$GPSDCTL" add "$dev" 2>&1 | sed 's/^/[gps-up] /'
 log "handed $dev to gpsd"
+exit $status
