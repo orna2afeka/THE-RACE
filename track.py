@@ -111,9 +111,14 @@ GATE_RIGHT_M = 30.0
 
 # Surveyed gate ends, (lat, lon), LEFT end then RIGHT end as the driver sees
 # them. None = derive the gate from FINISH_LINE_LAT/LON and the numbers above.
-# ⚠️ Walk these on site. FINISH_LINE_LAT/LON came off a map, and with the box a
-# few tens of metres before the line, an error of that size decides whether the
-# pit exit crosses the gate or starts beyond it.
+#
+# CHECKED ON SITE, 2026-09-18. A pin dropped on the painted start/finish line at
+# the pit wall (50.9891047, 5.2556404) lands 0.0 m along the track from
+# FINISH_LINE_LAT/LON and 11 m to its right — on the derived gate, between the
+# track and the pit lane, exactly where the wall is. So the derived gate stands
+# and these stay None. The same survey put our box 35-40 m PAST the line
+# (garage front 50.9890066, 5.2551452 .. 50.9889811, 5.2550858, 21 m right):
+# coming in, the car passes the gate in the pit lane BEFORE it stops.
 GATE_LEFT_LATLON = None
 GATE_RIGHT_LATLON = None
 
