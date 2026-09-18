@@ -151,6 +151,25 @@ Three independent things to look at, in this order:
 `NET` green with `PIT` red is the specific failure the badges exist to catch: a
 perfectly good internet connection and a dead uplink.
 
+### ☐ Confirm the GPS is actually receiving — not just that the modem is online
+
+The receiver is the GNSS engine inside the SIM7600 modem, and the modem being
+connected says nothing about it: LTE can sit at 100% signal while GNSS is switched
+off and gpsd holds no device at all. That combination is silent — the HUD simply
+never shows a position.
+
+```bash
+systemctl status gps-up      # active (exited), "handed /dev/ttyUSBx to gpsd"
+gpspipe -w -n 5              # TPV reports, not just VERSION
+```
+
+Or read the two `🛰️` lines `main.py` prints at startup. `searching for
+satellites` with a device named on the hardware line means the chain is healthy
+and only sky view is missing; `gpsd: NO device` or `no USB/serial port` is a
+setup fault to fix before rolling out. **Take the car outside and wait for a
+real fix before the race** — the GNSS antenna connector is separate from the
+LTE ones, and a loose one looks exactly like being parked indoors.
+
 ### ☐ Check GPS lap detection — **unproven, watch it**
 
 No lap in the store has ever been GPS-triggered: every lap boundary so far came

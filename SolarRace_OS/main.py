@@ -357,6 +357,10 @@ class SmartCANWorker(CANWorker):
         self._last_gps_publish = 0.0
         self._last_heartbeat = 0.0
         self._last_gps_log = ""
+        # Same change-only logging as _last_gps_log, for the receiver-hardware
+        # debug line: it must appear the moment a GPS is plugged in or drops
+        # off, and never once a second in between.
+        self._last_gps_hw_log = ""
 
     def run(self) -> None:
         """QThread entry point — runs the read loop with GUARANTEED teardown.
@@ -433,8 +437,19 @@ class SmartCANWorker(CANWorker):
         # CAN: GPS keeps working (and keeps reaching the pit) even if the bus
         # never opens.
         self.gps.start()
-        self._last_gps_log = self.gps.status()
+        # Give the reader its first round trip to gpsd before reporting, so
+        # both lines below state what IS rather than "connecting...". Bounded
+        # at 1 s, and only paid in full when gpsd is down — which is itself
+        # what the lines then say.
+        self.gps.wait_for_devices(1.0)
+        self._last_gps_log = self.gps.log_line()
         print(f"🛰️ {self._last_gps_log}")
+        # The receiver itself, not the fix: gpsd's device list next to the
+        # kernel's serial ports. Printed at startup (and again below whenever
+        # it changes) because "no fix" has three very different causes and
+        # this line is the one that says which — see GPSReader.hardware().
+        self._last_gps_hw_log = self.gps.hardware()
+        print(f"🛰️ {self._last_gps_hw_log}")
         print(f"🏁 {track.TRACK_LENGTH_METERS:.0f} m lap, finish line "
               f"{track.FINISH_LINE_LAT:.6f}, {track.FINISH_LINE_LON:.6f}")
 
@@ -1092,10 +1107,21 @@ class SmartCANWorker(CANWorker):
 
         # Log GPS state only when the summary changes, so the console shows the
         # moment a fix is acquired or lost without scrolling every second.
-        status = self.gps.status()
+        # log_line(), not status(): status() carries the fix age and report
+        # count, which change on every pass — logging it "only when it changes"
+        # would print twice a second forever. The state transitions are the
+        # thing worth a line; the numbers live in the health payload below.
+        status = self.gps.log_line()
         if status != self._last_gps_log:
             self._last_gps_log = status
             print(f"🛰️ {status}")
+
+        # And the hardware behind it, on the same change-only terms: a receiver
+        # plugged in mid-race, or a device gpsd has just lost, shows up here.
+        hardware = self.gps.hardware()
+        if hardware != self._last_gps_hw_log:
+            self._last_gps_hw_log = hardware
+            print(f"🛰️ {hardware}")
 
         # Only push when we actually have a position. Without this guard a Pi
         # left powered with the car off would write an all-empty payload to

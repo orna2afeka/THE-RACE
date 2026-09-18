@@ -40,6 +40,43 @@ gpspipe -w -n 5          # should print JSON
 `/dev/ttyUSB1` is not stable across reboots. Once it works, switch to the fixed
 name from `ls -l /dev/serial/by-id/` so a re-enumeration cannot break GPS.
 
+**This car's GPS is inside the LTE modem**, and gpsd alone is not enough for it.
+The receiver is the GNSS engine of the SIMCom SIM7600G-H, which means two extra
+things have to happen at every boot — neither of which reports an error when it
+does not:
+
+1. **The GNSS engine starts switched off.** The modem enumerates, LTE connects,
+   `mmcli -m 0` says `state: connected` — and the NMEA port emits nothing,
+   because GNSS is a separate subsystem nobody has started. `mmcli -m 0
+   --location-status` showing `enabled: 3gpp-lac-ci` with no `gps-*` entry is
+   what that looks like.
+2. **gpsd never learns the port exists.** gpsd starts at boot; the modem's
+   ttyUSB nodes appear ~20 s later, by which time gpsd has failed to open
+   `DEVICES=` and freed it. gpsd's hot-add udev rule only matches known GPS
+   vendor IDs, and a SimTech modem is not one, so nothing adds it back.
+
+`gps-up.service` does both, after ModemManager and gpsd are up:
+
+```bash
+sudo cp ~/Desktop/THE-RACE-main/deploy/gps-up.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now gps-up.service
+systemctl status gps-up            # ends with "handed /dev/ttyUSBx to gpsd"
+gpspipe -w -n 5                    # now prints JSON with TPV reports
+```
+
+It asks ModemManager which port is the GPS one rather than assuming `ttyUSB1`,
+so a re-enumeration cannot point it at the modem's AT port instead. Re-running
+it is harmless. On a car with a plain USB GPS dongle this unit is unnecessary —
+gpsd's own udev rule handles those.
+
+**Diagnosing "no fix":** start `main.py` and read its two `🛰️` lines. The
+hardware line names gpsd's device AND the kernel's serial ports, which is what
+separates the three causes — nothing enumerated (receiver unplugged), ports
+present but gpsd holding none (wrong `DEVICES=`, or this unit did not run), or
+gpsd reading the port fine (then it is antenna or sky view; note the SIM7600's
+GNSS antenna connector is SEPARATE from its LTE MAIN/AUX ones).
+
 ### 3. Python environment
 
 Bookworm marks the system Python "externally managed" (PEP 668), so `pip
@@ -277,6 +314,11 @@ sudo apt install -y gpsd gpsd-clients can-utils python3-gpiozero python3-lgpio
 # 2. GPS — point gpsd at your receiver
 sudo nano /etc/default/gpsd        # DEVICES="/dev/ttyUSB1"   GPSD_OPTIONS="-n"
 sudo systemctl enable --now gpsd.socket gpsd
+# GPS lives inside the SIM7600 modem: its GNSS engine boots OFF and gpsd never
+# sees the port on its own. This unit fixes both — see section 2 above.
+sudo cp deploy/gps-up.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now gps-up.service
 gpspipe -w -n 5                     # must print JSON
 
 # 3. Python (Bookworm blocks system pip — venv required)
