@@ -324,9 +324,21 @@ export default function History({ config, dark, visible, fresh, age }: Props) {
 
 // --------------------------------------------------------------------------- //
 interface LapsResp {
-  laps: { lap: number; energyWh: Num; lapTimeS: Num; distanceM: Num }[];
-  summary: { count: number; bestS: Num; avgS: Num; avgWh: Num };
+  /** kind is the CAR's verdict; null from a car that predates it. */
+  laps: { lap: number; energyWh: Num; lapTimeS: Num; distanceM: Num;
+          kind: string | null; flags: string[]; source: string | null;
+          stoppedS: Num }[];
+  summary: { count: number; flyingCount: number; bestS: Num; avgS: Num; avgWh: Num };
 }
+
+// Flying laps keep the chart's own colours; everything else is drawn muted, so
+// a 15-minute in-lap reads as "pit stop" and not as the race falling apart.
+const KIND_NAME: Record<string, string> = {
+  flying: 'flying', in: 'in-lap', out: 'out-lap', in_out: 'in + out',
+  start: 'not from the line', suspect: 'suspect',
+};
+const MUTED = '#8a93a6';
+const counts = (kind: string | null) => kind === null || kind === 'flying';
 
 function LapCharts({ dark, visible }: { dark: boolean; visible: boolean }) {
   const { data } = usePoll(() => getJSON<LapsResp>('/api/laps'), 10000, [], visible);
@@ -339,11 +351,18 @@ function LapCharts({ dark, visible }: { dark: boolean; visible: boolean }) {
   // object every 10 s, and redrawing identical data on that cadence is what
   // froze the page.
   const last = data?.laps.length ? data.laps[data.laps.length - 1] : null;
-  const sig = data ? `${data.laps.length}:${last?.lap}:${last?.energyWh}:${last?.lapTimeS}` : '';
+  const sig = data ? `${data.laps.length}:${last?.lap}:${last?.energyWh}:${last?.lapTimeS}:${last?.kind}` : '';
 
   useEffect(() => {
     if (!data?.laps.length || !eRef.current || !tRef.current) return;
-    const laps = data.laps.map((l) => l.lap);
+    // Lap NUMBERS repeat (a counter reset, a pit correction), and a repeated x
+    // stacks two laps on one bar. Use them only while they strictly increase.
+    const increasing = data.laps.every((l, i) => i === 0 || l.lap > data.laps[i - 1].lap);
+    const laps = data.laps.map((l, i) => (increasing ? l.lap : i + 1));
+    const note = data.laps.map((l) =>
+      `lap ${l.lap}${l.kind ? ' · ' + (KIND_NAME[l.kind] ?? l.kind) : ''}` +
+      `${l.stoppedS !== null && l.stoppedS >= 10 ? ` · stood ${Math.round(l.stoppedS)} s` : ''}` +
+      `${l.flags.length ? ' · ' + l.flags.join(', ') : ''}`);
     // One label per lap (dtick: 1) made Plotly measure hundreds of labels: 358
     // laps took 4.5-5.4 s to draw, against 54 ms with a coarser step. About a
     // dozen integer labels, whatever the lap count.
@@ -352,8 +371,9 @@ function LapCharts({ dark, visible }: { dark: boolean; visible: boolean }) {
     const t = theme(dark);
     void Plotly.newPlot(eRef.current, [{
       type: 'bar', x: laps, y: data.laps.map((l) => l.energyWh),
-      marker: { color: '#00B3FF', line: { width: 0 } }, width: 0.55,
-      hovertemplate: '%{y:.1f} Wh<extra>lap %{x}</extra>',
+      marker: { color: data.laps.map((l) => (counts(l.kind) ? '#00B3FF' : MUTED)),
+                line: { width: 0 } }, width: 0.55,
+      customdata: note, hovertemplate: '%{y:.1f} Wh<extra>%{customdata}</extra>',
     }], { ...base, margin: { l: 50, r: 12, t: 8, b: 36 }, bargap: 0.4,
           xaxis: { ...base.xaxis, title: { text: 'lap', font: { size: 11, color: t.ink3 } }, dtick },
           showlegend: false }, plotConfig);
@@ -361,8 +381,9 @@ function LapCharts({ dark, visible }: { dark: boolean; visible: boolean }) {
       type: 'scatter', mode: 'lines+markers', x: laps,
       y: data.laps.map((l) => (l.lapTimeS === null ? null : l.lapTimeS / 60)),
       connectgaps: false, line: { color: '#00e0b4', width: 2 },
-      marker: { size: 8, color: '#00e0b4', line: { width: 2, color: t.card } },
-      hovertemplate: '%{y:.2f} min<extra>lap %{x}</extra>',
+      marker: { size: 8, color: data.laps.map((l) => (counts(l.kind) ? '#00e0b4' : MUTED)),
+                line: { width: 2, color: t.card } },
+      customdata: note, hovertemplate: '%{y:.2f} min<extra>%{customdata}</extra>',
     }], { ...base, margin: { l: 50, r: 12, t: 8, b: 36 },
           xaxis: { ...base.xaxis, title: { text: 'lap', font: { size: 11, color: t.ink3 } }, dtick },
           showlegend: false }, plotConfig);
@@ -380,11 +401,19 @@ function LapCharts({ dark, visible }: { dark: boolean; visible: boolean }) {
               <div><div className="caption">Lap time (minutes)</div><div ref={tRef} /></div>
             </div>
             <div className="kv" style={{ gridTemplateColumns: 'repeat(4, 1fr)', marginTop: 10 }}>
-              <div><div className="k">Laps recorded</div><div className="v">{data.summary.count}</div></div>
+              <div><div className="k">Laps recorded</div><div className="v">{data.summary.count}
+                {data.summary.flyingCount !== data.summary.count &&
+                  <span className="caption"> · {data.summary.flyingCount} flying</span>}</div></div>
               <div><div className="k">Best lap</div><div className="v mono">{lapTime(data.summary.bestS)}</div></div>
               <div><div className="k">Average lap</div><div className="v mono">{lapTime(data.summary.avgS)}</div></div>
               <div><div className="k">Average Wh / lap</div><div className="v mono">{fmtStat(data.summary.avgWh)}</div></div>
             </div>
+            {data.summary.flyingCount !== data.summary.count && (
+              <div className="caption" style={{ marginTop: 6 }}>
+                Best and averages use flying laps only. In-laps, out-laps and laps the car
+                marked suspect are drawn grey — hover one to see why.
+              </div>
+            )}
           </>
         )}
     </Disclosure>

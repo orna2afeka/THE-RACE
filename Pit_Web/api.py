@@ -183,6 +183,11 @@ _STATE_COLUMNS = {
     "last_lap_regen_energy": "last_lap_regen_energy",
     "stint_energy": "stint_energy", "stint_regen_energy": "stint_regen_energy",
     "last_lap_time_s": "last_lap_time_s", "lap_distance_m": "lap_distance_m",
+    # The car's own lap tags (gate-based tracker). last_lap_kind and
+    # last_lap_stopped_s describe a FINISHED lap, which stays true however old
+    # the row is, so they carry forward. current_lap too.
+    "last_lap_kind": "last_lap_kind", "last_lap_flags": "last_lap_flags",
+    "last_lap_stopped_s": "last_lap_stopped_s", "current_lap": "current_lap",
     # Road speed comes from ONE place: the controller's own field on 0x610, the
     # same one the driver HUD reads. NO fallback to a value derived from RPM.
     "speed_kmh": "mms_vehicle_speed_kmh",
@@ -194,7 +199,9 @@ _STATE_COLUMNS = {
 
 # Not carried forward, deliberately:
 #   lap_source is only meaningful paired with the lap that just happened.
-_NO_CARRY_FORWARD = {"lap_source"}
+#   zone and track_pos_m answer "where is the car NOW"; a carried-forward
+#   "track" while the car sits in its box is a wrong answer, not an old one.
+_NO_CARRY_FORWARD = {"lap_source", "zone", "track_pos_m"}
 
 
 def read_live_state(conn):
@@ -218,6 +225,7 @@ def read_live_state(conn):
         "motor_map": None, "throttle_zone": None,
         "batt_temp": None,
         "lap_source": None, "auto_lap": None, "odometer_km": None,
+        "zone": None, "track_pos_m": None,
         # lat/lon fall back to the Zolder paddock so the map has somewhere to
         # centre. has_gps says whether the pin is REAL: 0,0 is a real place in
         # the Atlantic, and a placeholder must never be mistakable for a fix.
@@ -255,6 +263,8 @@ def read_live_state(conn):
     state["motor_map"] = cf("motor_map", "mms_motor_map")
     state["motor_map_raw"] = cf("motor_map_raw", "mms_motor_map_raw")
     state["lap_source"] = _val(row, "lap_source", None)
+    state["zone"] = _val(row, "zone", None)
+    state["track_pos_m"] = _val(row, "track_pos_m", None)
 
     # Prefer the zone the CAR classified — what the driver's bar actually
     # showed. Fall back to classifying here only for rows written before the
@@ -891,9 +901,18 @@ def build_live(conn, manual_lap=-1):
     # Prefer the car's own "metres since the last lap trigger". Once laps are
     # cut at the GPS finish line, odometer % 4000 no longer lines up with the
     # real boundary and the sector display drifts further out of step each lap.
+    #
+    # Better still is the car's GPS lap position, which cannot be out of phase
+    # with the track at all. And lap_distance_m is CLAMPED, not wrapped: it runs
+    # past 4000 m whenever the car is waiting for a lap trigger (a virtual
+    # crossing fires up to 400 m late), and "% 4000" turned those metres into
+    # "Sector 1, Start - Turn 1" while the car was still in the last chicane.
     odo_km = state["odometer_km"]
-    if state["lap_distance_m"] is not None:
-        lap_dist = float(state["lap_distance_m"]) % C.TRACK_LENGTH_METERS
+    if state.get("track_pos_m") is not None:
+        lap_dist = float(state["track_pos_m"]) % C.TRACK_LENGTH_METERS
+    elif state["lap_distance_m"] is not None:
+        lap_dist = min(max(float(state["lap_distance_m"]), 0.0),
+                       C.TRACK_LENGTH_METERS - 1.0)
     elif odo_km is not None:
         lap_dist = (odo_km * 1000.0) % C.TRACK_LENGTH_METERS
     else:
@@ -1392,16 +1411,24 @@ def api_laps():
     computed each lap's energy and time when it cut the lap, so a dropped
     telemetry link cannot punch holes in these charts."""
     with closing(ro_conn()) as conn:
-        rows = db.fetch_lap_summary(conn)
+        rows = db.fetch_laps(conn)
+    # `kind` is the car's own verdict: flying | in | out | in_out | start |
+    # suspect, or None from a car that predates it. Every lap is LISTED; only
+    # flying laps feed best / average, because an in-lap's time holds a pit
+    # stop and an out-lap starts from the pit lane.
     laps = [{"lap": r["lap"], "energyWh": r["energy_wh"],
-             "lapTimeS": r["lap_time_s"], "distanceM": r["distance_m"]}
+             "lapTimeS": r["lap_time_s"], "distanceM": r["distance_m"],
+             "kind": r["kind"], "flags": r["flags"], "source": r["lap_source"],
+             "stoppedS": r["stopped_s"], "finishedTs": r["finished_ts"]}
             for r in rows]
-    times = [l["lapTimeS"] for l in laps if l["lapTimeS"]]
-    energy = [l["energyWh"] for l in laps if l["energyWh"] is not None]
+    flying = db.flying_laps(rows)
+    times = [r["lap_time_s"] for r in flying if r["lap_time_s"]]
+    energy = [r["energy_wh"] for r in flying if r["energy_wh"] is not None]
     return {
         "laps": laps,
         "summary": {
             "count": len(laps),
+            "flyingCount": len(flying),
             "bestS": min(times) if times else None,
             "avgS": (sum(times) / len(times)) if times else None,
             "avgWh": (sum(energy) / len(energy)) if energy else None,
@@ -2528,16 +2555,11 @@ class LapSetBody(BaseModel):
 
 @app.post("/api/lap/set")
 def api_lap_set(body: LapSetBody):
-    """Start a FRESH lap on the car without counting one.
+    """Correct the car's lap NUMBER, e.g. to match the officials' count.
 
-    The pit-exit command. /api/cut_lap re-datums as well, but it records the
-    partial as a real lap -- part-lap time, part-lap energy, and one more on
-    the counter -- and those go on to feed the per-lap history and the
-    strategy matrix. This re-datums distance, energy and the lap clock and
-    records nothing.
-
-    `lap` is what the count should READ afterwards, not an increment. The UI
-    sends the count the car is already on, so a pit exit leaves it alone.
+    `lap` is what the count should READ afterwards, not an increment. With the
+    gate-based tracker this changes the number and nothing else; starting a
+    fresh lap is /api/lap/restart.
     """
     if body.lap < 0:
         raise HTTPException(400, "lap must be 0 or more")
@@ -2547,6 +2569,22 @@ def api_lap_set(body: LapSetBody):
     except Exception as e:
         raise HTTPException(502, "set lap failed: %s" % e)
     return {"ok": True, "lap": body.lap, "sentAt": time.strftime("%H:%M:%S")}
+
+
+@app.post("/api/lap/restart")
+def api_lap_restart():
+    """Start a FRESH lap on the car without counting one.
+
+    For a lap that has to be thrown away. NOT a pit-stop button: the car closes
+    the in-lap itself when it passes the line in the pit lane. The lap number
+    is not touched -- /api/lap/set corrects that, and nothing else.
+    """
+    import driver_message
+    try:
+        driver_message.send_lap_restart()
+    except Exception as e:
+        raise HTTPException(502, "restart lap failed: %s" % e)
+    return {"ok": True, "sentAt": time.strftime("%H:%M:%S")}
 
 
 @app.get("/api/cut_lap/ack")

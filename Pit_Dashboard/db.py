@@ -198,6 +198,26 @@ METRIC_COLUMNS = [
     # from twenty minutes ago while the car is a kilometre down the track. Any
     # consumer that draws the position must gate on this.
     "gps_age_s",
+
+    # --- Laps, as the car's gate-based tracker tags them ------------------ #
+    # (SolarRace_OS/modules/lap_tracker.py). All NULL on rows from a car that
+    # predates them; every consumer must cope with that.
+    #
+    # calculated_lap is laps COMPLETED and restarts whenever the car's counter
+    # does, so neither it nor calculated_lap + 1 can name a lap safely:
+    #   current_lap      the lap being driven
+    #   last_lap_number  the lap the last_lap_* figures on this row belong to
+    #   lap_seq          laps ever counted by this tracker; the pit cannot set
+    #                    it, so it does not repeat when someone corrects the
+    #                    lap number. fetch_laps() keys on it.
+    "current_lap",
+    "last_lap_number",
+    "lap_seq",
+    # Seconds the car stood still during the last lap. A pit stop lives here.
+    "last_lap_stopped_s",
+    # Lap distance from GPS, NULL in the pit lane or without a fresh fix.
+    # Unlike lap_distance_m it cannot be out of phase with the track.
+    "track_pos_m",
 ]
 
 # Fault / error columns — surfaced and exported separately from the numeric
@@ -232,6 +252,14 @@ STATE_COLUMNS = [
     # "odometer" means the GPS trigger MISSED and the distance backstop fired —
     # a visible signal that finish-line detection needs looking at.
     "lap_source",
+    # What kind of lap the last one was: flying | in | out | in_out | start |
+    # suspect. ONLY "flying" laps are fit to build energy and strategy figures
+    # from. last_lap_flags says why a lap is not flying, comma-separated
+    # (ended_in_pit, virtual_end, distance_suspect, interrupted, stopped, ...).
+    "last_lap_kind",
+    "last_lap_flags",
+    # Where the car is: track | pit_lane | box. NULL until GPS has said.
+    "zone",
     # Which speed profile the car was following, as the CAR reports it. The car
     # has always published this and the pit used to drop it on the floor, which
     # meant a stored lap could not be attributed to the profile it was driven
@@ -271,6 +299,9 @@ _COL_TYPES = {
     "mms_motor_map": "TEXT",
     "mms_throttle_zone": "TEXT",
     "lap_source": "TEXT",
+    "last_lap_kind": "TEXT",
+    "last_lap_flags": "TEXT",
+    "zone": "TEXT",
     "active_strategy": "TEXT",
     "pi_uptime_s": "REAL",
     "can_silent_s": "REAL",
@@ -411,6 +442,23 @@ def fetch_lap_profile_samples(conn: sqlite3.Connection, lap: int,
     ).fetchall()
 
 
+def has_lap_tags(conn: sqlite3.Connection) -> bool:
+    """Does this store have the gate-based tracker's columns yet?
+
+    init_db() adds them, and only the COLLECTOR runs init_db(): the web backend
+    opens the store read-only. So between pulling this code and restarting the
+    collector, the backend is reading a store without them, and a query that
+    names one raises "no such column" - which took /api/laps down. Every lap
+    query asks here first and reads the old shape until the columns exist.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(telemetry)")}
+    return {"lap_seq", "last_lap_kind", "last_lap_number"} <= cols
+
+
+def _kind_expr(conn: sqlite3.Connection) -> str:
+    return "MAX(last_lap_kind)" if has_lap_tags(conn) else "NULL"
+
+
 def lap_energy_by_strategy(conn: sqlite3.Connection, recent_laps: int = 60,
                            device_id: str = DEVICE_ID):
     """Measured energy per lap, grouped by the profile the lap was driven under.
@@ -444,6 +492,7 @@ def lap_energy_by_strategy(conn: sqlite3.Connection, recent_laps: int = 60,
     rows = conn.execute(
         "SELECT CAST(calculated_lap AS INTEGER) AS lap, "
         "       MAX(last_lap_energy) AS energy_wh, "
+        "       " + _kind_expr(conn) + " AS kind, "
         "       active_strategy AS strat, COUNT(*) AS n "
         "FROM telemetry "
         "WHERE device_id = ? AND calculated_lap >= ? "
@@ -453,6 +502,13 @@ def lap_energy_by_strategy(conn: sqlite3.Connection, recent_laps: int = 60,
     energy, modal = {}, {}
     for r in rows:
         lap = r["lap"]
+        # An in-lap, an out-lap or a lap the car marked suspect is not what a
+        # lap of this profile costs. Untagged laps (an older car) stay in.
+        if r["kind"] and r["kind"] != FLYING:
+            energy[lap] = None
+            continue
+        if lap in energy and energy[lap] is None:
+            continue
         if r["energy_wh"] is not None:
             energy[lap] = max(energy.get(lap, float("-inf")), float(r["energy_wh"]))
         if r["strat"]:
@@ -463,7 +519,7 @@ def lap_energy_by_strategy(conn: sqlite3.Connection, recent_laps: int = 60,
     out = {}
     for lap, wh in energy.items():
         driven_under = modal.get(lap - 1)      # the trace of THIS lap
-        if driven_under:
+        if driven_under and wh is not None:
             out.setdefault(driven_under[0], []).append(wh)
     return out
 
@@ -504,6 +560,7 @@ def laps_measured(conn: sqlite3.Connection, recent_laps: int = 60,
         "       MAX(last_lap_time_s)     AS lap_time_s, "
         "       MAX(last_lap_distance_m) AS distance_m, "
         "       MAX(lap_source)          AS lap_source, "
+        "       " + _kind_expr(conn) + " AS kind, "
         "       active_strategy          AS strat, COUNT(*) AS n "
         "FROM telemetry "
         "WHERE device_id = ? AND calculated_lap >= ? "
@@ -515,7 +572,10 @@ def laps_measured(conn: sqlite3.Connection, recent_laps: int = 60,
         lap = r["lap"]
         cur = facts.setdefault(lap, {"lap": lap, "energy_wh": None,
                                      "lap_time_s": None, "distance_m": None,
-                                     "lap_source": None, "strategy": None})
+                                     "lap_source": None, "strategy": None,
+                                     "kind": None})
+        if r["kind"] and not cur["kind"]:
+            cur["kind"] = r["kind"]
         for col in ("energy_wh", "lap_time_s", "distance_m"):
             if r[col] is not None:
                 v = float(r[col])
@@ -532,7 +592,10 @@ def laps_measured(conn: sqlite3.Connection, recent_laps: int = 60,
         f = facts[lap]
         driven_under = modal.get(lap - 1)          # the trace of THIS lap
         f["strategy"] = driven_under[0] if driven_under else None
-        out.append(f)
+        # Only flying laps describe what a lap costs. A lap with no kind comes
+        # from a car that predates the tags and is kept, as it always was.
+        if f["kind"] in (None, FLYING):
+            out.append(f)
     return out
 
 
@@ -1059,6 +1122,14 @@ def flatten_record(rtdb_key: str, record: dict, device_id: str = DEVICE_ID) -> d
         "last_lap_distance_m": _num(motor.get("last_lap_distance_m")),
         "lap_distance_m": _num(motor.get("lap_distance_m")),
         "lap_source": _join(motor.get("lap_source")),
+        "last_lap_kind": _join(motor.get("last_lap_kind")),
+        "last_lap_flags": _join(motor.get("last_lap_flags")),
+        "zone": _join(motor.get("zone")),
+        "current_lap": _num(motor.get("current_lap")),
+        "last_lap_number": _num(motor.get("last_lap_number")),
+        "lap_seq": _num(motor.get("lap_seq")),
+        "last_lap_stopped_s": _num(motor.get("last_lap_stopped_s")),
+        "track_pos_m": _num(motor.get("track_pos_m")),
         "active_strategy": _join(motor.get("active_strategy")),
         "odometer_m": _num(motor.get("odometer_m")),
         "calculated_lap": _num(motor.get("calculated_lap")),
@@ -1250,6 +1321,89 @@ def fetch_lap_summary(conn: sqlite3.Connection, device_id: str = DEVICE_ID):
         "GROUP BY lap ORDER BY lap",
         (device_id,),
     ).fetchall()
+
+
+# Laps fit to build energy and strategy figures from. A lap with no kind at all
+# comes from a car that predates the tags; whether to trust those is the
+# caller's decision, see flying_laps().
+FLYING = "flying"
+
+
+def fetch_laps(conn: sqlite3.Connection, device_id: str = DEVICE_ID,
+               since_ts: float = None):
+    """One dict per COMPLETED lap, oldest first, as the car measured and tagged it.
+
+        lap, energy_wh, regen_wh, lap_time_s, distance_m, lap_source,
+        kind, flags (list), stopped_s, finished_ts
+
+    The car holds a finished lap's figures constant on every row of the
+    following lap, so a lap is a run of rows sharing those figures. Rows from
+    the gate-based tracker are grouped on `lap_seq`, which the pit cannot set
+    and which therefore survives a lap-number correction; the lap's figures are
+    part of the key too, so a car whose checkpoint was wiped (lap_seq back to
+    1 on another evening) still yields separate laps instead of one lap with
+    the MAX() of both - the defect documented above lap_traces().
+
+    Rows from an older car have no lap_seq and fall back to grouping on
+    calculated_lap, exactly as fetch_lap_summary() does, with kind = None.
+
+    `finished_ts` is the first row that carried the lap, i.e. when the pit
+    first heard it was over. Ordering is by that, never by lap number.
+    """
+    where = "device_id = ?"
+    args = [device_id]
+    if since_ts is not None:
+        where += " AND device_ts >= ?"
+        args.append(since_ts)
+    tags = has_lap_tags(conn)
+    tagged = [] if not tags else conn.execute(
+        "SELECT CAST(COALESCE(last_lap_number, calculated_lap) AS INTEGER) AS lap, "
+        "       last_lap_energy AS energy_wh, last_lap_regen_energy AS regen_wh, "
+        "       last_lap_time_s AS lap_time_s, last_lap_distance_m AS distance_m, "
+        "       MAX(lap_source) AS lap_source, MAX(last_lap_kind) AS kind, "
+        "       MAX(last_lap_flags) AS flags, MAX(last_lap_stopped_s) AS stopped_s, "
+        "       MIN(device_ts) AS finished_ts "
+        "FROM telemetry WHERE " + where + " AND lap_seq IS NOT NULL AND lap_seq > 0 "
+        "GROUP BY CAST(lap_seq AS INTEGER), last_lap_time_s, last_lap_energy, "
+        "         last_lap_distance_m",
+        args).fetchall()
+    legacy = conn.execute(
+        "SELECT CAST(calculated_lap AS INTEGER) AS lap, "
+        "       MAX(last_lap_energy) AS energy_wh, "
+        "       MAX(last_lap_regen_energy) AS regen_wh, "
+        "       MAX(last_lap_time_s) AS lap_time_s, "
+        "       MAX(last_lap_distance_m) AS distance_m, "
+        "       MAX(lap_source) AS lap_source, NULL AS kind, NULL AS flags, "
+        "       NULL AS stopped_s, MIN(device_ts) AS finished_ts "
+        "FROM telemetry WHERE " + where
+        + (" AND lap_seq IS NULL " if tags else " ") +
+        "  AND calculated_lap IS NOT NULL "
+        "  AND (last_lap_energy IS NOT NULL OR last_lap_time_s IS NOT NULL) "
+        "GROUP BY CAST(calculated_lap AS INTEGER)",
+        args).fetchall()
+    laps = []
+    for r in list(legacy) + list(tagged):
+        lap = dict(r)
+        lap["flags"] = [f for f in (lap["flags"] or "").split(",") if f]
+        if lap["lap_source"] == "none":         # an old car's sentinel, not a source
+            lap["lap_source"] = None
+        laps.append(lap)
+    laps.sort(key=lambda lap: lap["finished_ts"])
+    return laps
+
+
+def flying_laps(laps):
+    """The laps fit for energy and strategy figures.
+
+    Tagged laps: only kind == "flying". If NOTHING is tagged the whole list is
+    from an older car, and refusing all of it would blank every chart the pit
+    had yesterday - so untagged laps are returned as they always were. Once
+    one tagged lap exists, untagged ones are dropped: they cannot be told from
+    in-laps, and the tagged ones can.
+    """
+    if any(lap["kind"] for lap in laps):
+        return [lap for lap in laps if lap["kind"] == FLYING]
+    return list(laps)
 
 
 def fetch_lap_track(conn: sqlite3.Connection, lap: int, device_id: str = DEVICE_ID):

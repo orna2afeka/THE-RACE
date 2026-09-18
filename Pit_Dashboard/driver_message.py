@@ -119,24 +119,32 @@ def send_lap_cut() -> dict:
     return send_lap_command("cut_lap")
 
 
+def send_lap_restart() -> dict:
+    """Start a FRESH lap without counting one. The lap number is left alone.
+
+    For a lap that must be thrown away (a test session, a push back to the
+    grid). The part-lap driven so far is recorded nowhere, and the car takes
+    its next passage of the finish line as a "start" rather than as a lap.
+
+    NOT needed for a pit stop any more: the car closes the in-lap itself as it
+    passes the line in the pit lane, and tags the in- and out-laps so they stay
+    out of the energy figures (LapTracker, "WHAT A LAP IS").
+
+    A car running the older tracker does not know this action and ignores it
+    without an ack, so the pit's "no answer" is the symptom of an old car.
+    """
+    return send_lap_command("restart_lap")
+
+
 def send_lap_set(lap_number: int) -> dict:
-    """Start a FRESH lap without counting one, keeping the lap number given.
+    """Correct the car's lap NUMBER. Nothing else about the lap changes.
 
-    What a pit exit needs. send_lap_cut() re-datums too, but it counts a lap
-    on the way past: the partial the car did before it came in is filed as a
-    real lap, with its part-lap time and part-lap energy, and the count gains
-    one the car never drove. Those figures then feed the per-lap history and
-    the strategy matrix, which is exactly where a fabricated lap does damage.
+    For when the pit's count and the officials' differ. With the gate-based
+    tracker this no longer restarts the lap -- see send_lap_restart() for that.
 
-    LapTracker.set_lap() goes through _trigger_lap(count_it=False): distance,
-    energy and the lap clock all re-datum, nothing is recorded as a lap, and
-    the count becomes `lap_number`. Pass the count the car is ALREADY on to
-    keep it where it is.
-
-    ALWAYS SEND A NUMBER. The car reads this as `cmd.get("value") or 0`, so a
-    None -- or an omitted value -- silently resets the race lap count to zero.
-    That is why this takes a required argument and coerces it here rather than
-    defaulting anything.
+    ALWAYS SEND A NUMBER. The car refuses a set_lap without one (and an older
+    car read a missing one as 0, zeroing the race). That is why this takes a
+    required argument and coerces it here rather than defaulting anything.
 
     Shares /lap_command and /lap_command_ack with send_lap_cut(), so the ack
     comes back with action="set_lap" and the pit can tell the two apart.

@@ -405,13 +405,17 @@ class Feed:
     def _refresh_laps(self, conn):
         """The last few completed laps, newest first.
 
-        Straight off fetch_lap_summary, which reads the figures the CAR
-        integrated — the pit never re-derives a lap time from samples, so this
-        screen and the dashboard cannot disagree about what a lap took.
+        Straight off fetch_laps, which reads the figures the CAR integrated —
+        the pit never re-derives a lap time from samples, so this screen and
+        the dashboard cannot disagree about what a lap took. Ordered by when
+        each lap finished, not by lap number, so a car whose counter restarted
+        does not put last week's lap 40 above today's lap 3. `kind` is the
+        car's own tag (flying, in, out, ...), None from an older car.
         """
-        rows = db.fetch_lap_summary(conn)
+        rows = db.fetch_laps(conn)
         out = [{"lap": r["lap"], "time_s": r["lap_time_s"],
-                "energy_wh": r["energy_wh"]} for r in rows[-self.lap_count:]]
+                "energy_wh": r["energy_wh"], "kind": r["kind"]}
+               for r in rows[-self.lap_count:]]
         out.reverse()
         with self._lock:
             self._laps, self._laps_at = out, time.time()

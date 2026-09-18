@@ -62,6 +62,13 @@ export interface LiveState {
   last_lap_energy: Num; total_race_energy: Num; last_lap_time_s: Num;
   lap_distance_m: Num; lap_source: string | null;
   auto_lap: Num; odometer_km: Num;
+  /** The car's own lap tags (gate-based tracker). All null from an older car.
+      zone: where the car is NOW - 'track' | 'pit_lane' | 'box'.
+      last_lap_kind: 'flying' | 'in' | 'out' | 'in_out' | 'start' | 'suspect';
+      only flying laps feed averages and strategy. */
+  zone: string | null; track_pos_m: Num; current_lap: Num;
+  last_lap_kind: string | null; last_lap_flags: string | null;
+  last_lap_stopped_s: Num;
   lat: number; lon: number;
   /** Deliberately separate from lat/lon: the map falls back to the Zolder
    *  paddock so it has somewhere to centre, and this says whether the pin is
