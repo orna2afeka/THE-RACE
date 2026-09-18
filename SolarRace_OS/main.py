@@ -1012,6 +1012,10 @@ class SmartCANWorker(CANWorker):
         for cmd in self.lap_inbox.drain():
             action = cmd.get("action")
             applied = True
+            # Display-only commands change the HUD and nothing the car records,
+            # so they must not write a lap checkpoint: a checkpoint is for state
+            # a reboot would otherwise lose, and there is none here.
+            display_only = False
             if action == "cut_lap":
                 self.laps.force_lap("manual")
                 print(f"🏁 PIT CUT LAP -> lap {self.laps.lap_count}")
@@ -1034,12 +1038,29 @@ class SmartCANWorker(CANWorker):
             elif action == "reset_trip":
                 self.laps.reset_trip()
                 print("🏁 PIT RESET TRIP")
+            elif action in ("reset_stopwatch", "clear_stopwatch"):
+                # THE DRIVER'S STOPWATCH, from the pit. Deliberately routed
+                # through lap_timer_updated -- the same signal a real lap cut
+                # uses -- rather than into LapTracker: the HUD clock is a
+                # reading, not a record. The lap count, the recorded lap times,
+                # the energy totals and the odometer are all untouched, exactly
+                # as when the driver presses the button beside the clock.
+                #
+                # _lap_timer_sent is NOT updated, so the next genuine lap cut
+                # still differs from it and takes the clock back over. The pit
+                # cannot leave the stopwatch permanently out of step with the
+                # car's own lap timing.
+                display_only = True
+                start = time.monotonic() if action == "reset_stopwatch" else None
+                self.lap_timer_updated.emit(start, None)
+                print("⏱️ PIT %s DRIVER STOPWATCH (display only)"
+                      % ("RESET" if start is not None else "CLEARED"))
             else:
                 applied = False
             self.vehicle_state["motor"].update(self.laps.snapshot())
             ack_lap_command(cmd.get("id"), action, applied,
                             lap=self.laps.lap_count)
-            if applied:
+            if applied and not display_only:
                 # A pit command is a deliberate, infrequent edit to state that
                 # a reboot must not silently undo -- don't make it wait for the
                 # next throttled tick (up to LAP_CHECKPOINT_INTERVAL_S away).

@@ -51,7 +51,12 @@ MAX_COMMAND_AGE_S = 30.0
 # (no RTC, no NTP), so any age comparison would be meaningless.
 _PLAUSIBLE_EPOCH = 1_700_000_000
 
-VALID_ACTIONS = ("cut_lap", "set_lap", "restart_lap", "reset_energy", "reset_trip")
+# reset_stopwatch / clear_stopwatch are DISPLAY-ONLY (see main._apply_lap_commands):
+# they move the number on the HUD and nothing else -- no lap is cut, no count
+# moves, no energy or odometer is touched, and nothing is checkpointed. They are
+# the pit's copy of the button the driver already has beside the clock.
+VALID_ACTIONS = ("cut_lap", "set_lap", "restart_lap", "reset_energy", "reset_trip",
+                 "reset_stopwatch", "clear_stopwatch")
 
 # The strategy selector uses the same machinery on its own node — see
 # CommandInbox below and firebase_client.STRATEGY_COMMAND_PATH.
