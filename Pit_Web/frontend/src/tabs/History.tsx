@@ -161,8 +161,38 @@ export default function History({ config, dark, visible, fresh, age }: Props) {
         };
       }).filter(Boolean);
 
+      // NEUTRAL LINE for the pedal trace. The one-pedal control regenerates
+      // below config.pedal.neutralMv and accelerates above it, so a raw pedal
+      // trace without that datum is just a wandering voltage — the line is what
+      // turns it into "lifting here, on the power there".
+      //
+      // Only when the pedal is on a real millivolt axis: normalising rescales
+      // every trace to % of its own range, and a fixed millivolt value has no
+      // meaning on that axis. Matched by UNIT, so it follows the metric whether
+      // it landed on the left or the right axis.
+      const pedalAxis = normalize
+        ? null
+        : (traces.find((tr) => tr.name.endsWith('(mV)'))?.yaxis ?? null);
+      const shapes = pedalAxis ? [{
+        type: 'line' as const, xref: 'paper' as const, x0: 0, x1: 1,
+        yref: (pedalAxis === 'y2' ? 'y2' : 'y') as 'y' | 'y2',
+        y0: config.pedal.neutralMv, y1: config.pedal.neutralMv,
+        line: { color: t.ink3, width: 1, dash: 'dot' as const },
+      }] : [];
+      // Its own array rather than a push onto `annotations`: that one is typed
+      // from the end-label map above, whose x is a timestamp string. This one
+      // is anchored to the paper's left edge, so its x is a number.
+      const pedalNote = pedalAxis ? [{
+        x: 0, y: config.pedal.neutralMv, xref: 'paper', yref: pedalAxis === 'y2' ? 'y2' : 'y',
+        text: 'neutral — regen below, power above', showarrow: false,
+        xanchor: 'left', xshift: 4, yshift: 8,
+        font: { size: 10, color: t.ink3 },
+        bgcolor: dark ? 'rgba(20,25,36,0.85)' : 'rgba(255,255,255,0.85)', borderpad: 2,
+      }] : [];
+
       const base = layoutBase(dark, 470);
       await Plotly.newPlot(host, traces, {
+        shapes,
         ...base,
         margin: { l: 56, r: 64, t: 36, b: 40 },
         xaxis: { ...base.xaxis, type: 'date', rangebreaks: hist.rangebreaks,
@@ -174,7 +204,7 @@ export default function History({ config, dark, visible, fresh, age }: Props) {
         },
         showlegend: traces.length > 1,
         dragmode: dragRef.current,
-        annotations,
+        annotations: [...annotations, ...pedalNote],
         // Keyed on the WINDOW, not a constant. A constant asked Plotly to keep
         // the viewer's zoom across every redraw, and whether it honoured that
         // on a window change depended on the new window's range breaks: the

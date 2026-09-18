@@ -272,6 +272,14 @@ def read_live_state(conn):
     zone = cf("throttle_zone", "mms_throttle_zone")
     state["throttle_zone"] = zone or efficiency.zone(state["throttle_pct"])
 
+    # Regeneration, the other half of the one-pedal control. DERIVED HERE from
+    # the raw millivolts rather than stored: the car publishes it, but adding a
+    # column would leave every row recorded before today blank, and
+    # efficiency.regen_percent() is the same function the car ran on the same
+    # number. None stays None — a pedal that never reported has no regen
+    # reading either, and must not render as 0 %.
+    state["regen_pct"] = efficiency.regen_percent(state["throttle_mv"])[0]
+
     # Per-cell thermistor temperatures, however many are configured.
     for i in range(1, db.THERMISTOR_CELL_COLUMN_COUNT + 1):
         col = "bms_cell_temp_%02d_C" % i
@@ -1077,6 +1085,13 @@ def api_config():
             "colors": C.SECTION_COLORS,
             "bounds": {sid: info["range"] for sid, info in SECTIONS_INFO.items()},
         },
+        # The one-pedal control's three landmarks, straight from efficiency.py
+        # so the browser never carries its own copy of the neutral point. The
+        # pedal bar is drawn from these: regen below neutral, acceleration
+        # above it, and the scale runs 0..full in raw millivolts.
+        "pedal": {"idleMv": efficiency.THROTTLE_MV_IDLE,
+                  "neutralMv": efficiency.THROTTLE_MV_NEUTRAL,
+                  "fullMv": efficiency.THROTTLE_MV_FULL},
         "trackLengthM": C.TRACK_LENGTH_METERS,
         "dataStaleAfterS": C.DATA_STALE_AFTER_S,
         "targetLapTimeMin": C.TARGET_LAP_TIME_MIN,

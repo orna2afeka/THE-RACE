@@ -51,6 +51,11 @@ export interface Config {
   liveMetricCount: number;
   liveMetricsPerRow: number;
   mapFallback: { lat: number; lon: number };
+  /** The one-pedal control's landmarks, in raw millivolts, straight from
+   *  efficiency.py. The browser holds no copy of the neutral point: regen is
+   *  below neutralMv, acceleration above it, and idleMv is where a fully
+   *  released pedal sits (maximum regen). */
+  pedal: { idleMv: number; neutralMv: number; fullMv: number };
 }
 
 export interface LiveState {
@@ -88,6 +93,12 @@ export interface LiveState {
    *  clock the row's timestamp is in. null when it cannot be said. */
   gps_fix_ts: Num;
   speed_kmh: Num;
+  /** The one-pedal control. throttle_pct is ACCELERATION above the neutral
+   *  point and regen_pct is REGENERATION below it, so at most one of the two
+   *  is ever non-zero; throttle_mv is the raw reading both are made of. All
+   *  null when the pedal is not reporting - never 0. */
+  throttle_pct: Num; regen_pct: Num; throttle_mv: Num;
+  throttle_zone: string | null;
   bms_has_error: number; bms_error_code: number; bms_protections: string;
   mms_has_error: number; mms_error_code: number; mms_alerts: string;
 }

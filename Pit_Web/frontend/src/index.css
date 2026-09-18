@@ -239,6 +239,28 @@ button, input, select, textarea { font: inherit; color: inherit; }
 }
 .tile-unit { font-size: calc(13px * var(--pit-font-scale)); font-weight: 500; color: var(--ink-2); letter-spacing: 0; white-space: nowrap; }
 .tile-note { font-size: calc(11px * var(--pit-font-scale)); color: var(--ink-3); line-height: 1.35; margin-top: auto; }
+/* PEDAL BAR — the one-pedal control (Rest.tsx PedalBar). Full width under the
+   Driver Input tiles rather than inside the 4-up grid: it is a scale, and a
+   scale squeezed into a quarter-width tile stops being readable at the ends,
+   which is exactly where full regen and full acceleration live. */
+.pedal-tile { margin-top: 12px; }
+.pedal-row { display: flex; align-items: center; gap: 14px; }
+.pedal-value {
+	font-size: calc(20px * var(--pit-font-scale)); font-weight: 600; letter-spacing: -0.01em;
+	color: var(--ink-3); white-space: nowrap; min-width: 128px;
+}
+.pedal-track {
+	position: relative; flex: 1; height: 26px; border-radius: 6px; overflow: hidden;
+	background: var(--card); border: 1px solid var(--line);
+}
+/* The two territories, washed so they read even with nothing filled — i.e.
+   with the pedal sitting exactly at neutral, which is a normal thing to see. */
+.pedal-zone { position: absolute; top: 0; bottom: 0; opacity: 0.16; }
+.pedal-fill { position: absolute; top: 0; bottom: 0; transition: left 120ms linear, width 120ms linear; }
+/* Drawn last and over the fill: the neutral point is the one landmark on this
+   bar, and a fill that hid it would leave the reader with no datum at all. */
+.pedal-neutral { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--ink-1); }
+
 .tile.large { min-height: 112px; padding: 14px 16px; }
 .tile.large .tile-value { font-size: calc(38px * var(--pit-font-scale)); }
 .tile.large .tile-unit { font-size: calc(15px * var(--pit-font-scale)); }
