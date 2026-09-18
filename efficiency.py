@@ -50,19 +50,31 @@ NEVER pass a zone to limits.classify() or a limits tier to ZONE_COLOURS.
 # sensor driven from a reference rail, so it swings between two voltages that
 # are properties of THIS pedal and THIS wiring loom — not of the protocol.
 #
-# ⚠️ PLACEHOLDERS — these are the span of a typical 5 V hall throttle, not a
-# measurement of the car's pedal. Until they are replaced, every throttle
-# percentage on both dashboards is approximately right and precisely
-# untrustworthy, which is why the pit tile publishes the raw mV beside it.
+# MEASURED ON THE CAR 2026-09-18, replacing the placeholders that shipped here.
+# Read off GPIO0 (input ID 0x08) on can0 with the pedal worked by hand:
 #
-# HOW TO MEASURE (five minutes, car stationary, wheels off the ground):
+#   released          0x02D0 = 720 mV, rock steady over many seconds
+#   floored           0x1097 = 4247 mV peak, plateau 4202..4247 mV
+#
+# FULL is set to 4200 rather than the 4247 peak on purpose. The top of the
+# travel wanders by ~45 mV between presses, and a driver who floors the pedal
+# must see 100 %, not 99 %. Percentages clamp at 100, so aiming slightly low
+# costs nothing and guarantees the bar reaches the top. The same logic in
+# reverse is why IDLE is the measured 720 and not something lower: with
+# THROTTLE_MV_DEADBAND below it, a parked car reads a clean 0 %.
+#
+# TO RE-MEASURE (five minutes, car stationary, wheels off the ground):
 #   1. Bring the throttle report up (config.THROTTLE_GPIO_* on the car).
-#   2. Watch the "Throttle Raw" tile on the pit dashboard, or candump can1.
+#   2. Watch the "Throttle Raw" tile on the pit dashboard, or on the Pi:
+#        cansend can0 147#0008000C00640064
+#        stdbuf -oL candump can0,150:7F8 | grep --line-buffered '0D 08'
+#      GPIO0's millivolts are bytes 2-3 of a '0D 08' frame, big-endian.
 #   3. Pedal fully RELEASED, engine armed  -> that mV is THROTTLE_MV_IDLE.
-#   4. Pedal fully FLOORED                 -> that mV is THROTTLE_MV_FULL.
+#   4. Pedal fully FLOORED                 -> that mV is THROTTLE_MV_FULL,
+#      less a small margin as above.
 #   5. Put both numbers below. Nothing else changes.
-THROTTLE_MV_IDLE = 800.0      # ⚠️ PLACEHOLDER — measure with the pedal released
-THROTTLE_MV_FULL = 4200.0     # ⚠️ PLACEHOLDER — measure with the pedal floored
+THROTTLE_MV_IDLE = 720.0      # measured, pedal released
+THROTTLE_MV_FULL = 4200.0     # measured 4247 peak; set low so floored = 100 %
 
 # Noise band just above idle that still reads 0 %. A pedal at rest jitters by a
 # few mV, and without this the driver's zone bar would sit at 1-2 % — a car
