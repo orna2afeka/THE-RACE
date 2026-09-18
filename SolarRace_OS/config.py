@@ -324,6 +324,118 @@ _OPEN_BUSES = []
 CAN_REGISTRY_BUILD = "bus-registry/2"
 
 
+# ── USB adapter pre-flight: don't "open" hardware that cannot be there ── #
+#
+# Trying a USB candidate that is absent is not free and not silent. python-can
+# builds the Bus object BEFORE it talks to the adapter (PcanBus calls
+# super().__init__ last), so a constructor that raises still leaves a
+# half-built bus for the garbage collector — and BusABC.__del__ then logs
+# "PcanBus was not properly shut down" even though nothing was ever open.
+# With the silent-bus escalation retrying every USB_FALLBACK_RETRY_S, that
+# phantom warning repeated every 5 s for the whole session on a car that has
+# no PCAN adapter at all, burying the log lines that matter.
+#
+# So: ask cheaply whether the backend could possibly work before constructing
+# anything. Absent → skip, no object, no warning, no subprocess.
+_BACKEND_LIB_CACHE = {}
+
+# What each non-socketcan backend needs present on this machine. The driver
+# library is what python-can dlopen()s; a missing one means the backend can
+# never open, adapter plugged in or not.
+_BACKEND_LIBS = {
+    "pcan": ("pcanbasic", "PCBUSB"),   # PEAK PCANBasic (Linux/Windows, macOS)
+    "ixxat": ("vcinpl2", "vcinpl"),
+    "vector": ("vxlapi64", "vxlapi"),
+    "kvaser": ("canlib32", "canlib"),
+}
+
+
+def _backend_library_present(interface):
+    """True when the driver library this backend needs can be found.
+
+    Cached: ctypes.util.find_library() can shell out to ldconfig/gcc, which is
+    far too expensive to repeat on a 5-second retry timer. A driver library
+    does not appear mid-race — installing one means apt and a restart — so one
+    lookup per process is the right granularity.
+    """
+    names = _BACKEND_LIBS.get(interface)
+    if not names:
+        return True                     # unknown backend — let it try
+    if interface in _BACKEND_LIB_CACHE:
+        return _BACKEND_LIB_CACHE[interface]
+    import ctypes.util
+    found = any(ctypes.util.find_library(n) for n in names)
+    _BACKEND_LIB_CACHE[interface] = found
+    return found
+
+
+def candidate_available(cand):
+    """Cheap "could this candidate possibly open?" check.
+
+    Deliberately conservative — it only reports False when we are CERTAIN the
+    open would fail (no driver library, or a serial device node that does not
+    exist). Anything it cannot prove absent is still tried, so this can never
+    hide a working adapter; it only removes doomed attempts.
+    """
+    interface = cand.get("interface")
+    channel = cand.get("channel")
+    if interface == "socketcan":
+        return True                     # the HAT; `ip link` is the real probe
+    # slcan / serial adapters are named by device node — a missing node is
+    # conclusive, and os.path.exists() is cheap enough for the retry timer.
+    if isinstance(channel, str) and channel.startswith("/dev/"):
+        return os.path.exists(channel)
+    return _backend_library_present(interface)
+
+
+class _quiet_unopened_bus_warning:
+    """Silence BusABC.__del__'s warning for a bus that never actually opened.
+
+    A failed constructor leaves an object whose _is_shutdown is still False,
+    so __del__ reports it as leaked — a warning about a bus that was never
+    open, with no way to call shutdown() on it because the constructor never
+    returned a reference. The filter is installed only around the construction
+    call and removed immediately after; release() below is what makes the
+    phantom object's __del__ run while the filter is still in place.
+
+    Narrow on purpose: it drops ONLY the "not properly shut down" message, and
+    only during an open attempt. A genuinely leaked bus is still reported by
+    shutdown_all_buses()' safety net at exit, which names its call site.
+    """
+
+    _PHANTOM = "was not properly shut down"
+
+    def __init__(self):
+        import logging
+        self._log = logging.getLogger("can.bus")
+
+    def _filter(self, record):
+        return self._PHANTOM not in record.getMessage()
+
+    def __enter__(self):
+        self._log.addFilter(self._filter)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._log.removeFilter(self._filter)
+        return False                    # never swallow the open error itself
+
+    @staticmethod
+    def release(exc):
+        """Let the half-built bus die NOW, while the filter is still on.
+
+        Call this from the `except` that caught a failed open. The exception's
+        traceback holds the backend's __init__ frame, and that frame holds the
+        half-built `self` — so without this the object outlives the filter and
+        logs its phantom warning from wherever the caller's except block ends.
+        Only the traceback is dropped, never the exception or its message (all
+        any caller here ever shows), and the re-raise attaches a fresh one.
+        """
+        import gc
+        exc.__traceback__ = None
+        gc.collect()
+
+
 def _new_bus(interface, channel):
     """Open one bus and register it for guaranteed cleanup at exit.
 
@@ -340,11 +452,18 @@ def _new_bus(interface, channel):
     _OPEN_BUSES[:] = [r for r in _OPEN_BUSES
                       if not getattr(r["bus"], "_is_shutdown", True)]
 
-    bus = can.interface.Bus(
-        interface=interface,
-        channel=channel,
-        bitrate=bitrate_for(channel),
-    )
+    # The filter only covers the construction itself: a bus that fails to
+    # open must not log itself as a leak (see _quiet_unopened_bus_warning).
+    with _quiet_unopened_bus_warning() as quiet:
+        try:
+            bus = can.interface.Bus(
+                interface=interface,
+                channel=channel,
+                bitrate=bitrate_for(channel),
+            )
+        except BaseException as exc:
+            quiet.release(exc)
+            raise
     label = _bus_label(interface, channel)
     where = "".join(traceback.format_stack(limit=4)[:-1]).strip().splitlines()
     _OPEN_BUSES.append({
@@ -426,6 +545,8 @@ def open_bus():
     """
     last_exc = None
     for cand in CAN_CANDIDATES:
+        if not candidate_available(cand):
+            continue                # no driver / no device node — can't open
         try:
             bus = _new_bus(cand["interface"], cand["channel"])
             return bus, _bus_label(cand["interface"], cand["channel"]), None
@@ -463,6 +584,8 @@ def open_buses():
         for cand in CAN_CANDIDATES:
             if cand["interface"] == "socketcan":
                 continue                    # already tried above
+            if not candidate_available(cand):
+                continue                    # no driver / no device node
             try:
                 buses.append((_new_bus(cand["interface"], cand["channel"]),
                               _bus_label(cand["interface"], cand["channel"])))
@@ -487,6 +610,11 @@ def open_usb_candidates():
     for cand in CAN_CANDIDATES:
         if cand["interface"] == "socketcan":
             continue                    # that's the HAT, not USB
+        if not candidate_available(cand):
+            # Nothing to open: the backend's driver library isn't installed,
+            # or the serial node isn't there. Skipping keeps the silent-bus
+            # retry free instead of constructing a doomed bus every 5 s.
+            continue
         try:
             bus = _new_bus(cand["interface"], cand["channel"])
             return bus, _bus_label(cand["interface"], cand["channel"])
