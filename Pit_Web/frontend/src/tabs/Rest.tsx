@@ -35,6 +35,10 @@ const PEDAL_REGEN = '#2e86de';
 const PEDAL_ACCEL = '#d63447';
 
 function PedalBar({ live, config }: { live: Live; config: Config }) {
+  // Optional because the API and this page are separate processes: a page
+  // newer than its backend gets a config with no `pedal` in it, and
+  // destructuring that threw where the tile should simply not appear.
+  if (!config.pedal) return null;
   const { idleMv, neutralMv, fullMv } = config.pedal;
   const mv = live.state.throttle_mv;
   const accel = live.state.throttle_pct;

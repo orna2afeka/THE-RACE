@@ -170,20 +170,24 @@ export default function History({ config, dark, visible, fresh, age }: Props) {
       // every trace to % of its own range, and a fixed millivolt value has no
       // meaning on that axis. Matched by UNIT, so it follows the metric whether
       // it landed on the left or the right axis.
-      const pedalAxis = normalize
+      // config.pedal is optional for the same reason the lap fields are: an API
+      // process older than this page does not send it. No neutral point means
+      // no line — the pedal trace still draws, just without its datum.
+      const neutralMv = config.pedal?.neutralMv ?? null;
+      const pedalAxis = normalize || neutralMv === null
         ? null
         : (traces.find((tr) => tr.name.endsWith('(mV)'))?.yaxis ?? null);
       const shapes = pedalAxis ? [{
         type: 'line' as const, xref: 'paper' as const, x0: 0, x1: 1,
         yref: (pedalAxis === 'y2' ? 'y2' : 'y') as 'y' | 'y2',
-        y0: config.pedal.neutralMv, y1: config.pedal.neutralMv,
+        y0: neutralMv, y1: neutralMv,
         line: { color: t.ink3, width: 1, dash: 'dot' as const },
       }] : [];
       // Its own array rather than a push onto `annotations`: that one is typed
       // from the end-label map above, whose x is a timestamp string. This one
       // is anchored to the paper's left edge, so its x is a number.
       const pedalNote = pedalAxis ? [{
-        x: 0, y: config.pedal.neutralMv, xref: 'paper', yref: pedalAxis === 'y2' ? 'y2' : 'y',
+        x: 0, y: neutralMv, xref: 'paper', yref: pedalAxis === 'y2' ? 'y2' : 'y',
         text: 'neutral — regen below, power above', showarrow: false,
         xanchor: 'left', xshift: 4, yshift: 8,
         font: { size: 10, color: t.ink3 },
@@ -380,38 +384,51 @@ function LapCharts({ dark, visible }: { dark: boolean; visible: boolean }) {
   // Redraw only when the laps actually changed. The poll hands back a new
   // object every 10 s, and redrawing identical data on that cadence is what
   // froze the page.
-  const last = data?.laps.length ? data.laps[data.laps.length - 1] : null;
-  const sig = data ? `${data.laps.length}:${last?.lap}:${last?.energyWh}:${last?.lapTimeS}:${last?.kind}` : '';
+  // ?? [] on EVERY read of an API array, here and below. The pit runs the API
+  // and the page as separate processes, and restarting the browser is not the
+  // same act as restarting "Pit Web": a page newer than its backend gets JSON
+  // without the fields it expects, and `data.laps.length` on a missing array
+  // took the whole History tab down with "Cannot read properties of undefined".
+  // A tab that quietly shows nothing is recoverable; one that crashes is not.
+  const laps = data?.laps ?? [];
+  // Same reasoning for the summary block: an older API sends no `summary` at
+  // all, and reading through it crashed the tab rather than leaving four
+  // readouts blank. undefined !== undefined is false, so a missing summary
+  // simply hides the flying-lap note instead of claiming every lap was flying.
+  const summary = data?.summary;
+  const someNotFlying = summary != null && summary.flyingCount !== summary.count;
+  const last = laps.length ? laps[laps.length - 1] : null;
+  const sig = data ? `${laps.length}:${last?.lap}:${last?.energyWh}:${last?.lapTimeS}:${last?.kind}` : '';
 
   useEffect(() => {
-    if (!data?.laps.length || !eRef.current || !tRef.current) return;
+    if (!laps.length || !eRef.current || !tRef.current) return;
     // Lap NUMBERS repeat (a counter reset, a pit correction), and a repeated x
     // stacks two laps on one bar. Use them only while they strictly increase.
-    const increasing = data.laps.every((l, i) => i === 0 || l.lap > data.laps[i - 1].lap);
-    const laps = data.laps.map((l, i) => (increasing ? l.lap : i + 1));
-    const note = data.laps.map((l) =>
+    const increasing = laps.every((l, i) => i === 0 || l.lap > laps[i - 1].lap);
+    const lapX = laps.map((l, i) => (increasing ? l.lap : i + 1));
+    const note = laps.map((l) =>
       `lap ${l.lap}${l.kind ? ' · ' + (KIND_NAME[l.kind] ?? l.kind) : ''}` +
       `${l.stoppedS !== null && l.stoppedS >= 10 ? ` · stood ${Math.round(l.stoppedS)} s` : ''}` +
-      `${l.flags.length ? ' · ' + l.flags.join(', ') : ''}`);
+      `${l.flags?.length ? ' · ' + l.flags.join(', ') : ''}`);
     // One label per lap (dtick: 1) made Plotly measure hundreds of labels: 358
     // laps took 4.5-5.4 s to draw, against 54 ms with a coarser step. About a
     // dozen integer labels, whatever the lap count.
-    const dtick = Math.max(1, Math.ceil(laps.length / 12));
+    const dtick = Math.max(1, Math.ceil(lapX.length / 12));
     const base = layoutBase(dark, 230);
     const t = theme(dark);
     void Plotly.newPlot(eRef.current, [{
-      type: 'bar', x: laps, y: data.laps.map((l) => l.energyWh),
-      marker: { color: data.laps.map((l) => (counts(l.kind) ? '#00B3FF' : MUTED)),
+      type: 'bar', x: lapX, y: laps.map((l) => l.energyWh),
+      marker: { color: laps.map((l) => (counts(l.kind) ? '#00B3FF' : MUTED)),
                 line: { width: 0 } }, width: 0.55,
       customdata: note, hovertemplate: '%{y:.1f} Wh<extra>%{customdata}</extra>',
     }], { ...base, margin: { l: 50, r: 12, t: 8, b: 36 }, bargap: 0.4,
           xaxis: { ...base.xaxis, title: { text: 'lap', font: { size: 11, color: t.ink3 } }, dtick },
           showlegend: false }, plotConfig);
     void Plotly.newPlot(tRef.current, [{
-      type: 'scatter', mode: 'lines+markers', x: laps,
-      y: data.laps.map((l) => (l.lapTimeS === null ? null : l.lapTimeS / 60)),
+      type: 'scatter', mode: 'lines+markers', x: lapX,
+      y: laps.map((l) => (l.lapTimeS === null ? null : l.lapTimeS / 60)),
       connectgaps: false, line: { color: '#00e0b4', width: 2 },
-      marker: { size: 8, color: data.laps.map((l) => (counts(l.kind) ? '#00e0b4' : MUTED)),
+      marker: { size: 8, color: laps.map((l) => (counts(l.kind) ? '#00e0b4' : MUTED)),
                 line: { width: 2, color: t.card } },
       customdata: note, hovertemplate: '%{y:.2f} min<extra>%{customdata}</extra>',
     }], { ...base, margin: { l: 50, r: 12, t: 8, b: 36 },
@@ -421,8 +438,8 @@ function LapCharts({ dark, visible }: { dark: boolean; visible: boolean }) {
   }, [sig, dark]);
 
   return (
-    <Disclosure icon="timer" title="Per-lap energy & times" count={data?.laps.length ?? 0} open>
-      {!data?.laps.length
+    <Disclosure icon="timer" title="Per-lap energy & times" count={laps.length} open>
+      {!laps.length
         ? <Pill kind="info">No completed laps yet. Laps appear once the car crosses the finish line (or the pit cuts one manually).</Pill>
         : (
           <>
@@ -431,14 +448,14 @@ function LapCharts({ dark, visible }: { dark: boolean; visible: boolean }) {
               <div><div className="caption">Lap time (minutes)</div><div ref={tRef} /></div>
             </div>
             <div className="kv" style={{ gridTemplateColumns: 'repeat(4, 1fr)', marginTop: 10 }}>
-              <div><div className="k">Laps recorded</div><div className="v">{data.summary.count}
-                {data.summary.flyingCount !== data.summary.count &&
-                  <span className="caption"> · {data.summary.flyingCount} flying</span>}</div></div>
-              <div><div className="k">Best lap</div><div className="v mono">{lapTime(data.summary.bestS)}</div></div>
-              <div><div className="k">Average lap</div><div className="v mono">{lapTime(data.summary.avgS)}</div></div>
-              <div><div className="k">Average Wh / lap</div><div className="v mono">{fmtStat(data.summary.avgWh)}</div></div>
+              <div><div className="k">Laps recorded</div><div className="v">{summary?.count ?? laps.length}
+                {someNotFlying &&
+                  <span className="caption"> · {summary?.flyingCount} flying</span>}</div></div>
+              <div><div className="k">Best lap</div><div className="v mono">{lapTime(summary?.bestS ?? null)}</div></div>
+              <div><div className="k">Average lap</div><div className="v mono">{lapTime(summary?.avgS ?? null)}</div></div>
+              <div><div className="k">Average Wh / lap</div><div className="v mono">{fmtStat(summary?.avgWh ?? null)}</div></div>
             </div>
-            {data.summary.flyingCount !== data.summary.count && (
+            {someNotFlying && (
               <div className="caption" style={{ marginTop: 6 }}>
                 Best and averages use flying laps only. In-laps, out-laps and laps the car
                 marked suspect are drawn grey — hover one to see why.
@@ -453,7 +470,7 @@ function LapCharts({ dark, visible }: { dark: boolean; visible: boolean }) {
 function RecentSamples({ config, visible }: { config: Config; visible: boolean }) {
   const { data } = usePoll(() => getJSON<{ rows: Record<string, Num | string>[] }>('/api/samples?limit=60'), 10000, [], visible);
   return (
-    <Disclosure icon="table" title="Recent samples" count={data?.rows.length ?? 0}>
+    <Disclosure icon="table" title="Recent samples" count={data?.rows?.length ?? 0}>
       <div className="scroll">
         <table className="tbl">
           <thead>
