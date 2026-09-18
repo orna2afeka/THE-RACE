@@ -4,16 +4,86 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import * as Plotly from 'plotly.js-dist-min';
 import { CatalogueTile, MetricTile, Pill, SectionTitle } from '../components';
 import { Icon } from '../icons';
-import { ageText, fmt, getJSON, postJSON, usePoll, useResizePlot, useStored } from '../lib';
+import { MISSING, ageText, fmt, getJSON, postJSON, usePoll, useResizePlot, useStored } from '../lib';
 import { config as plotConfig, layoutBase, theme } from '../plotly-theme';
 import { toast } from '../toast';
 import type { CellExtremesResp, CellTileData, CellsResp, Config, Live, StrategyResp } from '../types';
 
 /* ------------------------------- Live Metrics ---------------------------- */
 const GROUP_ICON: Record<string, string> = {
-  'Motion': 'gauge', 'Motor': 'zap',
+  'Motion': 'gauge', 'Motor': 'zap', 'Driver Input': 'gauge',
   'Battery': 'battery', 'Energy': 'bolt', 'Lap & Distance': 'flag',
 };
+
+/** The one-pedal control, as a bar the pit reads the same way the driver does.
+ *
+ *  The pedal commands REGEN below its neutral point and POWER above it (see
+ *  efficiency.py), so the scale is raw millivolts with neutral marked, and the
+ *  fill grows OUT FROM NEUTRAL — left and blue into regen, right and red into
+ *  acceleration. Filling from the left end instead would light the whole regen
+ *  half whenever the driver was accelerating hard, which is the one thing a
+ *  one-pedal control can never be doing.
+ *
+ *  Identical geometry and colours to the driver's DS001 bar
+ *  (driver_dash_v2.PedalBar), because the pit coaches against what the driver
+ *  is looking at. Every number here comes from the API: the browser holds no
+ *  copy of the neutral point.
+ *
+ *  A pedal that is not reporting draws an empty track and a dash — never a bar
+ *  at zero, which would read as a driver sitting at neutral. */
+const PEDAL_REGEN = '#2e86de';
+const PEDAL_ACCEL = '#d63447';
+
+function PedalBar({ live, config }: { live: Live; config: Config }) {
+  // Optional because the API and this page are separate processes: a page
+  // newer than its backend gets a config with no `pedal` in it, and
+  // destructuring that threw where the tile should simply not appear.
+  if (!config.pedal) return null;
+  const { idleMv, neutralMv, fullMv } = config.pedal;
+  const mv = live.state.throttle_mv;
+  const accel = live.state.throttle_pct;
+  const regen = live.state.regen_pct;
+
+  const pct = (v: number) => Math.max(0, Math.min(100, (v / fullMv) * 100));
+  const neutralPct = pct(neutralMv);
+  const pedalPct = mv === null ? null : pct(mv);
+
+  // Which command is being given, and how much of it. Non-zero regen wins:
+  // at most one of the two is ever non-zero, and inside the deadband either
+  // side of neutral both are 0 — which is coasting, not "0 % of" either.
+  const label = mv === null ? MISSING
+    : regen ? `REGEN ${fmt(regen, '.0f')}%`
+    : accel ? `ACCEL ${fmt(accel, '.0f')}%`
+    : 'COAST';
+  const labelColour = mv === null ? undefined : regen ? PEDAL_REGEN : accel ? PEDAL_ACCEL : undefined;
+
+  return (
+    <div className="tile large pedal-tile">
+      <div className="tile-label">Pedal</div>
+      <div className="pedal-row">
+        <div className="pedal-value" style={{ color: labelColour }}>{label}</div>
+        <div className="pedal-track">
+          <div className="pedal-zone" style={{ left: 0, width: `${neutralPct}%`, background: PEDAL_REGEN }} />
+          <div className="pedal-zone" style={{ left: `${neutralPct}%`, right: 0, background: PEDAL_ACCEL }} />
+          {pedalPct !== null && (
+            <div
+              className="pedal-fill"
+              style={pedalPct < neutralPct
+                ? { left: `${pedalPct}%`, width: `${neutralPct - pedalPct}%`, background: PEDAL_REGEN }
+                : { left: `${neutralPct}%`, width: `${pedalPct - neutralPct}%`, background: PEDAL_ACCEL }}
+            />
+          )}
+          <div className="pedal-neutral" style={{ left: `${neutralPct}%` }} />
+        </div>
+      </div>
+      <div className="tile-note">
+        {`regen below ${fmt(neutralMv, '.0f')} mV, acceleration above it · released pedal is `}
+        {`${fmt(idleMv, '.0f')} mV (full regen), floored is ${fmt(fullMv, '.0f')} mV`}
+        {mv === null ? '' : ` · now ${fmt(mv, '.0f')} mV`}
+      </div>
+    </div>
+  );
+}
 
 export function LiveMetrics({ live, config }: { live: Live; config: Config }) {
   return (
@@ -29,6 +99,10 @@ export function LiveMetrics({ live, config }: { live: Live; config: Config }) {
           <div className="grid g4">
             {g.metrics.map((m) => <CatalogueTile key={m.label} m={m} />)}
           </div>
+          {/* Under its own group's tiles: the bar is the same three numbers
+              (throttle %, zone, raw mV) drawn as one picture, and reading it
+              beside them is what makes the millivolts mean something. */}
+          {g.group === 'Driver Input' && <PedalBar live={live} config={config} />}
           {g.group === 'Lap & Distance' && <TripReset />}
         </div>
       ))}

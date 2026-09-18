@@ -443,7 +443,7 @@ def parse_motor_temp_frame(data_bytes):
 #     bytes 6-7  UINT16  delay between transmissions [ms], big-endian; 0 disables
 #
 # RESPONSE — periodic frames on the bank's ID (0x150/0x158/0x160/0x168):
-#     byte  0    UINT8   device signature; BIT 0 IS AN ERROR FLAG
+#     byte  0    UINT8   device signature. 0x0D on this car's ESC.
 #     byte  1    UINT8   the input ID of the FIRST value in this frame
 #     bytes 2-3  UINT16  value for that ID, in MILLIVOLTS, big-endian
 #     bytes 4-5  UINT16  value for ID+1   (present when the range is wider)
@@ -484,9 +484,22 @@ def gpio_input_id(gpio_number):
 THROTTLE_GPIO_NUMBER = 0
 THROTTLE_INPUT_ID = gpio_input_id(THROTTLE_GPIO_NUMBER)
 
-# Bit 0 of byte 0 means the controller could not serve the request (unknown
-# input ID, bank misconfigured). The values in such a frame are meaningless.
-GPIO_ERROR_FLAG = 0x01
+# Byte 0 is the ESC's device signature and this car's reads 0x0D on every frame
+# — including frames whose values are plainly good (a pedal tracking a foot
+# from 720 mV to 2688 mV, measured 2026-09-18).
+#
+# ⚠️ THERE IS NO ERROR-FLAG CHECK HERE ANY MORE, on purpose. The vendor's docs
+# say "device signature (last bit indicates error state)", which we read as bit
+# 0 — so the decoder discarded EVERY frame this controller sends, 0x0D having
+# bit 0 set. That was one of four faults that kept the throttle blank. Which
+# bit (if any) really flags an error cannot be told from the wire without an
+# ESC that will produce one, so guessing a different bit would just be the same
+# mistake with different odds.
+#
+# Nothing is lost by dropping it: a frame the ESC could not serve carries
+# implausible millivolts, and efficiency.throttle_percent() already refuses
+# anything outside THROTTLE_MV_MIN_VALID..MAX_VALID and returns a status saying
+# why. Validation by measured range beats validation by guessed bit.
 
 
 def build_gpio_request(bank=0, start_id=THROTTLE_INPUT_ID,
@@ -525,18 +538,14 @@ def build_gpio_request(bank=0, start_id=THROTTLE_INPUT_ID,
 def parse_gpio_report(arb_id, data_bytes):
     """A bank report frame -> {input_id: millivolts}, or {} if not one.
 
-    Returns {} — not zeros — for a frame the controller flagged as an error,
-    for a truncated frame, and for any ID that is not a GPIO report. Callers
-    therefore cannot accidentally read a failed request as a pedal at rest.
+    Returns {} — not zeros — for a truncated frame and for any ID that is not a
+    GPIO report. Implausible readings are rejected downstream by their
+    millivolts (see the signature note above), not by a flag bit here.
     """
     if arb_id not in GPIO_REPORT_ID_SET:
         return {}
     if data_bytes is None or len(data_bytes) < 4:
         return {}          # signature + ID + at least one value
-    if data_bytes[0] & GPIO_ERROR_FLAG:
-        # The ESC is telling us the request itself was bad. Whatever is in the
-        # value bytes is not a measurement.
-        return {}
 
     first_id = data_bytes[1]
     values = {}
@@ -556,9 +565,16 @@ def parse_throttle_frame(arb_id, data_bytes, input_id=THROTTLE_INPUT_ID):
     report covering other GPIOs never blanks a good reading.
 
         mms_throttle_mv        the raw millivolts, ALWAYS published when present
-        mms_throttle_percent   0-100, or absent when the raw value is implausible
-        mms_throttle_status    efficiency.THROTTLE_* — why the percent is missing
+        mms_throttle_percent   ACCELERATION 0-100 (0 at and below neutral)
+        mms_regen_percent      REGENERATION 0-100 (0 at and above neutral)
+        mms_throttle_status    efficiency.THROTTLE_* — why the percents are missing
         mms_throttle_zone      "eco" | "normal" | "power" (absent with no percent)
+
+    Two percentages because the pedal is a one-pedal control: below neutral it
+    commands regen, above it commands power (see efficiency.py's diagram). Both
+    are published on every frame so a dashboard never has to work out which
+    half of the pedal a raw voltage fell in — that comparison lives in
+    efficiency.py and nowhere else.
 
     The raw mV is published even when it converts to nothing, for exactly the
     reason mms_motor_ohms is: an out-of-range raw value is what diagnoses a
@@ -571,6 +587,7 @@ def parse_throttle_frame(arb_id, data_bytes, input_id=THROTTLE_INPUT_ID):
 
     millivolts = values[input_id]
     percent, status = efficiency.throttle_percent(millivolts)
+    regen, _ = efficiency.regen_percent(millivolts)
 
     parsed = {
         "mms_throttle_mv": millivolts,
@@ -579,6 +596,8 @@ def parse_throttle_frame(arb_id, data_bytes, input_id=THROTTLE_INPUT_ID):
     if percent is not None:
         parsed["mms_throttle_percent"] = percent
         parsed["mms_throttle_zone"] = efficiency.zone(percent)
+    if regen is not None:
+        parsed["mms_regen_percent"] = regen
     return parsed
 
 

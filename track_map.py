@@ -36,10 +36,17 @@ from track import (FINISH_LINE_LAT, FINISH_LINE_LON, TRACK_LENGTH_METERS,
                    haversine_metres, to_local_xy)
 from zolder_centreline import CENTRELINE_LATLON, LABEL_SIDE, OSM_ATTRIBUTION
 
+try:
+    from zolder_pitlane import PITLANE_LATLON
+except ImportError:                 # not baked yet: no pit zone, laps still count
+    PITLANE_LATLON = ()
+
 __all__ = [
     "CENTRELINE_XY", "CUM_M", "BOUNDS_XY", "LABEL_SIDE", "OSM_ATTRIBUTION",
     "position_at_distance", "split_at", "boundary_ticks", "is_at_zolder",
-    "ZOLDER_GEOFENCE_M",
+    "ZOLDER_GEOFENCE_M", "project", "track_position", "distance_to_polyline",
+    "TRACK_POS_MAX_OFFSET_M", "TRACK_POS_MIN_MARGIN_M",
+    "PITLANE_XY", "PIT_ZONE_ENABLED", "lane_of", "locate",
 ]
 
 # How close a REAL fix has to be to the finish line before we will believe the
@@ -117,6 +124,139 @@ def position_at_distance(d_m):
     ax, ay = CENTRELINE_XY[i]
     bx, by = CENTRELINE_XY[(i + 1) % len(CENTRELINE_XY)]
     return ax + t * (bx - ax), ay + t * (by - ay)
+
+
+def _nearest_on_segment(x, y, ax, ay, bx, by):
+    """(distance_m, t, signed_lateral_m) from a point to the segment a->b.
+
+    The lateral is left-positive in the direction a->b, and is only meaningful
+    while the foot of the perpendicular is inside the segment.
+    """
+    dx, dy = bx - ax, by - ay
+    seg_sq = dx * dx + dy * dy
+    if seg_sq <= 0.0:
+        return math.hypot(x - ax, y - ay), 0.0, 0.0
+    t = max(0.0, min(1.0, ((x - ax) * dx + (y - ay) * dy) / seg_sq))
+    d = math.hypot(x - (ax + t * dx), y - (ay + t * dy))
+    lateral = (dx * (y - ay) - dy * (x - ax)) / math.sqrt(seg_sq)
+    return d, t, lateral
+
+
+# A GPS fix only becomes a lap distance when it is this close to the centreline
+# AND the runner-up piece of track is this much farther away. Zolder doubles
+# back on itself: the start straight has another straight 79 m beside it running
+# the other way, and a fix halfway between them belongs to neither. Refusing is
+# right — the caller falls back to the odometer, which is merely a little stale,
+# whereas the wrong straight is 1600 m wrong.
+TRACK_POS_MAX_OFFSET_M = 15.0
+TRACK_POS_MIN_MARGIN_M = 15.0
+# Two candidates this close along the lap are the same piece of track (the two
+# segments either side of a vertex), not rivals.
+_SAME_PLACE_M = 60.0
+
+
+def project(lat, lon):
+    """Nearest point of the centreline to a position.
+
+    Returns (s_m, lateral_m, dist_m, runner_up_m):
+
+    s_m          distance along the lap of the nearest centreline point
+    lateral_m    signed offset from it, LEFT of travel positive
+    dist_m       unsigned offset
+    runner_up_m  offset to the nearest OTHER part of the lap, i.e. how
+                 unambiguous s_m is
+
+    This is the Python twin of trackDistAt() in Pit_Dashboard/wall.html. 216
+    segments, a third of a millisecond on a laptop: fine once per GPS fix, not
+    something to call per CAN frame.
+    """
+    x, y = to_local_xy(float(lat), float(lon))
+    n = len(CENTRELINE_XY)
+    found = []
+    for i in range(n):
+        ax, ay = CENTRELINE_XY[i]
+        bx, by = CENTRELINE_XY[(i + 1) % n]
+        d, t, lateral = _nearest_on_segment(x, y, ax, ay, bx, by)
+        found.append((d, CUM_M[i] + t * (CUM_M[i + 1] - CUM_M[i]), lateral))
+    found.sort()
+    d, s, lateral = found[0]
+    runner_up = math.inf
+    for d2, s2, _lat2 in found[1:]:
+        gap = abs(s2 - s)
+        if min(gap, TRACK_LENGTH_METERS - gap) > _SAME_PLACE_M:
+            runner_up = d2
+            break
+    return s % TRACK_LENGTH_METERS, lateral, d, runner_up
+
+
+def track_position(lat, lon):
+    """Lap distance for a fix that is unmistakably ON the track, else None."""
+    s, _lateral, d, runner_up = project(lat, lon)
+    return s if _unambiguous(d, runner_up) else None
+
+
+def _unambiguous(d, runner_up):
+    return d <= TRACK_POS_MAX_OFFSET_M and runner_up - d >= TRACK_POS_MIN_MARGIN_M
+
+
+def distance_to_polyline(xy, polyline_xy):
+    """Metres from a local-xy point to an OPEN polyline (the pit lane)."""
+    x, y = xy
+    return min(_nearest_on_segment(x, y, a[0], a[1], b[0], b[1])[0]
+               for a, b in zip(polyline_xy, polyline_xy[1:]))
+
+
+# --------------------------------------------------------------------------- #
+# Track or pit lane?
+# --------------------------------------------------------------------------- #
+# Set False to switch the whole pit-zone feature off (say the OSM pit lane turns
+# out to be drawn wrong). Nothing about COUNTING laps reads the zone — it only
+# tags laps as in/out and blanks the target speed — so this is always safe.
+PIT_ZONE_ENABLED = bool(PITLANE_LATLON)
+PITLANE_XY = tuple(to_local_xy(la, lo) for la, lo in PITLANE_LATLON)
+
+# Along the start straight the pit lane runs only 12-14 m from the track
+# centreline, which is the same size as a bad GPS fix. So one fix is allowed to
+# say "don't know": it must be within LANE_NEAR_M of one and LANE_MARGIN_M
+# nearer to it than to the other. At pit entry and pit exit the two are 30-90 m
+# apart and every fix is decisive; that is where the zone really gets decided,
+# and LapTracker's hysteresis carries it along the straight.
+LANE_NEAR_M = 12.0
+LANE_MARGIN_M = 8.0
+
+
+# A verdict is DECISIVE when the other candidate is this far away, which only
+# happens where the pit lane has left the track (entry, exit). LapTracker lets
+# only decisive fixes CHANGE an established zone, so noise on the straight can
+# never flip a racing car into the pit lane and blank the driver's target speed.
+LANE_DECISIVE_M = 20.0
+
+
+def lane_of(lat, lon):
+    """("track" | "pit_lane" | None, decisive) for one fix. None = can't tell."""
+    return locate(lat, lon)[1:3]
+
+
+def locate(lat, lon):
+    """Everything LapTracker wants from one fix, in one pass over the geometry.
+
+    Returns (track_pos_m, lane, decisive):
+
+    track_pos_m  lap distance, or None when the fix is not unmistakably on the
+                 track (see track_position)
+    lane         "track", "pit_lane" or None
+    decisive     True when the other lane is LANE_DECISIVE_M or more away
+    """
+    s, _lateral, d_track, runner_up = project(lat, lon)
+    pos = s if _unambiguous(d_track, runner_up) else None
+    if not PIT_ZONE_ENABLED:
+        return pos, None, False
+    d_pit = distance_to_polyline(to_local_xy(float(lat), float(lon)), PITLANE_XY)
+    if d_pit <= LANE_NEAR_M and d_track - d_pit >= LANE_MARGIN_M:
+        return None, "pit_lane", d_track >= LANE_DECISIVE_M
+    if d_track <= LANE_NEAR_M and d_pit - d_track >= LANE_MARGIN_M:
+        return pos, "track", d_pit >= LANE_DECISIVE_M
+    return pos, None, False
 
 
 def split_at(boundaries):
@@ -251,6 +391,43 @@ if __name__ == "__main__":
                                            CENTRELINE_XY[i])))
         for i in range(len(CENTRELINE_XY)))
     print(f"interp vs vertex  {worst:.9f} m (worst of {len(CENTRELINE_XY)})")
+
+    # project() must undo position_at_distance() all the way round, including
+    # from 12 m off the centreline on either side, where the pit lane runs.
+    import track as _track
+    lat0 = math.radians(FINISH_LINE_LAT)
+
+    def _latlon(x, y):
+        return (FINISH_LINE_LAT + math.degrees(y / _track._EARTH_RADIUS_M),
+                FINISH_LINE_LON + math.degrees(
+                    x / (_track._EARTH_RADIUS_M * math.cos(lat0))))
+
+    worst_s = worst_lat = 0.0
+    refused = 0
+    for k in range(0, 4000, 5):
+        px, py = position_at_distance(k)
+        tx, ty = tangent_at(k)
+        for off in (-12.0, 0.0, 12.0):
+            la, lo = _latlon(px - off * ty, py + off * tx)
+            s, lateral, d, _runner = project(la, lo)
+            err = abs(s - k)
+            err = min(err, TRACK_LENGTH_METERS - err)
+            # Inside a hairpin a 12 m offset genuinely lands nearer another
+            # part of the bend; that is geometry, not a bug. Count it, bound it.
+            if err > 25.0:
+                refused += 1
+                continue
+            worst_s = max(worst_s, err)
+            if off == 0.0:
+                worst_lat = max(worst_lat, abs(lateral))
+    print(f"project round trip worst {worst_s:.2f} m along, "
+          f"{worst_lat:.3f} m lateral on the centreline, "
+          f"{refused} of 2400 probes fell onto another bend")
+    assert worst_lat < 0.01 and refused < 120, "project() does not invert the map"
+    assert track_position(FINISH_LINE_LAT, FINISH_LINE_LON) is not None
+    tx, ty = tangent_at(0.0)
+    half = _latlon(39.5 * ty, -39.5 * tx)          # 39.5 m RIGHT of the line
+    print(f"between the two straights  track_position = {track_position(*half)}")
 
     w = BOUNDS_XY[1] - BOUNDS_XY[0]
     h = BOUNDS_XY[3] - BOUNDS_XY[2]

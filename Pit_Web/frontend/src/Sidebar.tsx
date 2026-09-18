@@ -55,6 +55,9 @@ export default function Sidebar({
           <KV k="Lap delta" v={fmt(live?.lapDelta ?? null, '+.1f')} mono />
           <KV k="Distance" v={live?.odometerKm == null ? MISSING : `${live.odometerKm.toFixed(1)} km`} />
           <KV k="Sector" v={live ? `S${live.sectorId} · ${live.sectorName}` : MISSING} wide />
+          <KV k="Car is" v={ZONE_LABEL[live?.state?.zone ?? ''] ?? MISSING} />
+          <KV k="Last lap" v={lastLapLabel(live?.state?.last_lap_kind ?? null,
+                                           live?.state?.last_lap_stopped_s ?? null)} />
         </div>
       </Sec>
 
@@ -104,12 +107,31 @@ export default function Sidebar({
   );
 }
 
+// What the CAR says, in the pit's words. A key the car did not send (an older
+// car, or no GPS yet) has no entry and renders as the usual dash.
+const ZONE_LABEL: Record<string, string> = {
+  track: 'on track', pit_lane: 'in the pit lane', box: 'in the box',
+};
+const KIND_LABEL: Record<string, string> = {
+  flying: 'flying', in: 'in-lap', out: 'out-lap', in_out: 'in + out',
+  start: 'not from the line', suspect: 'suspect',
+};
+
+function lastLapLabel(kind: string | null, stoppedS: number | null): string {
+  if (!kind) return MISSING;
+  const label = KIND_LABEL[kind] ?? kind;
+  return stoppedS !== null && stoppedS >= 10
+    ? `${label} · stood ${Math.round(stoppedS)} s` : label;
+}
+
 function CutLap({ carLap }: { carLap: number | null }) {
   const [sent, setSent] = useState<string | null>(null);
   const [freshSent, setFreshSent] = useState<string | null>(null);
+  const [setSentAt, setSetSentAt] = useState<string | null>(null);
+  const [wanted, setWanted] = useState('');
   const { data: ack } = usePoll(
     () => getJSON<{ ack: { applied?: boolean; lap?: number; action?: string } | null }>('/api/cut_lap/ack'),
-    5000, [sent ?? '', freshSent ?? '']);
+    5000, [sent ?? '', freshSent ?? '', setSentAt ?? '']);
 
   // Both commands share /lap_command and come back on the same ack node, so
   // the ack's own `action` is what says which one landed. Without that, a Cut
@@ -118,11 +140,21 @@ function CutLap({ carLap }: { carLap: number | null }) {
   const applied = (what: string) => ack?.ack?.applied && ack.ack.action === what;
 
   const freshLap = async () => {
-    if (carLap === null) { toast("The car has not reported a lap count yet", "err"); return; }
     try {
-      setFreshSent((await postJSON<{ sentAt: string }>('/api/lap/set', { lap: carLap })).sentAt);
-      toast(`Fresh lap sent — staying on lap ${carLap}`);
-    } catch (e) { toast(`Fresh lap failed: ${e}`, "err"); }
+      setFreshSent((await postJSON<{ sentAt: string }>('/api/lap/restart', {})).sentAt);
+      toast('Restart lap sent — nothing will be counted');
+    } catch (e) { toast(`Restart lap failed: ${e}`, "err"); }
+  };
+
+  const setLapNumber = async () => {
+    const lap = Number(wanted);
+    if (wanted.trim() === '' || !Number.isInteger(lap) || lap < 0) {
+      toast('Type the lap count the car should show', 'err'); return;
+    }
+    try {
+      setSetSentAt((await postJSON<{ sentAt: string }>('/api/lap/set', { lap })).sentAt);
+      toast(`Lap number ${lap} sent to the car`);
+    } catch (e) { toast(`Set lap failed: ${e}`, "err"); }
   };
 
   return (
@@ -138,26 +170,35 @@ function CutLap({ carLap }: { carLap: number | null }) {
           ? (applied('cut_lap')
               ? `Car confirmed — now on lap ${ack?.ack?.lap} · sent ${sent}`
               : `Sent ${sent} — awaiting the car's confirmation.`)
-          : 'Closes the lap and COUNTS it: the part-lap so far is recorded as a real lap, with its time and energy. Use it when the line was missed.'}
+          : 'Closes the lap and COUNTS it. Only for a count that is genuinely one short. Not in the box: the car counts a pit-lane pass of the line by itself.'}
       </div>
 
-      {/* The pit-exit command. Kept next to Cut lap because the two look alike
-          and are not: this one records nothing. Coming out of the box, the
-          part-lap before the stop is not a lap, and filing it as one puts a
-          fake time and a fake energy figure into the per-lap history the
-          strategy matrix is built from. */}
-      <button className="btn block" style={{ marginTop: 8 }}
-              disabled={carLap === null} onClick={freshLap}>
-        <Icon name="timer" size={13} />Fresh lap, don’t count it
+      {/* Kept next to Cut lap because the two look alike and are not: this one
+          records nothing. NOT a pit-stop button any more — the car closes the
+          in-lap itself at the line in the pit lane and tags in/out laps, so
+          they stay out of the energy figures without anyone pressing anything. */}
+      <button className="btn block" style={{ marginTop: 8 }} onClick={freshLap}>
+        <Icon name="timer" size={13} />Restart lap, don’t count it
       </button>
       <div className="caption">
         {freshSent
-          ? (applied('set_lap')
+          ? (applied('restart_lap')
               ? `Car confirmed — fresh lap, still on lap ${ack?.ack?.lap} · sent ${freshSent}`
-              : `Sent ${freshSent} — awaiting the car's confirmation.`)
-          : carLap === null
-            ? 'Waiting for the car to report a lap count.'
-            : `For a pit exit. Zeroes lap distance, lap energy and the lap clock, and stays on lap ${carLap} — nothing is recorded as a lap.`}
+              : `Sent ${freshSent} — awaiting the car's confirmation. (A car on the old lap code never answers this.)`)
+          : 'Throws the lap in progress away: zeroes lap distance, energy and clock, counts nothing, and the next pass of the line only starts the clock. For test sessions — not needed for a pit stop.'}
+      </div>
+
+      <div className="btnrow" style={{ marginTop: 8 }}>
+        <input type="text" inputMode="numeric" placeholder={carLap === null ? 'lap' : String(carLap)}
+               value={wanted} onChange={(e) => setWanted(e.target.value)} style={{ width: 72 }} />
+        <button className="btn" onClick={setLapNumber}>Set car lap number</button>
+      </div>
+      <div className="caption">
+        {setSentAt
+          ? (applied('set_lap')
+              ? `Car confirmed — now on lap ${ack?.ack?.lap} · sent ${setSentAt}`
+              : `Sent ${setSentAt} — awaiting the car's confirmation.`)
+          : 'Laps COMPLETED, to match the officials. Changes the number only; the lap in progress carries on.'}
       </div>
     </Sec>
   );

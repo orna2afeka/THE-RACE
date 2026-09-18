@@ -67,6 +67,7 @@ from PySide6.QtGui import QKeySequence, QShortcut           # noqa: E402
 from PySide6.QtWidgets import QApplication                  # noqa: E402
 
 import drivetrain                                           # noqa: E402
+import efficiency                                           # noqa: E402
 import limits                                               # noqa: E402
 from cell_extremes import RollingExtremes                   # noqa: E402
 import speed_profile                                        # noqa: E402
@@ -118,6 +119,29 @@ DRIVE_W = 3900.0
 # and inside the -3.5 kW the fake car can make on its own, so the bench sees the
 # same power the car reports braking hard into a corner.
 FORCED_REGEN_W = -900.0
+
+
+def pedal_mv_for_power(power_w: float) -> float:
+    """Motor power -> a plausible pedal voltage for the DS001 pedal bar.
+
+    The fake car is driven by power, not by a pedal, so this runs the real
+    car's relationship backwards: power above zero means the driver is asking
+    for acceleration, power below zero means they have lifted into regen, and
+    the pedal sits that far either side of efficiency.THROTTLE_MV_NEUTRAL.
+
+    It is a PLAUSIBLE INVERSE, not a model of the real pedal. The car's actual
+    pedal-to-power curve is the ESC's business and is not linear. What this has
+    to get right is only what the bench is for: that the bar moves the right
+    way, reaches both ends, and shows REGEN exactly when the brake light is
+    lit — which it does, because both are driven from this same power figure.
+    """
+    span_up = efficiency.THROTTLE_MV_FULL - efficiency.THROTTLE_MV_NEUTRAL
+    span_down = efficiency.THROTTLE_MV_NEUTRAL - efficiency.THROTTLE_MV_IDLE
+    if power_w >= 0.0:
+        frac = min(1.0, power_w / limits.POWER.full_scale)
+        return efficiency.THROTTLE_MV_NEUTRAL + frac * span_up
+    frac = min(1.0, abs(power_w) / abs(FORCED_REGEN_W))
+    return efficiency.THROTTLE_MV_NEUTRAL - frac * span_down
 
 
 def raw_rpm_for_speed(kmh: float) -> int:
@@ -486,6 +510,7 @@ def build_sim(hud: RacingDashboard, car: FakeCar, strategy: str,
         hud._on_cell_voltages(None, {})
         hud._on_bms_probe_temps({})
         hud._on_motor_temp(0.0, -1000.0, pt1000.STATUS_NO_READING)
+        hud._on_pedal(None, None, None)
         push("alerts", hud._on_alerts, [])
         push("map", lambda m: hud._on_motor_map(*m), ("", -1))
 
@@ -541,6 +566,13 @@ def build_sim(hud: RacingDashboard, car: FakeCar, strategy: str,
         # recorded pack maximum of 36 A.
         hud._on_battery_current(-0.49 * amps)
         hud._on_motor_current(amps * 1.4)
+        # The pedal bar, from the same power figure that drives the brake lamp
+        # above — so REGEN on the bar and BRAKE LIGHT ON in the status line
+        # always agree, which is the pair worth checking on a bench.
+        pedal_mv = pedal_mv_for_power(f["power_w"])
+        hud._on_pedal(pedal_mv,
+                      efficiency.throttle_percent(pedal_mv)[0],
+                      efficiency.regen_percent(pedal_mv)[0])
         hud._on_ctrl_temp(int(round(f["ctrl_c"])))
         hud._on_motor_temp(pt1000.ohms_from_celsius(f["motor_c"]),
                            f["motor_c"], pt1000.STATUS_OK)

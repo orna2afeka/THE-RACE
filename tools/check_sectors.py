@@ -224,7 +224,11 @@ try:
                 worst_real = max(worst_real, max(sp.values()))
                 print("      tag %-4s %s" % (
                     tag, " ".join("S%d=%.1f" % (k, v) for k, v in sorted(sp.items()))))
-        check("no split from the real store is absurd", worst_real < 4 * LAP_S,
+        # What this guards against is a split stitched ACROSS SESSIONS (612,896 s,
+        # seven days). A car that stands still inside a sector produces a long
+        # split too, and a true one: 1246.7 s on 2026-09-18, parked in the box
+        # with the lap still open. So the bound is "not hours", not "about a lap".
+        check("no split from the real store is absurd", worst_real < 3600.0,
               "largest %.1f s (was 612,896 s before the run segmentation)"
               % worst_real)
 except Exception as exc:                                   # pragma: no cover

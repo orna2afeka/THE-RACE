@@ -623,6 +623,10 @@ class SmartCANWorker(CANWorker):
         self.controller_temp_updated.emit(None)
         self.motor_current_updated.emit(None)
         self.battery_current_updated.emit(None)
+        # The pedal blanks to a dash like every gauge. It must NOT fall back to
+        # the neutral point: "coasting" is a thing the driver is doing, and a
+        # dead bus is not evidence that they are doing it.
+        self.throttle_updated.emit(None, None, None)
         self.cell_temp_updated.emit(None)
         # Values blank like every other gauge; _thermistor_configured does
         # NOT reset -- a module that has already proven it's configured stays
@@ -891,13 +895,27 @@ class SmartCANWorker(CANWorker):
 
         event = self.laps.update_gps(self.gps.get_coordinates(), now)
         if event == "lap":
-            print(f"🏁 LAP {self.laps.lap_count} — "
-                  f"{self.laps.last_lap_time_s:.1f}s, "
-                  f"{self.laps.last_lap_energy_wh:.1f} Wh, "
-                  f"{self.laps.last_lap_distance_m:.0f} m ({self.laps.lap_source})")
+            self._print_lap()
         elif event == "start":
             print("🏁 Finish line acquired — lap timing armed.")
+        # "resync" prints its own line from LapTracker, with the distance.
         self.vehicle_state["motor"].update(self.laps.snapshot())
+
+    def _print_lap(self) -> None:
+        """One console line per counted lap. Any figure may be unknown — a lap
+        timed across a reboot has no time, one cut with the CAN bus dead has no
+        energy — and a lap must never fail to print because of it."""
+        laps = self.laps
+
+        def fmt(value, spec, unit):
+            return "—" if value is None else f"{value:{spec}}{unit}"
+
+        print(f"🏁 LAP {laps.lap_count} [{laps.last_lap_kind}] — "
+              f"{fmt(laps.last_lap_time_s, '.1f', ' s')}, "
+              f"{fmt(laps.last_lap_energy_wh, '.1f', ' Wh')}, "
+              f"{fmt(laps.last_lap_distance_m, '.0f', ' m')} "
+              f"({laps.lap_source}"
+              f"{'; ' + ', '.join(laps.last_lap_flags) if laps.last_lap_flags else ''})")
 
     def _poll_vehicle_inputs(self) -> None:
         """Refresh the GPIO-sourced indicators, independently of CAN.
@@ -932,10 +950,16 @@ class SmartCANWorker(CANWorker):
         if profile is None:
             return
 
-        lap_distance = self.laps.odometer_m - self.laps._lap_start_odometer_m
-        target_kmh = profile.speed_kmh_at(lap_distance)
-        self.target_speed_updated.emit(float(target_kmh), self.active_strategy)
-        self.vehicle_state["motor"]["target_speed_kmh"] = round(target_kmh, 1)
+        # GPS lap position when it is fresh, the odometer's otherwise, and None
+        # in the pit lane, where there is a speed limit and no target. None goes
+        # to the HUD and to the pit as None: a target left over from the last
+        # corner of the in-lap is worse than a dash.
+        lap_distance = self.laps.profile_distance_m(now)
+        target_kmh = (None if lap_distance is None
+                      else float(profile.speed_kmh_at(lap_distance)))
+        self.target_speed_updated.emit(target_kmh, self.active_strategy)
+        self.vehicle_state["motor"]["target_speed_kmh"] = (
+            None if target_kmh is None else round(target_kmh, 1))
         self.vehicle_state["motor"]["active_strategy"] = self.active_strategy
 
     def _publish_lap_timer(self) -> None:
@@ -948,7 +972,7 @@ class SmartCANWorker(CANWorker):
         restart the clock with nothing to show. Same process and the same
         time.monotonic(), so the HUD can count up from the start itself.
         """
-        start = self.laps._lap_start_ts
+        start = self.laps.lap_start_ts
         if start == self._lap_timer_sent:
             return
         self._lap_timer_sent = start
@@ -995,8 +1019,18 @@ class SmartCANWorker(CANWorker):
                 self.laps.force_lap("manual")
                 print(f"🏁 PIT CUT LAP -> lap {self.laps.lap_count}")
             elif action == "set_lap":
-                self.laps.set_lap(cmd.get("value") or 0)
-                print(f"🏁 PIT SET LAP -> {self.laps.lap_count}")
+                # A command with no number is refused, not read as 0: `or 0`
+                # here once meant a malformed message could zero the race.
+                value = cmd.get("value")
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    self.laps.set_lap(value)
+                    print(f"🏁 PIT SET LAP -> {self.laps.lap_count}")
+                else:
+                    applied = False
+                    print(f"⚠️ PIT SET LAP ignored: no lap number in {cmd!r}")
+            elif action == "restart_lap":
+                self.laps.restart_lap()
+                print("🏁 PIT RESTART LAP — nothing counted, looking for the line")
             elif action == "reset_energy":
                 self.laps.reset_energy()
                 print("🏁 PIT RESET ENERGY")

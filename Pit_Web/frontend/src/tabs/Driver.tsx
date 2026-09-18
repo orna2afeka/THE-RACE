@@ -9,7 +9,7 @@ import 'maplibre-gl/dist/maplibre-gl.css';
 import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url';
 import { SectionTitle, SectorCard } from '../components';
 import { Icon } from '../icons';
-import { getJSON, usePoll } from '../lib';
+import { ageText, clockTime, getJSON, usePoll } from '../lib';
 import type { Config, Live, Sectors } from '../types';
 import { SectorTimes } from '../Sectors';
 
@@ -85,6 +85,10 @@ function CarMap({ live, config }: { live: Live; config: Config }) {
     const { lat, lon, has_gps } = live.state;
     marker.current.setLngLat([lon, lat]);
     marker.current.getElement().classList.toggle('nofix', !has_gps);
+    // Everything below belongs to a LIVE fix. A stale one leaves the marker
+    // where it was last seen, dimmed, and stops extending the trail -- drawing
+    // a breadcrumb from a position that is not changing would paint a car
+    // standing still on a track it is driving.
     if (!has_gps) return;
     const last = trail.current[trail.current.length - 1];
     if (!last || last[0] !== lon || last[1] !== lat) {
@@ -94,14 +98,31 @@ function CarMap({ live, config }: { live: Live; config: Config }) {
     if (followed.current) m.easeTo({ center: [lon, lat], duration: 600 });
   }, [live.state.lat, live.state.lon, live.state.has_gps]);
 
-  const fix = live.state.has_gps;
+  // Three states, never two. "Has a position" and "that position is current"
+  // are different questions: the car keeps serving its last known fix after the
+  // receiver loses lock, so the map can hold a perfectly good-looking pin that
+  // is an hour old. Say which it is, and when it was taken.
+  const { has_gps: fix, has_gps_point: point, gps_age_s: age,
+          gps_fix_ts: fixTs } = live.state;
+  const mark = fixTs == null ? null : clockTime(fixTs);
+  const label = fix
+    ? `${live.state.lat.toFixed(5)}, ${live.state.lon.toFixed(5)}`
+      + (mark ? ` · ${mark}` : '')
+    : point
+      // The instant AND the elapsed time: a screenshot pasted into the team
+      // chat an hour later still says when the car was last seen.
+      ? `NO FIX · last seen ${mark ?? '—'}${age == null ? '' : ` · ${ageText(age)} ago`}`
+      : 'No GPS fix — paddock fallback';
   return (
     <div className="mapwrap">
       <div ref={holder} style={{ width: '100%', height: '100%' }} />
       <div className="map-overlay">
-        <span className={`status ${fix ? 'live' : 'stale'}`}>
+        <span className={`status ${fix ? 'live' : 'stale'}`}
+              title={fix ? 'Position is current'
+                         : point ? 'The car is still sending its last known fix; the receiver has lost lock'
+                                 : 'The car has never reported a position this session'}>
           <Icon name="pin" size={13} />
-          {fix ? `${live.state.lat.toFixed(5)}, ${live.state.lon.toFixed(5)}` : 'No GPS fix — paddock fallback'}
+          {label}
         </span>
         <button className="btn" style={{ padding: '5px 10px', fontSize: 'calc(12px * var(--pit-font-scale))' }} onClick={() => {
           followed.current = true;

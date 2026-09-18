@@ -483,13 +483,22 @@ def _laps_from_rows(rows):
         if key in seen:
             continue
         seen.add(key)
+        # The car's own tags, absent on rows from a car (or a store) that
+        # predates them. last_lap_number is the lap these figures belong to;
+        # calculated_lap is only right until someone corrects the lap number.
+        have = r.keys()
+        number = r["last_lap_number"] if "last_lap_number" in have else None
         laps.append({
-            "lap": int(lap),
+            "lap": int(number if number is not None else lap),
             "ts": r["device_ts"],
             "time_s": t,
             "energy_wh": e,
             "regen_wh": r["last_lap_regen_energy"],
             "distance_m": r["last_lap_distance_m"],
+            "kind": r["last_lap_kind"] if "last_lap_kind" in have else None,
+            "flags": r["last_lap_flags"] if "last_lap_flags" in have else None,
+            "stopped_s": r["last_lap_stopped_s"] if "last_lap_stopped_s" in have else None,
+            "source": r["lap_source"] if "lap_source" in have else None,
         })
     return laps
 
@@ -506,9 +515,10 @@ def _write_laps_sheet(ls, laps, race_start):
     from openpyxl.utils import get_column_letter
 
     headers = ["Lap", "Finished (local)", "Race Time", "Lap Time",
-               "Energy (Wh)", "Regen (Wh)", "Distance (m)", "Avg Speed (km/h)"]
+               "Energy (Wh)", "Regen (Wh)", "Distance (m)", "Avg Speed (km/h)",
+               "Kind", "Stood still (s)", "Cut by", "Flags"]
     formats = [None, "yyyy-mm-dd hh:mm:ss", "[h]:mm:ss", "[m]:ss.000",
-               "0.0", "0.0", "0", "0.0"]
+               "0.0", "0.0", "0", "0.0", None, "0", None, None]
     ls.append(headers)
 
     def as_duration(sec):
@@ -519,19 +529,29 @@ def _write_laps_sheet(ls, laps, race_start):
         avg = (d / 1000.0) / (t / 3600.0) if t and d is not None else None
         ls.append([lap["lap"], _excel_dt(lap["ts"]),
                    _race_duration(lap["ts"], race_start), as_duration(t),
-                   lap["energy_wh"], lap["regen_wh"], d, avg])
+                   lap["energy_wh"], lap["regen_wh"], d, avg,
+                   lap.get("kind"), lap.get("stopped_s"), lap.get("source"),
+                   lap.get("flags")])
     if not laps:
         ls.append(["No lap completed in this window."] + [None] * (len(headers) - 1))
     else:
-        times = [l["time_s"] for l in laps if l["time_s"]]
+        # Best and Average describe RACING laps. Once the car tags its laps,
+        # an in-lap (it holds the pit stop) or an out-lap must not drag them;
+        # a window with no tags at all is from an older car and is averaged
+        # whole, as it always was. Same rule as db.flying_laps().
+        tagged = any(l.get("kind") for l in laps)
+        pool = [l for l in laps if l.get("kind") == "flying"] if tagged else laps
+        label = " (flying laps)" if tagged else ""
+        times = [l["time_s"] for l in pool if l["time_s"]]
         ls.append([])
-        ls.append(["Best", None, None, as_duration(min(times) if times else None),
+        ls.append(["Best" + label, None, None,
+                   as_duration(min(times) if times else None),
                    None, None, None, None])
-        ls.append(["Average", None, None,
-                   as_duration(_mean(l["time_s"] for l in laps)),
-                   _mean(l["energy_wh"] for l in laps),
-                   _mean(l["regen_wh"] for l in laps),
-                   _mean(l["distance_m"] for l in laps), None])
+        ls.append(["Average" + label, None, None,
+                   as_duration(_mean(l["time_s"] for l in pool)),
+                   _mean(l["energy_wh"] for l in pool),
+                   _mean(l["regen_wh"] for l in pool),
+                   _mean(l["distance_m"] for l in pool), None])
         for row in ls.iter_rows(min_row=ls.max_row - 1, max_row=ls.max_row):
             row[0].font = Font(bold=True)
 

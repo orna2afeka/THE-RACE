@@ -67,6 +67,10 @@ from strategy_engine import (DOC_TO_TRACK_OFFSET_M,           # noqa: E402
                              SECTIONS_INFO, TRACK_LANDMARKS,
                              TURN_START_TRACK_M)
 from constants import SECTION_NAMES                           # noqa: E402
+# How long a displayed position stays "live". limits.py owns it, and the pit's
+# own API reads the same constant -- two answers to "is this position current"
+# is how the wall and the dashboard end up disagreeing in front of the crew.
+from limits import GPS_LIVE_MAX_AGE_S                         # noqa: E402
 
 # BOTH generated pages live in docs/, and neither is application code.
 #
@@ -726,6 +730,23 @@ function trailPath(d) {
   return "M " + pts.map(p => p[0].toFixed(1) + "," + p[1].toFixed(1)).join(" L ");
 }
 
+// hh:mm:ss in the viewer's timezone, for marking WHEN something happened.
+function fmtClockTime(epochS) {
+  if (epochS == null || !isFinite(epochS)) return "—";
+  const d = new Date(epochS * 1000), p = n => String(n).padStart(2, "0");
+  return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+}
+
+function fmtAgeShort(sec) {
+  if (sec == null || !isFinite(sec)) return "—";
+  const s = Math.floor(sec);
+  if (s < 90) return s + "s";
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + "m";
+  const h = Math.floor(m / 60);
+  return h < 24 ? h + "h " + (m % 60) + "m" : Math.floor(h / 24) + "d";
+}
+
 function fmtTime(s) {
   if (s == null) return "—";
   const m = Math.floor(s / 60);
@@ -1161,6 +1182,7 @@ __BASE_CSS__
       <div class="label">Where the car is</div>
       <div class="value small" id="sector-name">&mdash;</div>
       <div class="sub" id="next-sub">&mdash;</div>
+      <div class="sub" id="gps-mark">&mdash;</div>
       <div id="progress"><div id="progress-mark"></div></div>
     </div>
 
@@ -1239,6 +1261,8 @@ let dist = 0, target = null, everPainted = false;
 // The GPS marker, in SVG units: where the last fix put it, and where it is
 // drawn (eased toward the first, so a 1 Hz feed reads as motion).
 let fixTarget = null, fixShown = null;
+// The age of the car's last fix and the car-clock instant it was sampled at.
+let gpsAge = null, gpsSampleTs = null;
 let race = { start: CONFIG.raceStart, end: CONFIG.raceEnd };
 let sun = null;
 
@@ -1314,6 +1338,10 @@ function applySnapshot(obj) {
   const lat = num(obj.lat), lon = num(obj.lon);
   const gpsDist = trackDistAt(lat, lon);
   fixTarget = gpsDist == null ? null : geoToSvg(lat, lon);
+  // The car sends the age of its last fix even when it withholds a stale
+  // position, so the page can say WHEN rather than just "no GPS".
+  gpsAge = num(obj.gps_age_s);
+  gpsSampleTs = num(obj.ts);
   if (fixTarget == null) fixShown = null;
   const d = gpsDist != null ? gpsDist : num(obj.lap_distance_m);
   if (d != null) {
@@ -1493,6 +1521,20 @@ function render() {
   el("lastlap").textContent = fmtTime(num(s.last_lap_time_s));
   const odo = num(s.odometer_m);
   el("odo").textContent = odo == null ? "—" : dash(odo / 1000, 1);
+
+  // Is the marker on GPS, and if not, when was the car last seen? Both the
+  // instant and the elapsed time: a screenshot sent to somebody an hour later
+  // still answers the question.
+  const gmark = el("gps-mark");
+  if (fixTarget != null) {
+    gmark.textContent = "GPS live" + (gpsSampleTs == null ? ""
+                                      : " · " + fmtClockTime(gpsSampleTs));
+  } else if (gpsAge != null && gpsSampleTs != null) {
+    gmark.textContent = "no GPS · last fix " + fmtClockTime(gpsSampleTs - gpsAge)
+                        + " · " + fmtAgeShort(gpsAge) + " ago";
+  } else {
+    gmark.textContent = "position from lap distance";
+  }
 
   const soc = num(s.soc_percent);
   el("soc").textContent = soc == null ? "—" : Math.round(soc);
@@ -1754,6 +1796,7 @@ __BASE_CSS__
     <div id="foot">
       <span>Next: <b id="nextcorner" style="color:var(--text)">&mdash;</b></span>
       <span>Sector <b id="sector" style="color:var(--text)">&mdash;</b></span>
+      <span>Pos <b id="gpsmark" style="color:var(--text)">&mdash;</b></span>
       <span class="spacer"></span>
       <span id="src">&mdash;</span>
     </div>
@@ -1955,9 +1998,18 @@ function render() {
   // -- the map ---------------------------------------------------------- //
   // GPS first, exactly as on the spectator page: a fix needs no datum, so it
   // survives a Pi restart mid-lap and a trip reset taken off the line, both of
-  // which leave lap_distance_m pointing at the wrong corner. isCarried keeps a
-  // position the car has stopped sending from being redrawn as current.
-  const haveFix = !isCarried(s, "lat") && !isCarried(s, "lon");
+  // which leave lap_distance_m pointing at the wrong corner.
+  //
+  // But ONLY a current fix. The car goes on serving its last known position
+  // after the receiver loses lock -- deliberately, a frozen dot beats an empty
+  // map on the driver's screen -- so gps_age_s is what separates "here" from
+  // "here half an hour ago". Without this gate the marker sits still while
+  // lap_distance_m, which is live, says the car is two laps down the road.
+  // isCarried is a different guard and both are needed: it catches a field the
+  // car has STOPPED sending, not one it keeps resending unchanged.
+  const fixAge = isCarried(s, "gps_age_s") ? null : num(s.gps_age_s);
+  const haveFix = fixAge != null && fixAge <= CONFIG.gpsMaxAgeS
+                  && !isCarried(s, "lat") && !isCarried(s, "lon");
   const lat = haveFix ? num(s.lat) : null, lon = haveFix ? num(s.lon) : null;
   const gpsDist = trackDistAt(lat, lon);
   const fixXY = gpsDist == null ? null : geoToSvg(lat, lon);
@@ -1971,6 +2023,22 @@ function render() {
       ? nx[0].name + (nx[0].speed != null ? " · " + nx[0].speed + " km/h" : "") +
         " in " + Math.round(nx[1]) + " m"
       : "—";
+  }
+
+  // Where the marker came from, and -- when it is not GPS -- the instant of the
+  // last fix as well as its age. A wall photographed and sent to someone an hour
+  // later still says when the car was last seen.
+  const gm = el("gpsmark");
+  if (haveFix) {
+    gm.textContent = "GPS live · " + fmtClockTime(s.device_ts);
+    gm.style.color = "var(--ok, #35d07f)";
+  } else if (fixAge != null) {
+    gm.textContent = "no fix · last " + fmtClockTime(s.device_ts - fixAge)
+                     + " · " + fmtAgeShort(fixAge) + " ago";
+    gm.style.color = "var(--warn, #ffb300)";
+  } else {
+    gm.textContent = dist == null ? "—" : "by distance";
+    gm.style.color = "var(--text)";
   }
 
   el("src").textContent =
@@ -2076,6 +2144,7 @@ def render_wall(data):
     config = {
         "pollMs": 1000,
         "staleAfterS": STALE_AFTER_S,
+        "gpsMaxAgeS": GPS_LIVE_MAX_AGE_S,
         "profiles": _all_profile_lap_seconds(),
         # A running lap longer than this is not a lap, it is a stopped feed or a
         # car sitting in the box, and the clock is blanked rather than counted.

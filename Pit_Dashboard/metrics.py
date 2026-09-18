@@ -34,6 +34,15 @@ HISTORY_CHARTS = [
     # where the energy goes. NaN never 0 — a dropout must not read as lift-off.
     Metric("Throttle", "Throttle", "%", "#ff4dd2",
            "mms_throttle_percent", None),
+    # The RAW pedal voltage, charted beside Throttle % on purpose. The percentage
+    # above is acceleration only — it is 0 for the whole of the regen half of
+    # the pedal's travel — so a lap spent lifting and coasting is a flat zero
+    # line there and a moving trace here. This is the one that shows how the
+    # driver actually used the one-pedal control. History.tsx draws
+    # efficiency.THROTTLE_MV_NEUTRAL across it: above that line the driver was
+    # asking for power, below it the car was recovering energy.
+    Metric("PedalRaw", "Pedal Position", "mV", "#4aa3ff",
+           "mms_throttle_mv", None),
     Metric("Power", "Motor Power", "W", "#00B3FF",
            "mms_power_W", None),
     Metric("RPM", "Motor RPM", "rpm", "#9b59b6",

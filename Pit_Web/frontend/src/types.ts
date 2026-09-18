@@ -51,6 +51,11 @@ export interface Config {
   liveMetricCount: number;
   liveMetricsPerRow: number;
   mapFallback: { lat: number; lon: number };
+  /** The one-pedal control's landmarks, in raw millivolts, straight from
+   *  efficiency.py. The browser holds no copy of the neutral point: regen is
+   *  below neutralMv, acceleration above it, and idleMv is where a fully
+   *  released pedal sits (maximum regen). */
+  pedal: { idleMv: number; neutralMv: number; fullMv: number };
 }
 
 export interface LiveState {
@@ -62,12 +67,38 @@ export interface LiveState {
   last_lap_energy: Num; total_race_energy: Num; last_lap_time_s: Num;
   lap_distance_m: Num; lap_source: string | null;
   auto_lap: Num; odometer_km: Num;
+  /** The car's own lap tags (gate-based tracker). All null from an older car.
+      zone: where the car is NOW - 'track' | 'pit_lane' | 'box'.
+      last_lap_kind: 'flying' | 'in' | 'out' | 'in_out' | 'start' | 'suspect';
+      only flying laps feed averages and strategy. */
+  zone: string | null; track_pos_m: Num; current_lap: Num;
+  last_lap_kind: string | null; last_lap_flags: string | null;
+  last_lap_stopped_s: Num;
   lat: number; lon: number;
   /** Deliberately separate from lat/lon: the map falls back to the Zolder
    *  paddock so it has somewhere to centre, and this says whether the pin is
-   *  real. 0,0 is a real place in the Atlantic. */
+   *  real. 0,0 is a real place in the Atlantic.
+   *
+   *  LIVE, not merely present: the car goes on serving its last known fix
+   *  after the receiver loses lock, so a position can be well-formed and an
+   *  hour old. Decided in Python against limits.GPS_LIVE_MAX_AGE_S. */
   has_gps: boolean;
+  /** There is a position on the row at all, however old. has_gps && !this is
+   *  impossible; !has_gps && this means "last seen here". */
+  has_gps_point: boolean;
+  /** Seconds since the car's last usable fix, straight from its GPSReader.
+   *  null on a car whose build predates the field. */
+  gps_age_s: Num;
+  /** When that fix was taken, epoch seconds on the CAR's clock — the same
+   *  clock the row's timestamp is in. null when it cannot be said. */
+  gps_fix_ts: Num;
   speed_kmh: Num;
+  /** The one-pedal control. throttle_pct is ACCELERATION above the neutral
+   *  point and regen_pct is REGENERATION below it, so at most one of the two
+   *  is ever non-zero; throttle_mv is the raw reading both are made of. All
+   *  null when the pedal is not reporting - never 0. */
+  throttle_pct: Num; regen_pct: Num; throttle_mv: Num;
+  throttle_zone: string | null;
   bms_has_error: number; bms_error_code: number; bms_protections: string;
   mms_has_error: number; mms_error_code: number; mms_alerts: string;
 }
@@ -135,6 +166,8 @@ export interface CarHealth {
   canFrames: Num;
   gpsFix: Num;
   gpsDetail: string | null;
+  gpsAgeS: Num;
+  gpsFixTs: Num;
 }
 
 /** One strategy's simulation, exactly as the engine ran it. The chart draws

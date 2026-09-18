@@ -170,14 +170,36 @@ setup fault to fix before rolling out. **Take the car outside and wait for a
 real fix before the race** — the GNSS antenna connector is separate from the
 LTE ones, and a loose one looks exactly like being parked indoors.
 
-### ☐ Check GPS lap detection — **unproven, watch it**
+### ☐ Check GPS lap detection — **unproven on the car, watch it**
 
-No lap in the store has ever been GPS-triggered: every lap boundary so far came
-from the 4400 m odometer force-cut, because the finish-line geofence is at
-Zolder and all testing was done in Israel. On the first laps, check `lap_source`
-(shown per lap in the profile builder). If it reads `odometer` rather than `gps`
-at Zolder, finish-line detection is not working — lap times and any measured
-speed profile inherit that error.
+A lap is one FORWARD passage of the finish gate: a 50 m line across the track
+**and the pit lane** (`track.py`, 20 m left / 30 m right of the finish point).
+Proven only in simulation (`python SolarRace_OS/modules/lap_tracker.py`); no lap
+in the store has ever been GPS-triggered, because all testing was in Israel.
+
+**The gate was checked on site on 2026-09-18:** a pin on the painted
+start/finish line at the pit wall lands 0.0 m along the track from the
+coordinate in `track.py`. Nothing to enter. Our box is 35-40 m **past** the
+line, so coming in the car passes the line in the pit lane *before* it stops.
+At a different circuit or box, re-check: `python tools/check_gate.py`.
+
+**On the first laps, watch the console / the pit's Lap Source tile:**
+
+| You do | You should see |
+|---|---|
+| first passage of the line | `Finish line acquired` — nothing counted |
+| a flying lap | `LAP n [flying] … (gps)` |
+| come into the pit lane | **no button pressed**; `LAP n [in]` as the car passes the line in the pit lane, just before the box |
+| stop in the box, drive out, complete the lap | nothing while parked; `LAP n+1 [out]` at the line on track — that lap holds the stop, so its time is long |
+| target speed on the HUD | `—` in the pit lane, back within ~150 m of the pit exit |
+
+If `lap_source` reads `odometer` with GPS healthy, the gate is in the wrong
+place: re-survey it. If lane tags are wrong but laps count, set
+`PIT_ZONE_ENABLED = False` in `track_map.py` — counting never depends on it.
+
+**Do not press Cut Lap in the box.** The passage on the way in already counted
+that lap. Cut Lap is for a count that is genuinely one short; Set Lap corrects
+the number and touches nothing else.
 
 ---
 
