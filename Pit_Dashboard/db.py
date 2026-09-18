@@ -191,6 +191,13 @@ METRIC_COLUMNS = [
     "calculated_lap",
     "lat",
     "lon",
+    # How old the position on this row is, in seconds, straight from the car's
+    # GPSReader. Without it lat/lon cannot be read at all: the car keeps serving
+    # the LAST KNOWN fix once the receiver loses lock, on purpose (a frozen dot
+    # beats an empty map), so a row can carry a perfectly well-formed position
+    # from twenty minutes ago while the car is a kilometre down the track. Any
+    # consumer that draws the position must gate on this.
+    "gps_age_s",
 ]
 
 # Fault / error columns — surfaced and exported separately from the numeric
@@ -1057,6 +1064,7 @@ def flatten_record(rtdb_key: str, record: dict, device_id: str = DEVICE_ID) -> d
         "calculated_lap": _num(motor.get("calculated_lap")),
         "lat": _num(gps.get("lat")),
         "lon": _num(gps.get("lon")),
+        "gps_age_s": _num(gps.get("fix_age_s")),
         # Faults
         "bms_has_error": _flag(battery.get("bms_has_error")),
         "bms_error_code": _int(battery.get("bms_error_code")),

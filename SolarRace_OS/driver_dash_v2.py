@@ -2162,9 +2162,10 @@ class RacingDashboard(QMainWindow):
                 return True
         return False
 
-    @Slot(float, str)
-    def _on_target_speed(self, target_kmh: float, strategy: str) -> None:
-        """Target speed for this point on the lap, from the active profile."""
+    @Slot(object, str)
+    def _on_target_speed(self, target_kmh, strategy: str) -> None:
+        """Target speed for this point on the lap, from the active profile.
+        None in the pit lane, which renders as a dash like any unknown."""
         self._target_kmh = target_kmh
         self._target_strategy = strategy
         self._apply_target_style(self._speed_delta())

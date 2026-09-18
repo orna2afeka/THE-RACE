@@ -139,8 +139,8 @@ class NetMonitor:
 
         # --- everything below is guarded by self._lock -------------------- #
         self._status = STATUS_UNKNOWN
-        self._checked_time = 0.0     # time.time() of the last completed sweep
-        self._last_ok_time = 0.0     # time.time() of the last success, 0 if never
+        self._checked_time = None    # time.monotonic() of the last completed sweep
+        self._last_ok_time = None    # time.monotonic() of the last success
         self._consecutive_failures = 0
         self._responder = None       # ("8.8.8.8", 53) that answered, or None
         self._check_count = 0        # proves the thread is really running
@@ -198,7 +198,7 @@ class NetMonitor:
             net_stale         True when the probe stopped producing answers
             net_responder     which target answered, or None
         """
-        now = time.time()
+        now = time.monotonic()
         with self._lock:
             status = self._status
             checked = self._checked_time
@@ -211,7 +211,7 @@ class NetMonitor:
         # An answer nobody has refreshed is not an answer (see note 4 in the
         # header). Only a status we actually established can go stale — UNKNOWN
         # is already the "don't know" value and has nothing to decay into.
-        stale = bool(checked) and (now - checked) > STALE_AFTER_S
+        stale = checked is not None and (now - checked) > STALE_AFTER_S
         if stale and status != STATUS_UNKNOWN:
             status = STATUS_UNKNOWN
 
@@ -219,7 +219,7 @@ class NetMonitor:
             "net_status": status,
             "net_online": (True if status == STATUS_ONLINE else
                            False if status == STATUS_OFFLINE else None),
-            "net_last_ok_age_s": (now - last_ok) if last_ok else None,
+            "net_last_ok_age_s": (now - last_ok) if last_ok is not None else None,
             "net_consecutive_failures": failures,
             "net_stale": stale,
             "net_responder": responder,
@@ -268,7 +268,7 @@ class NetMonitor:
 
     def _record(self, responder):
         """Fold one sweep result into the snapshot, with the flap guard."""
-        now = time.time()
+        now = time.monotonic()
         with self._lock:
             self._checked_time = now
             self._check_count += 1

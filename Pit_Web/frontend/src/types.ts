@@ -65,8 +65,21 @@ export interface LiveState {
   lat: number; lon: number;
   /** Deliberately separate from lat/lon: the map falls back to the Zolder
    *  paddock so it has somewhere to centre, and this says whether the pin is
-   *  real. 0,0 is a real place in the Atlantic. */
+   *  real. 0,0 is a real place in the Atlantic.
+   *
+   *  LIVE, not merely present: the car goes on serving its last known fix
+   *  after the receiver loses lock, so a position can be well-formed and an
+   *  hour old. Decided in Python against limits.GPS_LIVE_MAX_AGE_S. */
   has_gps: boolean;
+  /** There is a position on the row at all, however old. has_gps && !this is
+   *  impossible; !has_gps && this means "last seen here". */
+  has_gps_point: boolean;
+  /** Seconds since the car's last usable fix, straight from its GPSReader.
+   *  null on a car whose build predates the field. */
+  gps_age_s: Num;
+  /** When that fix was taken, epoch seconds on the CAR's clock — the same
+   *  clock the row's timestamp is in. null when it cannot be said. */
+  gps_fix_ts: Num;
   speed_kmh: Num;
   bms_has_error: number; bms_error_code: number; bms_protections: string;
   mms_has_error: number; mms_error_code: number; mms_alerts: string;
@@ -135,6 +148,8 @@ export interface CarHealth {
   canFrames: Num;
   gpsFix: Num;
   gpsDetail: string | null;
+  gpsAgeS: Num;
+  gpsFixTs: Num;
 }
 
 /** One strategy's simulation, exactly as the engine ran it. The chart draws

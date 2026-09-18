@@ -388,6 +388,23 @@ function trailPath(d) {
   return "M " + pts.map(p => p[0].toFixed(1) + "," + p[1].toFixed(1)).join(" L ");
 }
 
+// hh:mm:ss in the viewer's timezone, for marking WHEN something happened.
+function fmtClockTime(epochS) {
+  if (epochS == null || !isFinite(epochS)) return "—";
+  const d = new Date(epochS * 1000), p = n => String(n).padStart(2, "0");
+  return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+}
+
+function fmtAgeShort(sec) {
+  if (sec == null || !isFinite(sec)) return "—";
+  const s = Math.floor(sec);
+  if (s < 90) return s + "s";
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + "m";
+  const h = Math.floor(m / 60);
+  return h < 24 ? h + "h " + (m % 60) + "m" : Math.floor(h / 24) + "d";
+}
+
 function fmtTime(s) {
   if (s == null) return "—";
   const m = Math.floor(s / 60);

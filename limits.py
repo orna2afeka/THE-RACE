@@ -370,6 +370,36 @@ SPEED = Threshold(warn=None, crit=90.0, full_scale=100.0)
 # where it matters. Filter the replay to rows with a GPS fix to see that.
 
 
+# --------------------------------------------------------------------------- #
+# GPS freshness — not a Threshold, because it judges an AGE, not a reading.
+# --------------------------------------------------------------------------- #
+# How old the car's last GPS fix may be before a display must stop calling the
+# position live.
+#
+# This is not the same question the car asks itself. GPSReader flags a fix stale
+# after 5 s (gps_reader.FIX_STALE_AFTER_S) and then GOES ON SERVING IT, on
+# purpose: a frozen dot beats an empty map on the driver's screen. So the pit
+# receives a perfectly well-formed position on every row, for as long as the
+# receiver stays lost, and nothing in the shape of the data says it is old.
+#
+# Which is exactly what happened on 2026-09-18: the receiver lost lock at 11:47
+# with three satellites in view, and for the next 57 minutes every telemetry row
+# carried the same coordinates while the car drove two laps. The pit map showed
+# a stationary car on a track it was driving.
+#
+# 15 s, not 5: a displayed position has travelled through the car's 0.5 s push,
+# Firebase, the collector and the pit's own poll, so cutting at the car's own
+# threshold would flicker between "live" and "stale" on a healthy fix. Three
+# times FIX_STALE_AFTER_S is comfortably past that and still far short of a
+# lap.
+#
+# Consumers: Pit_Web/api.py (has_gps and the map badge) and the pit wall page
+# built by tools/build_zolder_animation.py. Both import it from here rather than
+# keeping a number of their own -- two answers to "is this position live" is how
+# the two screens end up disagreeing in front of the crew.
+GPS_LIVE_MAX_AGE_S = 15.0
+
+
 def _validate(name, t):
     """Reject a Threshold that cannot render honestly.
 

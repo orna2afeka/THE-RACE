@@ -384,12 +384,114 @@ def emit(path, latlon, ways, order, stamp, raw_length, finish_offset, sides):
 
 
 # --------------------------------------------------------------------------- #
+# The pit lane. Excluded from the centreline above on purpose, and baked into
+# its own file for the same reason: it is not part of a lap's 4000 m. The car
+# uses it only to TAG laps (in-lap, out-lap) and to blank the target speed in
+# the pit lane — never to decide whether a lap counts (see lap_tracker.py).
+PITLANE_WAY_ID = 179267542
+PITLANE_QUERY = f"[out:json][timeout:60];way({PITLANE_WAY_ID});out meta geom;"
+PITLANE_OUT_PATH = os.path.join(_REPO, "zolder_pitlane.py")
+
+_PITLANE_TEMPLATE = '''"""
+zolder_pitlane.py — GENERATED, DO NOT EDIT BY HAND
+===================================================
+Circuit Zolder's pit lane, baked from OpenStreetMap by
+
+    python tools/build_zolder_track.py --pitlane
+
+    Pit lane (c) OpenStreetMap contributors, ODbL 1.0
+    OSM way {way_id}, fetched {fetched}
+
+In the direction of travel: index 0 is where it leaves the track (pit entry),
+the last point is where it rejoins (pit exit). It passes the finish line
+{finish_lateral:.1f} m to the {finish_side} of the track centreline.
+"""
+
+OSM_WAY_ID = {way_id}
+OSM_TIMESTAMP = "{osm_stamp}"
+BUILT_UTC = "{built}"
+LENGTH_M = {length:.1f}
+
+# Lap distance (track_map.CUM_M metres) where the pit lane leaves and rejoins.
+ENTRY_S_M = {entry_s:.1f}
+EXIT_S_M = {exit_s:.1f}
+
+PITLANE_LATLON = (
+{points}
+)
+'''
+
+
+def build_pitlane():
+    import track_map                       # needs the baked centreline
+
+    _log(f"querying Overpass for way {PITLANE_WAY_ID} ...")
+    resp = requests.get(OVERPASS_URL, params={"data": PITLANE_QUERY},
+                        headers={"User-Agent": USER_AGENT}, timeout=120)
+    resp.raise_for_status()
+    way = resp.json()["elements"][0]
+    assert "pit" in way.get("tags", {}).get("name", "").lower(), (
+        f"way {PITLANE_WAY_ID} is no longer named as a pit lane: {way.get('tags')}")
+    latlon = [(p["lat"], p["lon"]) for p in way["geometry"]]
+
+    def s_of(pt):
+        return track_map.project(*pt)[0]
+
+    # OSM draws it one-way, but do not take the direction on trust: the entry
+    # is late in the lap and the exit early, so the end nearer s = 0 going
+    # FORWARD is the exit.
+    if s_of(latlon[0]) < s_of(latlon[-1]):
+        _log("pit lane runs against the lap -> reversing")
+        latlon.reverse()
+    entry_s, exit_s = s_of(latlon[0]), s_of(latlon[-1])
+    assert entry_s > track.TRACK_LENGTH_METERS / 2 > exit_s, (
+        f"pit entry at {entry_s:.0f} m and exit at {exit_s:.0f} m do not "
+        f"straddle the finish line")
+
+    xy = [track.to_local_xy(*p) for p in latlon]
+    length = sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(xy, xy[1:]))
+    # Where it passes the finish gate, for the docstring and the log.
+    lateral = None
+    for a, b in zip(xy, xy[1:]):
+        (ua, va), (ub, vb) = track.gate_coords(a), track.gate_coords(b)
+        if ua < 0.0 <= ub:
+            lateral = va + (ua / (ua - ub)) * (vb - va)
+    assert lateral is not None, "the pit lane never passes the finish line"
+    assert abs(lateral) < track.GATE_RIGHT_M and abs(lateral) < 40.0, (
+        f"pit lane passes the line {lateral:.1f} m off the centreline, outside "
+        f"the gate: a pit-lane lap would not be counted")
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    text = _PITLANE_TEMPLATE.format(
+        way_id=PITLANE_WAY_ID,
+        fetched=now.strftime("%Y-%m-%d"),
+        osm_stamp=way.get("timestamp", ""),
+        built=now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        length=length, entry_s=entry_s, exit_s=exit_s,
+        finish_lateral=abs(lateral),
+        finish_side="right" if lateral < 0 else "left",
+        points="\n".join(f"    ({la!r}, {lo!r})," for la, lo in latlon))
+    with open(PITLANE_OUT_PATH, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    _log(f"wrote {PITLANE_OUT_PATH} ({len(latlon)} points, {length:.0f} m, "
+         f"entry {entry_s:.0f} m, exit {exit_s:.0f} m, "
+         f"{abs(lateral):.1f} m {'right' if lateral < 0 else 'left'} at the line)")
+
+
+# --------------------------------------------------------------------------- #
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--verify", action="store_true",
                     help="print the full geometry report after building")
+    ap.add_argument("--pitlane", action="store_true",
+                    help="bake zolder_pitlane.py ONLY; the centreline is not "
+                         "refetched, so sector ticks and the map do not move")
     args = ap.parse_args()
+
+    if args.pitlane:
+        build_pitlane()
+        return
 
     ways, stamp = fetch_ways()
     ring, order = chain_ways(ways)

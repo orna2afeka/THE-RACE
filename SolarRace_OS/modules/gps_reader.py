@@ -125,7 +125,7 @@ class GPSReader:
 
         # --- everything below is guarded by self._lock --------------------- #
         self._fix = None          # newest usable fix, or None if never seen one
-        self._fix_time = 0.0      # time.time() when _fix was stored
+        self._fix_time = 0.0      # time.monotonic() when _fix was stored
         self._connected = False
         self._sats_used = None    # from SKY reports; nice for diagnostics
         self._last_error = None
@@ -196,9 +196,9 @@ class GPSReader:
             if self._fix is None:
                 return None
             out = dict(self._fix)
-            age = time.time() - self._fix_time
+            age = time.monotonic() - self._fix_time
             sats = self._sats_used
-        out["fix_age_s"] = round(max(0.0, age), 1)
+        out["fix_age_s"] = round(age, 1)
         out["stale"] = age > FIX_STALE_AFTER_S
         if sats is not None:
             out["sats_used"] = sats
@@ -211,7 +211,7 @@ class GPSReader:
             has_fix = self._fix is not None
             tpv = self._tpv_count
             err = self._last_error
-            age = time.time() - self._fix_time if has_fix else None
+            age = time.monotonic() - self._fix_time if has_fix else None
             sats = self._sats_used
             devices = self._devices
 
@@ -267,7 +267,7 @@ class GPSReader:
             devices = list(self._device_info or [])
             known = self._devices
             has_fix = self._fix is not None
-            fresh = has_fix and (time.time() - self._fix_time) <= FIX_STALE_AFTER_S
+            fresh = has_fix and (time.monotonic() - self._fix_time) <= FIX_STALE_AFTER_S
             tpv = self._tpv_count
 
         if not connected:
@@ -292,7 +292,7 @@ class GPSReader:
         with self._lock:
             if self._fix is None:
                 return False
-            return (time.time() - self._fix_time) <= FIX_STALE_AFTER_S
+            return (time.monotonic() - self._fix_time) <= FIX_STALE_AFTER_S
 
     # ------------------------------------------------------------------ #
     # Background thread                                                   #
@@ -434,7 +434,7 @@ class GPSReader:
 
         with self._lock:
             self._fix = fix
-            self._fix_time = time.time()
+            self._fix_time = time.monotonic()
 
     # ------------------------------------------------------------------ #
     # Hardware debug                                                      #
