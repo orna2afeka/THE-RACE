@@ -9,7 +9,7 @@ from firebase_admin import credentials
 from firebase_admin import db
 from firebase_admin import exceptions as firebase_exceptions
 
-from edge_sync import Client as OutboxClient, RejectedError
+from edge_sync import Client as OutboxClient, RefetchBatch, RejectedError
 from edge_sync.queue import clean_json
 
 # ==============================================================================
@@ -237,7 +237,7 @@ _latest_payload = None
 _latest_lock = threading.Lock()
 
 
-class _OutboxReconciled(RuntimeError):
+class _OutboxReconciled(RefetchBatch):
     """Raised by the sender after renumbering or clearing queued samples, so
     edge_sync fetches the batch again with the corrected keys."""
 

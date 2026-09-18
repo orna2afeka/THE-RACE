@@ -27,3 +27,5 @@ See "THE OUTBOX" in that file. Offline test: `python tools/check_outbox.py`.
 
 **Do not edit these files here.** Change the SDK, run its tests, then copy the four
 files over again.
+
+**One local change since the copy (2026-09-18), to upstream after the race:** `RefetchBatch` in `client.py` — a sender that changed the queue under its batch asks for an immediate refetch instead of being counted as a failed upload and costing a full backoff. Made here during race week because the SDK repo is frozen until after the race; without it the car took up to 11 s to resume uploading after an outage. Carry it into the SDK before the next copy, or the copy will undo it.

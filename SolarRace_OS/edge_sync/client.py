@@ -36,6 +36,22 @@ from .queue import Queue
 log = logging.getLogger("edge_sync")
 
 
+class RefetchBatch(Exception):
+    """Raised by a sender that changed the queue under the batch it was given
+    (renumbered or cleared rows), so the batch in hand is stale.
+
+    NOT a failure: nothing is wrong with the link. The drain loop fetches the
+    batch again at once. Before this existed the signal fell into the generic
+    `except Exception`, was counted as a failed upload, and cost a full backoff
+    wait -- up to max_backoff -- once per run, right after the link came back.
+    Found on the car on 2026-09-18: tools/check_outbox.py measured 10.9 s to
+    resume against a 5 s cap.
+
+    A sender must raise this at most once per change it makes; the loop guards
+    against a sender that raises it forever (see _drain).
+    """
+
+
 class RejectedError(Exception):
     """Raise this from a sender when the server refused a batch PERMANENTLY.
 
@@ -297,6 +313,7 @@ class Client:
 
     def _drain(self, final: bool = False) -> bool:
         """Send batches until the queue is empty. False if a send failed."""
+        refetches = 0
         while final or not self._stop.is_set():
             if final and self._close_deadline is not None                     and time.monotonic() >= self._close_deadline:
                 return False
@@ -307,6 +324,17 @@ class Client:
                 return True
             try:
                 self._send_batch(points)
+            except RefetchBatch:
+                # The sender changed the queue; this batch is stale. Fetch it
+                # again now, no backoff, no failure recorded. Bounded, so a
+                # sender that raises this every time degrades into an ordinary
+                # failure with backoff instead of a busy loop.
+                refetches += 1
+                if refetches > 3:
+                    self._record_failure(RuntimeError(
+                        "sender asked to refetch the batch more than 3 times"))
+                    return False
+                continue
             except RejectedError:
                 if not self._isolate_rejected(points):
                     return False
@@ -314,6 +342,7 @@ class Client:
             except Exception as exc:
                 self._record_failure(exc)
                 return False
+            refetches = 0
             self._acknowledge(points)
         return True
 
