@@ -85,11 +85,25 @@ def parse_jbd_bms_message(arb_id, data_bytes):
         parsed_data["bms_temp_2_C"] = round((ntc2 * 0.1) - 273.15, 1)
         parsed_data["bms_temp_3_C"] = round((ntc3 * 0.1) - 273.15, 1)
 
-    # 6. Cell voltages — 3 cells per ID, incrementing 0x107..0x110 (1 mV units)
-    elif 0x107 <= arb_id <= 0x110 and len(data_bytes) >= 6:
+    # 6. Cell voltages — up to 3 cells per ID, incrementing 0x107..0x110 (1 mV)
+    #
+    # The LAST group of a pack whose cell count is not a multiple of 3 comes
+    # back SHORT, not padded: this car's 13-cell packs answer 0x10B (cells
+    # 13-15) with DLC 4 — cell 13's two bytes plus the CRC — and nothing for
+    # the two cells that do not exist. Requiring the documented 6 data bytes
+    # here dropped that frame whole, which is why the pit only ever saw 12
+    # cells per pack (24 of 26), with cells 13 and 26 permanently missing
+    # while bms_string_count correctly said 26. Verified on the car with
+    # `candump -td can0,10B:7FF`: `0F 5D B9 C5`, whose CRC-16 checks out over
+    # the first two bytes, = 3.933 V.
+    #
+    # So take however many whole cells the frame actually carries, minus the
+    # 2-byte CRC, capped at the documented 3.
+    elif 0x107 <= arb_id <= 0x110 and len(data_bytes) >= 4:
         first_cell = (arb_id - 0x107) * 3 + 1
-        cell_a, cell_b, cell_c = struct.unpack_from(">HHH", data_bytes, 0)
-        for offset, raw_mv in enumerate((cell_a, cell_b, cell_c)):
+        n_cells = min(3, (len(data_bytes) - 2) // 2)
+        for offset in range(n_cells):
+            raw_mv = struct.unpack_from(">H", data_bytes, offset * 2)[0]
             parsed_data[f"bms_cell_{first_cell + offset:02d}_V"] = round(raw_mv * 0.001, 3)
 
     return parsed_data if parsed_data else None
