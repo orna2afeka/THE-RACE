@@ -5,9 +5,21 @@ Topology: TWO CAN buses — as of 2026-08-25 both at the SAME bitrate.
 
     Channel  Rate       Device  Protocol             IDs
     -------  ---------  ------  -------------------  -----------------
-    can0     500 kbit/s bms     JBD query/response   0x100-0x110 (11b)
-    can0     500 kbit/s temp    J1939 thermistor     0x1839F3xx (29b)
-    can1     500 kbit/s mms     SiliXcon LYNX        0x600-0x628 (11b)
+    can0     500 kbit/s mms     SiliXcon LYNX        0x600-0x628 (11b)
+    can0     500 kbit/s mms     siliXcon ESC API     0x147 out, 0x150 in
+    can1     500 kbit/s temp    J1939 thermistor     0x1839F3xx (29b)
+    ?        500 kbit/s bms     JBD query/response   0x100-0x110 (11b)
+
+    ⚠️ THIS TABLE WAS WRONG UNTIL 2026-09-18, and it cost the car its throttle
+    for weeks. It claimed the MMS was on can1 and the temp module on can0; the
+    truth is the other way round, measured with candump on both wires. Reading
+    never noticed, because frames are dispatched by ID and not by channel —
+    only the throttle request noticed, because it is the one frame the car
+    TRANSMITS, and it was being sent down a wire the motor controller cannot
+    hear. Which wire the BMS answers on has NOT been re-measured; the poll goes
+    to both (BMS_POLL_CHANNELS), so it works either way, but BMS_CELL_OFFSETS
+    below assigns pack A/B BY CHANNEL and may therefore have the two packs
+    swapped. Verify that before trusting a per-pack cell alarm.
 
 The engineering team reconfigured BOTH the BMS and the MMS to 500 kbit/s. The
 MMS previously ran at 1 Mbit/s, and that disagreement is what USED to force the
@@ -17,10 +29,10 @@ collapses.
 
 That constraint is now gone, so the two channels are a WIRING fact rather than
 a bitrate requirement. can0 and can1 are separate wires into separate
-controllers on the HAT; the MMS is on can1 because that is where its wire
-lands, and the BMS shares can0 with the J1939 temp module. Reading is
-channel-agnostic (see below), so collapsing the car onto one wire would be a
-wiring job plus a re-measure — not an edit to this file.
+controllers on the HAT; the MMS is on can0 because that is where its wire
+lands, and the J1939 temp module has can1. Reading is channel-agnostic (see
+below), so collapsing the car onto one wire would be a wiring job plus a
+re-measure — not an edit to this file.
 
     Both ends of a wire must be re-flashed together. Do NOT change the numbers
     below on their own: at a mismatched bitrate the interface comes up
@@ -30,8 +42,8 @@ wiring job plus a re-measure — not an edit to this file.
     mismatch is exactly what drove can0 to BUS-OFF.
 
     After any rate change, re-verify on the car rather than assuming: a 0x5A
-    query on 0x100 should draw a valid ~48V pack-voltage reply from the BMS on
-    can0, and 0x600-0x628 should stream continuously from the MMS on can1.
+    query on 0x100 should draw a valid ~48V pack-voltage reply from the BMS,
+    and 0x600-0x628 should stream continuously from the MMS on can0.
 
 Reading is channel-agnostic on purpose: the three message-ID ranges don't
 overlap (11-bit BMS vs 11-bit MMS vs 29-bit extended J1939), so frames from
@@ -188,11 +200,16 @@ BMS_POLL_IDS = [
 #     limit, or anything the motor acts on.
 THROTTLE_GPIO_REQUEST_ENABLED = True
 
-# Which wire the ESC is on. can1: a request sent down the other wire is never
+# Which wire the ESC is on. can0: a request sent down the other wire is never
 # answered, and unanswered transmits are the thing that kills a channel.
 # None = send on every open bus, which is only appropriate on a
 # single-channel car.
-THROTTLE_GPIO_CHANNEL = "can1"
+#
+# ⚠️ This said "can1" until 2026-09-18 and that is why the throttle was dead:
+# can1 carries the J1939 temp module, which has nothing to say about a pedal.
+# Measured, not assumed — `candump can0` streams 0x600-0x628, and a request
+# sent to 0x147 on can0 draws replies on 0x150 within a frame or two.
+THROTTLE_GPIO_CHANNEL = "can0"
 
 # The ESC's node address, which travels in byte 0 of the request. 0 is the
 # default address and matches the documented example. If the controller has
@@ -206,15 +223,22 @@ THROTTLE_GPIO_ADDRESS = 0
 # other, silently.
 THROTTLE_GPIO_BANK = 0
 
-# Which inputs to sample. Both default to the throttle pedal alone (GPIO0), so
-# the ESC sends exactly one frame per period and nothing else on the bus has to
-# be filtered out.
+# Which inputs to sample. The pedal is GPIO0 (input ID 0x08) and that is the
+# only value the decoder keeps — but the RANGE ASKED FOR IS DELIBERATELY WIDER.
 #
-# To find the pedal when GPIO0 turns out to be the wrong pin, widen this to
-# sweep the block — set END_ID to mms_parser.gpio_input_id(4) — and watch which
-# value moves on the pit's raw-mV tile while somebody presses the pedal.
-THROTTLE_GPIO_START_ID = None    # None = mms_parser.THROTTLE_INPUT_ID (GPIO0)
-THROTTLE_GPIO_END_ID = None      # None = same as start; one input only
+# ⚠️ Do not narrow this back to GPIO0 alone. Asking for 0x08..0x08 is what the
+# vendor's docs imply, and on this controller it does NOT work: the ESC answers
+# once with "0D 00 00 00 00 00" — inputs 0 and 1, both zero — and then stops.
+# Asking for 0x00..0x0C makes it stream properly at the requested period, and
+# GPIO0's real reading arrives in the frame tagged 0x08. Measured on the car
+# 2026-09-18; the reason for the narrow-request behaviour is not understood, so
+# this is a workaround rather than a fix, and it costs two extra frames per
+# period on a bus that is nowhere near full.
+#
+# The wide sweep is also how you FIND the pedal if it is ever moved to another
+# pin: watch which input ID's value tracks somebody's foot.
+THROTTLE_GPIO_START_ID = 0x00    # the ESC's first input ID
+THROTTLE_GPIO_END_ID = 0x0C      # GPIO4; the vendor example's top of range
 
 # How often the ESC samples and reports, in milliseconds. 100 ms (10 Hz) is the
 # documented example and the right cadence for the pit's throttle trace: fast
