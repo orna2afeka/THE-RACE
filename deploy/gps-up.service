@@ -1,0 +1,39 @@
+[Unit]
+# Starts the GNSS engine inside the SIM7600 modem and gives its NMEA port to
+# gpsd. Without this the car boots with a modem that is connected on LTE and a
+# GPS that reports nothing — see deploy/gps_up.sh for why those are separate.
+#
+# Install:
+#   sudo cp ~/Desktop/THE-RACE-main/deploy/gps-up.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now gps-up.service
+#   systemctl status gps-up          # should end with "handed /dev/ttyUSBx to gpsd"
+#
+# ABSOLUTE PATH below, like solarrace-hud.desktop: if this repo moves or is
+# cloned by another user, fix ExecStart or the unit silently does nothing.
+Description=Start SolarRace GNSS (SIM7600) and register it with gpsd
+# ModemManager owns the modem's AT ports and is what we ask to start GNSS;
+# gpsd has to be up to accept the device. Wants, not Requires: a car running
+# without the modem must still boot cleanly, and the script exits 0 when there
+# is no modem to talk to.
+After=ModemManager.service gpsd.service network-online.target
+Wants=ModemManager.service gpsd.service
+
+[Service]
+Type=oneshot
+# The work is done once and stays done (GNSS on, device registered), so the
+# unit should read as active afterwards rather than dead.
+RemainAfterExit=yes
+# The modem's ttyUSB nodes appear ~20 s after power-on and ModemManager probes
+# them after that, so the script waits for them itself (GPS_WAIT_S, default
+# 120 s). This timeout has to be longer than that wait or systemd kills it
+# mid-wait on exactly the slow boot it exists for.
+TimeoutStartSec=180
+ExecStart=/bin/bash /home/orna2/Desktop/THE-RACE-main/deploy/gps_up.sh
+# Re-running is harmless (every step is idempotent), so a failure caused by a
+# modem that was still enumerating is worth one more try.
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

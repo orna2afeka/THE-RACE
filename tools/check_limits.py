@@ -38,7 +38,8 @@ for _p in (_REPO, os.path.join(_REPO, "SolarRace_OS")):
 
 import limits                                          # noqa: E402
 from PySide6.QtWidgets import QApplication             # noqa: E402
-from driver_dash_v2 import MiniGauge, TachometerWidget, C_WARNING, C_CRITICAL  # noqa: E402
+from driver_dash_v2 import (MiniGauge, TachometerWidget, C_WARNING,  # noqa: E402
+                            C_CRITICAL, _HUD_SPEED)
 
 FAILURES = []
 
@@ -134,15 +135,40 @@ def main():
         check(f"{name}: negative input clamps the arc to 0", frac, 0.0)
 
     print()
-    print("TachometerWidget shares the same rule")
+    print("HUD speed never changes colour and never blinks")
     tach = TachometerWidget()
     check("tacho: starts with no speed", tach._speed, None)
     tach.set_speed(eps_beyond(limits.SPEED.crit, False))
-    check("tacho: past crit -> red", tach._alert, True)
-    check("tacho: past crit blinks", tach._flash_timer.isActive(), True)
+    check("tacho: past the pit's crit keeps the reading", tach._speed,
+          eps_beyond(limits.SPEED.crit, False))
+    check("tacho: has no tiers", hasattr(tach, "_alert"), False)
+    check("tacho: has no blink at all", hasattr(tach, "_flash_timer"), False)
     tach.set_speed(None)
-    check("tacho: None stops the blink", tach._flash_timer.isActive(), False)
-    check("tacho: None clears red", tach._alert, False)
+    check("tacho: None blanks the reading", tach._speed, None)
+
+    print()
+    print("Per-gauge overrides")
+    ds2_speed = MiniGauge("SPEED", "km/h", C_WARNING, _HUD_SPEED)
+    ds2_speed.set_value(limits.SPEED.full_scale)
+    check("DS002 speed: flat out is not red", ds2_speed._alert, False)
+    check("DS002 speed: flat out is not amber", ds2_speed._warning, False)
+    check("DS002 speed: never blinks", ds2_speed._flash_timer.isActive(), False)
+    check("DS002 speed: keeps the pit's scale", ds2_speed._max_val,
+          limits.SPEED.full_scale)
+
+    soc = MiniGauge("SOC", "%", C_WARNING, limits.SOC, flash=limits.SOC_BLINK_PCT)
+    soc.set_value(eps_beyond(limits.SOC.crit, True))
+    check("soc: just under crit -> red", soc._alert, True)
+    check("soc: just under crit does NOT blink", soc._flash_timer.isActive(), False)
+    soc.set_value(limits.SOC_BLINK_PCT)
+    check("soc: at the blink level blinks", soc._flash_timer.isActive(), True)
+    soc.set_value(eps_within(limits.SOC_BLINK_PCT, True))
+    check("soc: back above the blink level stops it",
+          soc._flash_timer.isActive(), False)
+    check("soc: ...but stays red", soc._alert, True)
+    soc.set_value(limits.SOC_BLINK_PCT / 2)
+    soc.set_value(None)
+    check("soc: None stops the blink", soc._flash_timer.isActive(), False)
 
     print()
     if FAILURES:

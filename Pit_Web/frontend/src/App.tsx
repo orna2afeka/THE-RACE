@@ -36,6 +36,22 @@ const STRIP_TREND = ['Speed', 'MotorTemp', 'CtrlTemp', 'SoC', 'Power', 'Energy']
 
 /** The seven-tile strip plus the three lap tiles. Tiers are computed in
  *  Python by limits.classify(); nothing here compares against a threshold. */
+// How far into a lap the energy baseline may sit before the Current-lap figure
+// is meaningfully short. A sample lands every ~0.5 s, so a healthy baseline is
+// a few metres in; 100 m means the pit missed the start of the lap outright.
+const LAP_ENERGY_BASELINE_MAX_M = 100;
+
+/** Says when Current lap energy is measured from partway into the lap, so a
+ *  figure that is short because of a dropped link never passes for a low one.
+ *  Same rule as an assumed speed profile: never let a gap look like a reading. */
+function lapEnergyNote(live: Live): string | null {
+  const from = live.currentLapEnergyFromM;
+  if (live.currentLapEnergy === null || from === null) return null;
+  return from > LAP_ENERGY_BASELINE_MAX_M
+    ? `from ${Math.round(from)} m in — start of lap not received`
+    : null;
+}
+
 function TopStrip({ live }: { live: Live }) {
   const s = live.state;
   const t = live.tiers;
@@ -58,9 +74,14 @@ function TopStrip({ live }: { live: Live }) {
         <MetricTile title="Power out" value={fmt(s.power_w)} unit="W" tier={t.power} trend={trend.Power} />
         <MetricTile title="Lap distance" value={fmt(live.lapDistanceM)} unit="m" />
       </div>
-      <div className="grid g3" style={{ marginTop: 12 }}>
+      <div className="grid g4" style={{ marginTop: 12 }}>
         <MetricTile title="Last lap time" value={lapTime(s.last_lap_time_s)} unit={`m:ss${lapSrc}`} />
         <MetricTile title="Last lap energy" value={fmt(s.last_lap_energy, '.1f')} unit="Wh" />
+        {/* Next to Last lap energy on purpose: the pair is "am I spending more
+            than the lap that just worked?", and that only reads at a glance
+            when the two numbers are side by side. Both are net of regen. */}
+        <MetricTile title="Current lap energy" value={fmt(live.currentLapEnergy, '.1f')} unit="Wh"
+                    note={lapEnergyNote(live)} />
         <MetricTile title="Total race energy" value={fmt(s.total_race_energy, '.1f')} unit="Wh net" trend={trend.Energy} />
       </div>
     </>
@@ -157,7 +178,7 @@ export default function App() {
 
   if (error) return (
     <main style={{ padding: 32, maxWidth: 560 }}>
-      <h1 style={{ fontSize: 20, marginBottom: 8 }}>Cannot reach the backend</h1>
+      <h1 style={{ fontSize: 'calc(20px * var(--pit-font-scale))', marginBottom: 8 }}>Cannot reach the backend</h1>
       <p className="caption">{error}</p>
       <p className="caption">Is uvicorn running? <code>python -m uvicorn Pit_Web.api:app --port 8000</code></p>
     </main>
@@ -230,7 +251,8 @@ export default function App() {
           {tab === 'Live Metrics' && live && <ErrorBoundary name="Live Metrics"><LiveMetrics live={live} config={config} /></ErrorBoundary>}
           {tab === 'Cell Voltages' && <ErrorBoundary name="Cell Voltages"><Cells /></ErrorBoundary>}
           {tab === 'Weather' && <ErrorBoundary name="Weather"><Weather dark={dark} /></ErrorBoundary>}
-          {tab === 'Strategy' && <ErrorBoundary name="Strategy"><Strategy config={config} manualLap={manualLap} dark={dark} /></ErrorBoundary>}
+          {tab === 'Strategy' && <ErrorBoundary name="Strategy"><Strategy config={config} manualLap={manualLap} dark={dark}
+                     selected={live?.activeProfile?.source === 'pit' ? live.activeProfile.key : undefined} /></ErrorBoundary>}
         </main>
       </div>
       <ToastHost />

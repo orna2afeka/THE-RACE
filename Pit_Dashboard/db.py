@@ -71,6 +71,13 @@ METRIC_COLUMNS = [
     "bms_soc_percent",
     "bms_voltage_V",
     "bms_current_A",
+    # The same three from BMS B (can1), as main._remap_bms_frame names them.
+    # The car has published them all along; before these columns existed they
+    # were only in raw_json, and the pit showed battery A's SoC as if it were
+    # the whole car's.
+    "bms2_soc_percent",
+    "bms2_voltage_V",
+    "bms2_current_A",
     # How many cell taps the BMS itself reports as configured (ID 0x104). The
     # authoritative "is this cell real" signal for the bms_cell_NN_V columns
     # below — see BMS_CELL_COLUMN_COUNT for why that fixed 30 is a wiring limit,
@@ -454,6 +461,74 @@ def lap_energy_by_strategy(conn: sqlite3.Connection, recent_laps: int = 60,
     return out
 
 
+def laps_measured(conn: sqlite3.Connection, recent_laps: int = 60,
+                  device_id: str = DEVICE_ID):
+    """Every recent lap as {lap, energy_wh, lap_time_s, distance_m, strategy}.
+
+    lap_energy_by_strategy() answers "what did a lap on profile X cost", which
+    is the right question ONLY when the lap really was flown at X's pace. This
+    answers the more careful version — what a lap cost AND how fast and how far
+    it actually was — so a caller can check that for itself.
+
+    That check is not academic. A lap cut by the ODOMETER fallback rather than
+    the GPS line is 4200 m, not 4000 (track.ODOMETER_FORCE_LAP_M), and carries
+    whatever pace the car happened to be doing; `active_strategy` still names
+    the profile the pit last SENT. Costing such a lap as though it were a lap
+    of that profile is how a bench session at 50 km/h ends up setting the
+    energy budget for a race at 68.
+
+    MINDS THE SAME OFF-BY-ONE as lap_energy_by_strategy, for the same reason:
+    rows tagged N carry lap N's figures in last_lap_*, while their
+    active_strategy is the profile being followed during lap N+1. So the
+    strategy for lap N comes from the rows tagged N-1.
+
+    Bounded to the most recent `recent_laps` laps, as that function is.
+    """
+    top = conn.execute(
+        "SELECT MAX(calculated_lap) AS m FROM telemetry WHERE device_id = ?",
+        (device_id,)).fetchone()
+    if not top or top["m"] is None:
+        return []
+    floor = max(0.0, float(top["m"]) - float(recent_laps))
+
+    rows = conn.execute(
+        "SELECT CAST(calculated_lap AS INTEGER) AS lap, "
+        "       MAX(last_lap_energy)     AS energy_wh, "
+        "       MAX(last_lap_time_s)     AS lap_time_s, "
+        "       MAX(last_lap_distance_m) AS distance_m, "
+        "       MAX(lap_source)          AS lap_source, "
+        "       active_strategy          AS strat, COUNT(*) AS n "
+        "FROM telemetry "
+        "WHERE device_id = ? AND calculated_lap >= ? "
+        "GROUP BY lap, strat",
+        (device_id, floor)).fetchall()
+
+    facts, modal = {}, {}
+    for r in rows:
+        lap = r["lap"]
+        cur = facts.setdefault(lap, {"lap": lap, "energy_wh": None,
+                                     "lap_time_s": None, "distance_m": None,
+                                     "lap_source": None, "strategy": None})
+        for col in ("energy_wh", "lap_time_s", "distance_m"):
+            if r[col] is not None:
+                v = float(r[col])
+                cur[col] = v if cur[col] is None else max(cur[col], v)
+        if r["lap_source"] and not cur["lap_source"]:
+            cur["lap_source"] = r["lap_source"]
+        if r["strat"]:
+            best = modal.get(lap)
+            if best is None or r["n"] > best[1]:
+                modal[lap] = (r["strat"], r["n"])
+
+    out = []
+    for lap in sorted(facts):
+        f = facts[lap]
+        driven_under = modal.get(lap - 1)          # the trace of THIS lap
+        f["strategy"] = driven_under[0] if driven_under else None
+        out.append(f)
+    return out
+
+
 def lap_overview(conn: sqlite3.Connection, device_id: str = DEVICE_ID):
     """One grouped pass over every lap TRACE: cheap enough to run on a 300 MB
     store, and the only query the builder's lap table needs before a human has
@@ -503,6 +578,31 @@ def lap_overview(conn: sqlite3.Connection, device_id: str = DEVICE_ID):
 # by profile_build.count_backward_jumps().
 TRACE_GAP_S = 300.0
 
+# ── Standstills, and why they matter more than gaps ───────────────────────── #
+# A DRIVER CHANGE DOES NOT PRODUCE A GAP. The Pi stays powered through it and
+# keeps publishing speed-0 samples, and calculated_lap only moves when the car
+# crosses the finish line — so driver A's in-lap, the standstill and driver B's
+# out-lap arrive as ONE lap number with no gap anywhere in it, and TRACE_GAP_S
+# above never fires. Confirmed here: trace L0R53 of 26 Aug is a single 1423 s
+# run holding a 730 s standstill at lap_distance_m = 3670.
+#
+# So the stop has to be found INSIDE a trace, which is what the islands CTE in
+# lap_traces does. Mirrored in profile_build.STOP_MOVING_KMH and friends, which
+# hold the same rule in Python for one focused lap (and let a self-test compare
+# the two).
+#
+# Below this the car is not moving. Not zero on purpose: the controller's speed
+# field jitters around standstill, and an "= 0" test shatters one 730 s stop
+# into dozens of two-sample fragments that pass no threshold at all.
+STOP_MOVING_KMH = 1.0
+# The shortest standstill worth reporting. The UI's pit threshold is NOT applied
+# here — profile_build.classify_traces() applies it — so dragging that slider
+# costs nothing instead of invalidating this query's ~2 s cached result.
+STOP_MIN_S = 2.0
+# One lap_distance_m quantum: the store steps distance in 10 m, so a car that
+# really was stationary can still show one step of movement.
+STOP_DISTANCE_QUANTUM_M = 10.0
+
 # How close the next lap's run must start to a trace ending for the two to be
 # the same drive. The car crosses the line and increments in the same sample, so
 # in practice this is well under a second; the slack covers a dropped sample or
@@ -510,8 +610,35 @@ TRACE_GAP_S = 300.0
 TRACE_JOIN_SLACK_S = 30.0
 
 
+def store_watermark(conn: sqlite3.Connection, device_id: str = DEVICE_ID):
+    """(newest device_ts, highest calculated_lap). Sub-millisecond, always.
+
+    The change probe the profile builder polls so a finished lap shows up
+    without re-running the ~2 s lap_traces query on a timer. The lap counter
+    moving means a lap ENDED, which is exactly when the cache must be dropped.
+
+    TWO STATEMENTS ON PURPOSE — DO NOT TIDY THESE INTO ONE SELECT. SQLite's
+    index-max optimisation applies only to a query whose result is a LONE
+    aggregate, so each of these is an index seek (idx_telemetry_dev_ts,
+    idx_telemetry_lap) and returns in 0.0 ms. Ask for both MAXes in a single
+    SELECT and the optimisation is lost and it full-scans: measured 650 ms on a
+    130k-row store, against 0.0 ms for the pair.
+    """
+    ts = conn.execute(
+        "SELECT MAX(device_ts) FROM telemetry WHERE device_id = ?",
+        (device_id,)).fetchone()[0]
+    lap = conn.execute(
+        "SELECT MAX(calculated_lap) FROM telemetry WHERE device_id = ?",
+        (device_id,)).fetchone()[0]
+    return (float(ts) if ts is not None else 0.0,
+            int(lap) if lap is not None else -1)
+
+
 def lap_traces(conn: sqlite3.Connection, device_id: str = DEVICE_ID,
-               gap_s: float = TRACE_GAP_S):
+               gap_s: float = TRACE_GAP_S,
+               move_kmh: float = STOP_MOVING_KMH,
+               stop_min_s: float = STOP_MIN_S,
+               quantum_m: float = STOP_DISTANCE_QUANTUM_M):
     """One row per (lap number, run). The session-aware lap_overview.
 
     Replaces BOTH lap_overview() and fetch_lap_summary() for the builder, which
@@ -528,6 +655,20 @@ def lap_traces(conn: sqlite3.Connection, device_id: str = DEVICE_ID,
     lap_overview() and fetch_lap_summary() are left exactly as they were: the
     pit dashboard and the pit wall read them on hot paths and neither cares
     about drives.
+
+    ALSO RETURNS, per drive: `v_start_kmh` / `v_end_kmh` (the first and last
+    speed the car reported, so an out-lap and an in-lap can be told from a
+    flying lap) and `stop_s` / `stop_at_m` / `stop_rows` / `stopped_s_total` /
+    `n_stops` (the longest standstill INSIDE the drive, and where on the lap it
+    was). All NULL when the drive has no stop. See STOP_MOVING_KMH above for
+    why a standstill, not a gap, is what marks a driver change — and note the
+    pit threshold itself is NOT applied here, so moving that slider does not
+    invalidate this query's cached result.
+
+    Measured cost on a 130k-row store: 1.7-3.1 s, against 1.1-1.8 s before the
+    extra CTEs. The window sort over (calculated_lap, device_ts) is the expense
+    and no index provides that order, which is why the stop and speed work
+    shares this one sort instead of living in a second function.
     """
     return conn.execute(
         "WITH seq AS ("
@@ -546,22 +687,100 @@ def lap_traces(conn: sqlite3.Connection, device_id: str = DEVICE_ID,
         "            OVER (PARTITION BY lap ORDER BY device_ts"
         "                  ROWS UNBOUNDED PRECEDING) AS run"
         "  FROM seq"
+        # The original per-trace aggregate, now a CTE so the extras can join to
+        # it. Unchanged column for column.
+        "), base AS ("
+        "  SELECT CAST(lap AS INTEGER) AS trace_lap, run,"
+        "         COUNT(*) AS n_samples,"
+        "         SUM(v IS NOT NULL) AS n_speed,"
+        "         SUM(p IS NOT NULL) AS n_power,"
+        "         MAX(lap_distance_m) AS trace_end_m,"
+        "         MIN(device_ts) AS t0, MAX(device_ts) AS t1,"
+        "         MAX(ABS(v)) AS v_max_kmh,"
+        "         MAX(lap_source) AS lap_source,"
+        "         MAX(last_lap_time_s) AS carried_lap_time_s,"
+        "         MAX(last_lap_energy) AS carried_energy_wh,"
+        "         MAX(last_lap_regen_energy) AS carried_regen_wh,"
+        "         MAX(last_lap_distance_m) AS carried_distance_m"
+        "  FROM runs GROUP BY CAST(lap AS INTEGER), run"
+        # First and last speed the car actually REPORTED in this drive: what
+        # tells an out-lap from a standing start apart from a flying lap.
+        # SQLite has no FIRST_VALUE(... IGNORE NULLS), so the NULLs are filtered
+        # out first and the survivors numbered.
+        "), spd AS ("
+        "  SELECT CAST(lap AS INTEGER) AS trace_lap, run, ABS(v) AS av,"
+        "         ROW_NUMBER() OVER (PARTITION BY lap, run"
+        "                            ORDER BY device_ts) AS rn,"
+        "         COUNT(*)     OVER (PARTITION BY lap, run) AS cnt"
+        "  FROM runs WHERE v IS NOT NULL"
+        "), ends AS ("
+        "  SELECT trace_lap, run,"
+        "         MAX(CASE WHEN rn = 1   THEN av END) AS v_start_kmh,"
+        "         MAX(CASE WHEN rn = cnt THEN av END) AS v_end_kmh"
+        "  FROM spd GROUP BY trace_lap, run"
+        # Gaps and islands. `island` is the number of MOVING samples seen so far
+        # in this drive, so every maximal run of not-moving rows shares one
+        # value. A NULL speed is "not moving" here, which means it CONTINUES an
+        # island rather than splitting it -- one dropped sample must not turn a
+        # 730 s stop into two 365 s halves that slip under every threshold.
+        "), marks AS ("
+        "  SELECT CAST(lap AS INTEGER) AS trace_lap, run, device_ts,"
+        "         lap_distance_m, v,"
+        "         CASE WHEN v IS NOT NULL AND ABS(v) >= ? THEN 1 ELSE 0 END"
+        "              AS moving,"
+        "         SUM(CASE WHEN v IS NOT NULL AND ABS(v) >= ?"
+        "                  THEN 1 ELSE 0 END)"
+        "             OVER (PARTITION BY lap, run ORDER BY device_ts"
+        "                   ROWS UNBOUNDED PRECEDING) AS island"
+        "  FROM runs"
+        "), islands AS ("
+        "  SELECT trace_lap, run, island,"
+        # WALL CLOCK, from the island's own first row to its last. Conservative
+        # on purpose: it never counts the unknown time between the last moving
+        # sample and the first stopped one, so a reported stop is a LOWER bound
+        # and can never be invented.
+        "         MAX(device_ts) - MIN(device_ts) AS stop_s,"
+        "         MIN(lap_distance_m) AS stop_at_m,"
+        "         COALESCE(MAX(lap_distance_m) - MIN(lap_distance_m), 0.0)"
+        "             AS drift_m,"
+        "         SUM(CASE WHEN v IS NOT NULL AND ABS(v) < ?"
+        "                  THEN 1 ELSE 0 END) AS n_still,"
+        "         COUNT(*) AS n_rows"
+        "  FROM marks WHERE moving = 0"
+        "  GROUP BY trace_lap, run, island"
+        "), real_stops AS ("
+        "  SELECT trace_lap, run, stop_s, stop_at_m, n_rows,"
+        "         ROW_NUMBER() OVER (PARTITION BY trace_lap, run"
+        "                            ORDER BY stop_s DESC) AS rk,"
+        "         SUM(stop_s) OVER (PARTITION BY trace_lap, run)"
+        "             AS stopped_s_total,"
+        "         COUNT(*)    OVER (PARTITION BY trace_lap, run) AS n_stops"
+        "  FROM islands"
+        # A RUN OF NULL SPEEDS IS NOT A STANDSTILL. It needs at least one row
+        # where the car actually reported a speed under move_kmh. This clause is
+        # load-bearing: 74,341 of 125,771 lap-tagged rows here have no speed at
+        # all, 40-odd whole traces have none, and the longest such run is
+        # 9494 s -- which without this reads as a 2.6-hour pit stop.
+        "  WHERE n_still >= 1 AND stop_s >= ?"
+        # And the car cannot have covered more ground than move_kmh allows in
+        # that time. THIS is what separates a real standstill from a telemetry
+        # dropout AT SPEED, whose distance keeps climbing. Physical rather than
+        # a flat metre budget: a flat 20 m rule lost a real stop here (trace
+        # L0R56 read 306 s against 453 s), and this form self-scales. The last
+        # term is one 10 m distance quantum of slack.
+        "    AND drift_m <= ? / 3.6 * stop_s + ?"
         ") "
-        "SELECT CAST(lap AS INTEGER) AS trace_lap, run, "
-        "       COUNT(*) AS n_samples, "
-        "       SUM(v IS NOT NULL) AS n_speed, "
-        "       SUM(p IS NOT NULL) AS n_power, "
-        "       MAX(lap_distance_m) AS trace_end_m, "
-        "       MIN(device_ts) AS t0, MAX(device_ts) AS t1, "
-        "       MAX(ABS(v)) AS v_max_kmh, "
-        "       MAX(lap_source) AS lap_source, "
-        "       MAX(last_lap_time_s) AS carried_lap_time_s, "
-        "       MAX(last_lap_energy) AS carried_energy_wh, "
-        "       MAX(last_lap_regen_energy) AS carried_regen_wh, "
-        "       MAX(last_lap_distance_m) AS carried_distance_m "
-        "FROM runs GROUP BY CAST(lap AS INTEGER), run "
-        "ORDER BY trace_lap, run",
-        (device_id, float(gap_s)),
+        "SELECT b.*, e.v_start_kmh, e.v_end_kmh, "
+        "       s.stop_s, s.stop_at_m, s.n_rows AS stop_rows, "
+        "       s.stopped_s_total, s.n_stops "
+        "FROM base b "
+        "LEFT JOIN ends e ON e.trace_lap = b.trace_lap AND e.run = b.run "
+        "LEFT JOIN real_stops s ON s.trace_lap = b.trace_lap "
+        "                      AND s.run = b.run AND s.rk = 1 "
+        "ORDER BY b.trace_lap, b.run",
+        (device_id, float(gap_s), float(move_kmh), float(move_kmh),
+         float(move_kmh), float(stop_min_s), float(move_kmh),
+         float(quantum_m)),
     ).fetchall()
 
 
@@ -775,6 +994,9 @@ def flatten_record(rtdb_key: str, record: dict, device_id: str = DEVICE_ID) -> d
         "bms_soc_percent": _num(battery.get("bms_soc_percent")),
         "bms_voltage_V": _num(battery.get("bms_voltage_V")),
         "bms_current_A": _num(battery.get("bms_current_A")),
+        "bms2_soc_percent": _num(battery.get("bms2_soc_percent")),
+        "bms2_voltage_V": _num(battery.get("bms2_voltage_V")),
+        "bms2_current_A": _num(battery.get("bms2_current_A")),
         "bms_string_count": _num(battery.get("bms_string_count")),
         # One key per possible cell tap. .get() returns None for anything the
         # car never reported (fewer cells wired than BMS_CELL_COLUMN_COUNT, or
@@ -916,15 +1138,20 @@ def upsert_many(conn: sqlite3.Connection, items, ingested_ts: float,
     if not rows:
         return 0
 
+    # Count the telemetry inserts ALONE. Spanning the last_known upserts too
+    # made this return roughly 48x the truth -- a 5,000-sample catch-up page
+    # logged "+242791 sample(s)" beside a running total that had gone up by
+    # 4,999 -- because every sample also touches dozens of last_known metrics.
     before = conn.total_changes
     conn.executemany(_INSERT_SQL, rows)
+    inserted = conn.total_changes - before
 
     last_known_rows = [lk for row in rows for lk in _last_known_rows(row)]
     if last_known_rows:
         conn.executemany(_LAST_KNOWN_SQL, last_known_rows)
 
     conn.commit()
-    return conn.total_changes - before
+    return inserted
 
 
 def latest_known(conn: sqlite3.Connection, device_id: str = DEVICE_ID) -> dict:
@@ -1049,6 +1276,45 @@ def fetch_lap_track(conn: sqlite3.Connection, lap: int, device_id: str = DEVICE_
         "ORDER BY device_ts ASC",
         (device_id, float(int(lap)), float(int(lap)) + 1.0),
     ).fetchall()
+
+
+def lap_start_energy(conn: sqlite3.Connection, lap: int,
+                     device_id: str = DEVICE_ID):
+    """The energy baseline of one lap: (total_race_energy, lap_distance_m) of
+    its EARLIEST sample, or None when no sample of it carries energy.
+
+    "Energy used so far this lap" is the one per-lap figure the car does not
+    publish. lap_tracker.snapshot() sends lap_distance_m -- metres since the
+    trigger -- but has no energy counterpart, so the pit subtracts this
+    baseline from the live total_race_energy instead. NET of regen, like every
+    energy column here, which is exactly what makes the result comparable with
+    the last_lap_energy tile beside it.
+
+    lap_distance_m comes back with it so the caller can tell whether this
+    baseline really is the start of the lap. If the link was down when the lap
+    began, the earliest sample the pit HAS may be hundreds of metres in, and
+    the subtraction then understates the lap by whatever was missed. Saying so
+    is the point of returning it — see the tile note in the dashboard.
+
+    MATCHED AS A HALF-OPEN RANGE, not with a CAST, for the reason spelled out
+    in fetch_lap_track's docstring. `ORDER BY device_ts ASC LIMIT 1` keeps the
+    plan on idx_telemetry_lap (verified with EXPLAIN QUERY PLAN) and sorts only
+    the one lap's rows rather than walking the table in device_ts order.
+
+    COST SCALES WITH THE LAP, so the caller must not run this every frame. A
+    normal 210 s lap is ~400 rows and 0.2 ms. A lap whose counter STALLED is
+    not: the same _runs() failure the sector code guards against leaves hours
+    of driving under one lap tag, and this measured 200 ms over a 49k-row lap
+    in a bench store. build_live() runs every 2 s for every viewer, so api.py
+    caches the result per lap.
+    """
+    return conn.execute(
+        "SELECT total_race_energy, lap_distance_m FROM telemetry "
+        "WHERE device_id = ? AND calculated_lap >= ? AND calculated_lap < ? "
+        "  AND total_race_energy IS NOT NULL "
+        "ORDER BY device_ts ASC LIMIT 1",
+        (device_id, float(int(lap)), float(int(lap)) + 1.0),
+    ).fetchone()
 
 
 def recent_laps(conn: sqlite3.Connection, count: int = 2,

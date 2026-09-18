@@ -89,7 +89,7 @@ export default function Sidebar({
                     racing={!!race?.isRacing} />
       </Sec>
 
-      <CutLap />
+      <CutLap carLap={live?.state?.auto_lap ?? null} />
       <DriverMessage />
       <ExportPanel config={config} />
 
@@ -104,26 +104,60 @@ export default function Sidebar({
   );
 }
 
-function CutLap() {
+function CutLap({ carLap }: { carLap: number | null }) {
   const [sent, setSent] = useState<string | null>(null);
+  const [freshSent, setFreshSent] = useState<string | null>(null);
   const { data: ack } = usePoll(
-    () => getJSON<{ ack: { applied?: boolean; lap?: number } | null }>('/api/cut_lap/ack'),
-    5000, [sent ?? '']);
+    () => getJSON<{ ack: { applied?: boolean; lap?: number; action?: string } | null }>('/api/cut_lap/ack'),
+    5000, [sent ?? '', freshSent ?? '']);
+
+  // Both commands share /lap_command and come back on the same ack node, so
+  // the ack's own `action` is what says which one landed. Without that, a Cut
+  // Lap ack arriving after a Fresh Lap press would read as confirmation of the
+  // press that had not landed yet.
+  const applied = (what: string) => ack?.ack?.applied && ack.ack.action === what;
+
+  const freshLap = async () => {
+    if (carLap === null) { toast("The car has not reported a lap count yet", "err"); return; }
+    try {
+      setFreshSent((await postJSON<{ sentAt: string }>('/api/lap/set', { lap: carLap })).sentAt);
+      toast(`Fresh lap sent — staying on lap ${carLap}`);
+    } catch (e) { toast(`Fresh lap failed: ${e}`, "err"); }
+  };
 
   return (
-    <Sec icon="timer" title="Cut lap">
+    <Sec icon="timer" title="Lap control">
       <button className="btn block" onClick={async () => {
         try {
           setSent((await postJSON<{ sentAt: string }>('/api/cut_lap', {})).sentAt);
           toast('Cut Lap sent to the car');
-        } catch (e) { toast(`Cut Lap failed: ${e}`, 'err'); }
+        } catch (e) { toast(`Cut Lap failed: ${e}`, "err"); }
       }}><Icon name="flag" size={13} />Cut lap now</button>
       <div className="caption">
         {sent
-          ? (ack?.ack?.applied
-              ? `Car confirmed — now on lap ${ack.ack.lap} · sent ${sent}`
+          ? (applied('cut_lap')
+              ? `Car confirmed — now on lap ${ack?.ack?.lap} · sent ${sent}`
               : `Sent ${sent} — awaiting the car's confirmation.`)
-          : 'Asks the car to close its lap. Does not change the manual override.'}
+          : 'Closes the lap and COUNTS it: the part-lap so far is recorded as a real lap, with its time and energy. Use it when the line was missed.'}
+      </div>
+
+      {/* The pit-exit command. Kept next to Cut lap because the two look alike
+          and are not: this one records nothing. Coming out of the box, the
+          part-lap before the stop is not a lap, and filing it as one puts a
+          fake time and a fake energy figure into the per-lap history the
+          strategy matrix is built from. */}
+      <button className="btn block" style={{ marginTop: 8 }}
+              disabled={carLap === null} onClick={freshLap}>
+        <Icon name="timer" size={13} />Fresh lap, don’t count it
+      </button>
+      <div className="caption">
+        {freshSent
+          ? (applied('set_lap')
+              ? `Car confirmed — fresh lap, still on lap ${ack?.ack?.lap} · sent ${freshSent}`
+              : `Sent ${freshSent} — awaiting the car's confirmation.`)
+          : carLap === null
+            ? 'Waiting for the car to report a lap count.'
+            : `For a pit exit. Zeroes lap distance, lap energy and the lap clock, and stays on lap ${carLap} — nothing is recorded as a lap.`}
       </div>
     </Sec>
   );

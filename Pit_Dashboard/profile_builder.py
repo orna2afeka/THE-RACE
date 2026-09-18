@@ -13,8 +13,15 @@ WHY IT IS NOT A TAB IN THE PIT DASHBOARD
 Streamlit runs every fragment of a session on one script thread. Reading and
 resampling whole laps is exactly the kind of work that, on that thread, stops the
 speed tile updating — which is the bug we just spent a day removing from the
-History tab. This is also not race-time work: it is done between sessions, by one
-person, deliberately.
+History tab. Building a profile is still not race-time work: it is done between
+sessions, by one person, deliberately.
+
+WATCHING laps arrive, however, now is. The Live toggle re-checks the store every
+few seconds and reloads the moment a lap ends, so the pit can see each lap
+classified as it happens during practice. That is safe here for the same reason
+the whole app is: separate process, separate port, read-only connection. The
+probe it polls is two index seeks and costs nothing; the ~2 s lap query behind it
+runs only when the lap counter actually moves.
 
 WHAT IT REPLACES
 profiles/*.csv are synthetic — tools/generate_profiles.py scales one modelled lap
@@ -36,6 +43,7 @@ import datetime
 import json
 import os
 import sys
+import time
 
 import numpy as np
 import pandas as pd
@@ -49,9 +57,10 @@ for _p in (_REPO_ROOT, _HERE):
 
 import db                                                   # noqa: E402
 import profile_build as pb                                  # noqa: E402
+import profile_manage as pm                                 # noqa: E402
 import speed_profile                                        # noqa: E402
-from constants import (STRATEGIES, DEFAULT_STRATEGY_KEY,     # noqa: E402
-                       SECTION_NAMES)
+from constants import (DEFAULT_STRATEGY_KEY,                # noqa: E402
+                       SECTION_NAMES, MIN_LAPS_FOR_MEASURED)
 from strategy_engine import SECTIONS_INFO                    # noqa: E402
 
 try:
@@ -78,44 +87,107 @@ st.set_page_config(page_title="Speed Profile Builder", layout="wide",
 
 
 # --------------------------------------------------------------------------- #
-# Categories — the five built-ins plus anything the team has added
+# The profile matrix — saved in constants.py, drafted in profiles.json
 # --------------------------------------------------------------------------- #
-def _default_categories():
-    return {s["key"]: {"label": s["label"],
-                       "target_s": round(float(s["lap_time_min"]) * 60.0, 1),
-                       "energy_wh": s.get("energy_wh")}
-            for s in STRATEGIES}
+# SAVED is PROFILE_MATRIX in constants.py: what the pit dashboard reads.
+# DRAFT is what this page shows: one row per CSV on disk, starting from its
+# saved row, with any unsaved edits from profiles.json laid over it. Manage
+# profiles and Build and write change the draft; only the Save button at the top
+# of the page writes the code.
+def load_saved_matrix():
+    try:
+        return pm.read_saved_matrix()
+    except Exception as exc:                      # never let a bad file block work
+        st.error(f"Cannot read PROFILE_MATRIX from constants.py ({exc}). Fix the "
+                 f"file before saving from here.", icon=":material/error:")
+        return None
 
 
 def load_sidecar():
-    """profiles/profiles.json, merged over the five built-ins."""
-    cats = _default_categories()
+    """The DRAFT matrix: {key: {label, target_s, energy_wh}} for every CSV."""
+    saved = load_saved_matrix() or {}
+    edits = {}
     try:
         with open(SIDECAR_PATH, encoding="utf-8") as fh:
-            stored = json.load(fh)
-        for key, meta in (stored.get("categories") or {}).items():
-            cats.setdefault(key, {})
-            cats[key].update(meta)
+            edits = json.load(fh).get("categories") or {}
     except FileNotFoundError:
         pass
-    except Exception as exc:                      # never let a bad file block work
-        st.warning(f"profiles.json unreadable ({exc}) — using the built-in five.",
+    except Exception as exc:
+        st.warning(f"profiles.json unreadable ({exc}) — showing the saved matrix.",
                    icon=":material/warning:")
+
+    cats = {}
+    for key, path in speed_profile.available_profiles(PROFILE_DIR).items():
+        row = dict(saved.get(key) or {})
+        row.update(edits.get(key) or {})
+        if not row.get("label"):
+            row["label"] = key.replace("_", " ").title()
+        if row.get("target_s") is None:
+            try:
+                lap_s = speed_profile.load_csv(path, lap_length_m=pb.LAP_M).lap_time_s()
+                row["target_s"] = round(lap_s, 1)
+            except Exception:
+                row["target_s"] = 0.0
+        row.setdefault("energy_wh", None)
+        cats[key] = pm.normalise_entry(row)
     return cats
 
 
-def save_sidecar(cats, provenance=None):
-    """Write the sidecar atomically. Provenance is merged, never replaced."""
+def load_stint_drivers():
+    """{stint key: driver name} from profiles/profiles.json.
+
+    THE BUILDER'S STORE CONNECTION IS READ-ONLY (db.get_conn_ro), which is why
+    driver names live here and not on telemetry.db. The key is the ISO second a
+    stint began — see pb._stint_key for why that is the most stable identity
+    available, and for what it cannot survive.
+    """
+    try:
+        with open(SIDECAR_PATH, encoding="utf-8") as fh:
+            rows = json.load(fh).get("stints") or {}
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}                      # load_sidecar already warns about this
+    return {k: (v or {}).get("driver") or "" for k, v in rows.items()}
+
+
+def save_sidecar(cats, provenance=None, drop_built=(), stints=None):
+    """Store the draft atomically. Provenance is merged, never replaced.
+
+    Only rows that DIFFER from constants.py are stored as edits, so once Save
+    has written the code the draft is empty again, and a hand edit to
+    constants.py is never silently overridden by an old draft.
+
+    `drop_built` removes provenance for keys whose file no longer came from a
+    measured lap (regenerated or removed), so profiles.json never claims a
+    curve was measured when it is not.
+    """
     existing = {}
     try:
         with open(SIDECAR_PATH, encoding="utf-8") as fh:
             existing = json.load(fh)
     except Exception:
         pass
-    existing["categories"] = cats
+    saved = load_saved_matrix() or {}
+    existing["categories"] = {
+        k: pm.normalise_entry(v) for k, v in cats.items()
+        if pm.normalise_entry(v) != saved.get(k)}
     built = existing.setdefault("built", {})
     if provenance:
         built.update(provenance)
+    for key in drop_built:
+        built.pop(key, None)
+    # Merged, never replaced, exactly like provenance above: a stint whose name
+    # was typed in an earlier session must survive a save made in this one.
+    if stints:
+        who = existing.setdefault("stints", {})
+        for key, name in stints.items():
+            if name:
+                who[key] = {"driver": name,
+                            "noted_at": datetime.datetime.now().isoformat(
+                                timespec="seconds")}
+            else:
+                who.pop(key, None)
     os.makedirs(PROFILE_DIR, exist_ok=True)
     tmp = SIDECAR_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
@@ -145,11 +217,37 @@ def _col(row, name, default=None):
     return default if value is None else value
 
 
-@st.cache_data(ttl=60, show_spinner="Reading laps…")
-def load_laps():
+def store_watermark():
+    """(newest sample, highest lap) — the probe that says "refetch now".
+
+    Two index seeks, 0.0 ms, so it can be polled every few seconds. The lap
+    counter moving means a lap ENDED, which is the moment the matrix must be
+    rebuilt; see db.store_watermark for why it is two statements.
+    """
+    conn, _mode = db.get_conn_ro()
+    try:
+        return db.store_watermark(conn)
+    finally:
+        conn.close()
+
+
+@st.cache_data(ttl=600, max_entries=4, show_spinner="Reading laps…")
+def load_laps(watermark):
     """One row per DRIVE, plus the alignment proof. One pass over the store.
 
-    Returns (DataFrame, offset, detail, db_mode).
+    Returns (DataFrame, offset, detail, db_mode, paired).
+
+    `watermark` IS A CACHE KEY, NOT AN ARGUMENT — the body never reads it. The
+    grouped query costs 1.7-3.1 s on a 130k-row store, so re-running it on a
+    short TTL would leave the spinner flickering for a third of every minute.
+    Keying on db.store_watermark() instead means the cache is dropped exactly
+    when a lap ends and never on a timer, so an idle page costs nothing and a
+    finished lap does not have to wait out a TTL.
+
+    `paired` is returned as well as the frame because classify_traces needs the
+    trace dicts, and it has to run OUTSIDE this cache: the two lap-rule sliders
+    feed it, and rebuilding it from the DataFrame instead would be a second
+    source of truth for the same facts.
 
     A row is a trace: (lap number, run). The lap number alone is not an
     identity -- it restarts whenever the car's counter is reset, so the same
@@ -181,8 +279,16 @@ def load_laps():
                 "Samples": n,
                 "Speed %": (100.0 * t["n_speed"] / n) if n else 0.0,
                 "Power %": (100.0 * t["n_power"] / n) if n else 0.0,
-                "Spacing (m)": (t["trace_end_m"] / n) if n else 0.0,
                 "Max speed": t["v_max_kmh"],
+                # Where the drive began and ended, and the longest standstill
+                # inside it. These are what tell an out-lap, an in-lap and a
+                # driver change apart from a flying lap; see db.lap_traces.
+                "Start speed": t["v_start_kmh"],
+                "End speed": t["v_end_kmh"],
+                "Stop (s)": t["stop_s"],
+                "Stop at (m)": t["stop_at_m"],
+                "Stops": t["n_stops"],
+                "Stopped (s)": t["stopped_s_total"],
                 "When": datetime.datetime.fromtimestamp(t["t0"]).strftime("%d %b %H:%M"),
                 "t0": t["t0"], "t1": t["t1"],
                 # How the lap boundary was decided. "gps" is a real finish-line
@@ -192,7 +298,7 @@ def load_laps():
                 # built from it.
                 "lap_source": t["lap_source"] or "—",
             })
-        return pd.DataFrame(recs), offset, detail, mode
+        return pd.DataFrame(recs), offset, detail, mode, traces
     finally:
         conn.close()
 
@@ -245,30 +351,63 @@ def installed_profile(key):
 # button — because a synthetic lap in profiles/base_210s.csv would be a lie the
 # car would then drive to.
 DEMO_LAPS = [
-    # (lap number, run, lap_time_s, energy_wh, lap_source, flaw)
+    # (lap, run, lap_time_s, energy_wh, lap_source, flaw, v_start, v_end, stop)
+    #
+    # `v_start` / `v_end` are the speeds the drive began and ended at, and `stop`
+    # is None or (standstill_s, at_m). Declared here rather than derived, exactly
+    # as lap_time_s and energy_wh already are, because the point of the demo is
+    # to review how each CASE reads before Zolder -- and two of the cases (a
+    # driver change, a drive with no speed at all) cannot be produced by the
+    # sample generator at all.
     #
     # LAP 7 APPEARS TWICE on purpose. A lap number is not an identity -- reset
     # the counter between practice and the race and the numbers start again --
     # so the table has to stay readable when two drives both call themselves
     # lap 7. Everything else here is one drive per number, which is what a
     # clean race looks like.
-    (1,  0, 208.4, 79.6, "gps", None),
-    (2,  0, 211.9, 82.1, "gps", None),
-    (3,  0, 209.7, 78.9, "gps", None),
-    (4,  0, 213.2, 84.7, "gps", None),
-    (5,  0, 210.6, 81.3, "gps", "gap"),
-    (6,  0, 207.9, 77.8, "gps", None),
-    (7,  0, 231.4, 71.2, "gps", None),
-    (7,  1, 229.8, 69.9, "gps", "interleaved"),
-    (8,  0, 233.1, 72.6, "gps", None),
-    (9,  0, 190.2, 95.4, "gps", None),
-    (10, 0, 188.7, 97.1, "gps", None),
-    (11, 0, 191.5, 94.2, "odometer", None),
-    (12, 0, 204.3, 80.2, "gps", "short"),
-    (13, 0, 215.0, 83.4, "odometer", "nopower"),
-    (14, 0, 198.6, 88.0, "gps", None),
-    (15, 0, 212.4, 81.9, "gps", "legacy"),
+    #
+    # THE BADGES THIS TABLE IS BUILT TO SHOW, in order: FIRST from a standing
+    # start, a run of NET laps, a NET lap that is still unbuildable (badge and
+    # reject are different axes), LAST rolling to a stop, PIT holding a driver
+    # change, FIRST of the second stint, the lap in progress with no time yet,
+    # and a drive the car reported no speed for.
+    (1,  0, 208.4, 79.6, "gps", None,            0.0,  86.0, None),
+    (2,  0, 211.9, 82.1, "gps", None,           86.0,  84.0, None),
+    (3,  0, 209.7, 78.9, "gps", None,           84.0,  88.0, None),
+    (4,  0, 213.2, 84.7, "gps", None,           88.0,  85.0, None),
+    (5,  0, 210.6, 81.3, "gps", "gap",          85.0,  87.0, None),
+    (6,  0, 207.9, 77.8, "gps", None,           87.0,  90.0, None),
+    (7,  0, 231.4, 71.2, "gps", None,           90.0,  82.0, None),
+    (7,  1, 229.8, 69.9, "gps", "interleaved",  82.0,  83.0, None),
+    (8,  0, 233.1, 72.6, "gps", None,           83.0,   0.0, None),
+    # The driver change. These figures are COPIED FROM THE REAL STORE -- trace
+    # L0R53 of 26 Aug: 1423 s of samples holding a 730 s standstill at 3670 m,
+    # started from rest, crossed the line at 66.1 km/h. The one place this
+    # table quotes reality instead of inventing it, because the case it shows
+    # is the whole reason the badges exist.
+    (9,  0, 1310.0, 110.0, "gps", "pitstop",     0.0,  66.1, (730.0, 3670.0)),
+    (10, 0, 188.7, 97.1, "gps", None,            0.0,  92.0, None),
+    (11, 0, 191.5, 94.2, "odometer", None,      92.0,  91.0, None),
+    (12, 0, 204.3, 80.2, "gps", "short",        91.0,  86.0, None),
+    (13, 0, 215.0, 83.4, "odometer", "nopower", 86.0,  84.0, None),
+    (14, 0, 198.6, 88.0, "gps", None,           84.0,  89.0, None),
+    (15, 0, 212.4, 81.9, "gps", "legacy",       89.0,  85.0, None),
+    # The lap in progress: driven, recorded, but the car has not reported a time
+    # for it yet -- so nearest_key gives it no cell in any profile column. This
+    # is the case "every lap appears the second it ends" is actually about, and
+    # the Type column is the only thing that makes it visible.
+    (16, 0, None,  None,  "gps", None,          82.0,  81.0, None),
+    # No speed anywhere in the drive. 59 of the real store's 93 traces look like
+    # this; with four badges they would all read NET and be offered as material.
+    (17, 0, 209.0, 80.0, "gps", None,           None,  None, None),
 ]
+
+# The demo's clock. Real, increasing timestamps matter now that drives are
+# grouped into stints: classify_traces orders by t0 and splits on standstills,
+# so demo drives all sharing t0 = 0.0 would put the whole session in one instant
+# and make the Stint column meaningless. An arbitrary fixed epoch, so the demo
+# reads the same every time it is opened.
+DEMO_T0 = 1789700000.0
 
 # A plausible car, so the demo's sector split is shaped like a real lap instead
 # of flat. Same road-load model the 210 s baseline spreadsheet uses:
@@ -300,6 +439,50 @@ def _demo_index():
             for lap, run in ((row[0], row[1]),)}
 
 
+def _demo_timeline():
+    """{trace id: (t0, t1)} — the demo drives laid back to back in real time."""
+    out, t = {}, DEMO_T0
+    for row in DEMO_LAPS:
+        span = row[2] if row[2] is not None else 210.0
+        out[pb.trace_id(row[0], row[1])] = (t, t + span)
+        t += span + 4.0
+    return out
+
+
+def _demo_paired():
+    """The demo drives in pair_traces() shape.
+
+    So classify_traces runs on the demo BYTE-IDENTICALLY to how it runs on the
+    store, rather than through a second code path. That is what makes the demo a
+    real review of the badges: whatever it shows here is what it will do at
+    Zolder.
+    """
+    clock = _demo_timeline()
+    out = []
+    for (lap, run, lap_time, wh, source, flaw,
+         v0, v1, stop) in DEMO_LAPS:
+        tid = pb.trace_id(lap, run)
+        t0, t1 = clock[tid]
+        blind = v0 is None and v1 is None
+        out.append({
+            "id": tid, "lap": lap, "run": run,
+            "t0": t0, "t1": t1, "span_s": t1 - t0,
+            "n_samples": 500, "n_speed": 0 if blind else 500, "n_power": 500,
+            "trace_end_m": 3860.0 if flaw == "short" else 4000.0,
+            "v_max_kmh": 90.0, "lap_source": source,
+            "lap_time_s": lap_time, "energy_wh": wh,
+            "regen_wh": None, "distance_m": None,
+            "own_lap_time_s": None, "next_id": None,
+            "v_start_kmh": v0, "v_end_kmh": v1,
+            "stop_s": None if stop is None else stop[0],
+            "stop_at_m": None if stop is None else stop[1],
+            "stop_rows": 0,
+            "stopped_s_total": None if stop is None else stop[0],
+            "n_stops": 0 if stop is None else 1,
+        })
+    return out
+
+
 def _demo_samples(tid):
     """One demo drive's samples, shaped like db.fetch_trace_samples rows.
 
@@ -308,7 +491,11 @@ def _demo_samples(tid):
     over dt, so an index axis would make every demo lap's Wh meaningless while
     still looking entirely plausible.
     """
-    lap, run, lap_time, wh, source, flaw = _demo_index()[tid]
+    lap, run, lap_time, wh, source, flaw, _v0, _v1, _stop = _demo_index()[tid]
+    # The lap in progress has no reported time or energy yet; it still has
+    # samples, so the generator needs a shape to work from.
+    lap_time = 210.0 if lap_time is None else lap_time
+    wh = 80.0 if wh is None else wh
     length = 3860.0 if flaw == "short" else 4000.0
 
     # Shaped from the INSTALLED base profile, not from a periodic synthetic
@@ -370,6 +557,17 @@ def _demo_samples(tid):
         # thing the coverage check exists to refuse.
         out = [(ts, d, v, source, (None if 1200.0 < d < 2600.0 else p))
                for ts, d, v, _s, p in out]
+    if flaw == "pitstop":
+        # A REAL standstill in the samples, not just a declared one: distance
+        # frozen, speed zero, clock running for 730 s at 3670 m. Declared in
+        # DEMO_LAPS as well, so the matrix and the samples tell one story -- and
+        # so pb.reject_reasons' standstill refusal is exercised by the demo
+        # rather than only by the self-check.
+        i = next((k for k, r in enumerate(out) if r[1] >= 3670.0), len(out) - 1)
+        t_at, d_at = out[i][0], out[i][1]
+        held = [(t_at + float(k), d_at, 0.0, source, 0.0) for k in range(731)]
+        out = (out[:i] + held
+               + [(ts + 730.0, d, v, s_, p) for ts, d, v, s_, p in out[i:]])
     if flaw == "interleaved":
         # A second publisher: what three copies of the car code running at once
         # actually looks like in the store.
@@ -381,12 +579,16 @@ def _demo_samples(tid):
 
 def _demo_laps_df():
     """The lap table, built from DEMO_LAPS rather than telemetry.db."""
+    clock = _demo_timeline()
     recs = []
-    for lap, run, lap_time, wh, source, _flaw in DEMO_LAPS:
+    for (lap, run, lap_time, wh, source, _flaw,
+         v0, v1, stop) in DEMO_LAPS:
         tid = pb.trace_id(lap, run)
         samples = _demo_samples(tid)
         _d, _v, diag = pb.clean_samples(samples)
         n_power = sum(1 for r in samples if r[4] is not None)
+        t0, t1 = clock[tid]
+        blind = v0 is None and v1 is None
         recs.append({
             "id": tid,
             "Trace lap": lap,
@@ -396,12 +598,19 @@ def _demo_laps_df():
             "Trace distance (m)": diag["length_m"],
             "Energy (Wh)": wh,
             "Samples": diag["n_used"],
-            "Speed %": 100.0,
+            # A drive the car reported no speed for has no speed coverage
+            # either -- quick_check must see that, not a cheerful 100%.
+            "Speed %": 0.0 if blind else 100.0,
             "Power %": 100.0 * n_power / max(1, len(samples)),
-            "Spacing (m)": diag["mean_spacing_m"],
             "Max speed": diag["max_kmh"],
-            "When": f"demo {lap}.{run}",
-            "t0": 0.0, "t1": lap_time,
+            "Start speed": v0,
+            "End speed": v1,
+            "Stop (s)": None if stop is None else stop[0],
+            "Stop at (m)": None if stop is None else stop[1],
+            "Stops": 0 if stop is None else 1,
+            "Stopped (s)": None if stop is None else stop[0],
+            "When": datetime.datetime.fromtimestamp(t0).strftime("%d %b %H:%M"),
+            "t0": t0, "t1": t1,
             "lap_source": source,
         })
     return pd.DataFrame(recs)
@@ -425,6 +634,12 @@ FAR_S = 5.0
 CHOSEN_CSS = "background-color:#00FFCC; color:#04140f; font-weight:700"
 FAR_CSS = "background-color:#4a3410; color:#ffb84d; font-weight:600"
 REJECT_CSS = "color:#64748b"
+# A drive with a pit stop in it. Loud, because its lap time looks like a pace
+# and is not one.
+PIT_CSS = "background-color:#3b1120; color:#ff8fa3; font-weight:700"
+# FIRST, LAST and ? — real laps, just not net ones.
+EDGE_CSS = "background-color:#22222b; color:#cbd5e1; font-weight:600"
+NET_CSS = "color:#94a3b8"
 
 
 def profile_columns(cats):
@@ -446,16 +661,25 @@ def nearest_key(lap_time, columns):
     """Which profile a lap belongs to: simply the closest target.
 
     No radius and no "unassigned" bucket -- every lap that has a time lands
-    somewhere and stays visible. A lap far from its nearest target is FLAGGED
-    (amber, and the detail panel says how far in words) rather than hidden,
-    because a lap you cannot see is a lap you cannot judge.
+    somewhere. A lap far from its nearest target is FLAGGED (amber, and the
+    detail panel says how far in words) rather than hidden, because a lap you
+    cannot see is a lap you cannot judge.
+
+    ONE LAP IS KEPT OUT OF THE PACE LADDER, and it is build_matrix that does it,
+    not this function: a drive holding a pit stop. Its reported time is a lap
+    PLUS the stop -- 1310 s for the 730 s driver change in the store -- and a
+    number in the ladder is a claim about PACE. The rule is exactly that: a lap
+    leaves the ladder when its reported time is not time spent driving. It does
+    NOT leave the table; it keeps its row, its Stint cell, its Type cell and its
+    click, so it can still be judged. FIRST and LAST laps stay in the ladder
+    (greyed): their times are real line-to-line times, merely unrepresentative.
     """
     if lap_time is None or pd.isna(lap_time) or not columns:
         return None
     return min(columns, key=lambda c: abs(lap_time - c["target_s"]))["key"]
 
 
-def quick_check(row):
+def quick_check(row, stop_s=pb.DEFAULT_STOP_S):
     """Why this lap could not become a profile, from the grouped query alone.
 
     Cheap on purpose: gaps and coverage need the lap's own samples read, which
@@ -464,6 +688,17 @@ def quick_check(row):
     look like the tool contradicting itself.
     """
     why = []
+    # A DRIVE WITH A PIT STOP IN IT IS NOT ONE LAP. Putting it here rather than
+    # only in the badge is what makes "never selectable" hold without new
+    # plumbing: a non-empty rejects list already greys the cell in
+    # style_matrix, and already makes lap_detail return before the Choose
+    # button is ever drawn.
+    stop = row.get("Stop (s)")
+    if stop is not None and not pd.isna(stop) and stop >= stop_s:
+        at = row.get("Stop at (m)")
+        why.append(f"{stop:.0f} s standstill"
+                   + ("" if at is None or pd.isna(at) else f" at {at:.0f} m")
+                   + " — a pit stop or driver change, not one lap of driving")
     if row["Max speed"] > pb.LEGACY_SPEED_KMH:
         why.append("pre-decode-fix rows: speeds ~50x too high, not rescalable")
     if row["Speed %"] < 99.0:
@@ -477,11 +712,20 @@ def quick_check(row):
     return why
 
 
-def lap_meta(laps_df, columns):
+def lap_meta(laps_df, columns, badges=None, stop_s=pb.DEFAULT_STOP_S):
     """{trace id: facts} — everything the matrix, the colours and the panel need.
 
     Keyed by TRACE ID, not by lap number: two drives can both be lap 7.
+
+    `badges` is pb.classify_traces()' first return value. It stays a SEPARATE
+    argument rather than being computed here because classify_traces is pure and
+    must remain so — it takes trace dicts, not DataFrame rows, and importing
+    quick_check into it would drag Streamlit-shaped data into the arithmetic
+    module. The AND of the two ("is it a net lap" and "is it buildable") is
+    `offerable` below, and those really are different axes: a NET-badged lap can
+    still have three interleaved publishers in it.
     """
+    badges = badges or {}
     by_key = {c["key"]: c for c in columns}
     # A lap number more than one drive claims gets a date on it. Unique numbers
     # -- a clean race -- keep the bare number, so the common case stays plain.
@@ -495,6 +739,7 @@ def lap_meta(laps_df, columns):
     out = {}
     for _, row in laps_df.iterrows():
         tid = row["id"]
+        b = badges.get(tid, {})
         t = _num(row["Lap time (s)"])
         key = nearest_key(t, columns)
         lap_no = int(row["Trace lap"])
@@ -508,17 +753,30 @@ def lap_meta(laps_df, columns):
             "key": key,
             "delta": None if (t is None or key is None)
                      else t - by_key[key]["target_s"],
-            "rejects": quick_check(row),
+            "rejects": quick_check(row, stop_s=stop_s),
             "when": row.get("When", ""),
             "energy": _num(row.get("Energy (Wh)")),
             "distance": _num(row.get("Car distance (m)")),
             "power_pct": float(row.get("Power %", 0.0) or 0.0),
             "source": row.get("lap_source", "—"),
             "samples": int(row["Samples"]),
-            "spacing": float(row["Spacing (m)"]),
             "t0": float(row.get("t0", 0.0) or 0.0),
             "t1": float(row.get("t1", 0.0) or 0.0),
+            "v_start": _num(row.get("Start speed")),
+            "v_end": _num(row.get("End speed")),
+            "stop_s": _num(row.get("Stop (s)")),
+            "stop_at_m": _num(row.get("Stop at (m)")),
+            "n_stops": int(row.get("Stops") or 0),
+            "stopped_s": _num(row.get("Stopped (s)")),
+            "badge": b.get("badge", pb.BADGE_UNKNOWN),
+            "stint": b.get("stint"),
+            "badge_reasons": b.get("reasons", []),
         }
+        # Offered as profile material only when it is BOTH a net lap and
+        # buildable. Computed here, after rejects, because it is the one place
+        # the pure classifier's answer and the row-level checks meet.
+        out[tid]["offerable"] = (out[tid]["badge"] == pb.BADGE_NET
+                                 and not out[tid]["rejects"])
     return out
 
 
@@ -532,16 +790,57 @@ def efficiency_rank(tid, meta):
     m = meta[tid]
     if m["key"] is None or m["energy"] is None:
         return None
+    # NET LAPS ONLY, ON BOTH SIDES. A pit drive's energy covers a lap PLUS a
+    # twelve-minute stop and an out-lap's covers a standing start, so neither
+    # belongs in the peer set -- and neither can be GIVEN a rank either. An
+    # out-lap placed third of eight flying laps reads as a comparison of pace
+    # when it is nothing of the kind, so it gets no rank at all.
+    if m.get("badge") != pb.BADGE_NET:
+        return None
     peers = [x for x in meta.values()
-             if x["key"] == m["key"] and x["energy"] is not None]
-    if len(peers) < 2:
+             if x["key"] == m["key"] and x["energy"] is not None
+             and x.get("badge") == pb.BADGE_NET]
+    if len(peers) < 2 or tid not in {p["id"] for p in peers}:
         return None
     peers.sort(key=lambda x: x["energy"])
     return [p["id"] for p in peers].index(tid) + 1, len(peers)
 
 
-def build_matrix(laps_df, columns, meta, chosen):
-    """(numeric view, display frame). Rows sorted by lap time, no-time laps last.
+def badge_cell(m):
+    """The Type cell's text. A WORD, never a colour on its own.
+
+    A Styler can set background-color, color and font-weight and nothing else
+    (see the note on CHOSEN_CSS), so the badge has to live in the display value
+    the same way the chosen tick does -- and a word survives a screenshot, a
+    projector and a colour-blind reader, which is the whole reason for the rule.
+    """
+    if m["badge"] == pb.BADGE_PIT:
+        stop = m.get("stop_s")
+        at = m.get("stop_at_m")
+        bits = "PIT"
+        if stop is not None:
+            bits += f" {stop:.0f}s"
+        if at is not None:
+            bits += f" @{at:.0f}m"
+        return bits
+    return m["badge"]
+
+
+def stint_cell(m, drivers, stints_by_index):
+    """The Stint cell's text: the number, and the driver if one has been typed."""
+    if m["badge"] == pb.BADGE_PIT:
+        return "— pit —"
+    idx = m.get("stint")
+    if idx is None:
+        return "—"
+    s = stints_by_index.get(idx)
+    name = (drivers.get(s["key"], "") if s else "").strip()
+    return f"{idx} · {name}" if name else f"{idx}"
+
+
+def build_matrix(laps_df, columns, meta, chosen, stints=(), drivers=None,
+                 order="pace"):
+    """(numeric view, display frame). Two leading columns, then the pace ladder.
 
     Two frames because they do different jobs: the numeric one is the truth the
     logic reads, the display one carries the tick and the energy. They share an
@@ -550,15 +849,44 @@ def build_matrix(laps_df, columns, meta, chosen):
     `view` also carries `_id`, which `disp` does not: the row position a click
     returns has to resolve to a DRIVE, and the visible Lap column is a label
     that two rows can legitimately share.
+
+    `order` is "pace" (by lap time, no-time laps last — what this always did and
+    still the default) or "clock" (by t0, which is the only order in which the
+    Stint column reads as contiguous blocks). THERE ARE NO SEPARATOR ROWS between
+    stints and there cannot be: any column header can be clicked to re-sort, and
+    under a pace sort the stints interleave, so a separator would separate
+    nothing — and a sentinel row would break resolve_click, which turns a row
+    position into a trace id.
+
+    THE TYPE COLUMN IS WHAT MAKES "EVERY LAP APPEARS" TRUE. A lap the car has
+    not timed yet gets no cell in any profile column (nearest_key returns None),
+    so before this its row was entirely blank: nothing to read and nothing to
+    click. Now every row has a populated, classified, clickable cell.
     """
+    drivers = drivers or {}
+    by_index = {s["index"]: s for s in stints}
+
     ids = [r["id"] for _, r in laps_df.iterrows()]
-    ids.sort(key=lambda i: (meta[i]["time"] is None,
-                            meta[i]["time"] if meta[i]["time"] is not None else 0.0))
+    if order == "clock":
+        ids.sort(key=lambda i: meta[i]["t0"])
+    else:
+        ids.sort(key=lambda i: (meta[i]["time"] is None,
+                                meta[i]["time"] if meta[i]["time"] is not None
+                                else 0.0))
 
     cols = [c["key"] for c in columns]
-    view = pd.DataFrame({"_id": ids, "Lap": [meta[i]["label"] for i in ids]})
+    view = pd.DataFrame({
+        "_id": ids,
+        "Stint": [stint_cell(meta[i], drivers, by_index) for i in ids],
+        "Lap": [meta[i]["label"] for i in ids],
+        "Type": [badge_cell(meta[i]) for i in ids],
+    })
     for k in cols:
-        view[k] = [meta[i]["time"] if meta[i]["key"] == k else np.nan for i in ids]
+        # A PIT drive is withheld from the ladder — see nearest_key's docstring.
+        view[k] = [meta[i]["time"]
+                   if (meta[i]["key"] == k and meta[i]["badge"] != pb.BADGE_PIT)
+                   else np.nan
+                   for i in ids]
     view = view.reset_index(drop=True)
 
     disp = view.drop(columns=["_id"]).copy()
@@ -576,6 +904,9 @@ def build_matrix(laps_df, columns, meta, chosen):
     return view, disp
 
 
+BADGE_CSS = {}                     # filled below; PIT/FIRST/LAST/? vs NET
+
+
 def style_matrix(view, disp, columns, meta, chosen):
     cols = [c["key"] for c in columns]
 
@@ -584,18 +915,29 @@ def style_matrix(view, disp, columns, meta, chosen):
         for i in view.index:
             tid = view.at[i, "_id"]
             m = meta[tid]
+            css.at[i, "Type"] = BADGE_CSS.get(m["badge"], NET_CSS)
+            if m["badge"] == pb.BADGE_PIT:
+                css.at[i, "Stint"] = PIT_CSS
             for k in cols:
                 if pd.isna(view.at[i, k]):
                     continue
                 if chosen.get(k) == tid:
                     css.at[i, k] = CHOSEN_CSS
-                elif m["rejects"]:
+                elif m["badge"] == pb.BADGE_PIT:
+                    css.at[i, k] = PIT_CSS
+                # Greyed for EITHER reason: not a net lap, or not buildable.
+                # They are different axes and both mean "not offered".
+                elif m["rejects"] or m["badge"] != pb.BADGE_NET:
                     css.at[i, k] = REJECT_CSS
                 elif m["delta"] is not None and abs(m["delta"]) > FAR_S:
                     css.at[i, k] = FAR_CSS
         return css
 
     return disp.style.apply(paint, axis=None)
+
+
+BADGE_CSS.update({pb.BADGE_PIT: PIT_CSS, pb.BADGE_FIRST: EDGE_CSS,
+                  pb.BADGE_LAST: EDGE_CSS, pb.BADGE_UNKNOWN: EDGE_CSS})
 
 
 def resolve_click(cells, view, columns, meta):
@@ -625,17 +967,368 @@ def reset_selection():
         st.session_state.pop(k, None)
 
 
+def _stint_driver(index, stints, drivers):
+    """The driver's name for a stint index, or None. Passed in, not global."""
+    if index is None:
+        return None
+    for s in stints or ():
+        if s["index"] == index:
+            return (drivers or {}).get(s["key"]) or None
+    return None
+
+
+def best_net_laps(meta, columns):
+    """{profile key: trace id} — the leanest NET lap offered in each column.
+
+    The one automation a {key: trace id} selection can express: pb_chosen holds
+    ONE lap per profile, so "pre-select the net laps" is not a thing that fits
+    in it. Ranked by the CAR's energy figure, the same ordering
+    efficiency_rank uses, and never anything but an offerable NET lap.
+    """
+    out = {}
+    for c in columns:
+        peers = [m for m in meta.values()
+                 if m["key"] == c["key"] and m.get("offerable")
+                 and m.get("energy") is not None]
+        if peers:
+            out[c["key"]] = min(peers, key=lambda m: m["energy"])["id"]
+    return out
+
+
+def stint_editor(stints, drivers, demo):
+    """The stints, with a driver's name you can type. Returns {key: name}.
+
+    A SEPARATE FRAME FROM THE MATRIX, and above it, so lap selection is left
+    alone: the matrix is one st.dataframe with single-cell selection whose row
+    positions resolve to trace ids through resolve_click, and editable rows
+    inside it would break that. Here the rows are stints, not laps.
+
+    FROM AND TO SIT BESIDE EVERY NAME ON PURPOSE. A stint is identified by the
+    second its first lap began, which is the most stable key available -- stints
+    grow forward, so that second never moves -- but it cannot survive a stint
+    SPLITTING later, which happens when a standstill in the middle of it is
+    finally observed and what looked like one run of laps becomes two. The name
+    then stays on the first half. No name is ever moved automatically, and the
+    dates are what make a name on the wrong half visible instead of silent.
+    """
+    if not stints:
+        return drivers
+
+    rows = [{"Stint": s["index"],
+             "From": datetime.datetime.fromtimestamp(s["t0"]).strftime(
+                 "%d %b %H:%M"),
+             "To": datetime.datetime.fromtimestamp(s["t1"]).strftime("%H:%M"),
+             "Laps": len(s["ids"]),
+             "Net laps": s["n_net"],
+             "Driver": drivers.get(s["key"], "")}
+            for s in stints]
+
+    with st.expander(f"Stints and drivers — {len(stints)} stint(s)",
+                     expanded=any(not r["Driver"] for r in rows)):
+        if demo:
+            st.caption("Demo stints. A name typed here is **not** saved.")
+        edited = st.data_editor(
+            pd.DataFrame(rows), key="pb_stints", hide_index=True,
+            width="stretch",
+            disabled=["Stint", "From", "To", "Laps", "Net laps"],
+            column_config={"Driver": st.column_config.TextColumn(
+                "Driver", max_chars=40,
+                help="Who drove this stint. Kept in profiles/profiles.json — "
+                     "the store is opened read-only, so nothing is written "
+                     "back to telemetry.db — and recorded with any profile "
+                     "built from these laps.")})
+        st.caption("A new stint begins after every standstill long enough to "
+                   "count as a pit stop. **From**/**To** are shown because a "
+                   "stint can split later, when a standstill inside it is "
+                   "finally seen; the name stays on the first half.")
+
+    got = {s["key"]: str(edited.at[i, "Driver"] or "").strip()
+           for i, s in enumerate(stints)}
+    if not demo and got != {k: drivers.get(k, "") for k in got}:
+        save_sidecar(load_sidecar(), stints=got)
+        drivers = {**drivers, **got}
+    return drivers
+
+
+# --------------------------------------------------------------------------- #
+# Manage profiles — add, edit, remove. The file work is in profile_manage.py.
+# --------------------------------------------------------------------------- #
+AFTER_CHANGE = ("Press **Save to constants.py** at the top to put the label and "
+                "Wh/lap into the code, then restart the **Pit Web** window. The "
+                "car loads the curves at startup, so commit `profiles/`, pull on "
+                "the Pi and restart the HUD before sending a new curve to the car.")
+
+
+WH_HELP = ("Estimated energy per lap on this profile. The Strategy tab uses it "
+           "until the car has driven " + str(MIN_LAPS_FOR_MEASURED) + " laps on "
+           "the profile, then switches to what the car measured. Leave empty if "
+           "unknown.")
+
+
+def _measured_keys():
+    """Keys whose current CSV was built from a real lap, per profiles.json."""
+    try:
+        with open(SIDECAR_PATH, encoding="utf-8") as fh:
+            return set((json.load(fh).get("built") or {}).keys())
+    except Exception:
+        return set()
+
+
+def _finish(message):
+    """Close the dialog and say what happened at the top of the page."""
+    load_installed.clear()
+    st.session_state["pm_flash"] = message
+    st.rerun()
+
+
+@st.dialog("Manage profiles", width="large")
+def manage_profiles():
+    cats = load_sidecar()
+    columns = profile_columns(cats)
+    targets = {c["key"]: c["target_s"] for c in columns}
+    labels = {c["key"]: c["label"] for c in columns}
+    measured = _measured_keys()
+
+    def describe(k):
+        tag = "measured" if k in measured else "modelled"
+        return f"{labels[k]} · {targets[k]:.1f} s · {k} ({tag})"
+
+    st.dataframe(pd.DataFrame([{
+        "Key": c["key"], "Label": c["label"], "Target (s)": round(c["target_s"], 1),
+        "Curve": "measured lap" if c["key"] in measured else "scaled baseline",
+        "Wh/lap estimate": cats[c["key"]].get("energy_wh"),
+    } for c in columns]), hide_index=True, width="stretch")
+    st.caption("Curves are written to `profiles/` straight away. Labels and "
+               "Wh/lap reach `constants.py` only when you press **Save to "
+               "constants.py** at the top of the page.")
+
+    add_tab, edit_tab, remove_tab = st.tabs([":material/add: Add",
+                                             ":material/edit: Edit",
+                                             ":material/delete: Remove"])
+
+    with add_tab:
+        a1, a2, a3 = st.columns([2, 1, 1])
+        label = a1.text_input("Label", key="pm_add_label",
+                              placeholder="e.g. Eco Push")
+        target = a2.number_input("Target lap time (s)", pm.MIN_TARGET_S,
+                                 pm.MAX_TARGET_S, 205.0, 0.5, key="pm_add_target")
+        energy = a3.number_input("Wh per lap", 1.0, 500.0, None, 0.5,
+                                 key="pm_add_wh", placeholder="unknown",
+                                 help=WH_HELP)
+        suggested = pm.suggest_key(label or "profile", target)
+        key = st.text_input(
+            "Key", key="pm_add_key", placeholder=suggested,
+            help="The file name and the name the car is sent. It can never be "
+                 "renamed later, because recorded laps point at it. Leave empty "
+                 f"to use `{suggested}`.").strip() or suggested
+        st.caption("The curve is the baseline lap scaled to this time, the same "
+                   "way the original five were made: corners never faster than "
+                   "the baseline, braking never harder. Replace it with a real "
+                   "lap in the builder whenever you have one."
+                   + ("" if energy is not None else
+                      " :orange[Without a Wh/lap estimate the Strategy tab leaves "
+                      "it out until the car has driven "
+                      f"{MIN_LAPS_FOR_MEASURED} laps on it.]"))
+        problem = ((None if label.strip() else "enter a label")
+                   or pm.key_problem(key, cats.keys())
+                   or pm.target_problem(target, targets))
+        if problem and label.strip():
+            st.error(problem, icon=":material/error:")
+        if st.button(f":material/add: Add `{key}`", type="primary",
+                     disabled=problem is not None, key="pm_add_go"):
+            try:
+                with st.spinner("Scaling the baseline…"):
+                    info = pm.write_scaled(key, target)
+            except Exception as exc:
+                st.error(f"Nothing was added: {exc}", icon=":material/error:")
+            else:
+                cats[key] = {"label": label.strip(), "target_s": round(target, 1),
+                             "energy_wh": energy}
+                save_sidecar(cats)
+                _finish(f"Added **{label.strip()}** as `profiles/{key}.csv` "
+                        f"({info['lap_s']:.1f} s, {info['avg_kmh']:.1f} km/h "
+                        f"average, {info['max_kmh']:.0f} km/h max). "
+                        + AFTER_CHANGE)
+
+    with edit_tab:
+        sel = st.selectbox("Profile", [c["key"] for c in columns],
+                           format_func=describe, key="pm_edit_sel")
+        e1, e2, e3 = st.columns([2, 1, 1])
+        new_label = e1.text_input("Label", labels[sel], key=f"pm_edit_label_{sel}")
+        new_target = e2.number_input("Target lap time (s)", pm.MIN_TARGET_S,
+                                     pm.MAX_TARGET_S,
+                                     min(max(float(targets[sel]), pm.MIN_TARGET_S),
+                                         pm.MAX_TARGET_S),
+                                     0.5, key=f"pm_edit_target_{sel}")
+        old_wh = cats[sel].get("energy_wh")
+        new_wh = e3.number_input("Wh per lap", 1.0, 500.0, old_wh, 0.5,
+                                 key=f"pm_edit_wh_{sel}", placeholder="unknown",
+                                 help=WH_HELP)
+        retarget = abs(new_target - targets[sel]) >= 0.05
+        problem = ((None if new_label.strip() else "enter a label")
+                   or (pm.target_problem(new_target,
+                                         {k: t for k, t in targets.items() if k != sel})
+                       if retarget else None))
+        confirmed = True
+        if retarget:
+            st.info(f"A new target regenerates the curve from the baseline. The "
+                    f"key stays `{sel}` even if its name mentions the old time, "
+                    f"because the car and recorded laps know it by that name. The "
+                    f"old file is copied to `profiles/_backup/`.",
+                    icon=":material/info:")
+            if sel in measured:
+                confirmed = st.checkbox(
+                    f"Replace the curve measured from a real lap with a scaled "
+                    f"baseline", key=f"pm_edit_confirm_{sel}")
+        if problem:
+            st.error(problem, icon=":material/error:")
+        rewh = (new_wh is None) != (old_wh is None) or (
+            new_wh is not None and abs(new_wh - old_wh) >= 0.05)
+        changed = retarget or rewh or new_label.strip() != labels[sel]
+        if st.button(":material/save: Save", type="primary", key="pm_edit_go",
+                     disabled=bool(problem) or not changed or not confirmed):
+            info, failed = None, None
+            if retarget:
+                try:
+                    with st.spinner("Scaling the baseline…"):
+                        info = pm.write_scaled(sel, new_target)
+                except Exception as exc:
+                    failed = exc
+            if failed is not None:
+                st.error(f"Nothing was changed: {failed}", icon=":material/error:")
+            else:
+                cats[sel]["label"] = new_label.strip()
+                cats[sel]["energy_wh"] = new_wh
+                if retarget:
+                    cats[sel]["target_s"] = round(new_target, 1)
+                save_sidecar(cats, drop_built=[sel] if retarget else ())
+                _finish(f"Updated `{sel}`"
+                        + (f": new curve laps in {info['lap_s']:.1f} s. "
+                           if info else ". ")
+                        + AFTER_CHANGE)
+
+    with remove_tab:
+        removable = [c["key"] for c in columns if c["key"] not in pm.PROTECTED_KEYS]
+        st.caption(f"`{DEFAULT_STRATEGY_KEY}` cannot be removed: it is the car's "
+                   f"startup profile and the reference every built lap is "
+                   f"checked against.")
+        if not removable:
+            st.info("Nothing to remove.", icon=":material/info:")
+        else:
+            gone = st.selectbox("Profile", removable, format_func=describe,
+                                key="pm_remove_sel")
+            st.warning(f"Deletes `profiles/{gone}.csv` (a copy goes to "
+                       f"`profiles/_backup/`). A car that still has it loaded keeps "
+                       f"driving it until the HUD restarts; after that, sending "
+                       f"`{gone}` is refused by the car.",
+                       icon=":material/warning:")
+            sure = st.checkbox(f"Remove {labels[gone]}", key=f"pm_remove_ok_{gone}")
+            if st.button(":material/delete: Remove", type="primary",
+                         disabled=not sure, key="pm_remove_go"):
+                try:
+                    backup = pm.remove_profile(gone)
+                except Exception as exc:
+                    st.error(f"Nothing was removed: {exc}", icon=":material/error:")
+                else:
+                    cats.pop(gone, None)
+                    save_sidecar(cats, drop_built=[gone])
+                    st.session_state.get("pb_chosen", {}).pop(gone, None)
+                    if st.session_state.get("pb_focus_key") == gone:
+                        st.session_state["pb_focus_key"] = None
+                    _finish(f"Removed `{gone}`"
+                            + (f" (backup: `{os.path.relpath(backup, _REPO_ROOT)}`). "
+                               if backup else ". ")
+                            + AFTER_CHANGE)
+
+
 # --------------------------------------------------------------------------- #
 # UI
 # --------------------------------------------------------------------------- #
 st.title(":material/route: Speed Profile Builder")
 
+
+def _fmt(x):
+    return "—" if x is None else f"{x:g}"
+
+
+def save_matrix_bar():
+    """The Save button: writes the draft matrix into constants.py."""
+    saved = load_saved_matrix()
+    draft = load_sidecar()
+    with st.container(border=True):
+        b1, b2 = st.columns([4, 1], vertical_alignment="center")
+        diff = [] if saved is None else pm.matrix_diff(saved, draft)
+        if saved is None:
+            b1.caption("Save is unavailable until constants.py can be read.")
+        elif not diff:
+            b1.caption(":material/check_circle: Profile matrix saved — "
+                       "`constants.py` matches what this page shows.")
+        else:
+            b1.markdown(f":orange[**{len(diff)} unsaved change(s)** to the profile "
+                        f"matrix.] The pit dashboard keeps the old labels and "
+                        f"Wh/lap until you save.")
+            lines = []
+            for kind, key, d in diff:
+                if kind == "added":
+                    lines.append(f"- **add** `{key}`: {d['label']}, "
+                                 f"{_fmt(d['target_s'])} s, {_fmt(d['energy_wh'])} Wh")
+                elif kind == "removed":
+                    lines.append(f"- **remove** `{key}` ({d['label']})")
+                else:
+                    lines.append(f"- **change** `{key}`: " + ", ".join(
+                        f"{f} {_fmt(a) if f != 'label' else a} → "
+                        f"{_fmt(b) if f != 'label' else b}"
+                        for f, (a, b) in d.items()))
+            with b1.expander("What Save will write"):
+                st.markdown("\n".join(lines))
+        if b2.button(":material/save: Save to constants.py", type="primary",
+                     disabled=not diff, width="stretch", key="pm_save_matrix"):
+            try:
+                pm.write_saved_matrix(draft)
+            except Exception as exc:
+                st.error(f"constants.py was not changed: {exc}",
+                         icon=":material/error:")
+            else:
+                save_sidecar(draft)          # stores no edits: draft == saved now
+                st.session_state["pm_flash"] = (
+                    f"Saved {len(diff)} change(s) to `Pit_Dashboard/constants.py` "
+                    f"(old copy in `profiles/_backup/`). Restart the **Pit Web** "
+                    f"window to use them, and commit `constants.py` together with "
+                    f"`profiles/`.")
+                st.rerun()
+
+
+save_matrix_bar()
+
 st.session_state.setdefault("pb_chosen", {})
 st.session_state.setdefault("pb_focus", None)
 st.session_state.setdefault("pb_focus_key", None)
 
-real_laps_df, real_offset, real_detail, db_mode = load_laps()
-_has_real = (real_offset is not None and not real_laps_df.empty)
+# How often the 0.0 ms watermark is re-checked while Live is on.
+REFRESH_S = 5
+# Coarseness of "the car is publishing but no lap has ended yet". The lap
+# counter moving refetches at once; a sample merely arriving is bucketed, so a
+# running car costs one ~2 s requery per bucket and a parked one costs nothing.
+BUCKET_S = 15
+# Newer than this and the store is treated as live, so Live defaults on.
+FRESH_S = 120.0
+
+
+def watermark_key():
+    """load_laps' cache key: (highest lap, coarse time bucket).
+
+    ONE SHAPE, DEFINED ONCE, because both the initial load and the Live watcher
+    compare against it — two spellings of the bucketing would drift and cost a
+    spurious ~2 s requery every time they disagreed.
+    """
+    ts, lap = store_watermark()
+    return lap, int(ts // BUCKET_S)
+
+
+st.session_state.setdefault("pb_watermark", watermark_key())
+_wm = st.session_state["pb_watermark"]
+real_laps_df, real_offset, real_detail, db_mode, real_paired = load_laps(_wm)
+_has_real = not real_laps_df.empty
 
 s1, s2 = st.columns([3, 1])
 with s2:
@@ -649,24 +1342,82 @@ with s2:
                      help="Invented laps, for seeing how this reads before the "
                           "car has run at Zolder. Nothing built from them can "
                           "be written to a real profile.")
+    # Before the empty-store stop below, so profiles can be managed on a
+    # laptop that has no laps recorded yet.
+    if st.button(":material/tune: Manage profiles", key="pm_open"):
+        manage_profiles()
+
+    with st.popover(":material/rule: Lap rules"):
+        min_start = st.slider(
+            "Minimum net-lap start speed (km/h)", 0, 60,
+            int(pb.DEFAULT_MIN_START_KMH), 5, key="pb_min_start",
+            help="A drive that began slower than this was an out-lap from the "
+                 "pit or a restart, not a flying lap. It is marked FIRST and "
+                 "not offered — you can still choose it by hand.")
+        stop_s = st.slider(
+            "Standstill that means a pit stop (s)", 20, 300,
+            int(pb.DEFAULT_STOP_S), 10, key="pb_stop_s",
+            help="The Pi stays powered through a driver change and keeps "
+                 "publishing speed-0 samples, so the stop is INSIDE one lap "
+                 "record and that lap's reported time includes it. Confirmed "
+                 "in this store: one drive held a 730 s standstill at 3670 m. "
+                 "Raising this never makes such a lap usable — a separate hard "
+                 "limit governs that.")
+        order = ("clock" if st.segmented_control(
+            "Order", ["Fastest first", "Chronological"],
+            default="Fastest first", key="pb_order") == "Chronological"
+            else "pace")
+        st.caption("Both sliders are applied here, not in SQL, so moving them "
+                   "is instant — the lap query's result stays cached.")
+
+    _fresh = (real_laps_df["t1"].max() > time.time() - FRESH_S
+              if _has_real and "t1" in real_laps_df else False)
+    live = st.toggle(
+        "Live", value=bool(_fresh), key="pb_live",
+        help=f"Re-check the store every {REFRESH_S} s and reload the moment a "
+             f"lap ends. The lap query takes about 2 s on this store, so a "
+             f"finished lap appears within a few seconds rather than instantly.")
+
+_flash = st.session_state.pop("pm_flash", None)
+if _flash:
+    st.success(_flash, icon=":material/check_circle:")
 
 if demo:
-    laps_df, offset, align_detail = _demo_laps_df(), 1, "demo data — not measured"
+    laps_df, paired, offset, align_detail = (
+        _demo_laps_df(), _demo_paired(), 1, "demo data — not measured")
 else:
-    laps_df, offset, align_detail = real_laps_df, real_offset, real_detail
+    laps_df, paired, offset, align_detail = (
+        real_laps_df, real_paired, real_offset, real_detail)
 
-# --- the alignment gate: same behaviour as before, a fraction of the pixels -- #
+# --- the alignment state: A WARNING, NOT A GATE ---------------------------- #
+# This used to st.stop() here, which meant the whole page — every lap, every
+# column — waited for a self-check that needs 3 finished laps. During the first
+# laps of a session you saw nothing at all, and there is no reason for that: the
+# car sends "the lap I just finished took N s" on the very next samples, so a
+# lap and its time are in the pit within a second of it ending. What the check
+# protects is the WRITE (a wrong pairing files every profile under a
+# neighbouring lap's time and nothing on screen looks wrong), so the refusal
+# belongs on the write button and in write_chosen — not on the whole page.
 if offset is None:
-    st.error("Cannot verify how lap traces line up with lap times — there are "
-             "not enough completed laps in the store yet. Build nothing from "
-             "this data.", icon=":material/error:")
+    st.warning("**The lap-time pairing is not verified yet.** Laps are shown "
+               "and can be inspected, but nothing can be built from them: with "
+               "too few finished laps to check against, a profile could be "
+               "filed under a neighbouring lap's time.",
+               icon=":material/warning:")
     st.caption(align_detail)
-    st.stop()
 
 with s1:
-    bits = [f"{'DEMO — invented laps' if demo else 'Alignment verified'}"
-            f" (trace N ↔ lap N+{offset})",
+    if demo:
+        _state = "DEMO — invented laps"
+    elif offset is None:
+        _state = "Alignment UNVERIFIED — nothing can be written"
+    else:
+        _state = "Alignment verified"
+    bits = [_state + ("" if offset is None else f" (trace N ↔ lap N+{offset})"),
             f"store `{db_mode}`", f"{len(laps_df)} lap trace(s)"]
+    if live and not demo:
+        bits.append(f"live · re-checked every {REFRESH_S} s · the lap query "
+                    f"takes ~2 s on this store")
     st.caption(" · ".join(bits))
     with st.popover("what these mean"):
         if demo:
@@ -688,7 +1439,7 @@ with s1:
                     if db_mode == "ro" else
                     "writes refused at the SQL level (query_only)."))
 
-if offset != 1:
+if offset is not None and offset != 1:
     st.warning(f"Expected offset 1 from the car's code; this store says "
                f"{offset}. Investigate before building anything.",
                icon=":material/warning:")
@@ -697,11 +1448,33 @@ if laps_df.empty:
     st.info("No laps recorded yet.", icon=":material/info:")
     st.stop()
 
+if live and not demo:
+    # A 0.0 ms probe on a timer, and a full rerun only when it MOVES. The lap
+    # counter changing means a lap ended, which is when the matrix must be
+    # rebuilt; a sample merely arriving is bucketed so a driving car costs one
+    # requery per bucket and a parked one costs nothing at all. Polling
+    # load_laps itself on a short TTL instead would spend a third of every
+    # minute inside a ~2 s blocking query.
+    @st.fragment(run_every=REFRESH_S)
+    def _watch_store():
+        now = watermark_key()
+        if now != st.session_state.get("pb_watermark"):
+            st.session_state["pb_watermark"] = now
+            st.rerun(scope="app")
+
+    _watch_store()
+
+badges, stints = pb.classify_traces(paired, stop_s=float(stop_s),
+                                    min_start_kmh=float(min_start))
 cats = load_sidecar()
+drivers = {} if demo else load_stint_drivers()
 columns = profile_columns(cats)
-meta = lap_meta(laps_df, columns)
+meta = lap_meta(laps_df, columns, badges, stop_s=float(stop_s))
 chosen = st.session_state["pb_chosen"]
-view, disp = build_matrix(laps_df, columns, meta, chosen)
+
+drivers = stint_editor(stints, drivers, demo)
+view, disp = build_matrix(laps_df, columns, meta, chosen, stints, drivers,
+                          order=order)
 
 cfg = {c["key"]: st.column_config.Column(
     width="medium",
@@ -711,6 +1484,17 @@ cfg["Lap"] = st.column_config.Column(
     width="small",
     help="The car's lap number. Where one number was used by more than one "
          "drive — a counter reset between sessions — the date tells them apart.")
+cfg["Stint"] = st.column_config.Column(
+    width="small",
+    help="Which driver's run this lap belongs to. A new stint starts after "
+         "every standstill long enough to be a pit stop. A drive that CONTAINS "
+         "the standstill belongs to neither — it holds two drivers' driving.")
+cfg["Type"] = st.column_config.Column(
+    width="small",
+    help="NET = a flying lap, offered as profile material. FIRST = started "
+         "from rest. LAST = rolled to a stop or has no time yet. PIT = a pit "
+         "stop or driver change is inside it. ? = the car reported no speed. "
+         "Click any lap for the reason in words.")
 
 event = st.dataframe(style_matrix(view, disp, columns, meta, chosen),
                      key="pb_matrix", on_select="rerun",
@@ -719,13 +1503,38 @@ event = st.dataframe(style_matrix(view, disp, columns, meta, chosen),
                      height=min(38 * len(view) + 45, 520))
 
 st.caption(
-    "Each lap sits under the profile its **lap time** is closest to, and each "
-    "cell reads `lap time · energy`. The energy is the car's own figure for "
-    "that lap, not anything re-derived here. Click any lap to open it below. ✓ marks a lap you have chosen; :orange[amber] means "
-    "the lap is more than "
-    f"{FAR_S:.0f} s from that profile's target; grey means it cannot be built "
-    "(the panel says why). Sorting clears the blue outline — your choices are "
-    "kept, and listed under **Write** below.")
+    "Every lap is here the moment the car records it. **Type** says what kind "
+    "of lap it is — `NET` is a flying lap and the only kind offered; `FIRST` "
+    "started from rest; `LAST` rolled to a stop or has no time yet; `PIT` has a "
+    "pit stop or driver change inside it; `?` means the car reported no speed. "
+    "**FIRST, LAST and PIT can only be known once the standstill after a lap "
+    "has been seen, so those badges may appear minutes late** — that is the "
+    "tool waiting for evidence rather than guessing. Click any lap for the "
+    "reason in words.\n\n"
+    "Otherwise a lap sits under the profile its **lap time** is closest to and "
+    "each cell reads `lap time · energy`, the car's own figure. ✓ marks a lap "
+    "you have chosen; :orange[amber] means the lap is more than "
+    f"{FAR_S:.0f} s from that profile's target; grey means it is not a net lap, "
+    "or cannot be built, or both. A `PIT` lap has no cell in the ladder at all: "
+    "its reported time is a lap **plus** the stop, and a number in the ladder "
+    "is a claim about pace. Clicking a column header re-sorts and breaks the "
+    "stint blocks apart — use **Order** under **Lap rules** instead. Sorting "
+    "clears the blue outline; your choices are kept, and listed under **Write** "
+    "below.")
+
+_best = best_net_laps(meta, columns)
+if _best:
+    b1, b2 = st.columns([1, 3])
+    with b1:
+        if st.button(f":material/bolt: Pick the leanest net lap for "
+                     f"{len(_best)} profile(s)", key="pb_pick_best",
+                     width="stretch"):
+            st.session_state["pb_chosen"].update(_best)
+            st.rerun()
+    with b2:
+        st.caption("The lowest-energy **net** lap in each column, by the car's "
+                   "own Wh figure. A starting point you can then change lap by "
+                   "lap — nothing is ever chosen for you without this click.")
 
 clicked_lap, clicked_key = resolve_click(list(event.selection.cells), view,
                                          columns, meta)
@@ -839,11 +1648,39 @@ def lap_detail(tid, key, meta, columns, demo):
                         + (f" · {m['when']}" if m["when"] else "")
                         + (f" · nearest profile `{m['key']}`" if m["key"] else ""))
 
+        # A PIT DRIVE STOPS HERE. Not a rejection message among others: its
+        # reported time is a lap PLUS the stop, its samples are two different
+        # drivers' driving with a long flat hole between them, and there is no
+        # version of this that becomes a profile. No build controls, no Choose
+        # button, ever.
+        if m["badge"] == pb.BADGE_PIT:
+            stop = m.get("stop_s") or 0.0
+            at = m.get("stop_at_m")
+            st.error(
+                f"**A pit stop or driver change is inside this drive.** The car "
+                f"stood still for {stop:.0f} s"
+                + ("" if at is None else f" at {at:.0f} m")
+                + (f", so the {m['time']:.0f} s the car reports as this lap's "
+                   f"time is mostly the stop" if m["time"] else "")
+                + ". The samples before the stop are one driver's in-lap and "
+                  "the samples after it are the next driver's out-lap, so this "
+                  "is not one lap of anything and cannot become a profile.",
+                icon=":material/error:")
+            if m.get("n_stops", 0) > 1 and m.get("stopped_s"):
+                st.caption(f"{m['n_stops']} standstills in this drive, "
+                           f"{m['stopped_s']:.0f} s stopped in total.")
+            st.caption("The pit threshold is on **Lap rules** at the top. "
+                       "Raising it will stop this being called a pit stop — it "
+                       "will not make the lap usable.")
+            return
+
         if m["key"] is None:
             st.warning("The car never reported a time for this lap, so it "
                        "cannot be placed under a profile or built into one. "
                        "This is usually the lap still in progress.",
                        icon=":material/info:")
+            if m["badge_reasons"]:
+                st.caption("· " + "  · ".join(m["badge_reasons"]))
             return
 
         # The honesty line. Always present, always in words -- colour is never
@@ -916,11 +1753,10 @@ def lap_detail(tid, key, meta, columns, demo):
                      icon=":material/error:")
             return
 
-        m1, m2, m3, m4 = st.columns(4)
+        m1, m2, m3 = st.columns(3)
         m1.metric("Measured lap", f"{m['time']:.1f} s")
         m2.metric("Samples used", f"{diag['n_used']}")
-        m3.metric("Mean spacing", f"{diag['mean_spacing_m']:.1f} m")
-        m4.metric("Coverage", f"{diag['coverage_pct']:.0f} %")
+        m3.metric("Coverage", f"{diag['coverage_pct']:.0f} %")
 
         notes = []
         if diag["n_dropped_nonmonotonic"]:
@@ -973,6 +1809,20 @@ def lap_detail(tid, key, meta, columns, demo):
                        "profile is interpolation, not measurement — which is "
                        "what the corner cap is protecting you from.")
 
+        # NOT A NET LAP, BUT STILL YOURS TO CHOOSE. The badge and the reasons
+        # are shown, and one deliberate tick unlocks the button -- enough that
+        # an out-lap cannot be written into a profile by a mis-click at 2pm in a
+        # noisy pit, and not so much that it gets in the way when you mean it.
+        allowed = True
+        if m["badge"] != pb.BADGE_NET:
+            st.warning(f"**This is not a net lap — it is marked "
+                       f"{m['badge']}.**\n\n"
+                       + "\n".join(f"- {r}" for r in m["badge_reasons"]),
+                       icon=":material/warning:")
+            allowed = st.checkbox(
+                f"I have read why this lap is marked {m['badge']} and want to "
+                f"use it anyway", key=f"override_{key}_{tid}")
+
         held = st.session_state["pb_chosen"].get(key)
         if held == tid:
             if st.button(f":material/close: Unchoose lap {m['lap']}",
@@ -990,7 +1840,10 @@ def lap_detail(tid, key, meta, columns, demo):
                            f"`{', '.join(others)}` — choosing it here as well "
                            f"writes the same lap into two files.",
                            icon=":material/warning:")
-            if st.button(label, key="pb_choose", type="primary"):
+            if st.button(label, key="pb_choose",
+                         type="primary" if m["badge"] == pb.BADGE_NET
+                         else "secondary",
+                         disabled=not allowed):
                 st.session_state["pb_chosen"][key] = tid
                 st.rerun()
 
@@ -1004,7 +1857,7 @@ if focus is not None and focus in meta:
 # --------------------------------------------------------------------------- #
 # Write
 # --------------------------------------------------------------------------- #
-def write_chosen(chosen, cats, offset, meta, demo):
+def write_chosen(chosen, cats, offset, meta, demo, stints=(), drivers=None):
     """Stage and validate everything, then replace nothing or all of it.
 
     All-or-nothing because the five profiles are a LADDER: a half-updated set is
@@ -1021,13 +1874,39 @@ def write_chosen(chosen, cats, offset, meta, demo):
                  icon=":material/error:")
         return
 
+    # MUST COME BEFORE ANY USE OF `offset` -- the provenance block below does
+    # int(m["lap"]) + int(offset), which raises TypeError on None.
+    if offset is None:
+        st.error("Refusing to write: how lap traces line up with lap times "
+                 "could not be verified from this store, so every profile "
+                 "could be filed under a neighbouring lap's time — and nothing "
+                 "on screen would look wrong.", icon=":material/error:")
+        return
+
     for stale in os.listdir(PROFILE_DIR):
         if stale.endswith(".staged"):
             os.remove(os.path.join(PROFILE_DIR, stale))
 
+    drivers = drivers or {}
     staged, failures = {}, []
     for key, tid in sorted(chosen.items()):
         m = meta[tid]
+
+        # A BADGE IS PROVISIONAL, WHICH IS WHY THIS IS REACHABLE. A lap chosen
+        # while it still looked like a net lap can become PIT minutes later,
+        # once the standstill after it is finally observed -- and pb_chosen
+        # survives reruns. Checked before the samples are even read.
+        if m.get("badge") == pb.BADGE_PIT:
+            stop = m.get("stop_s") or 0.0
+            at = m.get("stop_at_m")
+            failures.append((key, m["label"], [("error",
+                f"this drive contains a {stop:.0f} s standstill"
+                + ("" if at is None else f" at {at:.0f} m")
+                + " — a pit stop or driver change. Its reported lap time is "
+                  "mostly the stop, and the samples either side of it are two "
+                  "different drivers' driving.")]))
+            continue
+
         samples = load_trace_samples(m["lap"], m["t0"], m["t1"])
 
         # Re-checked here and not only in the panel. The panel is a UI state a
@@ -1098,6 +1977,18 @@ def write_chosen(chosen, cats, offset, meta, demo):
                 "drive_started": (datetime.datetime.fromtimestamp(m["t0"])
                                   .isoformat(timespec="seconds") if m["t0"] else None),
                 "summary_lap": int(m["lap"]) + int(offset),
+                # WHAT KIND OF LAP THIS WAS. A net lap and an out-lap chosen by
+                # hand produce identical-looking CSVs, so this is the only thing
+                # that will say, a year from now, which one the car is driving
+                # to — and who was behind the wheel when it was set.
+                "lap_badge": m.get("badge"),
+                "badge_reasons": m.get("badge_reasons", []),
+                "start_speed_kmh": m.get("v_start"),
+                "end_speed_kmh": m.get("v_end"),
+                "longest_standstill_s": m.get("stop_s"),
+                "standstill_at_m": m.get("stop_at_m"),
+                "stint": m.get("stint"),
+                "driver": _stint_driver(m.get("stint"), stints, drivers),
                 "measured_lap_time_s": m["time"],
                 "measured_energy_wh": m["energy"],
                 "energy_wh_per_km": (m["energy"] / ((m["distance"] or pb.LAP_M) / 1000.0)
@@ -1108,7 +1999,6 @@ def write_chosen(chosen, cats, offset, meta, demo):
                                  "coverage_pct": round(br["coverage_pct"], 1),
                                  "trusted": bool(trusted)},
                 "n_samples": diag["n_used"], "max_gap_m": diag["max_gap_m"],
-                "mean_spacing_m": diag["mean_spacing_m"],
                 "coverage_pct": diag["coverage_pct"],
                 "smoothing_window_m": diag["smoothing_window_m"],
                 "corner_cap": diag["corner_cap"],
@@ -1122,6 +2012,13 @@ def write_chosen(chosen, cats, offset, meta, demo):
                  icon=":material/error:")
         return
 
+    # The lap the curve came from is the best estimate there is of what this
+    # profile costs, so it replaces the stored Wh/lap in the draft. It reaches
+    # constants.py (and the Strategy tab) on Save, like every other change.
+    for key in replaced:
+        wh = meta[staged[key][1]]["energy"]
+        if wh is not None:
+            cats[key]["energy_wh"] = round(float(wh), 1)
     save_sidecar(cats, provenance=provenance)   # one call: it merges `built`
     load_installed.clear()
     # Clear the choices. Leaving them set means the Write button stays armed
@@ -1130,7 +2027,9 @@ def write_chosen(chosen, cats, offset, meta, demo):
     # panel would keep claiming work is outstanding when it is done.
     st.session_state["pb_chosen"] = {}
     st.success(f"Wrote {len(replaced)} profile(s): "
-               + ", ".join(f"`{k}.csv`" for k in replaced),
+               + ", ".join(f"`{k}.csv`" for k in replaced)
+               + ". Their measured Wh/lap is now in the matrix — press **Save to "
+               "constants.py** at the top to put it in the code.",
                icon=":material/check_circle:")
 
     # A ladder that is no longer in order is not an error, but it is not what
@@ -1189,15 +2088,39 @@ if chosen:
                 st.session_state["pb_chosen"].pop(key, None)
                 st.rerun()
 
+        # EVERY REASON THE WRITE IS REFUSED, LISTED. One branch per reason
+        # rather than a single disabled flag, so the caption says which one --
+        # and each of these is re-checked inside write_chosen, because a
+        # disabled button is a UI property and the refusal belongs in the write
+        # path.
+        blockers = []
         if demo:
+            blockers.append("Demo laps is on — a made-up lap written into "
+                            "`profiles/` is a target the car would actually "
+                            "drive to.")
+        if offset is None:
+            blockers.append("The trace ↔ lap-time pairing is unverified for "
+                            "this store, so a profile could be filed under a "
+                            "neighbouring lap's time. Build nothing from this "
+                            "data.")
+        pits = [k for k, t in chosen.items()
+                if meta.get(t, {}).get("badge") == pb.BADGE_PIT]
+        if pits:
+            blockers.append(
+                "Chosen for " + ", ".join(f"`{k}`" for k in sorted(pits))
+                + ": a drive with a pit stop or driver change inside it. A "
+                  "badge can change as more data arrives — this lap looked "
+                  "like a net lap when it was chosen.")
+
+        if blockers:
             st.button(f":material/save: Build and write {len(chosen)} profile(s)",
                       type="primary", disabled=True)
-            st.caption(":orange[Disabled while Demo laps is on] — a made-up lap "
-                       "written into `profiles/` is a target the car would "
-                       "actually drive to.")
+            for _b in blockers:
+                st.caption(f":orange[Disabled] — {_b}")
         elif st.button(f":material/save: Build and write {len(chosen)} profile(s)",
                        type="primary"):
-            write_chosen(dict(chosen), cats, offset, meta, demo)
+            write_chosen(dict(chosen), cats, offset, meta, demo,
+                         stints, drivers)
 
 st.divider()
 st.caption("Undo everything: `git checkout -- profiles/` on both machines, then "

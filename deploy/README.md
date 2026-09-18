@@ -40,6 +40,43 @@ gpspipe -w -n 5          # should print JSON
 `/dev/ttyUSB1` is not stable across reboots. Once it works, switch to the fixed
 name from `ls -l /dev/serial/by-id/` so a re-enumeration cannot break GPS.
 
+**This car's GPS is inside the LTE modem**, and gpsd alone is not enough for it.
+The receiver is the GNSS engine of the SIMCom SIM7600G-H, which means two extra
+things have to happen at every boot — neither of which reports an error when it
+does not:
+
+1. **The GNSS engine starts switched off.** The modem enumerates, LTE connects,
+   `mmcli -m 0` says `state: connected` — and the NMEA port emits nothing,
+   because GNSS is a separate subsystem nobody has started. `mmcli -m 0
+   --location-status` showing `enabled: 3gpp-lac-ci` with no `gps-*` entry is
+   what that looks like.
+2. **gpsd never learns the port exists.** gpsd starts at boot; the modem's
+   ttyUSB nodes appear ~20 s later, by which time gpsd has failed to open
+   `DEVICES=` and freed it. gpsd's hot-add udev rule only matches known GPS
+   vendor IDs, and a SimTech modem is not one, so nothing adds it back.
+
+`gps-up.service` does both, after ModemManager and gpsd are up:
+
+```bash
+sudo cp ~/Desktop/THE-RACE-main/deploy/gps-up.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now gps-up.service
+systemctl status gps-up            # ends with "handed /dev/ttyUSBx to gpsd"
+gpspipe -w -n 5                    # now prints JSON with TPV reports
+```
+
+It asks ModemManager which port is the GPS one rather than assuming `ttyUSB1`,
+so a re-enumeration cannot point it at the modem's AT port instead. Re-running
+it is harmless. On a car with a plain USB GPS dongle this unit is unnecessary —
+gpsd's own udev rule handles those.
+
+**Diagnosing "no fix":** start `main.py` and read its two `🛰️` lines. The
+hardware line names gpsd's device AND the kernel's serial ports, which is what
+separates the three causes — nothing enumerated (receiver unplugged), ports
+present but gpsd holding none (wrong `DEVICES=`, or this unit did not run), or
+gpsd reading the port fine (then it is antenna or sky view; note the SIM7600's
+GNSS antenna connector is SEPARATE from its LTE MAIN/AUX ones).
+
 ### 3. Python environment
 
 Bookworm marks the system Python "externally managed" (PEP 668), so `pip
@@ -231,6 +268,59 @@ attached. `Alt+F4` covers the common case: someone standing at the car.
 
 `~/hud-logs/hud.log`, rotated each boot and capped at 20 MB, keeping 3 files.
 
+### Is the Pi struggling? `deploy/pi_diag.sh`
+
+```bash
+bash ~/Desktop/THE-RACE-main/deploy/pi_diag.sh          # read-only snapshot
+bash ~/Desktop/THE-RACE-main/deploy/pi_diag.sh --spy    # + 10 stack dumps of the HUD
+```
+
+Prints, and saves to `~/hud-logs/pi_diag_<date>.txt`: throttling and
+under-voltage flags decoded, per-thread CPU of the HUD process, the camera
+player's cost, CAN RX overruns (frames the kernel dropped because nobody read
+the socket), upload-error counts from `hud.log`, and HTTPS round-trip times to
+the database. It changes nothing and is safe during a drive.
+
+`--spy` is opt-in because it attaches py-spy to the HUD, which pauses it for a
+few milliseconds per dump (and may `pip install py-spy` into the venv the first
+time). Its tally says, per dump, whether the CAN thread was inside a Firebase
+upload, reading the bus, or idle, and whether the GUI thread was painting.
+Most dumps in the upload = the freeze-then-jump the driver sees. The pit-side
+half of the same question is `python tools/car_stall_report.py`, which reads
+the freezes out of the pit's own telemetry store.
+
+### DNS: fixed resolvers on every connection (not in git — redo after a reflash)
+
+```bash
+nmcli -t -f NAME,TYPE,DEVICE con show --active
+# for the wifi connection AND the gsm/modem connection:
+nmcli con mod "<name>" ipv4.ignore-auto-dns yes \
+    ipv4.dns "1.1.1.1 8.8.8.8" ipv4.dns-options "timeout:1,attempts:2"
+nmcli con up "<name>"
+cat /etc/resolv.conf          # must list only 1.1.1.1 and 8.8.8.8
+```
+
+Found on 2026-09-18. The modem's DHCP hands out the carrier's own resolvers
+(Orange Belgium, 212.224.129.x), which answer only over the modem link. With a
+hotspot connected as well, lookups leave over wifi, never reach them, and
+every fresh name resolution took **8.0 s** (two dead servers, 4 s each) before
+the working one was tried. Two things followed from that one fault:
+
+- The Firebase upload runs on the CAN worker thread, and its `httpTimeout`
+  cannot bound `getaddrinfo`, so each cold lookup froze the driver's screen
+  for 8 s and the kernel dropped CAN frames nobody was reading.
+- The boot-time `timeout 20 git pull` in `start_hud.sh` was killed mid-unpack,
+  leaving zero-length loose objects in `.git/objects`. Those then broke every
+  later pull, so the Pi silently stopped updating itself. If that ever
+  recurs: `find .git/objects -type f -size 0 -delete`, then fetch; if the
+  fetch does not backfill, copy the pack from a fresh `--bare` clone into
+  `.git/objects/pack/`.
+
+Public resolvers answer over either uplink, `ignore-auto-dns` stops a carrier
+injecting its own, and `timeout:1,attempts:2` caps the worst case at 2 s.
+Measured after the change: ~55 ms per lookup, on both links and on the modem
+alone.
+
 ---
 
 ## Pit — Windows laptop
@@ -277,6 +367,11 @@ sudo apt install -y gpsd gpsd-clients can-utils python3-gpiozero python3-lgpio
 # 2. GPS — point gpsd at your receiver
 sudo nano /etc/default/gpsd        # DEVICES="/dev/ttyUSB1"   GPSD_OPTIONS="-n"
 sudo systemctl enable --now gpsd.socket gpsd
+# GPS lives inside the SIM7600 modem: its GNSS engine boots OFF and gpsd never
+# sees the port on its own. This unit fixes both — see section 2 above.
+sudo cp deploy/gps-up.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now gps-up.service
 gpspipe -w -n 5                     # must print JSON
 
 # 3. Python (Bookworm blocks system pip — venv required)

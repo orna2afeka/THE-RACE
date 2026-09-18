@@ -130,6 +130,19 @@ export function StintPanel({ stint, clockOffsetMs, racing }: {
     finally { setBusy(false); }
   };
 
+  // Names the driver already in the car without touching the countdown. Driver
+  // one is started by the green flag with no name, and "Driver changed" would
+  // restart their stint. An empty box removes the name.
+  const setName = async () => {
+    setBusy(true);
+    try {
+      const r = await postJSON<Stint>('/api/driver_stint/name', { driver: next.trim() || null });
+      toast(r.driver ? `Driver named · ${r.driver}` : 'Driver name removed', 'info');
+      setNext('');
+    } catch (e) { toast(`Setting the name failed: ${e}`, 'err'); }
+    finally { setBusy(false); }
+  };
+
   const undo = async () => {
     setBusy(true);
     try {
@@ -150,11 +163,19 @@ export function StintPanel({ stint, clockOffsetMs, racing }: {
         <div className="sub">
           {n.started
             ? <>Stint {stint?.stint}{stint?.driver ? ` · ${stint.driver}` : ''} · driven {hms(n.elapsed ?? 0)} of race time</>
-            : <>Starts automatically with the race, or press below when the first driver gets in.</>}
+            : <>Starts automatically with the race, or press below when the first driver gets in.
+                {stint?.driver ? ` Driver one: ${stint.driver}.` : ''}</>}
         </div>
+        {stint && stint.publicSynced !== null && (
+          <div className="sub">
+            Public page: {stint.publicSynced
+              ? (stint.driver ? `shows ${stint.driver}` : 'no driver shown')
+              : 'sending…'}
+          </div>
+        )}
       </div>
 
-      <label className="fld">Driver getting in (optional)</label>
+      <label className="fld">Driver name (optional, shown on the public page)</label>
       <input type="text" value={next} placeholder="e.g. Noa" autoComplete="off"
              onChange={(e) => setNext(e.target.value)}
              onKeyDown={(e) => e.key === 'Enter' && !busy && logChange()} />
@@ -162,6 +183,10 @@ export function StintPanel({ stint, clockOffsetMs, racing }: {
               style={{ marginTop: 10 }} disabled={busy} onClick={logChange}>
         <Icon name="timer" size={13} />
         {n.started ? 'Driver changed — reset timer' : 'Start driver stint'}
+      </button>
+      <button className="btn block" style={{ marginTop: 8 }}
+              disabled={busy || (!next.trim() && !stint?.driver)} onClick={setName}>
+        {next.trim() || !stint?.driver ? 'Name current driver (timer keeps running)' : 'Remove driver name'}
       </button>
 
       {stint?.canUndo && (

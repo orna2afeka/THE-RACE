@@ -78,17 +78,18 @@ export interface LiveTile {
   spec: string;
   note: string | null;
   text: boolean;
-  lapTime: boolean;
   value: Num | string;
   tier: Tier;
 }
 
-/** Which speed profile the car is running, and how well we know it.
- *  "car" is the telemetry column, "ack" the radio acknowledgement, "default"
- *  means nothing has been reported and the target speed is an assumption. */
+/** Which speed profile the PIT selected, and whether anyone selected one.
+ *  "pit" is the profile chosen in the Strategy section and sent to the car;
+ *  "default" means nobody has chosen yet and the target speed is an
+ *  assumption. The CAR's own report is not a source here — the Strategy
+ *  section shows that separately, via /api/strategy/ack. */
 export interface ActiveProfile {
   key: string;
-  source: 'car' | 'ack' | 'default';
+  source: 'pit' | 'default';
 }
 
 /** Purple, green, yellow. Decided server-side in api.py's _row(); the browser
@@ -229,6 +230,10 @@ export interface DriverStint {
    *  stopped — which is what makes the countdown hold instead of drain. */
   runningSince: Num;
   running: boolean;
+  /** Does the public spectator page show this driver name (or no name)?
+   *  False while the write is pending or failing; null in the demo, which
+   *  never publishes. */
+  publicSynced: boolean | null;
 }
 
 export interface Live {
@@ -247,6 +252,14 @@ export interface Live {
   activeLap: Num;
   lapDelta: Num;
   odometerKm: Num;
+  /** Wh used since this lap's trigger, net of regen — the same basis as
+   *  last_lap_energy, so the two tiles compare directly. Null until the car
+   *  has reported both a lap and an energy total. */
+  currentLapEnergy: Num;
+  /** How far into the lap the pit's earliest sample sits. Near 0 the figure
+   *  above covers the whole lap; a large value means the start of the lap was
+   *  never received and it understates. */
+  currentLapEnergyFromM: Num;
   lapDistanceM: number;
   sectorId: number;
   sectorName: string;

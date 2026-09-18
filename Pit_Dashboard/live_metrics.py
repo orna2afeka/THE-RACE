@@ -9,6 +9,11 @@
 # that app was removed (2026-09-16). The two solar tiles were dropped the same
 # day: the car runs without an MPPT.
 #
+# 2026-09-16: trimmed to what the always-visible top strip does not already
+# show (Energy stays whole: its tiles read as a race/stint/lap table), the
+# always-zero controller SoC dropped, Trip and Odometer labels swapped to their
+# usual meaning, and every note rewritten to say where the value comes from.
+#
 # FIELD SOURCES
 #   "state.<k>"  — a key of the live-state dict the backend builds
 #   derived      — a computation neither dict holds; resolve() implements each
@@ -20,90 +25,90 @@
 LIVE_METRICS_PER_ROW = 4
 
 # Every limit name used below must exist in limits.py.
-_KNOWN_LIMITS = {
-    "MOTOR_TEMP", "CTRL_TEMP", "CELL_TEMP", "SOC", "PACK_VOLTAGE",
-    "BATT_CURRENT", "MOTOR_CURRENT", "POWER", "SPEED",
-    "CELL_VOLTAGE",
-}
+_KNOWN_LIMITS = {"SOC", "PACK_VOLTAGE", "BATT_CURRENT", "MOTOR_CURRENT"}
 
 # Derived values resolve() computes by name.
 _KNOWN_DERIVED = {
     "delta_to_target", "relative_regen_total",
     "relative_regen_stint", "relative_regen_lap", "active_lap",
-    "lap_distance_m", "lap_source", "last_lap_time_text",
-    "throttle_zone_label",
+    "lap_source", "controller_odometer_km", "throttle_zone_label",
 }
 
 LIVE_METRIC_GROUPS = [
     ("Motion", [
-        dict(label="Speed", unit="km/h", spec=".1f", limit="SPEED", field="state.speed_kmh"),
         dict(label="Target Speed", unit="km/h", spec=".1f", field="state.target_speed_kmh",
-             note="from the active velocity profile"),
+             note="the car's active speed profile, at the car's lap distance"),
         dict(label="Delta to Target", unit="km/h", spec="+.1f", derived="delta_to_target",
-             note="actual minus target"),
-        dict(label="Motor RPM", unit="rpm", spec=".0f", field="state.rpm"),
+             note="actual speed minus target"),
+        dict(label="Motor RPM", unit="rpm", spec=".0f", field="state.rpm",
+             note="controller (CAN 0x610), corrected x2 on the car"),
     ]),
     ("Motor", [
-        dict(label="Motor Power", unit="W", spec=".0f", limit="POWER", field="state.power_w",
-             note="negative = regen"),
-        dict(label="Motor Temp", unit="°C", spec=".1f", limit="MOTOR_TEMP", field="state.motor_temp"),
-        dict(label="Motor Sensor", unit="Ω", spec=".1f", field="state.motor_ohms",
-             note="raw PT1000; the temp is derived from this"),
         dict(label="Motor Current", unit="A", spec=".1f", limit="MOTOR_CURRENT", field="state.motor_current", mag=True,
-             note="amber only; high current is normal"),
-        dict(label="Power Map", unit="", spec=".0f", field="state.motor_map", text=True),
+             note="motor phase current from the controller, not battery current - amber only"),
     ]),
+    # Two batteries, each with its own JBD BMS: A on can0, B on can1. One row
+    # per battery, then the controller's reading of the voltage both feed.
+    # The top strip's SoC is battery A's.
     ("Driver Input", [
         dict(label="Throttle", unit="%", spec=".0f", field="state.throttle_pct",
-             note="pedal position - see zone below"),
+             note="pedal position from the ESC's GPIO0 (CAN 0x150)"),
         dict(label="Efficiency Zone", unit="", spec=".0f", derived="throttle_zone_label", text=True,
-             note="what the driver's HUD bar is showing"),
+             note="eco / normal / power from efficiency.py"),
         dict(label="Throttle Raw", unit="mV", spec=".0f", field="state.throttle_mv",
-             note="calibrate efficiency.py from this"),
-    ]),
-    ("Controller", [
-        dict(label="Controller Temp", unit="°C", spec=".1f", limit="CTRL_TEMP", field="state.temp"),
+             note="calibrate efficiency.py from this: pedal released, then floored"),
     ]),
     ("Battery", [
-        dict(label="Battery SoC", unit="%", spec=".0f", limit="SOC", field="state.soc",
-             note="BMS coulomb count"),
+        dict(label="Battery A SoC", unit="%", spec=".0f", limit="SOC", field="state.soc",
+             note="battery A's BMS (can0) coulomb count"),
+        dict(label="Battery A Voltage", unit="V", spec=".2f", field="state.voltage",
+             note="measured by battery A's BMS (CAN 0x100)"),
+        dict(label="Battery A Current", unit="A", spec=".1f", limit="BATT_CURRENT", field="state.current", mag=True,
+             note="battery A's BMS - negative = discharge"),
         dict(label="Pack Voltage", unit="V", spec=".2f", limit="PACK_VOLTAGE", field="state.pack_voltage",
-             note="controller measurement - the one to trust"),
-        dict(label="Pack Voltage (BMS)", unit="V", spec=".2f", field="state.voltage",
-             note="agrees since 2026-08-20 12:12; older history reads 2.25x high"),
-        dict(label="Battery Current", unit="A", spec=".1f", limit="BATT_CURRENT", field="state.current", mag=True,
-             note="negative = discharge"),
-        dict(label="Battery Temp", unit="°C", spec=".1f", limit="CELL_TEMP", field="state.batt_temp",
-             note="hottest cell in the pack"),
-        dict(label="SoC (controller est.)", unit="%", spec=".0f", field="state.soc_ctrl",
-             note="unimplemented on this controller - always 0"),
+             note="measured by the motor controller (CAN 0x618)"),
+        dict(label="Battery B SoC", unit="%", spec=".0f", limit="SOC", field="state.soc_b",
+             note="battery B's BMS (can1) coulomb count"),
+        dict(label="Battery B Voltage", unit="V", spec=".2f", field="state.voltage_b",
+             note="measured by battery B's BMS (CAN 0x100 on can1)"),
+        dict(label="Battery B Current", unit="A", spec=".1f", limit="BATT_CURRENT", field="state.current_b", mag=True,
+             note="battery B's BMS - negative = discharge"),
     ]),
     ("Energy", [
         dict(label="Total Race Energy", unit="Wh", spec=".0f", field="state.total_race_energy",
-             note="integrated on the car, net of regen"),
+             note="car integrates controller power, net of regen - motor side, no auxiliary loads"),
         dict(label="Total Regen Energy", unit="Wh", spec=".0f", field="state.regen_energy",
-             note="recovered under braking, whole race"),
+             note="recovered while power was negative, whole race"),
         dict(label="Total Relative Regen", unit="%", spec=".1f", derived="relative_regen_total",
-             note="regen / (regen + total), whole race"),
+             note="share of drive energy recovered, whole race"),
         dict(label="Current Stint Energy", unit="Wh", spec=".1f", field="state.stint_energy",
-             note="since the last detected charging stop"),
+             note="since the last charging stop the car detected - race total until the first"),
         dict(label="Current Stint Regen Energy", unit="Wh", spec=".1f", field="state.stint_regen_energy",
-             note="since the last detected charging stop"),
+             note="stop = stopped + battery A charging over 1 A for 5 s"),
         dict(label="Current Stint Relative Regen", unit="%", spec=".1f", derived="relative_regen_stint",
-             note="regen / (regen + total), this stint"),
-        dict(label="Last Lap Energy", unit="Wh", spec=".1f", field="state.last_lap_energy"),
-        dict(label="Last Lap Regen Energy", unit="Wh", spec=".1f", field="state.last_lap_regen_energy"),
+             note="share of drive energy recovered, this stint"),
+        dict(label="Last Lap Energy", unit="Wh", spec=".1f", field="state.last_lap_energy",
+             note="taken at the last lap cut, held through the next lap"),
+        dict(label="Last Lap Regen Energy", unit="Wh", spec=".1f", field="state.last_lap_regen_energy",
+             note="taken at the last lap cut, held through the next lap"),
         dict(label="Last Lap Relative Regen", unit="%", spec=".1f", derived="relative_regen_lap",
-             note="regen / (regen + total), last lap"),
+             note="share of drive energy recovered, last lap"),
     ]),
     ("Lap & Distance", [
-        dict(label="Lap", unit="", spec=".0f", derived="active_lap"),
-        dict(label="Lap Distance", unit="m", spec=".0f", derived="lap_distance_m"),
-        dict(label="Last Lap Time", unit="", spec=".0f", derived="last_lap_time_text", text=True),
-        dict(label="Odometer", unit="km", spec=".2f", field="state.odometer_km"),
-        dict(label="Trip", unit="m", spec=".0f", field="state.trip_m", note="controller trip counter"),
+        dict(label="Lap", unit="", spec=".0f", derived="active_lap",
+             note="the car's lap count, or the pit's manual override when one is set"),
+        # The names follow the usual meaning: a TRIP resets, an ODOMETER does
+        # not. state.odometer_km is the Pi's race distance, which the pit's
+        # "Reset trip" zeroes; state.trip_m is the controller's own counter,
+        # which the pit cannot reset. The state keys keep their car-side names.
+        dict(label="Trip", unit="km", spec=".2f", field="state.odometer_km",
+             note="race distance built on the Pi - Reset trip zeroes it, a Pi reboot does not"),
+        dict(label="Odometer", unit="km", spec=".1f", derived="controller_odometer_km",
+             note="motor controller's own counter (CAN 0x620) - not resettable from the pit"),
         dict(label="Lap Source", unit="", spec=".0f", derived="lap_source", text=True,
-             note="what triggered the last lap"),
+             note="how the last lap was cut - gps = finish line, gps_no_can, "
+                  "odometer = distance fallback, manual = pit cut. Survives a "
+                  "Pi reboot with the lap count; - until the first lap"),
     ]),
 ]
 
@@ -173,18 +178,17 @@ def resolve(entry, state, ctx):
                                    state.get("last_lap_energy"))
         if d == "active_lap":
             return ctx.get("active_lap")
-        if d == "lap_distance_m":
-            return ctx.get("current_lap_dist_m")
         if d == "lap_source":
             return state.get("lap_source")
-        if d == "last_lap_time_text":
-            return state.get("last_lap_time_s")
         if d == "throttle_zone_label":
             # efficiency.py at the repo root is import-free, and its labels are
-            # what the driver HUD shows — never retyped here.
+            # the ones the car uses — never retyped here.
             import efficiency
             z = state.get("throttle_zone")
             return None if z is None else efficiency.ZONE_LABELS.get(z, z)
+        if d == "controller_odometer_km":
+            m = state.get("trip_m")
+            return None if m is None else m / 1000.0
         return None
     src, _, key = entry["field"].partition(".")
     return (state if src == "state" else ctx).get(key)

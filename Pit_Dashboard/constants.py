@@ -89,39 +89,31 @@ TARGET_LAP_TIME_MIN = 3.5
 # label is a human name and energy_wh needs a vehicle model, so both are stored;
 # lap time is a property of the curve itself and is always computed from it, so
 # a profile rebuilt from a real lap immediately reports its real lap time
-# everywhere instead of the target it was once named after.
-_BUILTIN_STRATEGY_META = {
-    "fast_189s":     ("Fast (-10%)",    88.0),
-    "med_fast_199s": ("Med-Fast (-5%)", 84.0),
-    "base_210s":     ("Base (210s)",    80.0),
-    "med_slow_220s": ("Med-Slow (+5%)", 76.0),
-    "slow_231s":     ("Slow (+10%)",    72.0),
+# everywhere instead of the target it was once named after. target_s is the
+# builder's column for the profile, which is also the fallback lap time below.
+#
+# THE BLOCK BETWEEN THE MARKERS IS REWRITTEN by the Save button in the Speed
+# Profile Builder (profile_manage.write_saved_matrix). Editing it by hand is
+# fine — keep it a plain literal, and keep the two marker lines.
+# >>> PROFILE MATRIX >>>
+PROFILE_MATRIX = {
+    "fast_189s": {"label": "Fast (-10%)", "energy_wh": 88.0, "target_s": 189.0},
+    "med_fast_199s": {"label": "Med-Fast (-5%)", "energy_wh": 84.0, "target_s": 199.5},
+    "base_210s": {"label": "Base (210s)", "energy_wh": 80.0, "target_s": 210.0},
+    "med_slow_220s": {"label": "Med-Slow (+5%)", "energy_wh": 76.0, "target_s": 220.5},
+    "slow_231s": {"label": "Slow (+10%)", "energy_wh": 72.0, "target_s": 231.0},
 }
+# <<< PROFILE MATRIX <<<
 DEFAULT_STRATEGY_KEY = "base_210s"
 
-# Exactly what the five hardcoded entries used to be, to the digit. Returned
-# whenever the profiles cannot be read, so this module can never fail to import
-# — collector.py and export.py import it too, and neither has any business
-# crashing because a CSV is malformed.
+# Returned whenever the profiles cannot be read, so this module can never fail
+# to import — collector.py and export.py import it too, and neither has any
+# business crashing because a CSV is malformed.
 _FALLBACK_STRATEGIES = [
-    {"key": "fast_189s",     "label": "Fast (-10%)",    "lap_time_min": 3.150, "energy_wh": 88.0},
-    {"key": "med_fast_199s", "label": "Med-Fast (-5%)", "lap_time_min": 3.325, "energy_wh": 84.0},
-    {"key": "base_210s",     "label": "Base (210s)",    "lap_time_min": 3.500, "energy_wh": 80.0},
-    {"key": "med_slow_220s", "label": "Med-Slow (+5%)", "lap_time_min": 3.675, "energy_wh": 76.0},
-    {"key": "slow_231s",     "label": "Slow (+10%)",    "lap_time_min": 3.850, "energy_wh": 72.0},
+    {"key": k, "label": m["label"], "lap_time_min": m["target_s"] / 60.0,
+     "energy_wh": m.get("energy_wh")}
+    for k, m in sorted(PROFILE_MATRIX.items(), key=lambda kv: kv[1]["target_s"])
 ]
-
-_SIDECAR_PATH = os.path.join(_REPO_ROOT, "profiles", "profiles.json")
-
-
-def _sidecar_meta():
-    """{key: {label, energy_wh}} written by profile_builder.py. Optional."""
-    try:
-        import json
-        with open(_SIDECAR_PATH, encoding="utf-8") as fh:
-            return json.load(fh).get("categories") or {}
-    except Exception:
-        return {}
 
 
 def load_strategies():
@@ -141,16 +133,13 @@ def load_strategies():
         found = speed_profile.available_profiles()
         if not found:
             return list(_FALLBACK_STRATEGIES)
-        side = _sidecar_meta()
-
         out = []
         for key, path in found.items():
             prof = speed_profile.load_csv(path, name=key,
                                           lap_length_m=track.TRACK_LENGTH_METERS)
-            label, energy = _BUILTIN_STRATEGY_META.get(key, (None, None))
-            meta = side.get(key) or {}
-            label = meta.get("label") or label or key.replace("_", " ").title()
-            energy = meta.get("energy_wh", energy)
+            meta = PROFILE_MATRIX.get(key) or {}
+            label = meta.get("label") or key.replace("_", " ").title()
+            energy = meta.get("energy_wh")
             out.append({"key": key, "label": label,
                         "lap_time_min": prof.lap_time_s() / 60.0,
                         "energy_wh": energy,
@@ -164,6 +153,10 @@ def load_strategies():
         print(f"⚠️ speed profiles unreadable ({exc}); using the built-in five")
         return list(_FALLBACK_STRATEGIES)
 
+
+# Laps the car must drive on a profile before the Strategy tab uses their
+# median energy instead of the stored Wh/lap estimate (Pit_Web/api.py).
+MIN_LAPS_FOR_MEASURED = 2
 
 STRATEGIES = load_strategies()
 STRATEGY_BY_LABEL = {s["label"]: s for s in STRATEGIES}

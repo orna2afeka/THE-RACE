@@ -63,7 +63,9 @@ import track                                                  # noqa: E402
 import track_map                                              # noqa: E402
 from zolder_centreline import (BUILT_UTC, OSM_ATTRIBUTION,    # noqa: E402
                                OSM_RELATION_ID, OSM_TIMESTAMP)
-from strategy_engine import SECTIONS_INFO, TRACK_LANDMARKS    # noqa: E402
+from strategy_engine import (DOC_TO_TRACK_OFFSET_M,           # noqa: E402
+                             SECTIONS_INFO, TRACK_LANDMARKS,
+                             TURN_START_TRACK_M)
 from constants import SECTION_NAMES                           # noqa: E402
 
 # BOTH generated pages live in docs/, and neither is application code.
@@ -86,8 +88,32 @@ WALL_PATH = os.path.join(_REPO, "Pit_Dashboard", "wall.html")
 PROFILES_DIR = os.path.join(_REPO, "profiles")
 PROFILE_PATH = os.path.join(_REPO, "profiles", "base_210s.csv")
 
-BOUNDARIES = [SECTIONS_INFO[s]["range"][0] for s in sorted(SECTIONS_INFO)]
 SECTOR_IDS = sorted(SECTIONS_INFO)
+
+
+def track_m(doc_m):
+    """A sector-document distance, as metres from the track.py finish line."""
+    return (float(doc_m) - DOC_TO_TRACK_OFFSET_M) % track.TRACK_LENGTH_METERS
+
+
+# Where each sector starts ON THE MAP, in sector order. Deliberately NOT shifted
+# by the document offset: S1 starts on the start/finish line, where the team
+# expects to see it, even though that leaves a few turns just outside the
+# sector the document lists them in. Only the 210 s profile lookup keeps the
+# offset (docOffset below).
+BOUNDARIES = [float(SECTIONS_INFO[s]["range"][0]) % track.TRACK_LENGTH_METERS
+              for s in SECTOR_IDS]
+
+
+def landmark_track_m(lm):
+    """Where a landmark is drawn: its turn's measured start, else its document
+    distance shifted into the car's frame. None for the finish line, which has
+    its own gate."""
+    if float(lm["dist_m"]) % track.TRACK_LENGTH_METERS == 0.0:
+        return None
+    if lm.get("turn") is not None:
+        return float(TURN_START_TRACK_M[lm["turn"]])
+    return track_m(lm["dist_m"])
 
 # ── The palette ───────────────────────────────────────────────────────────── #
 # Nine distinct hues, one per sector, deliberately NOT the pit dashboard's
@@ -111,32 +137,21 @@ CAR_COLOR = "#00e5ff"
 # metres wide, and a 26 m label is about two car lengths tall. Picking these in
 # ground units instead of pixels is what keeps them in proportion when the page
 # is shown on a phone and on a projector.
-# The drawing is fitted to its own CONTENT, not to the tarmac: the callouts
-# stick out much further than the track does, and a fixed margin big enough for
-# the longest of them ("Chicane (Turns 5,6)", which runs 260 m wide at this
-# scale) wastes that much space on all four sides. So the bounds below are
-# measured from the labels themselves and this is only the breathing room added
-# once they are all accounted for.
+# The drawing is fitted to the tarmac plus the labels and turn badges around
+# it; this is the breathing room added once they are all accounted for.
 PAD_M = 40.0
-# Rough advance width of one character as a fraction of font size, for working
-# out how far a callout actually reaches. It only has to be close: a little
-# generous costs a few metres of margin, a little tight clips a label.
-CHAR_W = 0.56
 TRACK_CASING_M = 17.0
 TRACK_CORE_M = 11.0
 GATE_HALF_M = 17.0
 FINISH_HALF_M = 24.0
 SECTOR_LABEL_OFFSET_M = 46.0
-LANDMARK_LEADER_M = 78.0
 CAR_RADIUS_M = 13.0
 TRAIL_M = 170.0       # how much track the car's tail covers
-# In metres, like everything else here, and known to PYTHON rather than only to
-# the stylesheet because the viewBox is fitted around the text: the bounds
-# maths cannot ask the browser how wide a word came out.
-LANDMARK_FONT_M = 25.0
-LANDMARK_SPEED_FONT_M = 21.0
 SECTOR_FONT_M = 30.0
-LABEL_PAD_M = 12.0
+# Numbered turn badges, one per ETCR turn, like the circles on the ETCR map.
+TURN_BADGE_R_M = 15.0
+TURN_BADGE_FONT_M = 17.0
+TURN_BADGE_OFFSETS_M = (34.0, 62.0, 90.0)   # tried nearest first
 
 
 def _svg_xy(x, y, ox, oy):
@@ -147,7 +162,7 @@ def _svg_xy(x, y, ox, oy):
 def _clearance(px, py):
     """How far a point is from the nearest bit of tarmac, in metres.
 
-    Used to decide which side of the track a turn callout goes on. The obvious
+    Used to decide which side of the track a turn badge goes on. The obvious
     rule — push it away from the middle of the circuit — is wrong at Zolder,
     because the lap doubles back on itself twice: at Turn 7 and at the final
     chicane the "outside" of the local corner is the INSIDE of the circuit as a
@@ -230,7 +245,7 @@ def build_data():
     centre_local = _centroid(track_map.CENTRELINE_XY)
 
     # -- pass 1: everything in local metres, and how far it all reaches ------ #
-    # Bounds start as the tarmac and grow to contain each callout, so the
+    # Bounds start as the tarmac and grow to contain each label, so the
     # finished viewBox is exactly the drawing and no more.
     x0, x1, y0, y1 = track_map.BOUNDS_XY
     lo_x, hi_x, lo_y, hi_y = x0, x1, y0, y1
@@ -240,55 +255,13 @@ def build_data():
         lo_x, hi_x = min(lo_x, px), max(hi_x, px)
         lo_y, hi_y = min(lo_y, py), max(hi_y, py)
 
-    landmarks_local = []
-    for lm in TRACK_LANDMARKS:
-        dist = float(lm["dist_m"]) % track.TRACK_LENGTH_METERS
-        if dist == 0.0:
-            continue          # the finish line already has its own white gate
-        px, py = track_map.position_at_distance(dist)
-        tx, ty = track_map.tangent_at(dist)
-        nx, ny = -ty, tx
-
-        # Which side: whichever end has more room around it. Near-ties (a
-        # straight, with equal space both ways) fall back to pointing away from
-        # the middle of the circuit, which keeps the callouts fanned outwards.
-        cands = []
-        for sign in (1.0, -1.0):
-            ex = px + LANDMARK_LEADER_M * sign * nx
-            ey = py + LANDMARK_LEADER_M * sign * ny
-            cands.append((_clearance(ex, ey), sign, ex, ey))
-        cands.sort(reverse=True)
-        if abs(cands[0][0] - cands[1][0]) < 15.0:
-            outward = ((px - centre_local[0]) * nx + (py - centre_local[1]) * ny)
-            sign = 1.0 if outward >= 0 else -1.0
-            ex = px + LANDMARK_LEADER_M * sign * nx
-            ey = py + LANDMARK_LEADER_M * sign * ny
-        else:
-            _, sign, ex, ey = cands[0]
-
-        speed = lm.get("max_speed")
-        text = str(lm["name"])
-        # How far the text itself reaches past the end of its leader line, so
-        # the bounds below account for the words and not just the line.
-        speed_reach = (len("%s km/h" % speed) * LANDMARK_SPEED_FONT_M * CHAR_W
-                       if speed is not None else 0.0)
-        reach = max(len(text) * LANDMARK_FONT_M * CHAR_W, speed_reach)
-        landmarks_local.append({
-            "name": text, "speed": speed, "dist": dist,
-            "px": px, "py": py, "ex": ex, "ey": ey,
-            "right": ex > px + 1.0, "left": ex < px - 1.0,
-        })
-        grow(px, py)
-        if ex > px + 1.0:
-            grow(ex + reach + LABEL_PAD_M, ey)
-        elif ex < px - 1.0:
-            grow(ex - reach - LABEL_PAD_M, ey)
-        else:
-            grow(ex - reach / 2, ey)
-            grow(ex + reach / 2, ey)
-        # Two lines of text hang below or above the end of the leader.
-        grow(ex, ey + LANDMARK_FONT_M * 2.2)
-        grow(ex, ey - LANDMARK_FONT_M * 2.2)
+    # Turn names and speeds are not drawn on the map (the numbered badges are);
+    # the page still needs them for its "next turn" readout.
+    landmarks = sorted(
+        ({"name": str(lm["name"]), "speed": lm.get("max_speed"), "dist": d}
+         for lm in TRACK_LANDMARKS
+         for d in [landmark_track_m(lm)] if d is not None),
+        key=lambda l: l["dist"])
 
     ticks = track_map.boundary_ticks(BOUNDARIES, GATE_HALF_M)
     slabels_local = []
@@ -299,6 +272,34 @@ def build_data():
         ly = py + SECTOR_LABEL_OFFSET_M * side * normal[1]
         slabels_local.append((sector_id, lx, ly))
         grow(lx, ly)
+
+    # -- turn badges: every ETCR turn gets its number beside the track ------- #
+    # Placed after the sector labels so they can keep clear of them: each badge
+    # takes the spot (either side, a few distances out) furthest from tarmac,
+    # other badges and sector labels.
+    avoid = [(lx, ly) for _sid, lx, ly in slabels_local]
+    turns_local = []
+    for number, start in sorted(TURN_START_TRACK_M.items()):
+        px, py = track_map.position_at_distance(start)
+        tx, ty = track_map.tangent_at(start)
+        nx, ny = -ty, tx
+        best = None
+        for off in TURN_BADGE_OFFSETS_M:
+            for sign in (1.0, -1.0):
+                bx, by = px + off * sign * nx, py + off * sign * ny
+                room = min([_clearance(bx, by) - TURN_BADGE_R_M]
+                           + [math.hypot(bx - ax, by - ay) - TURN_BADGE_R_M
+                              for ax, ay in avoid])
+                # Nearer is better as long as there is real room.
+                score = min(room, 14.0) - off * 0.05
+                if best is None or score > best[0]:
+                    best = (score, bx, by)
+        _, bx, by = best
+        avoid.extend([(bx, by)])
+        turns_local.append({"n": number, "dist": float(start),
+                            "px": px, "py": py, "bx": bx, "by": by})
+        grow(bx - TURN_BADGE_R_M, by - TURN_BADGE_R_M)
+        grow(bx + TURN_BADGE_R_M, by + TURN_BADGE_R_M)
 
     lo_x -= PAD_M
     hi_x += PAD_M
@@ -312,9 +313,13 @@ def build_data():
     line = [_svg_xy(x, y, ox, oy) for x, y in track_map.CENTRELINE_XY]
     cum = [round(c, 2) for c in track_map.CUM_M]
 
+    # split_at returns runs sorted by start distance; name each run by its
+    # start rather than by position so the order can never mislabel one.
+    id_at = {b: sid for b, sid in zip(BOUNDARIES, SECTOR_IDS)}
     sectors = []
-    for sector_id, (seg_start, seg_end, xs, ys) in zip(
-            SECTOR_IDS, track_map.split_at(BOUNDARIES)):
+    for seg_start, seg_end, xs, ys in sorted(
+            track_map.split_at(BOUNDARIES), key=lambda r: id_at[r[0]]):
+        sector_id = id_at[seg_start]
         pts = [_svg_xy(x, y, ox, oy) for x, y in zip(xs, ys)]
         sectors.append({
             "id": sector_id,
@@ -344,24 +349,43 @@ def build_data():
     fa_x, fa_y = _svg_xy(fa[0], fa[1], ox, oy)
     fb_x, fb_y = _svg_xy(fb[0], fb[1], ox, oy)
 
-    landmarks = []
-    for lm in landmarks_local:
-        sx, sy = _svg_xy(lm["px"], lm["py"], ox, oy)
-        exs, eys = _svg_xy(lm["ex"], lm["ey"], ox, oy)
-        landmarks.append({
-            "name": lm["name"], "speed": lm["speed"], "dist": lm["dist"],
-            "x1": sx, "y1": sy, "x2": exs, "y2": eys,
-            # Anchor away from the track: a callout on the left of the circuit
-            # must run leftwards, or its text crosses back over the tarmac.
-            "anchor": ("start" if lm["right"] else
-                       "end" if lm["left"] else "middle"),
-            "dy": 1 if eys > sy else -1,
-        })
-    landmarks.sort(key=lambda l: l["dist"])
+    turns = []
+    for t in turns_local:
+        x1, y1 = _svg_xy(t["px"], t["py"], ox, oy)
+        bx, by = _svg_xy(t["bx"], t["by"], ox, oy)
+        turns.append({"n": t["n"], "dist": t["dist"],
+                      "x1": x1, "y1": y1, "x": bx, "y": by})
+
+    # The projection, baked, so a page can put a GPS fix in SVG units without
+    # re-deriving anything. SVG user units ARE local metres with y flipped
+    # (see _svg_xy), and track.to_local_xy is equirectangular about the finish
+    # line, so the whole transform is two multiplies and two subtractions:
+    #
+    #     x_svg = (lon - lon0) * mPerDegLon - ox
+    #     y_svg = oy - (lat - lat0) * mPerDegLat
+    #
+    # Written out rather than shipping a formula the page has to agree with:
+    # this is the SAME to_local_xy the car's lap trigger uses, so the dot and
+    # the finish-line test can never drift apart.
+    deg = math.radians(1.0)
+    geo = {
+        "lat0": track.FINISH_LINE_LAT,
+        "lon0": track.FINISH_LINE_LON,
+        "mPerDegLat": round(deg * track._EARTH_RADIUS_M, 4),
+        "mPerDegLon": round(deg * track._EARTH_RADIUS_M
+                            * math.cos(math.radians(track.FINISH_LINE_LAT)), 4),
+        "ox": round(ox, 3),
+        "oy": round(oy, 3),
+    }
 
     return {
         "viewBox": "0 0 %.0f %.0f" % (width, height),
+        "geo": geo,
         "trackLength": track.TRACK_LENGTH_METERS,
+        # Sector-document zero minus the car's zero. Only the 210 s profile is
+        # read in the document's frame; sectors, posAt() and lap distance are
+        # all counted from the start/finish line.
+        "docOffset": DOC_TO_TRACK_OFFSET_M,
         "line": line,
         "cum": cum,
         "sectors": sectors,
@@ -369,6 +393,7 @@ def build_data():
         "sectorLabels": labels,
         "finish": {"x1": fa_x, "y1": fa_y, "x2": fb_x, "y2": fb_y},
         "landmarks": landmarks,
+        "turns": turns,
         "profile": [[round(d, 1), round(v, 2)] for d, v in _read_profile()],
         "profileLapSeconds": round(_profile_lap_seconds(), 2),
         "carColor": CAR_COLOR,
@@ -376,8 +401,8 @@ def build_data():
         "style": {
             "casing": TRACK_CASING_M, "core": TRACK_CORE_M,
             "car": CAR_RADIUS_M, "trail": TRAIL_M,
-            "lmFont": LANDMARK_FONT_M, "lmSpeedFont": LANDMARK_SPEED_FONT_M,
             "sFont": SECTOR_FONT_M,
+            "turnR": TURN_BADGE_R_M, "turnFont": TURN_BADGE_FONT_M,
         },
     }
 
@@ -394,7 +419,7 @@ def build_data():
 #                                         says it is not.
 #
 # They share MAP_JS and BASE_CSS. The map is the expensive, fiddly part — the
-# projection, the sector splits, the callout placement — and having it exist
+# projection, the sector splits, the label placement — and having it exist
 # twice is how the two would end up disagreeing about where Turn 12 is.
 # --------------------------------------------------------------------------- #
 
@@ -405,11 +430,21 @@ def build_data():
 DB_URL = "https://solar-race-telemetry-default-rtdb.europe-west1.firebasedatabase.app"
 PUBLIC_PATH = "public/live"
 RACE_PATH = "public/race"
+DRIVER_PATH = "public/driver"      # written by Pit_Dashboard/driver_message.py
 
 # How long after the car's last sample the page stops claiming to be live. The
 # car publishes once a second; 20 s is twenty missed updates, which is a real
 # outage and not a bad moment on a mobile network.
 STALE_AFTER_S = 20
+
+# Past this, the spectator page does not show the car's last reading at all:
+# every number goes to a dash and the car leaves the map. /public/live keeps the
+# last snapshot forever, so without this a page opened days after a test run
+# showed that run's lap, distance and battery. Judged on the CAR's own sample
+# time, so it also catches a snapshot that arrives the moment the page opens.
+# Ten minutes is far beyond any viewer's clock skew or a mid-race outage worth
+# riding out.
+OLD_AFTER_S = 600
 
 BASE_CSS = """
   :root {
@@ -457,10 +492,10 @@ BASE_CSS = """
   svg { width: 100%; height: 100%; display: block; }
   .gate { stroke: #64748b; stroke-width: 2.6; }
   .finish { stroke: #ffffff; stroke-width: 5; }
-  .leader { stroke: #475569; stroke-width: 2.4; }
-  .lm-dot { fill: var(--accent); }
-  .lm-name { fill: #cbd5e1; font-weight: 600; letter-spacing: 1px; }
-  .lm-speed { fill: #64748b; font-weight: 600; }
+  .turn-tick { stroke: #94a3b8; stroke-width: 2; }
+  .turn-badge { fill: #0f172a; stroke: #94a3b8; stroke-width: 2.2; }
+  .turn-num { fill: #e2e8f0; font-weight: 700; text-anchor: middle;
+              dominant-baseline: central; }
   .s-label { font-weight: 700; letter-spacing: 1px;
              text-anchor: middle; dominant-baseline: middle; }
   /* -- legend ----------------------------------------------------------- */
@@ -503,7 +538,7 @@ MAP_SVG = """
       <g id="g-casing"></g>
       <g id="g-sectors"></g>
       <g id="g-gates"></g>
-      <g id="g-landmarks"></g>
+      <g id="g-turns"></g>
       <g id="g-slabels"></g>
       <path id="trail" fill="none" stroke-linecap="round"></path>
       <circle id="car" r="0" filter="url(#glow)"></circle>
@@ -551,31 +586,17 @@ el("g-gates").appendChild(mk("line", {
   x2: DATA.finish.x2, y2: DATA.finish.y2, class: "finish",
 }));
 
-DATA.landmarks.forEach(lm => {
-  const g = el("g-landmarks");
-  g.appendChild(mk("line", {
-    x1: lm.x1, y1: lm.y1, x2: lm.x2, y2: lm.y2, class: "leader",
-  }));
-  g.appendChild(mk("circle", { cx: lm.x1, cy: lm.y1, r: 5, class: "lm-dot" }));
-
-  const pad = lm.anchor === "start" ? 12 : lm.anchor === "end" ? -12 : 0;
-  const name = mk("text", {
-    x: lm.x2 + pad, y: lm.y2 + (lm.dy > 0 ? 24 : -6),
-    "text-anchor": lm.anchor, class: "lm-name",
-    "font-size": DATA.style.lmFont,
-  });
-  name.textContent = lm.name;
-  g.appendChild(name);
-
-  if (lm.speed != null) {
-    const sp = mk("text", {
-      x: lm.x2 + pad, y: lm.y2 + (lm.dy > 0 ? 48 : 18),
-      "text-anchor": lm.anchor, class: "lm-speed",
-      "font-size": DATA.style.lmSpeedFont,
-    });
-    sp.textContent = lm.speed + " km/h";
-    g.appendChild(sp);
-  }
+// Every ETCR turn by number, as on the ETCR track map.
+(DATA.turns || []).forEach(t => {
+  const g = el("g-turns");
+  g.appendChild(mk("line", { x1: t.x1, y1: t.y1, x2: t.x, y2: t.y,
+                             class: "turn-tick" }));
+  g.appendChild(mk("circle", { cx: t.x, cy: t.y, r: DATA.style.turnR,
+                               class: "turn-badge" }));
+  const n = mk("text", { x: t.x, y: t.y, class: "turn-num",
+                         "font-size": DATA.style.turnFont });
+  n.textContent = t.n;
+  g.appendChild(n);
 });
 
 DATA.sectorLabels.forEach(s => {
@@ -637,10 +658,51 @@ function posAt(d) {
   return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
 }
 
+// A GPS fix in SVG user units. DATA.geo is track.to_local_xy with the same
+// y-flip and origin the map was baked with, so this lands on the drawn track
+// rather than near it.
+function geoToSvg(lat, lon) {
+  const g = DATA.geo;
+  return [(lon - g.lon0) * g.mPerDegLon - g.ox,
+          g.oy - (lat - g.lat0) * g.mPerDegLat];
+}
+
+// How far round the lap a point is, by projecting it onto the centreline: the
+// nearest point on the nearest segment, then that segment's baked distance.
+//
+// This is what makes the map GPS-truth rather than odometer-truth. The car's
+// lap_distance_m is a distance SINCE A DATUM, so a stale datum (a Pi restarted
+// mid-lap, a trip reset in the garage) puts the marker in the wrong corner
+// while GPS knows exactly where the car is. Returns metres, or null if there
+// is no usable fix.
+function trackDistAt(lat, lon) {
+  if (lat == null || lon == null) return null;
+  const [px, py] = geoToSvg(lat, lon);
+  const line = DATA.line, cum = DATA.cum;
+  let best = null;
+  for (let i = 0; i < line.length - 1; i++) {
+    const a = line[i], b = line[i + 1];
+    const vx = b[0] - a[0], vy = b[1] - a[1];
+    const len2 = vx * vx + vy * vy;
+    const t = len2 > 0
+      ? Math.max(0, Math.min(1, ((px - a[0]) * vx + (py - a[1]) * vy) / len2))
+      : 0;
+    const dx = px - (a[0] + vx * t), dy = py - (a[1] + vy * t);
+    const d2 = dx * dx + dy * dy;
+    if (best == null || d2 < best[0]) best = [d2, cum[i] + (cum[i + 1] - cum[i]) * t];
+  }
+  return best == null ? null : ((best[1] % DATA.trackLength) + DATA.trackLength)
+                               % DATA.trackLength;
+}
+
 function sectorAt(d) {
   const L = DATA.trackLength;
   d = ((d % L) + L) % L;
-  for (const s of DATA.sectors) if (d >= s.start && d < s.end) return s;
+  // S9 ends on the finish line (end 0 m), so its start > end: allow wrapping.
+  for (const s of DATA.sectors) {
+    if (s.start < s.end ? (d >= s.start && d < s.end)
+                        : (d >= s.start || d < s.end)) return s;
+  }
   return DATA.sectors[DATA.sectors.length - 1];
 }
 
@@ -681,8 +743,12 @@ function fmtClock(s) {
 let lastSector = null;
 // Moves the car and everything that follows it. Returns the sector it is in, so
 // the caller can label it without repeating the lookup.
-function paintMap(dist) {
-  const [x, y] = posAt(dist);
+function paintMap(dist, fixXY) {
+  // The marker sits on the true GPS point when there is one, and on the
+  // centreline at `dist` when there is not. Everything that follows it -- the
+  // trail, the sector, the progress bar -- is a distance concept and stays on
+  // `dist`, which the live pages already derive from the same fix.
+  const [x, y] = fixXY || posAt(dist);
   car.setAttribute("cx", x); car.setAttribute("cy", y);
   el("car-core").setAttribute("cx", x); el("car-core").setAttribute("cy", y);
 
@@ -692,7 +758,9 @@ function paintMap(dist) {
   el("trail").setAttribute("opacity", "0.55");
 
   if (progress) {
-    el("progress-mark").style.left = (dist / DATA.trackLength * 100) + "%";
+    // The bar is laid out S1..S9 from the start/finish line.
+    const L = DATA.trackLength;
+    el("progress-mark").style.left = ((dist % L + L) % L / L * 100) + "%";
   }
   if (s.id !== lastSector) {
     DATA.sectors.forEach(o => {
@@ -840,6 +908,7 @@ el("foot").innerHTML =
 
 function speedAt(d) {
   const p = DATA.profile, L = DATA.trackLength;
+  d += DATA.docOffset;                // the profile counts from the document's zero
   d = ((d % L) + L) % L;
   let lo = 0, hi = p.length - 1;
   while (lo < hi - 1) {
@@ -1029,6 +1098,8 @@ __BASE_CSS__
   /* The car stops being drawn as a live thing the moment the feed is not. */
   #car, #car-core, #trail { transition: opacity 0.4s ease; }
   body.stale #car, body.stale #car-core, body.stale #trail { opacity: 0.28; }
+  /* A reading too old to show at all (CONFIG.oldAfterS): no car on the map. */
+  body.old #car, body.old #car-core, body.old #trail { opacity: 0; }
   /* Hidden by sliding UP out of view, but the offset is in PIXELS, not a
      percentage of its own height. It was -140%, and an EMPTY banner is only
      about 24px tall (padding, no line box), so -140% lifted it just 34px from a
@@ -1078,6 +1149,12 @@ __BASE_CSS__
         <div class="label">Speed</div>
         <div class="value"><span id="speed">&mdash;</span><span class="unit">KM/H</span></div>
       </div>
+    </div>
+
+    <!-- Hidden until the pit types a name. There is no default driver. -->
+    <div class="card" id="driver-card" style="display:none">
+      <div class="label">Driving now</div>
+      <div class="value small" id="driver-name"></div>
     </div>
 
     <div class="card">
@@ -1159,10 +1236,23 @@ const HOME_TZ = "Asia/Jerusalem";       // where most of the people watching are
 let snap = null;
 let lastRxWall = 0;        // our clock, for "how long since anything arrived"
 let dist = 0, target = null, everPainted = false;
+// The GPS marker, in SVG units: where the last fix put it, and where it is
+// drawn (eased toward the first, so a 1 Hz feed reads as motion).
+let fixTarget = null, fixShown = null;
 let race = { start: CONFIG.raceStart, end: CONFIG.raceEnd };
 let sun = null;
 
 const num = (v) => (v == null || v === "" || isNaN(Number(v))) ? null : Number(v);
+
+// Is the last snapshot too old to show (CONFIG.oldAfterS)? Judged on the car's
+// own sample time, not on when this page received it: the stream delivers the
+// retained snapshot the moment the page opens, however old it is. A snapshot
+// with no time at all cannot be shown to be current, so it counts as old.
+function isOld(now) {
+  if (snap == null) return false;
+  const t = num(snap.ts);
+  return t == null || now - t > CONFIG.oldAfterS;
+}
 
 function fmtCountdown(s) {
   s = Math.max(0, Math.floor(s));
@@ -1216,7 +1306,16 @@ function applySnapshot(obj) {
   if (obj == null) return;
   snap = obj;
   lastRxWall = Date.now() / 1000;
-  const d = num(obj.lap_distance_m);
+  // POSITION, GPS FIRST. lap_distance_m is a distance since a datum, and the
+  // datum is wrong whenever the Pi restarted mid-lap or the trip was reset off
+  // the line -- the marker then sits in a corner the car is nowhere near. A fix
+  // needs no datum. It is still the fallback, because a car in a tunnel, in the
+  // garage or with a dead receiver must not take the map down with it.
+  const lat = num(obj.lat), lon = num(obj.lon);
+  const gpsDist = trackDistAt(lat, lon);
+  fixTarget = gpsDist == null ? null : geoToSvg(lat, lon);
+  if (fixTarget == null) fixShown = null;
+  const d = gpsDist != null ? gpsDist : num(obj.lap_distance_m);
   if (d != null) {
     target = ((d % DATA.trackLength) + DATA.trackLength) % DATA.trackLength;
     if (!everPainted) { dist = target; everPainted = true; }
@@ -1269,6 +1368,19 @@ function loadRace() {
     .then(r => {
       if (r && num(r.start_ts)) race = { start: num(r.start_ts), end: num(r.end_ts) };
       render();
+    }).catch(() => {});
+}
+
+// The driver's name, typed in at the pit (Pit_Web writes /public/driver). Only
+// a real name shows the card; no name, a deleted node or a failed read hides
+// it. textContent, never innerHTML: this is text someone typed.
+function loadDriver() {
+  fetch(CONFIG.dbUrl + "/" + CONFIG.driverPath + ".json", { cache: "no-store" })
+    .then(r => r.ok ? r.json() : null)
+    .then(d => {
+      const name = d && typeof d.name === "string" ? d.name.trim() : "";
+      el("driver-name").textContent = name;
+      el("driver-card").style.display = name ? "" : "none";
     }).catch(() => {});
 }
 
@@ -1354,19 +1466,27 @@ function render() {
   // sampleAge is how old the car says its own reading is. A phone with a wrong
   // clock skews the second, so the status is driven by the first.
   const stale = age == null || age > CONFIG.staleAfterS;
+  const old = isOld(now);
 
   const pill = el("status");
-  pill.className = "pill " + (age == null ? "off" : stale ? "stale" : "live");
+  pill.className = "pill " + (age == null || old ? "off" : stale ? "stale" : "live");
   el("status-text").textContent =
-    age == null ? "Waiting for the car" : stale ? "No data" : "Live";
+    age == null ? "Waiting for the car" : old ? "Car not running"
+                : stale ? "No data" : "Live";
+  const sampleTs = snap ? num(snap.ts) : null;
   el("status-sub").textContent =
     age == null ? "Nothing has arrived yet — the car may not be running."
+                : old ? "Last heard from " + (sampleTs == null ? "a while"
+                          : fmtClock(now - sampleTs)) + " ago. Numbers will "
+                          + "appear when the car is back on track."
                 : stale ? "Nothing for " + Math.round(age) + "s. The car is out of "
                           + "contact; the marker below is where it was last seen."
                 : "Updated " + Math.max(0, Math.round(age)) + "s ago";
   document.body.classList.toggle("stale", stale);
+  document.body.classList.toggle("old", old);
 
-  const s = snap || {};
+  // An old reading is not shown at all: every value renders as a dash.
+  const s = old ? {} : (snap || {});
   el("lap").textContent = num(s.lap) == null ? "—" : num(s.lap);
   el("speed").textContent = num(s.speed_kmh) == null ? "—"
                             : Math.round(num(s.speed_kmh));
@@ -1435,8 +1555,17 @@ function frame(t) {
     if (delta > L / 2) delta -= L;
     dist = ((dist + delta * Math.min(1, dt * 2.2)) % L + L) % L;
   }
-  if (everPainted) {
-    const s = paintMap(dist);
+  if (everPainted && isOld(Date.now() / 1000)) {
+    el("sector-name").textContent = "—";
+    el("next-sub").textContent = "—";
+  } else if (everPainted) {
+    if (fixTarget != null) {
+      const k = fixShown == null ? 1 : Math.min(1, dt * 2.2);
+      fixShown = fixShown == null ? fixTarget
+        : [fixShown[0] + (fixTarget[0] - fixShown[0]) * k,
+           fixShown[1] + (fixTarget[1] - fixShown[1]) * k];
+    }
+    const s = paintMap(dist, fixShown);
     el("sector-name").textContent = "S" + s.id + " · " + s.name;
     const nx = nextLandmark(dist);
     if (nx) {
@@ -1450,11 +1579,13 @@ function frame(t) {
 render();
 startStream();
 loadRace();
+loadDriver();
 loadWeather();
 setInterval(render, 1000);          // keeps the ages and the race clock moving
 setInterval(loadWeather, 900000);
 setInterval(renderDayNight, 60000);
 setInterval(loadRace, 300000);
+setInterval(loadDriver, 15000);
 requestAnimationFrame(frame);
 </script>
 </body>
@@ -1822,9 +1953,18 @@ function render() {
   fnode.classList.toggle("show", notes.length > 0);
 
   // -- the map ---------------------------------------------------------- //
-  const dist = isCarried(s, "lap_distance_m") ? null : num(s.lap_distance_m);
+  // GPS first, exactly as on the spectator page: a fix needs no datum, so it
+  // survives a Pi restart mid-lap and a trip reset taken off the line, both of
+  // which leave lap_distance_m pointing at the wrong corner. isCarried keeps a
+  // position the car has stopped sending from being redrawn as current.
+  const haveFix = !isCarried(s, "lat") && !isCarried(s, "lon");
+  const lat = haveFix ? num(s.lat) : null, lon = haveFix ? num(s.lon) : null;
+  const gpsDist = trackDistAt(lat, lon);
+  const fixXY = gpsDist == null ? null : geoToSvg(lat, lon);
+  const dist = gpsDist != null ? gpsDist
+             : (isCarried(s, "lap_distance_m") ? null : num(s.lap_distance_m));
   if (dist != null) {
-    const sec = paintMap(dist);
+    const sec = paintMap(dist, fixXY);
     el("sector").textContent = "S" + sec.id + " " + sec.name;
     const nx = nextLandmark(dist);
     el("nextcorner").textContent = nx
@@ -1911,7 +2051,9 @@ def render_spectator(data, race_start, race_end):
         "dbUrl": DB_URL.rstrip("/"),
         "publicPath": PUBLIC_PATH,
         "racePath": RACE_PATH,
+        "driverPath": DRIVER_PATH,
         "staleAfterS": STALE_AFTER_S,
+        "oldAfterS": OLD_AFTER_S,
         "raceStart": race_start,
         "raceEnd": race_end,
         "lat": track.FINISH_LINE_LAT,

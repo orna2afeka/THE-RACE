@@ -146,13 +146,17 @@ K = ["-K%05d" % i for i in range(1, 1201)]       # 1200 samples, in order
 print(__doc__.split("WHY")[0].strip())
 print()
 
-print("1. A cold start with a large backlog pages it in")
+print("1. A cold start does NOT page the backlog in")
+# An empty store with no cursor is a FRESH DATABASE, not a gap to be closed.
+# Paging here would walk the whole node from its oldest key and refill a store
+# that was just archived, which is what happened on 2026-09-17. The empty-
+# database policy is INITIAL_BACKFILL_LIMIT and it belongs to stream_once, so
+# catch_up must decline the case rather than serve it.
 cursor, stored, fake = run(K, None, page_size=250)
-check("every sample stored", stored == 1200, "%d stored" % stored)
-check("paged rather than one huge request", fake.requests >= 5,
-      "%d requests of %d" % (fake.requests, fake.limits[0]))
-check("cursor left at the newest key", cursor == K[-1], "cursor %s" % cursor)
-check("request size is bounded", max(fake.limits) == 250)
+check("no request made at all", fake.requests == 0,
+      "%d request(s) — a fresh store was being refilled" % fake.requests)
+check("nothing stored", stored == 0, "%d stored" % stored)
+check("cursor left unset for stream_once", cursor is None, "cursor %s" % cursor)
 
 print("\n2. Resuming mid-way only fetches what is new")
 cursor, stored, fake = run(K, K[999], page_size=250)
@@ -170,7 +174,10 @@ check("exactly one request", fake.requests == 1, "%d requests" % fake.requests)
 check("cursor unchanged", cursor == K[-1])
 
 print("\n4. An empty node terminates immediately")
-cursor, stored, fake = run([], None, page_size=250)
+# Driven WITH a cursor: catch_up now returns before its first request when
+# there is none, so passing None here would prove termination by never
+# starting, and case 1 already covers that.
+cursor, stored, fake = run([], K[0], page_size=250)
 check("no samples", stored == 0)
 check("one request, then stop", fake.requests == 1, "%d requests" % fake.requests)
 
@@ -184,7 +191,9 @@ except AssertionError as exc:
     check("terminated instead of spinning", False, str(exc))
 
 print("\n6. A backlog smaller than one page still lands")
-cursor, stored, fake = run(K[:40], None, page_size=250)
+# Driven from the oldest key rather than from None, for the same reason as
+# case 4. startAt is inclusive, so K[0] itself comes back and is stored too.
+cursor, stored, fake = run(K[:40], K[0], page_size=250)
 check("all 40 stored in one request", stored == 40 and fake.requests == 1,
       "%d stored in %d request(s)" % (stored, fake.requests))
 

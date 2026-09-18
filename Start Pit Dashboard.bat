@@ -9,6 +9,7 @@ REM  actually changed), checks the built frontend is present, and starts the
 REM  collector and the dashboard in their own windows. See that file for details.
 REM
 REM  Port map:  8000 pit dashboard   8502 profile builder   8503 pit wall (TV)
+REM             8010 demo dashboard   8504 energy matrix
 REM ===========================================================================
 if not exist "%~dp0Pit_Web\run_web.bat" (
     echo.

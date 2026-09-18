@@ -5,9 +5,9 @@ Reads from the local SQLite store (never Firebase). Filter by device, by which
 metrics (columns) to include, and by time range.
 
 The dashboard's download button produces a clean, readable **Excel workbook**
-(`to_xlsx_bytes`): a formatted Data sheet, a Charts sheet of history graphs, and
-a Faults sheet. The raw CSV writer (`to_csv_bytes`) is kept for machine use / the
-CLI.
+(`to_xlsx_bytes`): a formatted Data sheet, a Laps sheet (one row per lap), a
+Charts sheet of history graphs, and a Faults sheet. The raw CSV writer
+(`to_csv_bytes`) is kept for machine use / the CLI.
 
 As a library:
     from export import to_xlsx_bytes, to_csv_bytes
@@ -41,9 +41,10 @@ _BASE_COLUMNS = ["rtdb_key", "device_id", "device_ts_epoch", "device_ts_iso", "i
 # Subsystem groups — what the dashboard offers as BMS / MMS / Temperature / GPS
 # toggles, so users filter by system instead of remembering raw column names.
 METRIC_GROUPS = {
-    "BMS (battery)": ["bms_soc_percent", "bms_voltage_V", "bms_current_A"],
+    "BMS (battery)": ["bms_soc_percent", "bms_voltage_V", "bms_current_A",
+                      "bms2_soc_percent", "bms2_voltage_V", "bms2_current_A"],
     "MMS (motor)": ["mms_rpm", "mms_power_W", "mms_temperature_C",
-                    "mms_motor_temp_C", "mms_motor_ohms",
+                    "mms_motor_temp_C",
                     "mms_motor_map", "mms_motor_map_raw",
                     # The controller's own measurements — see db.METRIC_COLUMNS.
                     # mms_vehicle_speed_kmh is the SPEED source now that its
@@ -61,10 +62,13 @@ METRIC_GROUPS = {
     "Temperature": ["battery_temp_C",
                     "bms_temp_1_C", "bms_temp_2_C", "bms_temp_3_C",
                     "bms2_temp_1_C", "bms2_temp_2_C", "bms2_temp_3_C"],
-    "Motion / GPS": ["odometer_m", "calculated_lap", "lat", "lon",
-                     "target_speed_kmh"],
+    "Motion / GPS": ["odometer_m", "calculated_lap", "lap_distance_m",
+                     "lat", "lon", "target_speed_kmh"],
+    # The last_lap_* columns feed the Laps sheet (one row per lap), not the
+    # Data sheet: per row they only repeat the previous lap's figure.
     "Laps / Energy": ["total_race_energy", "last_lap_energy", "last_lap_time_s",
-                      "lap_source", "regen_energy", "last_lap_regen_energy",
+                      "regen_energy", "last_lap_regen_energy",
+                      "last_lap_distance_m", "active_strategy",
                       "stint_energy", "stint_regen_energy"],
     "Errors / Faults": ["bms_has_error", "bms_error_code", "bms_protections",
                         "mms_has_error", "mms_error_code", "mms_alerts"],
@@ -100,23 +104,17 @@ def _excel_dt(ts):
     """`ts` as a NAIVE local datetime, for a real Excel date cell.
 
     Naive because openpyxl refuses a timezone-aware datetime outright - Excel
-    has no timezone type. The zone is not lost: it is spelled out in the "Zone"
-    column beside it, which is also the only honest way to show a workbook whose
-    rows are in two different zones.
+    has no timezone type, so the workbook carries no zone of its own: every
+    time cell is pit-local for the moment it was recorded (pit_config
+    .export_local), which is what the team reads a race log in. The CSV export
+    is the one that keeps the offset per row (see `_iso`) for a reader that has
+    to be sure across the mid-season Tel Aviv -> Brussels switch.
 
     A real datetime rather than a string so Excel sorts, filters and charts it
     as a time instead of as text, which the old UTC ISO string could not do.
     """
     local = pit_config.export_local(ts)
     return None if local is None else local.replace(tzinfo=None)
-
-
-def _zone_label(ts):
-    """Short zone for the Zone column, e.g. "IDT +03:00"."""
-    local = pit_config.export_local(ts)
-    if local is None:
-        return ""
-    return f"{local.tzname()} {local.strftime('%z')[:3]}:{local.strftime('%z')[3:]}"
 
 
 def _parse_time(value):
@@ -293,7 +291,9 @@ def history_csv_bytes(df, charts, style="data", session="", device_id=DEVICE_ID)
 # is the display order on the Data sheet.
 _XLSX_COLS = {
     "device_ts_iso":     ("Time (local)",  "yyyy-mm-dd hh:mm:ss", None, None),
-    "tz_label":          ("Zone",                None,        None,  None),
+    # Time since the race start (Start race / corrected start time). Blank when
+    # no race start is set or the row is before it.
+    "race_time":         ("Race Time",           "[h]:mm:ss", None,  None),
     "speed_kmh":         ("Speed (km/h)",        "0.0",       "km/h", "00FFCC"),
     "mms_rpm":           ("Motor RPM",           "0",         "rpm",  "9B59B6"),
     "mms_power_W":       ("Motor Power (W)",     "0",         "W",    "00B3FF"),
@@ -302,7 +302,6 @@ _XLSX_COLS = {
     # a sensor, which would now collide with the real one two rows down.
     "mms_temperature_C": ("Controller Temp (°C)", "0.0",  "°C", "E74C3C"),
     "mms_motor_temp_C":  ("Motor Temp (°C)",      "0.0",  "°C", "FF5E5E"),
-    "mms_motor_ohms":    ("Motor Sensor (Ω)",     "0.0",  "Ω",  "C39BD3"),
     # Map name is text (no chart colour); the raw value charts as a step trace.
     "mms_motor_map":     ("Power Map",            None,   None, None),
     "mms_motor_map_raw": ("Power Map (raw)",      "0",    None, "58D68D"),
@@ -315,6 +314,11 @@ _XLSX_COLS = {
     "bms_voltage_V":     ("Pack Voltage BMS (V)", "0.00",     "V",    "2ECC71"),
     "bms_current_A":     ("Battery Current BMS (A)", "0.00",  "A",    "E67E22"),
     "mms_current_A":     ("Motor Current ctrl (A)", "0.00",   "A",    "D35400"),
+    # Battery B's BMS. The three bms_ columns above are battery A's. No chart
+    # colour, like the BMS B probes below: the Data sheet holds them.
+    "bms2_soc_percent":  ("Battery B SoC (%)",   "0.0",       "%",    None),
+    "bms2_voltage_V":    ("Pack Voltage BMS B (V)", "0.00",   "V",    None),
+    "bms2_current_A":    ("Battery Current BMS B (A)", "0.00", "A",   None),
     # mms_vehicle_speed_kmh is no longer excluded — its decode is fixed. It used
     # to peak at 6583 against an mms_rpm peak of 6352, with 2,569 rows over
     # 200 km/h, because the raw field was read as km/h when it is really
@@ -342,18 +346,17 @@ _XLSX_COLS = {
     "bms2_temp_3_C": ("BMS B T3 (°C)", "0.0", "°C", None),
     "distance_km":       ("Distance (km)",       "0.000",     "km",   "1ABC9C"),
     "calculated_lap":    ("Lap",                 "0",         "#",    "7F8C9B"),
+    # Distance into the lap being driven (resets at the line).
+    "lap_distance_m":    ("Lap Distance (m)",    "0",         "m",    None),
     "total_race_energy": ("Total Energy (Wh)",   "0.0",       "Wh",   "58D68D"),
-    "last_lap_energy":   ("Last Lap Energy (Wh)", "0.0",      "Wh",   "45B39D"),
-    # Regen counterpart of the row above it, and the stint pair below — same
-    # green family as the other energy columns so they read as one group.
-    "last_lap_regen_energy": ("Last Lap Regen Energy (Wh)", "0.0", "Wh", "82C79A"),
+    # Stint pair — same green family as the other energy columns so they read
+    # as one group. Per-lap energy/time live on the Laps sheet.
     # Since the last detected charging stop (charge_detector.py on the car),
     # NOT since the last lap — see LapTracker.mark_stint_start. Rows from
     # before this feature existed export blank, same as any other None.
     "stint_energy":      ("Current Stint Energy (Wh)", "0.0", "Wh", "27AE60"),
     "stint_regen_energy": ("Current Stint Regen Energy (Wh)", "0.0", "Wh", "76D7C4"),
-    "last_lap_time_s":   ("Last Lap Time (s)",   "0.000",     "s",    "5DADE2"),
-    "lap_source":        ("Lap Trigger",         None,        None,   None),
+    "active_strategy":   ("Speed Profile",       None,        None,   None),
     "lat":               ("Latitude",            "0.000000",  None,  None),
     "lon":               ("Longitude",           "0.000000",  None,  None),
 }
@@ -367,66 +370,63 @@ _FAULT_COLUMNS = set(METRIC_GROUPS["Errors / Faults"])
 _MAX_CHART_POINTS = 2000
 
 
-def _data_columns(metrics):
+# Data-sheet keys that are not a raw store column, and what gates them. Every
+# other _XLSX_COLS key IS a raw column and is emitted when it was selected, so a
+# column added to _XLSX_COLS can never again be silently left out of the file
+# (five were, when this was a hand-kept list that had to be updated twice).
+_DERIVED_SOURCE = {
+    # Speed is the controller's field, NOT a function of RPM.
+    "speed_kmh": "mms_vehicle_speed_kmh",
+    "distance_km": "odometer_m",
+}
+_ALWAYS = ("device_ts_iso",)
+# Lap is read out of the second column, where the Zone column used to sit: it
+# is what the team looks for first when reading a row, so it leads the metrics
+# instead of sitting among the Motion/GPS ones. Only when it was selected - an
+# export without the lap metric gets no empty column.
+_LEAD = "calculated_lap"
+
+
+def _data_columns(metrics, race_start=None):
     """Ordered output keys for the Data sheet, derived from the selected raw
-    metrics. Adds derived Speed (needs mms_vehicle_speed_kmh) and Distance
-    (needs odometer_m)."""
+    metrics. Time always leads, then Lap when it was selected; Race Time
+    follows whenever a race start is known."""
     m = set(metrics)
-    present = {
-        # Speed is the controller's field, NOT a function of RPM. Gating this
-        # on mms_rpm would emit a Speed column from a source that no longer
-        # feeds it, and produce an empty column whenever RPM was selected and
-        # speed was not.
-        "speed_kmh": "mms_vehicle_speed_kmh" in m,
-        "mms_rpm": "mms_rpm" in m,
-        "mms_power_W": "mms_power_W" in m,
-        "mms_temperature_C": "mms_temperature_C" in m,
-        "mms_motor_temp_C": "mms_motor_temp_C" in m,
-        "mms_motor_ohms": "mms_motor_ohms" in m,
-        "mms_motor_map": "mms_motor_map" in m,
-        "mms_motor_map_raw": "mms_motor_map_raw" in m,
-        "bms_soc_percent": "bms_soc_percent" in m,
-        "bms_voltage_V": "bms_voltage_V" in m,
-        "bms_current_A": "bms_current_A" in m,
-        "battery_temp_C": "battery_temp_C" in m,
-        "bms_temp_1_C": "bms_temp_1_C" in m,
-        "bms_temp_2_C": "bms_temp_2_C" in m,
-        "bms_temp_3_C": "bms_temp_3_C" in m,
-        "bms2_temp_1_C": "bms2_temp_1_C" in m,
-        "bms2_temp_2_C": "bms2_temp_2_C" in m,
-        "bms2_temp_3_C": "bms2_temp_3_C" in m,
-        "distance_km": "odometer_m" in m,
-        "calculated_lap": "calculated_lap" in m,
-        "total_race_energy": "total_race_energy" in m,
-        "last_lap_energy": "last_lap_energy" in m,
-        "last_lap_regen_energy": "last_lap_regen_energy" in m,
-        "stint_energy": "stint_energy" in m,
-        "stint_regen_energy": "stint_regen_energy" in m,
-        "last_lap_time_s": "last_lap_time_s" in m,
-        "lap_source": "lap_source" in m,
-        "lat": "lat" in m,
-        "lon": "lon" in m,
-    }
-    # Time and Zone always lead, and Zone is never optional: a workbook whose
-    # rows span the Tel Aviv -> Brussels switch is unreadable without it.
-    return ["device_ts_iso", "tz_label"] + [
-        k for k in _XLSX_COLS
-        if k not in ("device_ts_iso", "tz_label") and present.get(k)]
+    cols = list(_ALWAYS)
+    if _LEAD in m:
+        cols.append(_LEAD)
+    if race_start:
+        cols.append("race_time")
+    for k in _XLSX_COLS:
+        if k in _ALWAYS or k in (_LEAD, "race_time"):
+            continue
+        if _DERIVED_SOURCE.get(k, k) in m:
+            cols.append(k)
+    return cols
 
 
-def _cell_value(key, r):
+def _race_duration(ts, race_start):
+    """`ts` as an Excel duration (days) since the race start, or None."""
+    if not race_start or ts is None or ts < race_start:
+        return None
+    return (ts - race_start) / 86400.0
+
+
+def _cell_value(key, r, race_start=None):
     """Value for one Data-sheet cell from a telemetry row."""
+    if key == "race_time":
+        return _race_duration(r["device_ts"], race_start)
     if key == "device_ts_iso":
         return _excel_dt(r["device_ts"])
-    if key == "tz_label":
-        return _zone_label(r["device_ts"])
     if key == "speed_kmh":
         # Straight from the controller's decoded speed field. No `or 0`: a row
         # the car never reported speed for stays None -> an empty cell, not a
         # confident 0 km/h averaged into the stint statistics.
         return r["mms_vehicle_speed_kmh"]
     if key == "distance_km":
-        return (r["odometer_m"] or 0) / 1000.0
+        # Missing stays missing: an empty cell, never a 0 km odometer.
+        odo = r["odometer_m"]
+        return None if odo is None else odo / 1000.0
     return r[key]
 
 
@@ -453,9 +453,100 @@ def _style_header(ws, ncols, nrows):
         ws.auto_filter.ref = f"A1:{get_column_letter(ncols)}{nrows + 1}"
 
 
+# Selecting any of the "Laps / Energy" columns adds the per-lap sheet.
+_LAP_COLUMNS = set(METRIC_GROUPS["Laps / Energy"])
+
+
+def _laps_from_rows(rows):
+    """One dict per lap completed inside the exported window, in finish order.
+
+    The car holds each lap's figures (last_lap_*) constant for the whole of the
+    following lap, so every row of lap N+1 carries the same (time, energy,
+    distance) for lap N. A lap is therefore one DISTINCT set of those figures,
+    listed at the first row that carries it.
+
+    Keyed on the figures rather than on "the lap number changed": stores that
+    hold more than one stream (a replay beside the car, two collectors) have
+    rows from different laps interleaved second by second, and watching for a
+    change emitted the same lap on nearly every row. Keying on the figures also
+    keeps two laps apart when the car's lap counter restarts, which GROUP BY
+    lap would merge.
+    """
+    laps = []
+    seen = set()
+    for r in rows:
+        lap = r["calculated_lap"]
+        t, e = r["last_lap_time_s"], r["last_lap_energy"]
+        if lap is None or (t is None and e is None):
+            continue
+        key = (lap, t, e, r["last_lap_distance_m"])
+        if key in seen:
+            continue
+        seen.add(key)
+        laps.append({
+            "lap": int(lap),
+            "ts": r["device_ts"],
+            "time_s": t,
+            "energy_wh": e,
+            "regen_wh": r["last_lap_regen_energy"],
+            "distance_m": r["last_lap_distance_m"],
+        })
+    return laps
+
+
+def _mean(values):
+    vals = [v for v in values if v is not None]
+    return sum(vals) / len(vals) if vals else None
+
+
+def _write_laps_sheet(ls, laps, race_start):
+    """Laps sheet: one row per lap, then Best and Average rows.
+    Missing figures stay empty cells and are left out of the averages."""
+    from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter
+
+    headers = ["Lap", "Finished (local)", "Race Time", "Lap Time",
+               "Energy (Wh)", "Regen (Wh)", "Distance (m)", "Avg Speed (km/h)"]
+    formats = [None, "yyyy-mm-dd hh:mm:ss", "[h]:mm:ss", "[m]:ss.000",
+               "0.0", "0.0", "0", "0.0"]
+    ls.append(headers)
+
+    def as_duration(sec):
+        return None if sec is None else sec / 86400.0
+
+    for lap in laps:
+        t, d = lap["time_s"], lap["distance_m"]
+        avg = (d / 1000.0) / (t / 3600.0) if t and d is not None else None
+        ls.append([lap["lap"], _excel_dt(lap["ts"]),
+                   _race_duration(lap["ts"], race_start), as_duration(t),
+                   lap["energy_wh"], lap["regen_wh"], d, avg])
+    if not laps:
+        ls.append(["No lap completed in this window."] + [None] * (len(headers) - 1))
+    else:
+        times = [l["time_s"] for l in laps if l["time_s"]]
+        ls.append([])
+        ls.append(["Best", None, None, as_duration(min(times) if times else None),
+                   None, None, None, None])
+        ls.append(["Average", None, None,
+                   as_duration(_mean(l["time_s"] for l in laps)),
+                   _mean(l["energy_wh"] for l in laps),
+                   _mean(l["regen_wh"] for l in laps),
+                   _mean(l["distance_m"] for l in laps), None])
+        for row in ls.iter_rows(min_row=ls.max_row - 1, max_row=ls.max_row):
+            row[0].font = Font(bold=True)
+
+    for row in ls.iter_rows(min_row=2, max_row=ls.max_row):
+        for cell, nf in zip(row, formats):
+            if nf:
+                cell.number_format = nf
+    for i, h in enumerate(headers, start=1):
+        ls.column_dimensions[get_column_letter(i)].width = max(12, len(h) + 2)
+    _style_header(ls, len(headers), max(1, len(laps)))
+
+
 def write_xlsx(fileobj_or_path, start_ts=None, end_ts=None, metrics=None,
                device_id=DEVICE_ID, conn=None) -> int:
-    """Write a formatted Excel workbook (Data + Charts + Faults). Returns the
+    """Write a formatted Excel workbook (Data + Laps + Charts + Faults). Returns the
     Data row count. `fileobj_or_path` may be a path or a binary file object."""
     from openpyxl import Workbook
     from openpyxl.chart import LineChart, Reference
@@ -469,10 +560,14 @@ def write_xlsx(fileobj_or_path, start_ts=None, end_ts=None, metrics=None,
         conn = db.get_conn()
     try:
         rows = db.fetch_samples(conn, start_ts=start_ts, end_ts=end_ts, device_id=device_id)
+        race_start = db.load_race_state(conn).get("race_start_time")
         include_faults = any(m in _FAULT_COLUMNS for m in metrics)
+        include_laps = any(m in _LAP_COLUMNS for m in metrics)
         fault_rows = []
         if include_faults:
-            for r in db.fetch_faults(conn, device_id=device_id):
+            # limit=None: the default keeps only the newest 2000 fault rows,
+            # which silently dropped the start of a long race's window.
+            for r in db.fetch_faults(conn, limit=None, device_id=device_id):
                 ts = r["device_ts"] or 0
                 if (start_ts is None or ts >= start_ts) and (end_ts is None or ts <= end_ts):
                     fault_rows.append(r)
@@ -481,7 +576,7 @@ def write_xlsx(fileobj_or_path, start_ts=None, end_ts=None, metrics=None,
             conn.close()
 
     nrows = len(rows)
-    cols = _data_columns(metrics)
+    cols = _data_columns(metrics, race_start)
 
     wb = Workbook()
 
@@ -490,7 +585,7 @@ def write_xlsx(fileobj_or_path, start_ts=None, end_ts=None, metrics=None,
     ws.title = "Data"
     ws.append([_XLSX_COLS[k][0] for k in cols])
     for r in rows:
-        ws.append([_cell_value(k, r) for k in cols])
+        ws.append([_cell_value(k, r, race_start) for k in cols])
     # number formats + column widths
     numfmts = {i: _XLSX_COLS[k][1] for i, k in enumerate(cols, start=1) if _XLSX_COLS[k][1]}
     if numfmts:
@@ -501,9 +596,13 @@ def write_xlsx(fileobj_or_path, start_ts=None, end_ts=None, metrics=None,
         ws.column_dimensions[get_column_letter(i)].width = max(12, len(_XLSX_COLS[k][0]) + 2)
     _style_header(ws, len(cols), nrows)
 
+    # --- Laps sheet --------------------------------------------------------- #
+    if include_laps:
+        _write_laps_sheet(wb.create_sheet("Laps"), _laps_from_rows(rows), race_start)
+
     # --- Charts sheet (from a hidden, downsampled data block) ------------- #
     chart_keys = [k for k in cols
-                  if k not in ("device_ts_iso", "tz_label", "lat", "lon")
+                  if k not in ("device_ts_iso", "lat", "lon")
                   and _XLSX_COLS[k][3]]
     if nrows and chart_keys:
         step = max(1, math.ceil(nrows / _MAX_CHART_POINTS))
@@ -515,7 +614,7 @@ def write_xlsx(fileobj_or_path, start_ts=None, end_ts=None, metrics=None,
         cd.append(["Time"] + [_XLSX_COLS[k][0] for k in chart_keys])
         for r in sampled:
             cd.append([_excel_dt(r["device_ts"])]
-                      + [_cell_value(k, r) for k in chart_keys])
+                      + [_cell_value(k, r, race_start) for k in chart_keys])
 
         charts = wb.create_sheet("Charts")
         cats = Reference(cd, min_col=1, min_row=2, max_row=m + 1)
@@ -544,14 +643,13 @@ def write_xlsx(fileobj_or_path, start_ts=None, end_ts=None, metrics=None,
     # --- Faults sheet ----------------------------------------------------- #
     if include_faults:
         fs = wb.create_sheet("Faults")
-        fheaders = ["Time (local)", "Zone", "BMS error code", "BMS protections",
+        fheaders = ["Time (local)", "BMS error code", "BMS protections",
                     "Motor error code", "Motor alerts"]
         fs.append(fheaders)
         if fault_rows:
             for r in fault_rows:
                 fs.append([
                     _excel_dt(r["device_ts"]),
-                    _zone_label(r["device_ts"]),
                     r["bms_error_code"],
                     _safe(r["bms_protections"]),
                     r["mms_error_code"],
@@ -578,7 +676,7 @@ def main(argv=None):
     p = argparse.ArgumentParser(
         description="Export stored telemetry history. Output format follows the "
                     "--out extension: .xlsx -> formatted Excel workbook (Data + "
-                    "Charts + Faults), anything else -> raw CSV (stdout if omitted).")
+                    "Laps + Charts + Faults), anything else -> raw CSV (stdout if omitted).")
     p.add_argument("--out", "-o", help="output path; .xlsx for Excel, else CSV (default: stdout CSV)")
     p.add_argument("--device", default=DEVICE_ID, help=f"device id (default: {DEVICE_ID})")
     p.add_argument("--metric", "-m", action="append",

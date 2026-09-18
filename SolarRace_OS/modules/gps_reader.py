@@ -35,6 +35,8 @@ Typical use:
 
 import json
 import math
+import os
+import re
 import socket
 import threading
 import time
@@ -47,6 +49,25 @@ GPSD_PORT = 2947
 
 # Ask gpsd to stream JSON reports — the same request gpspipe -w makes.
 _WATCH_COMMAND = b'?WATCH={"enable":true,"json":true}\n'
+
+# Ask gpsd which receivers it actually holds. This is what separates the two
+# ways of having no position, which look identical from the fix alone:
+#   • gpsd has NO device      → nothing will ever arrive; a human must plug the
+#                               receiver in or fix DEVICES= in /etc/default/gpsd
+#   • gpsd has a device       → the receiver is there and still searching
+# Reporting both as "no fix yet" sent people looking for sky view when the
+# receiver was not connected at all.
+_DEVICES_COMMAND = b'?DEVICES;\n'
+
+# How long a /dev scan stays fresh. hardware() is called from the telemetry
+# loop's change detection, and walking /dev at loop rate to watch for a USB
+# plug event would be pure waste — enumeration takes a second or two anyway.
+_HARDWARE_SCAN_S = 5.0
+
+# How often to re-ask for the device list while gpsd is silent. gpsd announces
+# hot-plugged receivers with a DEVICE report, but only when udev tells it; the
+# poll is what notices a receiver plugged in on a Pi where that doesn't fire.
+_DEVICES_POLL_S = 10.0
 
 # How long a fix stays "current". gpsd emits TPV about once a second, so a fix
 # older than this means the receiver lost lock (tunnel, garage, antenna
@@ -109,6 +130,17 @@ class GPSReader:
         self._sats_used = None    # from SKY reports; nice for diagnostics
         self._last_error = None
         self._tpv_count = 0       # TPV reports seen (proves gpsd is talking)
+        # gpsd's own device list: None = not asked/answered yet, [] = gpsd is
+        # running but holds no receiver, [path, ...] = receivers it has open.
+        self._devices = None
+        # Full DEVICE entries behind the paths above (driver, bps, activated),
+        # for the hardware() debug line.
+        self._device_info = []
+        self._last_devices_poll = 0.0
+        # /dev scan cache — see _scan_serial_hardware().
+        self._hw_scan_time = 0.0
+        self._hw_ports = []
+        self._hw_configured = None
 
     # ------------------------------------------------------------------ #
     # Lifecycle                                                           #
@@ -181,18 +213,78 @@ class GPSReader:
             err = self._last_error
             age = time.time() - self._fix_time if has_fix else None
             sats = self._sats_used
+            devices = self._devices
 
         if not connected:
-            return f"GPS: gpsd unreachable at {self.host}:{self.port}" + (
-                f" ({err})" if err else "")
+            if err is None:
+                # First attempt hasn't finished yet — the worker prints this
+                # line immediately after start(). Saying "unreachable" before
+                # we have even tried once accused a gpsd that was fine.
+                return f"GPS: connecting to gpsd at {self.host}:{self.port}..."
+            return f"GPS: gpsd unreachable at {self.host}:{self.port} ({err})"
         if not has_fix:
             extra = f", {sats} sats" if sats is not None else ""
+            if devices == []:
+                # gpsd is up and answering, but owns no receiver: nothing will
+                # ever arrive until someone plugs one in (or fixes DEVICES= in
+                # /etc/default/gpsd). NOT "searching for satellites".
+                return ("GPS: no receiver — gpsd has no device "
+                        "(plug the GPS in, or check DEVICES= in "
+                        "/etc/default/gpsd)")
+            if devices and tpv == 0:
+                return (f"GPS: {devices[0]} attached, no data yet "
+                        f"(receiver silent{extra})")
+            if tpv:
+                # Reports ARE arriving — the receiver is alive and hunting.
+                # Deliberately WITHOUT the report count: this string drives
+                # change-only logging, and a counter that ticks every second
+                # would print a line every second for the whole cold start.
+                # Satellite count carries the same "is it working" signal and
+                # only moves when something actually changes.
+                sat_txt = (f"{sats} sats visible" if sats
+                           else "no satellites yet")
+                return f"GPS: searching for satellites ({sat_txt})"
             return (f"GPS: connected to gpsd, no fix yet "
                     f"({tpv} reports{extra})")
         sat_txt = f", {sats} sats" if sats is not None else ""
         if age > FIX_STALE_AFTER_S:
             return f"GPS: fix STALE ({age:.0f}s old{sat_txt})"
         return f"GPS: fix OK ({age:.1f}s old{sat_txt})"
+
+    def log_line(self):
+        """Coarse state, for the console's change-only logging.
+
+        status() carries the live numbers — fix age, report count, satellites —
+        which is right for the pit's health payload and wrong for a log: every
+        one of them changes on every pass, so logging status() on change printed
+        a line twice a second for the whole race. This says only WHICH state we
+        are in, so one line marks each transition and nothing is printed in
+        between. The numbers stay one status() call away.
+        """
+        with self._lock:
+            connected = self._connected
+            err = self._last_error
+            devices = list(self._device_info or [])
+            known = self._devices
+            has_fix = self._fix is not None
+            fresh = has_fix and (time.time() - self._fix_time) <= FIX_STALE_AFTER_S
+            tpv = self._tpv_count
+
+        if not connected:
+            if err is None:
+                return f"GPS: connecting to gpsd at {self.host}:{self.port}..."
+            return f"GPS: gpsd unreachable at {self.host}:{self.port} ({err})"
+        if has_fix:
+            return ("GPS: fix OK — position live" if fresh else
+                    "GPS: fix STALE — receiver lost lock")
+        if known == []:
+            return ("GPS: no receiver — gpsd has no device "
+                    "(plug the GPS in, or check DEVICES= in /etc/default/gpsd)")
+        if devices and tpv == 0:
+            return f"GPS: {devices[0].get('path')} attached, receiver silent"
+        if tpv:
+            return "GPS: searching for satellites"
+        return "GPS: connected to gpsd, no fix yet"
 
     @property
     def has_fix(self):
@@ -231,11 +323,14 @@ class GPSReader:
         """Open the gpsd socket and subscribe to the JSON stream."""
         sock = socket.create_connection((self.host, self.port), timeout=5.0)
         sock.settimeout(_SOCKET_TIMEOUT_S)
-        sock.sendall(_WATCH_COMMAND)
+        sock.sendall(_WATCH_COMMAND + _DEVICES_COMMAND)
         self._sock = sock
         with self._lock:
             self._connected = True
             self._last_error = None
+            self._devices = None        # this connection hasn't been told yet
+            self._device_info = []
+        self._last_devices_poll = time.time()
 
     def _stream(self):
         """Read newline-delimited JSON until the socket dies or we're stopped."""
@@ -245,7 +340,10 @@ class GPSReader:
                 chunk = self._sock.recv(4096)
             except socket.timeout:
                 # gpsd has nothing to say (commonly: no device attached).
-                # The connection is fine — keep waiting.
+                # The connection is fine — keep waiting, but use the lull to
+                # re-ask which receivers it holds, so a GPS plugged in mid-race
+                # is noticed even when no DEVICE announcement arrives.
+                self._poll_devices()
                 continue
             if not chunk:
                 return  # gpsd closed the connection → caller reconnects
@@ -271,7 +369,21 @@ class GPSReader:
             return
 
         kind = report.get("class")
-        if kind == "TPV":
+        if kind == "DEVICES":
+            devs = report.get("devices")
+            paths = [d.get("path") for d in devs
+                     if isinstance(d, dict) and d.get("path")] \
+                if isinstance(devs, list) else []
+            with self._lock:
+                self._devices = paths
+                self._device_info = [d for d in devs
+                                     if isinstance(d, dict)] \
+                    if isinstance(devs, list) else []
+        elif kind == "DEVICE":
+            # A receiver was activated or removed. gpsd sends the change, not
+            # the resulting list, so ask for the list rather than guessing.
+            self._poll_devices(force=True)
+        elif kind == "TPV":
             self._handle_tpv(report)
         elif kind == "SKY":
             # uSat = satellites actually used in the solution. Fall back to
@@ -325,8 +437,189 @@ class GPSReader:
             self._fix_time = time.time()
 
     # ------------------------------------------------------------------ #
+    # Hardware debug                                                      #
+    # ------------------------------------------------------------------ #
+    def wait_for_devices(self, timeout=1.0):
+        """Block briefly until gpsd has answered with its device list.
+
+        Only for the startup log line: gpsd is on localhost and answers ?DEVICES
+        in well under a millisecond, so this returns almost immediately when it
+        is running, and costs `timeout` exactly once when it is not — which is
+        itself the answer, and gets reported as such. Returns True if the list
+        arrived. Never raises; nothing but logging may depend on it.
+        """
+        end = time.time() + timeout
+        while time.time() < end:
+            with self._lock:
+                if self._devices is not None:
+                    return True
+            time.sleep(0.02)
+        with self._lock:
+            return self._devices is not None
+
+    def hardware(self):
+        """One debug line about the RECEIVER, not the fix.
+
+        status() answers "do we have a position?". This answers the question
+        you actually ask when we don't: *is the GPS even plugged in?* It puts
+        gpsd's view and the kernel's view on the same line, which is what tells
+        the three failure modes apart at a glance:
+
+          • no serial node at all      → the receiver is unplugged / dead cable
+          • node present, gpsd has none→ gpsd is pointed at the wrong device
+                                         (DEVICES= in /etc/default/gpsd), or was
+                                         started before the receiver enumerated
+          • gpsd holds the device      → the hardware is fine; anything missing
+                                         after this is sky view or antenna
+
+        Never raises and never blocks: an unreadable /dev or /etc is reported
+        as unknown, because a diagnostic that can fail is worse than none.
+        """
+        with self._lock:
+            devices = list(self._device_info or [])
+            known = self._devices
+            connected = self._connected
+            err = self._last_error
+        ports, configured = self._scan_serial_hardware()
+
+        if devices:
+            gpsd_part = "gpsd: " + "; ".join(self._describe_device(d)
+                                             for d in devices)
+        elif known == []:
+            gpsd_part = "gpsd: NO device"
+            if configured:
+                gpsd_part += f" (configured DEVICES={configured})"
+        elif not connected:
+            # No device list because there is no gpsd to ask. Say THAT — the
+            # kernel half of the line is still worth printing, since a receiver
+            # sitting there while gpsd is down is its own distinct fault.
+            gpsd_part = ("gpsd: not running / unreachable"
+                         + (f" ({err})" if err else ""))
+        else:
+            gpsd_part = "gpsd: device list not known yet"
+
+        held = {d.get("path") for d in devices if d.get("path")}
+        if ports:
+            os_part = "kernel: " + "; ".join(
+                self._describe_ports(name, paths, held)
+                for name, paths in ports)
+        else:
+            os_part = "kernel: no USB/serial port — nothing enumerated"
+        return f"GPS hardware: {gpsd_part} | {os_part}"
+
+    @staticmethod
+    def _describe_ports(name, paths, held):
+        """One physical USB device's ports, with gpsd's one marked.
+
+        A combined modem/GNSS module (the SIM7600 on this car) enumerates FIVE
+        ttyUSB nodes from one plug. Listing each with its full by-id string ran
+        to 400 characters of the same vendor name — unreadable, and the useful
+        fact (which of the five is the GPS) was buried. So: one entry per
+        physical device, and an arrow on the node gpsd is actually reading.
+        """
+        shown = []
+        for path in paths:
+            leaf = path.rsplit("/", 1)[-1]
+            shown.append(f"{leaf}←gpsd" if path in held else leaf)
+        ports = ", ".join(shown)
+        if not name:
+            return ports                # no by-id name (bare ttyUSB* scan)
+        # The by-id string repeats manufacturer and product, so it is long and
+        # mostly redundant; the tail (serial number) is the identifying part.
+        label = name if len(name) <= 40 else name[:20] + "…" + name[-16:]
+        return f"{label} ({ports})"
+
+    @staticmethod
+    def _describe_device(dev):
+        """Format one gpsd DEVICE entry: what it is and how it's being read."""
+        bits = [dev.get("path") or "?"]
+        for key in ("driver", "subtype", "subtype1"):
+            val = dev.get(key)
+            if val:
+                bits.append(str(val))
+                break                 # driver name is enough; subtype is fallback
+        bps = dev.get("bps")
+        if bps:
+            bits.append(f"{bps} bps")
+        # activated is an ISO timestamp; its presence is the interesting part —
+        # a device gpsd lists but has not activated is one it cannot read.
+        bits.append("active" if dev.get("activated") else "NOT activated")
+        return f"{bits[0]} ({', '.join(bits[1:])})" if len(bits) > 1 else bits[0]
+
+    def _scan_serial_hardware(self):
+        """(serial ports the kernel shows, DEVICES= from /etc/default/gpsd).
+
+        Cached for _HARDWARE_SCAN_S: hardware() is called from the telemetry
+        loop's change-detection, which runs many times a second, and this walks
+        /dev and reads a file. USB enumeration is not that fast.
+        """
+        now = time.time()
+        if now - self._hw_scan_time < _HARDWARE_SCAN_S:
+            return self._hw_ports, self._hw_configured
+
+        # [(device name, [node, ...]), ...] — grouped so a module that
+        # enumerates several nodes from one plug reads as one device.
+        groups = {}
+        try:
+            by_id = "/dev/serial/by-id"
+            # by-id first: the symlink NAME carries the vendor/product string,
+            # which is the difference between "a port exists" and "the u-blox
+            # receiver is plugged in".
+            for name in sorted(os.listdir(by_id)):
+                target = os.path.realpath(os.path.join(by_id, name))
+                # usb-<vendor>_<product>_<serial>-ifNN-portM → one key per
+                # physical device, with the per-interface suffix removed.
+                key = re.sub(r"-if[0-9a-fA-F]+-port\d+$", "",
+                             re.sub(r"^usb-", "", name))
+                groups.setdefault(key, []).append(target)
+        except OSError:
+            pass                       # no by-id tree (none plugged in) — fine
+        ports = sorted(groups.items())
+        if not ports:
+            try:
+                bare = sorted(f"/dev/{n}" for n in os.listdir("/dev")
+                              if n.startswith(("ttyUSB", "ttyACM")))
+            except OSError:
+                bare = []
+            ports = [("", bare)] if bare else []
+
+        configured = None
+        try:
+            with open("/etc/default/gpsd", "r") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line.startswith("DEVICES="):
+                        configured = line.split("=", 1)[1].strip().strip('"\'')
+                        break
+        except OSError:
+            pass                       # not a gpsd host (laptop) — nothing to say
+
+        self._hw_ports, self._hw_configured = ports, configured
+        self._hw_scan_time = now
+        return ports, configured
+
+    # ------------------------------------------------------------------ #
     # Helpers                                                             #
     # ------------------------------------------------------------------ #
+    def _poll_devices(self, force=False):
+        """Ask gpsd for its device list, at most every _DEVICES_POLL_S.
+
+        Never raises: a send that fails means the socket is gone, which the
+        read side is about to discover and reconnect over. Losing the device
+        list is a worse status line, never a worse fix.
+        """
+        now = time.time()
+        if not force and now - self._last_devices_poll < _DEVICES_POLL_S:
+            return
+        self._last_devices_poll = now
+        sock = self._sock
+        if sock is None:
+            return
+        try:
+            sock.sendall(_DEVICES_COMMAND)
+        except OSError:
+            pass
+
     def _close_socket(self):
         sock, self._sock = self._sock, None
         if sock is not None:
@@ -356,6 +649,7 @@ if __name__ == "__main__":
         while True:
             time.sleep(1.0)
             print(f"{reader.status():<55} {reader.get_coordinates()}")
+            print(f"    {reader.hardware()}")
     except KeyboardInterrupt:
         pass
     finally:

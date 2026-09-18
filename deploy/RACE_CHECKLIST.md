@@ -113,6 +113,20 @@ Watch for `🛑 regen brake light: GPIO 17 …` in the HUD's boot log. If it say
 **NOT DRIVEN**, the pin was not claimed and no lamp is being switched, however
 good the wiring looks.
 
+**To test it without driving the car**, stop the HUD (`deploy/stop_hud.sh`, so
+it lets go of the pin) and run the simulator from the Pi's own desktop:
+
+```bash
+./"Start HUD Demo.sh"        # then press R to hold the lamp on, R again to release
+```
+
+It drives the real `RegenLight` on GPIO 17 from a fake car, with the same
+thresholds and the same minimum-on hold. The lamp flashes on its own braking
+into every corner, `R` holds it lit while you walk to the back of the car, and
+the HUD's status line reads `🛑 BRAKE LIGHT ON` whenever the pin is being
+driven high. Hazard `Car silent — no data` (press `H` to reach it) shows the
+lamp releasing itself after two quiet seconds rather than sticking on.
+
 > ⚠️ **A GPIO pin cannot drive a lamp.** 3.3 V, ~16 mA. It switches a
 > logic-level MOSFET or an opto-isolated SSR, with a 10k pull-down on the gate
 > so the lamp stays off while the Pi boots. Circuit is in
@@ -136,6 +150,25 @@ Three independent things to look at, in this order:
 
 `NET` green with `PIT` red is the specific failure the badges exist to catch: a
 perfectly good internet connection and a dead uplink.
+
+### ☐ Confirm the GPS is actually receiving — not just that the modem is online
+
+The receiver is the GNSS engine inside the SIM7600 modem, and the modem being
+connected says nothing about it: LTE can sit at 100% signal while GNSS is switched
+off and gpsd holds no device at all. That combination is silent — the HUD simply
+never shows a position.
+
+```bash
+systemctl status gps-up      # active (exited), "handed /dev/ttyUSBx to gpsd"
+gpspipe -w -n 5              # TPV reports, not just VERSION
+```
+
+Or read the two `🛰️` lines `main.py` prints at startup. `searching for
+satellites` with a device named on the hardware line means the chain is healthy
+and only sky view is missing; `gpsd: NO device` or `no USB/serial port` is a
+setup fault to fix before rolling out. **Take the car outside and wait for a
+real fix before the race** — the GNSS antenna connector is separate from the
+LTE ones, and a loose one looks exactly like being parked indoors.
 
 ### ☐ Check GPS lap detection — **unproven, watch it**
 
@@ -400,6 +433,7 @@ is not evidence of a fault.
 | Pit dashboard | `Start Pit Dashboard.bat` → http://localhost:8000 (phones: http://<laptop-ip>:8000) |
 | Profile builder | `Build Speed Profiles.bat` → http://localhost:8502 |
 | Pit wall (big screen) | `python tools/pit_wall.py` → http://localhost:8503 |
+| Energy matrix | `Start Energy Matrix.bat` → http://localhost:8504 |
 | Spectator page (public) | https://orna2afeka.github.io/THE-RACE/ |
 | Presentation map | `docs/zolder_animation.html` (self-contained, works offline) |
 | Car logs | `~/hud-logs/hud.log` on the Pi |

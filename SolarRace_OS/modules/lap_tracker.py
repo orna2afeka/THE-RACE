@@ -86,6 +86,22 @@ GPS_HEALTH_TIMEOUT_S = 5.0
 CAN_DEAD_AFTER_S = 30.0
 GPS_ONLY_MIN_LAP_S = 60.0
 
+# How a lap was cut. Every one of these is passed to _trigger_lap by exactly one
+# route, and the pit's "Lap Source" tile names them in its caption — keep the two
+# in step (Pit_Dashboard/live_metrics.py).
+#
+#   gps         the finish-line crossing test fired
+#   gps_no_can  same crossing, with the motor controller silent, so the lap is
+#               timed by GPS alone and its distance is not to be trusted
+#   odometer    the distance fallback forced a lap the GPS trigger missed
+#   manual      the pit cut it from the Cut Lap button
+LAP_SOURCES = ("gps", "gps_no_can", "odometer", "manual")
+
+# Before the first lap of a run there is no trigger to name. This is a sentinel,
+# never a source: it is kept out of the telemetry snapshot (see snapshot()) so
+# the pit shows an unreported field rather than a fifth kind of lap.
+LAP_SOURCE_NONE = "none"
+
 
 class LapTracker:
     """Distance, energy, lap count and lap timing for one race.
@@ -130,7 +146,9 @@ class LapTracker:
 
         # --- laps ---------------------------------------------------------- #
         self.lap_count = 0
-        self.lap_source = "none"         # gps | odometer | manual | none
+        # gps | gps_no_can | odometer | manual, or LAP_SOURCE_NONE until a lap
+        # has actually been cut. Survives a restart — see state_dict/restore.
+        self.lap_source = LAP_SOURCE_NONE
         self.gps_lap_count = 0
         self.rejected_crossings = 0
         self.last_rejected_distance_m = None
@@ -145,6 +163,11 @@ class LapTracker:
         self._lap_start_energy_wh = 0.0
         self._lap_start_regen_energy_wh = 0.0
         self._lap_start_ts = None                  # monotonic
+        # Monotonic moment the last COUNTED lap ended. Equal to _lap_start_ts
+        # exactly when the current lap began by finishing one, which is how the
+        # HUD stopwatch tells a finished lap (hold its time) from the first
+        # sighting of the line or a pit correction (just restart the clock).
+        self.last_lap_finished_ts = None
         self._armed = False              # have we seen the line at least once?
 
         # --- GPS crossing state -------------------------------------------- #
@@ -378,6 +401,7 @@ class LapTracker:
             self.last_lap_time_s = (
                 (now - self._lap_start_ts) if self._lap_start_ts is not None else None)
             self.lap_source = source
+            self.last_lap_finished_ts = now
 
         self._lap_start_odometer_m = self.odometer_m
         self._lap_start_energy_wh = self.total_energy_wh
@@ -390,17 +414,69 @@ class LapTracker:
     # Commands from the pit                                               #
     # ------------------------------------------------------------------ #
     def force_lap(self, source="manual", now=None):
-        """Cut a lap now — the pit's manual override of the automatic trigger."""
+        """Cut a lap now — the pit's manual override of the automatic trigger.
+
+        Re-datums distance, energy and the lap clock, so the metres start from
+        zero again. Then RESYNCS TO THE FINISH LINE, which is the part that
+        makes the reset actually stick.
+
+        WHY UN-ARMING MATTERS. The cut moves the datum to wherever the car
+        happens to be — the pit box, usually. The GPS gate then measures the
+        next line crossing from THERE, and a pit exit is not 4000 m from the
+        line, so the crossing falls outside the 3800-4200 m window and is
+        thrown away. Nothing puts the datum back onto the line, so every
+        crossing after it is judged from a point the track does not agree
+        with, and lap counting drops onto the odometer fallback for the rest
+        of the race. Measured, before this line existed: cut at 2700 m, drive
+        out, and the next TWO crossings were rejected — at 1300 m and 900 m —
+        while lap_source went to "odometer" and stayed there.
+
+        Clearing `_armed` makes the next crossing a re-datum rather than a
+        judgement: the same "start" path a car gets on its first ever sight of
+        the line (see _on_finish_crossing). The out-lap is not counted, because
+        it is not a lap; from the line onwards every lap is line-to-line again
+        and the 4 km gate means something once more.
+
+        A manual cut is the pit SAYING the counter is not where the car is.
+        Carrying on trusting the old datum after being told that is the one
+        thing this must not do.
+        """
         self._trigger_lap(source, now)
         # Re-arm GPS immediately: after a manual cut the car may well be sitting
         # on the line, and leaving the zone latched would swallow the next
         # genuine crossing.
         self._in_finish_zone = False
+        # And take the next crossing as the new datum instead of distance-gating
+        # it — see the docstring.
+        self._armed = False
 
     def set_lap(self, lap_number, now=None):
-        """Correct the lap counter (pit recovery, e.g. after a Pi restart)."""
+        """Set the lap counter and start a fresh lap, WITHOUT counting one.
+
+        Two jobs, both of them pit recovery: correcting the count after a Pi
+        restart, and starting a clean lap when the car leaves the pit box.
+
+        The pit-exit case is why this is not force_lap(). A part-lap driven
+        before a stop is not a lap: counting it would file its part-lap time
+        and part-lap energy as real, and those numbers go on to feed the
+        per-lap history and the strategy matrix. count_it=False re-datums
+        distance, energy and the lap clock and records nothing.
+
+        Un-arms for the same reason force_lap() does — see its docstring. The
+        new datum is wherever the car is standing, which is not 4000 m from
+        the line, so without this the next crossing is judged against a window
+        it cannot satisfy and thrown away, and the car never finds the line
+        again. Measured: set_lap at 2700 m, then crossings rejected at 1300 m
+        and 900 m with lap_source stuck on "odometer".
+
+        Clearing `_in_finish_zone` matters here too: the car may be sitting in
+        the box inside the capture radius, and a latched zone would swallow
+        the crossing on the way back out.
+        """
         self.lap_count = max(0, int(lap_number))
         self._trigger_lap("manual_set", now, count_it=False)
+        self._in_finish_zone = False
+        self._armed = False
 
     def reset_energy(self):
         """Zero the energy totals without disturbing laps or distance."""
@@ -475,7 +551,12 @@ class LapTracker:
         return {
             "odometer_m": self.odometer_m if have_d else None,
             "calculated_lap": self.lap_count if have_d else None,
-            "lap_source": self.lap_source,
+            # The sentinel is not a trigger, so it goes out as null and the pit
+            # renders it as "—" like every other unreported field. Sending the
+            # string "none" put a fifth, meaningless value in a tile whose whole
+            # job is to name which of the four triggers cut the lap.
+            "lap_source": (self.lap_source
+                           if self.lap_source != LAP_SOURCE_NONE else None),
             "lap_distance_m": (self.odometer_m - self._lap_start_odometer_m
                                if have_d else None),
             "lap_started_ts": self.lap_started_ts,
@@ -514,6 +595,10 @@ class LapTracker:
             "total_energy_wh": self.total_energy_wh,
             "regen_energy_wh": self.regen_energy_wh,
             "lap_count": self.lap_count,
+            # Persisted with the lap it describes: lap_count comes back from the
+            # checkpoint after a reboot, so the trigger that cut that lap has to
+            # come back with it or the pit shows a restored lap with no source.
+            "lap_source": self.lap_source,
             "gps_lap_count": self.gps_lap_count,
             "lap_start_odometer_m": self._lap_start_odometer_m,
             "lap_start_energy_wh": self._lap_start_energy_wh,
@@ -538,6 +623,12 @@ class LapTracker:
             self.total_energy_wh = float(data.get("total_energy_wh", 0.0))
             self.regen_energy_wh = float(data.get("regen_energy_wh", 0.0))
             self.lap_count = int(data.get("lap_count", 0))
+            # A value from an older checkpoint, or a hand-edited file, must not
+            # be able to invent a trigger: anything not in LAP_SOURCES falls
+            # back to the sentinel.
+            restored_source = data.get("lap_source")
+            self.lap_source = (restored_source if restored_source in LAP_SOURCES
+                               else LAP_SOURCE_NONE)
             self.gps_lap_count = int(data.get("gps_lap_count", 0))
             self._lap_start_odometer_m = float(
                 data.get("lap_start_odometer_m", self.odometer_m))
@@ -566,6 +657,7 @@ class LapTracker:
         self._last_power_ts = None
         self._last_power_w = None
         self._lap_start_ts = None
+        self.last_lap_finished_ts = None
         return True
 
 
@@ -614,3 +706,97 @@ if __name__ == "__main__":
     print(f"  last lap dist   {t.last_lap_distance_m:.1f} m")
     print(f"  last lap energy {t.last_lap_energy_wh:.2f} Wh")
     print(f"  last lap time   {t.last_lap_time_s:.1f} s")
+
+    # The HUD stopwatch holds a lap's time only when the lap was FINISHED.
+    assert t.last_lap_finished_ts == t._lap_start_ts, "counted lap not marked"
+    t.set_lap(5, now=clock + 1.0)
+    assert t.last_lap_finished_ts != t._lap_start_ts, "set_lap looked like a lap"
+    print("  stopwatch marks ok")
+
+    # ---------------------------------------------------------------- #
+    # A manual cut must put the car BACK ON THE LINE, not just zero the
+    # metres. Zeroing alone left the datum at the pit box, and every
+    # crossing after that was judged against a 3800-4200 m window it could
+    # never satisfy — lap counting fell to the odometer fallback and stayed
+    # there. See force_lap().
+    # ---------------------------------------------------------------- #
+    print()
+    print("pit exit: cut the lap mid-lap, then reach the line")
+    c = LapTracker()
+    clk, trip = 5000.0, 0.0
+
+    def roll(metres, step=100.0):
+        """Drive `metres`, far from the line the whole way."""
+        global clk, trip
+        for _ in range(int(metres / step)):
+            clk += 2.0
+            trip += step
+            c.update_odometer(trip, now=clk)
+            c.update_gps(gps_at(2000.0), now=clk)
+
+    def over_the_line():
+        global clk
+        clk += 2.0
+        return c.update_gps(gps_at(0.0), now=clk)
+
+    roll(300.0)
+    assert over_the_line() == "start", "first sighting should arm, not count"
+    roll(4000.0)
+    assert over_the_line() == "lap", "a clean 4 km lap should count"
+    laps_before = c.lap_count
+
+    roll(2700.0)                       # into the pit, most of a lap done
+    c.force_lap("manual", now=clk)
+    assert round(c.odometer_m - c._lap_start_odometer_m) == 0, "cut did not zero the metres"
+    assert not c._armed, "cut must un-arm so the next crossing re-datums"
+
+    roll(1300.0)                       # out of the pit, round to the line
+    assert over_the_line() == "start", "the out-lap crossing must re-datum"
+    assert round(c.odometer_m - c._lap_start_odometer_m) == 0, "re-datum did not zero the metres"
+    assert c.lap_count == laps_before + 1, "only the manual cut should have counted"
+    assert c.rejected_crossings == 0, "no crossing should have been thrown away"
+
+    roll(4000.0)                       # and now a real lap, line to line
+    assert over_the_line() == "lap", "back in sync: a 4 km lap must count"
+    assert c.lap_source == "gps", "counted at the line, not by the odometer"
+    assert c.rejected_crossings == 0
+    print("  metres reset, line re-synced, next lap counted by GPS at 4000 m")
+
+    # The same, via set_lap — what the pit's "fresh lap" button sends. Must
+    # re-sync to the line exactly as force_lap does, AND must not count.
+    print()
+    print("pit exit via set_lap: fresh lap, nothing counted")
+    d = LapTracker()
+    dclk, dtrip = 9000.0, 0.0
+
+    def droll(metres, step=100.0):
+        global dclk, dtrip
+        for _ in range(int(metres / step)):
+            dclk += 2.0
+            dtrip += step
+            d.update_odometer(dtrip, now=dclk)
+            d.update_gps(gps_at(2000.0), now=dclk)
+
+    def dcross():
+        global dclk
+        dclk += 2.0
+        return d.update_gps(gps_at(0.0), now=dclk)
+
+    droll(300.0); assert dcross() == "start"
+    droll(4000.0); assert dcross() == "lap"
+    held = d.lap_count
+
+    droll(2700.0)
+    d.set_lap(held, now=dclk)
+    assert d.lap_count == held, "set_lap must hold the count it was given"
+    assert round(d.odometer_m - d._lap_start_odometer_m) == 0, "metres not zeroed"
+    assert not d._armed, "set_lap must un-arm so the next crossing re-datums"
+
+    droll(1300.0)
+    assert dcross() == "start", "the out-lap crossing must re-datum"
+    assert d.lap_count == held, "the out-lap must not have counted"
+    droll(4000.0)
+    assert dcross() == "lap", "back in sync: a 4 km lap must count"
+    assert d.lap_count == held + 1
+    assert d.lap_source == "gps" and d.rejected_crossings == 0
+    print("  count held, metres reset, line re-synced, no phantom lap")

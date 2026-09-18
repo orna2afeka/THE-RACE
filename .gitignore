@@ -30,6 +30,13 @@ REACT_MIGRATION_PROMPT.md
 *.bak-wal
 *.bak-shm
 
+# Session archives from tools/archive_db.py: one folder per practice day or
+# race, holding the retired telemetry_<stamp>.db and the manifest.txt that says
+# what is in it. *.db above already covers the database; this covers the
+# manifest beside it, so an archive never shows up as untracked noise the night
+# before a session.
+Pit_Dashboard/archive/
+
 # ---------------------------------------------------------------------------
 # Firebase credentials
 # ---------------------------------------------------------------------------

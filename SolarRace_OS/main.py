@@ -201,18 +201,13 @@ CELL_EXTREMES_EMIT_S = 1.0
 # and costs nothing; gpiozero debounces the contacts for us.
 VEHICLE_INPUT_POLL_S = 0.2
 
-# Target speed + corner look-ahead refresh. 5 Hz: fast enough that the number
+# Target speed refresh. 5 Hz: fast enough that the number
 # tracks the car down a straight, slow enough to be free.
 PROFILE_TICK_S = 0.2
 
 # Which profile the car runs until the pit says otherwise. The baseline is the
 # safe default — it is the lap the team actually measured.
 DEFAULT_STRATEGY = "base_210s"
-
-# How far ahead to look for a corner, and how big a speed drop is worth
-# interrupting the driver for. See speed_profile.look_ahead.
-TURN_LOOKAHEAD_M = 175.0
-TURN_MIN_DROP_KMH = 15.0
 
 # ==============================================================================
 # SMART CAN WORKER (Core Background Thread)
@@ -293,7 +288,7 @@ class SmartCANWorker(CANWorker):
         # See modules/regen_light.py, and READ ITS ELECTRICAL NOTE before wiring:
         # a GPIO pin switches a MOSFET, it does not drive a lamp.
         self.regen_light = RegenLight()
-        # Target speed + corner look-ahead. The car holds every generated
+        # Target speed. The car holds every generated
         # profile and the pit switches between them by name, so a strategy
         # change is a few bytes over the link instead of a 400-row table.
         self.strategy_inbox = StrategyCommandInbox()
@@ -301,7 +296,9 @@ class SmartCANWorker(CANWorker):
             lap_length_m=track.TRACK_LENGTH_METERS)
         self.active_strategy = DEFAULT_STRATEGY
         self._last_profile_tick = 0.0
-        self._last_turn_alert = None
+        # Lap start last sent to the HUD stopwatch. A sentinel, not None: None
+        # is a real value ("lap start unknown") that must still be sent once.
+        self._lap_timer_sent = object()
         self.last_cloud_print = time.time()
         self._last_bms_poll = 0.0
         self._poll_fail_count = 0
@@ -360,6 +357,10 @@ class SmartCANWorker(CANWorker):
         self._last_gps_publish = 0.0
         self._last_heartbeat = 0.0
         self._last_gps_log = ""
+        # Same change-only logging as _last_gps_log, for the receiver-hardware
+        # debug line: it must appear the moment a GPS is plugged in or drops
+        # off, and never once a second in between.
+        self._last_gps_hw_log = ""
 
     def run(self) -> None:
         """QThread entry point — runs the read loop with GUARANTEED teardown.
@@ -439,8 +440,19 @@ class SmartCANWorker(CANWorker):
         # CAN: GPS keeps working (and keeps reaching the pit) even if the bus
         # never opens.
         self.gps.start()
-        self._last_gps_log = self.gps.status()
+        # Give the reader its first round trip to gpsd before reporting, so
+        # both lines below state what IS rather than "connecting...". Bounded
+        # at 1 s, and only paid in full when gpsd is down — which is itself
+        # what the lines then say.
+        self.gps.wait_for_devices(1.0)
+        self._last_gps_log = self.gps.log_line()
         print(f"🛰️ {self._last_gps_log}")
+        # The receiver itself, not the fix: gpsd's device list next to the
+        # kernel's serial ports. Printed at startup (and again below whenever
+        # it changes) because "no fix" has three very different causes and
+        # this line is the one that says which — see GPSReader.hardware().
+        self._last_gps_hw_log = self.gps.hardware()
+        print(f"🛰️ {self._last_gps_hw_log}")
         print(f"🏁 {track.TRACK_LENGTH_METERS:.0f} m lap, finish line "
               f"{track.FINISH_LINE_LAT:.6f}, {track.FINISH_LINE_LON:.6f}")
 
@@ -468,8 +480,8 @@ class SmartCANWorker(CANWorker):
             except Exception as exc:
                 print(f"🎯 Strategy listener unavailable: {exc}")
         else:
-            print("⚠️ No speed profiles found — no target speed and no turn "
-                  "alerts. Generate them with: python tools/generate_profiles.py")
+            print("⚠️ No speed profiles found — no target speed. "
+                  "Generate them with: python tools/generate_profiles.py")
 
         while self._running:
             # ---- Pit commands and lap detection, CAN or no CAN ------------ #
@@ -485,6 +497,7 @@ class SmartCANWorker(CANWorker):
             # release are timers, and a quiet bus is exactly when they matter.
             self.regen_light.tick()
             self._tick_profile()
+            self._publish_lap_timer()
             self._publish_gps()
             self._save_lap_checkpoint()
             self._tick_cell_extremes()
@@ -903,10 +916,10 @@ class SmartCANWorker(CANWorker):
         self._emit_vehicle_flags(None)
 
     def _tick_profile(self) -> None:
-        """Target speed + corner look-ahead for the driver, from the active profile.
+        """Target speed for the driver, from the active profile.
 
         Runs on the CAN worker thread beside everything else that reads
-        LapTracker, so no locking is needed. Both values come from the SAME
+        LapTracker, so no locking is needed. The value comes from the SAME
         shared module the pit uses, so the target the driver is chasing is the
         target the strategist is judging them against.
         """
@@ -925,18 +938,24 @@ class SmartCANWorker(CANWorker):
         self.vehicle_state["motor"]["target_speed_kmh"] = round(target_kmh, 1)
         self.vehicle_state["motor"]["active_strategy"] = self.active_strategy
 
-        ahead = profile.look_ahead(lap_distance, TURN_LOOKAHEAD_M,
-                                   TURN_MIN_DROP_KMH)
-        # Emit only on change: the HUD strip would otherwise be restyled five
-        # times a second for the whole approach to every corner.
-        key = None if ahead is None else (round(ahead[0] / 10), round(ahead[1]))
-        if key != self._last_turn_alert:
-            self._last_turn_alert = key
-            if ahead is None:
-                self.turn_alert_updated.emit(0.0, 0.0, 0.0)
-            else:
-                self.turn_alert_updated.emit(float(ahead[0]), float(ahead[1]),
-                                             float(ahead[2]))
+    def _publish_lap_timer(self) -> None:
+        """Tell the HUD stopwatch when the current lap started, on change only.
+
+        Every lap cut (GPS, distance fallback, the pit's Cut Lap) re-datums
+        LapTracker._lap_start_ts, so watching that one value catches them all.
+        The finished lap's time goes with it only when a lap was actually
+        COUNTED: the first sighting of the line and a pit lap-number correction
+        restart the clock with nothing to show. Same process and the same
+        time.monotonic(), so the HUD can count up from the start itself.
+        """
+        start = self.laps._lap_start_ts
+        if start == self._lap_timer_sent:
+            return
+        self._lap_timer_sent = start
+        finished = (self.laps.last_lap_time_s
+                    if start is not None
+                    and self.laps.last_lap_finished_ts == start else None)
+        self.lap_timer_updated.emit(start, finished)
 
     def _apply_strategy_commands(self) -> None:
         """Switch the active speed profile when the pit selects a new strategy.
@@ -954,9 +973,7 @@ class SmartCANWorker(CANWorker):
                 print(f"🎯 STRATEGY -> {wanted} "
                       f"({profile.lap_time_s():.0f}s lap, "
                       f"{profile.average_kmh():.1f} km/h avg)")
-                # Force the next tick to re-evaluate rather than suppress the
-                # alert as unchanged — the new profile may corner differently.
-                self._last_turn_alert = None
+                # Force the next tick so the new target shows immediately.
                 self._last_profile_tick = 0.0
             else:
                 note = (f"unknown strategy {wanted!r}; "
@@ -1093,10 +1110,21 @@ class SmartCANWorker(CANWorker):
 
         # Log GPS state only when the summary changes, so the console shows the
         # moment a fix is acquired or lost without scrolling every second.
-        status = self.gps.status()
+        # log_line(), not status(): status() carries the fix age and report
+        # count, which change on every pass — logging it "only when it changes"
+        # would print twice a second forever. The state transitions are the
+        # thing worth a line; the numbers live in the health payload below.
+        status = self.gps.log_line()
         if status != self._last_gps_log:
             self._last_gps_log = status
             print(f"🛰️ {status}")
+
+        # And the hardware behind it, on the same change-only terms: a receiver
+        # plugged in mid-race, or a device gpsd has just lost, shows up here.
+        hardware = self.gps.hardware()
+        if hardware != self._last_gps_hw_log:
+            self._last_gps_hw_log = hardware
+            print(f"🛰️ {hardware}")
 
         # Only push when we actually have a position. Without this guard a Pi
         # left powered with the car off would write an all-empty payload to

@@ -27,7 +27,7 @@ import sqlite3
 import sys
 import threading
 import time
-from contextlib import closing
+from contextlib import asynccontextmanager, closing
 from datetime import datetime, timezone
 
 from fastapi import (FastAPI, HTTPException, Query, WebSocket,
@@ -167,6 +167,9 @@ def _val(row, key, default=None):
 _STATE_COLUMNS = {
     "soc": "bms_soc_percent", "voltage": "bms_voltage_V",
     "current": "bms_current_A", "pack_voltage": "mms_measured_voltage_V",
+    # Battery B's BMS (can1). The unprefixed three above are battery A's.
+    "soc_b": "bms2_soc_percent", "voltage_b": "bms2_voltage_V",
+    "current_b": "bms2_current_A",
     "motor_current": "mms_current_A", "regen_energy": "regen_energy",
     "target_speed_kmh": "target_speed_kmh",
     "soc_ctrl": "mms_estimated_soc_percent", "trip_m": "mms_trip_m",
@@ -324,11 +327,13 @@ def _race_clock(conn):
     elapsed_min = 0.0
     if r["is_racing"] and r["race_start_time"]:
         elapsed_min = (time.time() - r["race_start_time"]) / 60.0
-    return r, elapsed_min, max(0.0, 1440.0 - elapsed_min)
+    return r, elapsed_min, max(0.0, strategy_engine.RACE_DURATION_MIN
+                               - elapsed_min)
 
 
 DRIVER_STINT_KEY = "driver_stint"
 RACE_UNDO_KEY = "race_undo"
+STRATEGY_CHOICE_KEY = "strategy_choice"
 
 
 def race_undo_available(conn, now=None):
@@ -383,8 +388,12 @@ def driver_stint(conn, now=None):
         "warnS": DRIVER_STINT_WARN_S,
         "critS": DRIVER_STINT_CRIT_S,
     }
+    base["publicSynced"] = public_driver_synced(st.get("driver") or None)
     if not started:
-        return {**base, "startedAt": None, "stint": 0, "driver": None,
+        # A name typed before the green flag is kept here and carried into
+        # stint one when the race starts.
+        return {**base, "startedAt": None, "stint": 0,
+                "driver": st.get("driver") or None,
                 "elapsedS": None, "remainingS": None, "tier": limits.NORMAL,
                 "overdue": False, "canUndo": False, "previousStintS": None,
                 "accumulatedS": 0.0, "runningSince": None, "running": False,
@@ -443,6 +452,67 @@ def _set_stint_running(conn, running, now=None):
     st["accumulated_s"] = _stint_elapsed(st, now)
     st["running_since"] = now if running else None
     save_app_state(conn, DRIVER_STINT_KEY, st)
+
+
+# ── The driver's name on the public spectator page ─────────────────────────── #
+# The stint's driver name is mirrored to Firebase /public/driver, which
+# docs/index.html reads. No default: an unnamed stint deletes the node and the
+# page hides its driver card.
+#
+# The write happens on a background thread, never inside the request. The
+# "Driver changed" button is pressed mid pit stop and must not wait on the
+# internet. Endpoints that change the name wake the thread; it also re-checks
+# every PUBLIC_DRIVER_RESYNC_S, so a failed write is retried by itself.
+#
+# Only the REAL store publishes. The demo dashboard (SOLARRACE_DB_PATH pointed
+# at a demo store) must never put a made-up name in front of the public.
+PUBLIC_DRIVER_ENABLED = os.path.abspath(DB_PATH) == os.path.abspath(SQLITE_PATH)
+PUBLIC_DRIVER_RESYNC_S = 15
+PUBLIC_DRIVER_MAX_LEN = 40
+_NOT_SENT = object()
+_public_driver_sent = _NOT_SENT
+_public_driver_lock = threading.Lock()
+_public_driver_wake = threading.Event()
+
+
+def public_driver_synced(name):
+    """True when the public page shows `name` (or no name, for None), False
+    while a write is pending or failing, None when publishing is off."""
+    if not PUBLIC_DRIVER_ENABLED:
+        return None
+    return _public_driver_sent is not _NOT_SENT and _public_driver_sent == name
+
+
+def sync_public_driver():
+    """Make /public/driver match the current stint. Returns True when in sync."""
+    global _public_driver_sent
+    if not PUBLIC_DRIVER_ENABLED:
+        return None
+    with _public_driver_lock:
+        try:
+            with closing(ro_conn()) as conn:
+                st = load_app_state(conn, DRIVER_STINT_KEY) or {}
+            name = st.get("driver") or None
+            if _public_driver_sent is not _NOT_SENT and _public_driver_sent == name:
+                return True
+            import driver_message
+            driver_message.publish_driver_name(name)
+            _public_driver_sent = name
+            return True
+        except Exception as e:
+            print("[public driver] not published, will retry: %s" % e, flush=True)
+            return False
+
+
+def _kick_public_driver():
+    _public_driver_wake.set()
+
+
+def _public_driver_loop():
+    while True:
+        _public_driver_wake.clear()
+        sync_public_driver()
+        _public_driver_wake.wait(PUBLIC_DRIVER_RESYNC_S)
 
 
 def _stint_follows_race(st, old_start):
@@ -697,6 +767,60 @@ def build_cells(state, age, fresh):
     }
 
 
+# --------------------------------------------------------------------------- #
+# Energy used so far this lap
+# --------------------------------------------------------------------------- #
+# The car publishes last_lap_energy and total_race_energy, never "this lap so
+# far", so the pit subtracts: live total minus the total at the lap's first
+# sample. Net of regen on both sides, which is what makes the Current-lap tile
+# comparable with the Last-lap tile next to it.
+#
+# CACHED PER LAP, and that is not a micro-optimisation. db.lap_start_energy()
+# costs what the lap is big -- 0.2 ms for a normal lap, 200 ms for one whose
+# counter stalled and swallowed hours of samples -- and build_live() runs every
+# 2 s for every viewer on the pit LAN. Uncached, one stalled lap counter would
+# put the dashboard into exactly the read storm fetch_lap_track was rewritten to
+# escape.
+#
+# The TTL is what makes a late baseline self-correct. A lap's first sample is
+# normally the real start of it, but if the link was down at the trigger the
+# earliest sample the pit holds is further in, and the collector's catch-up
+# backfills the missing ones minutes later. Re-reading every 15 s picks the real
+# start up when it arrives instead of holding the understated figure all lap.
+_LAP_BASELINE_TTL_S = 15.0
+# No lap can end this far BELOW where it started. Scaled off what a lap
+# actually costs (the strategy matrix spends 72-88 Wh on one), so it stays
+# right if the profiles are rebuilt: net regen over a lap is a fraction of the
+# spend, never a multiple of it. Only an energy reset can clear this bar.
+LAP_ENERGY_IMPLAUSIBLE_WH = max(
+    [m.get("energy_wh") or 0.0 for m in C.PROFILE_MATRIX.values()] or [100.0])
+_lap_baseline = {}                       # lap -> (read_at, energy_wh, at_m)
+_lap_baseline_lock = threading.Lock()
+
+
+def _lap_energy_baseline(conn, lap):
+    """(energy_wh, metres_into_the_lap) for the start of `lap`, or (None, None).
+
+    The second value is how far into the lap the pit's earliest sample sits.
+    Near 0 it is the real start; a large number means the beginning of the lap
+    was never received and the subtraction understates it, which the tile says
+    out loud rather than quietly reporting a low number.
+    """
+    now = time.time()
+    with _lap_baseline_lock:
+        hit = _lap_baseline.get(lap)
+        if hit is not None and (now - hit[0]) < _LAP_BASELINE_TTL_S:
+            return hit[1], hit[2]
+    row = db.lap_start_energy(conn, lap)
+    energy = at_m = None
+    if row is not None:
+        energy, at_m = row["total_race_energy"], row["lap_distance_m"]
+    with _lap_baseline_lock:
+        _lap_baseline.clear()            # only the current lap is ever asked
+        _lap_baseline[lap] = (now, energy, at_m)
+    return energy, at_m
+
+
 def build_live(conn, manual_lap=-1):
     """The whole fast tier in one payload: tiles, sidebar, sectors, map.
 
@@ -708,6 +832,27 @@ def build_live(conn, manual_lap=-1):
 
     active_lap = manual_lap if manual_lap >= 0 else state["auto_lap"]
     expected = elapsed_min / C.TARGET_LAP_TIME_MIN if C.TARGET_LAP_TIME_MIN else 0
+
+    # Energy used so far this lap. Keyed on the CAR's lap, never on active_lap:
+    # a manual lap number typed in the pit is a correction to the COUNT, and
+    # using it here would look up stored rows that belong to a different lap.
+    lap_energy = lap_energy_from_m = None
+    car_lap, total_energy = state["auto_lap"], state["total_race_energy"]
+    if car_lap is not None and total_energy is not None:
+        base, lap_energy_from_m = _lap_energy_baseline(conn, car_lap)
+        if base is not None:
+            lap_energy = float(total_energy) - float(base)
+            # A baseline from BEFORE an energy reset. The pit can send
+            # reset_energy (lap_command.py), which zeroes total_race_energy on
+            # the car mid-lap while the stored first sample of that lap still
+            # holds the pre-reset total — subtracting gives a large negative
+            # that would sit on the tile for the rest of the lap. A mildly
+            # negative lap is REAL (energy is net of regen and may legitimately
+            # decrease; see LapTracker.update_energy), so only a difference
+            # bigger than any lap could physically regen is treated as the
+            # reset it is, and reported as unknown rather than as a number.
+            if lap_energy < -LAP_ENERGY_IMPLAUSIBLE_WH:
+                lap_energy = lap_energy_from_m = None
 
     # Prefer the car's own "metres since the last lap trigger". Once laps are
     # cut at the GPS finish line, odometer % 4000 no longer lines up with the
@@ -748,7 +893,7 @@ def build_live(conn, manual_lap=-1):
         "odometer_km": odo_km,
     }
 
-    # The 25 Live Metrics tiles, resolved and CLASSIFIED here. The browser is
+    # The Live Metrics tiles, resolved and CLASSIFIED here. The browser is
     # never handed a threshold to compare against — limits.classify() is the one
     # comparison in the project and both dashboards call it.
     tiles = []
@@ -765,7 +910,6 @@ def build_live(conn, manual_lap=-1):
                 "label": e["label"], "unit": e.get("unit", ""),
                 "spec": e.get("spec", ".0f"), "note": e.get("note"),
                 "text": bool(e.get("text")),
-                "lapTime": e.get("derived") == "last_lap_time_text",
                 "value": value, "tier": tier,
             })
         tiles.append({"group": group, "metrics": out})
@@ -794,6 +938,12 @@ def build_live(conn, manual_lap=-1):
         # looks like the car is losing the race.
         "lapDelta": None if active_lap is None else active_lap - expected,
         "odometerKm": odo_km,
+        # Wh used since this lap's trigger, net of regen — null until the car
+        # has reported both a lap and an energy total. `FromM` is how far into
+        # the lap the baseline sample sits, so the tile can flag a figure that
+        # is missing the start of the lap.
+        "currentLapEnergy": lap_energy,
+        "currentLapEnergyFromM": lap_energy_from_m,
         "lapDistanceM": lap_dist,
         "sectorId": sector_id,
         "sectorName": C.SECTION_NAMES.get(sector_id, "Section %d" % sector_id),
@@ -817,7 +967,17 @@ def build_live(conn, manual_lap=-1):
 
 
 # --------------------------------------------------------------------------- #
-app = FastAPI(title="Afeka Pit Wall — React backend")
+@asynccontextmanager
+async def _lifespan(_app):
+    # Started here, not at import: the tools/check_*.py scripts import this
+    # module and must not start writing to Firebase.
+    if PUBLIC_DRIVER_ENABLED:
+        threading.Thread(target=_public_driver_loop, name="public-driver",
+                         daemon=True).start()
+    yield
+
+
+app = FastAPI(title="Afeka Pit Wall — React backend", lifespan=_lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -1047,8 +1207,21 @@ def _history(chosen, minutes, start, end, limit, max_points):
     with closing(ro_conn()) as conn:
         lo, hi = db.time_bounds(conn)
         if hi is None:
-            return {"t": [], "series": {}, "cursor": None, "rangebreaks": [],
-                    "bounds": {"lo": None, "hi": None}, "total": 0}
+            # SAME KEYS AS THE POPULATED ANSWER BELOW. The History tab reads
+            # count, sampled and tz unconditionally, so a short payload here is
+            # not a smaller answer, it is a crash: this returned 200 without
+            # them on 2026-09-17 and the tab died on
+            # "Cannot read properties of undefined (reading 'toLocaleString')".
+            # An empty store is the first thing the pit sees after
+            # tools/archive_db.py, i.e. every practice morning and race morning.
+            # Zero ROWS is a true statement here and is not the same as the
+            # forbidden zero READING: nothing is being invented, the series are
+            # simply empty. tools/check_empty_db.py holds these two shapes equal.
+            return {"t": [], "series": {m.key: [] for m in chosen},
+                    "cursor": None, "rangebreaks": [],
+                    "bounds": {"lo": None, "hi": None},
+                    "total": 0, "count": 0, "sampled": 0, "downsampled": False,
+                    "tz": str(export_zone(None))}
         end_ts = end
         if REPLAY and end_ts is None:
             future = db.fetch_samples(conn, start_ts=lo, end_ts=hi,
@@ -1236,22 +1409,33 @@ def api_faults(limit_rows: int = Query(3000, ge=1, le=20000),
 
 
 # --------------------------------------------------------------------------- #
-# The profile the CAR is running
+# The profile the PIT selected
 # --------------------------------------------------------------------------- #
-# The pit's target speed must come from the profile the car is ACTUALLY flying,
-# not from whichever file this module was pinned to. Before this, api.py loaded
-# 210s.xlsx unconditionally, so selecting the 189 s strategy moved the driver's
-# HUD target and left the strategist reading the 210 s baseline: two numbers
-# called "target speed", disagreeing, on the two screens the crew compares.
+# The pit's target speed is the profile chosen in the Strategy section. Full
+# stop. The strategist picks a profile, sends it to the car, and every target
+# readout on this dashboard is then the curve they picked -- there is no second
+# source that can quietly move it underneath them.
 #
-# strategy_engine.profile_to_df() already existed for exactly this and was
-# never called from here. It loads through speed_profile.load_csv -- the CAR's
-# own loader -- so the pit and the car cannot interpret the same file
+# WHAT THIS REPLACED, and why it had to go. The selection used to be ignored on
+# purpose: the target came from the car's `active_strategy` column, falling back
+# to the Firebase acknowledgement, on the reasoning that "the message left the
+# pit" is not "the car changed profile". Sound in theory. In practice the ack
+# has no expiry, so with the car off and the store empty the dashboard served
+# whatever profile was last acknowledged -- a fast_189s ack from three weeks
+# earlier was still driving the target speed. A number nobody in the pit chose
+# and nobody could see the age of is worse than an assumption they made
+# themselves.
+#
+# The car's own report is NOT consulted here. That is deliberate and it is the
+# trade: if the car rejects a profile or has not applied it yet, this dashboard
+# shows what the pit asked for, not what the car is flying. The honest reading
+# of the car's answer lives in the Strategy section, which polls
+# /api/strategy/ack and says "Car confirmed it is running X" in as many words.
+# That is where a disagreement surfaces.
+#
+# strategy_engine.profile_to_df() loads through speed_profile.load_csv -- the
+# CAR's own loader -- so the pit and the car cannot read the same file
 # differently.
-#
-# THE SELECTION IS NEVER THE ANSWER. /api/strategy/select sends a name over the
-# radio and stores nothing, deliberately: "the message left the pit" is not
-# "the car changed profile". Only the car's own report counts.
 
 
 @memo(ttl=30)
@@ -1265,55 +1449,62 @@ def _profile_frame(key, path, mtime):
     return profile_to_df(path)
 
 
-@memo(ttl=20)
-def _acked_key():
-    """The profile key the car acknowledged over Firebase, or None.
+# The selection, cached in process. build_live() runs every 2 s per socket and
+# app_state is one tiny row, but this is also what makes a new selection appear
+# on the NEXT live frame rather than after a cache expiry: /api/strategy/select
+# updates this global in the same breath as it writes the row.
+_CHOICE_UNLOADED = object()
+_pit_choice = _CHOICE_UNLOADED
 
-    Memoised because this is a network call and build_live() runs every 2 s per
-    socket. read_strategy_ack() already swallows every exception and returns
-    None, and memo() deliberately does not cache a raised exception, so a
-    flapping link retries rather than latching a failure.
+
+def pit_strategy_choice():
+    """The profile key the pit last selected, or None if nobody has yet.
+
+    A key that is no longer on disk (the profile was renamed or deleted in the
+    Profile Builder) counts as no selection, so the caller falls back to the
+    default rather than to a curve that cannot be loaded.
     """
-    try:
-        import driver_message
-        ack = driver_message.read_strategy_ack()
-    except Exception:
-        return None
-    if not isinstance(ack, dict) or not ack.get("applied"):
-        return None
-    # The CAR writes "strategy". Not "key" -- see firebase_client.ack_strategy.
-    key = ack.get("strategy")
-    return key if isinstance(key, str) else None
+    global _pit_choice
+    if _pit_choice is _CHOICE_UNLOADED:
+        try:
+            with closing(ro_conn()) as conn:
+                stored = load_app_state(conn, STRATEGY_CHOICE_KEY)
+        except Exception:
+            return None                  # never CACHE a failed read; retry next
+        _pit_choice = stored if isinstance(stored, str) else None
+    return _pit_choice
+
+
+def set_pit_strategy_choice(key):
+    """Persist the pit's selection and make it live immediately."""
+    global _pit_choice
+    with closing(rw_conn()) as conn:
+        save_app_state(conn, STRATEGY_CHOICE_KEY, key)
+    _pit_choice = key
 
 
 def _active_profile(state):
-    """(frame, {key, source, ageS}) for the curve the car is running.
+    """(frame, {key, source}) for the curve the PIT selected.
 
-    Source order, best first:
+      "pit"     -- chosen in the Strategy section and sent to the car.
+      "default" -- nobody has chosen this race yet, so the target speed is an
+                   assumption. Flagged so the UI can SAY so: a target from an
+                   assumed profile must never look like one from a chosen
+                   profile, the same rule as has_gps versus the paddock
+                   fallback.
 
-      1. "car"  -- the telemetry column `active_strategy`. The car sets it in
-         the same block that sends the radio ack, so it is the same fact
-         arriving over a better path: it survives the radio being down, it
-         works in replay, and it costs nothing extra because the live read
-         already fetches it.
-      2. "ack"  -- the Firebase acknowledgement, for a car build that predates
-         the column.
-      3. "default" -- nothing has been reported. Flagged so the UI can SAY the
-         target speed is assumed. A target from an assumed profile must never
-         look like one from a confirmed profile; that is the same rule as
-         has_gps versus the paddock fallback.
+    `state` is accepted and unused. It is the live telemetry row, which carries
+    the car's own `active_strategy`; see the section comment for why that is
+    deliberately not read here.
     """
     try:
         available = speed_profile.available_profiles()
     except Exception:
         available = {}
 
-    key = state.get("active_strategy") if isinstance(state, dict) else None
-    source = "car"
+    key, source = pit_strategy_choice(), "pit"
     if not (isinstance(key, str) and key in available):
-        key, source = _acked_key(), "ack"
-        if not (isinstance(key, str) and key in available):
-            key, source = C.DEFAULT_STRATEGY_KEY, "default"
+        key, source = C.DEFAULT_STRATEGY_KEY, "default"
 
     path = available.get(key)
     frame = None
@@ -1326,8 +1517,7 @@ def _active_profile(state):
         # Last ditch. A target readout that vanishes is worse than a generic
         # one, and the label already says the profile is not confirmed.
         frame = load_velocity_profile(VELOCITY_PROFILE_PATH)
-        if source != "car":
-            source = "default"
+        source = "default"
     return frame, {"key": key, "source": source}
 
 
@@ -1713,6 +1903,7 @@ async def api_weather():
     with a black-holed default route that call can hang for minutes. The pit
     LAN is offline by design, so "unavailable" must come back fast.
     """
+    import pandas as pd
     from weather_service import fetch_zolder_weather
     try:
         df = await asyncio.wait_for(asyncio.to_thread(fetch_zolder_weather), 8.0)
@@ -1720,9 +1911,15 @@ async def api_weather():
         df = None
     if df is None:
         return {"available": False, "rows": []}
+    # Open-Meteo reports a missing hour as null, which pandas turns into NaN.
+    # Send it back as null (shown as "—"), never as 0 and never as bare NaN,
+    # which is not valid JSON.
+    def val(x):
+        return None if pd.isna(x) else x
     return {"available": True, "rows": [
-        {"t": str(r["Time"]), "temp": r["Temp (°C)"],
-         "cloud": r["Cloud Cover (%)"], "radiation": r["Solar Radiation (W/m²)"]}
+        {"t": str(r["Time"]), "temp": val(r["Temp (°C)"]),
+         "cloud": val(r["Cloud Cover (%)"]), "radiation": val(r["Solar Radiation (W/m²)"]),
+         "rain": val(r["Rain (mm)"]), "rainChance": val(r["Rain Chance (%)"])}
         for _, r in df.iterrows()]}
 
 
@@ -1759,7 +1956,7 @@ STRATEGY_WH_ROUND = 50.0
 # Energy per lap: what the car MEASURED under a profile once it has driven
 # enough laps of it to mean something, otherwise the stored estimate. Per
 # profile, so a profile nobody has driven keeps its original number.
-MIN_LAPS_FOR_MEASURED = 3
+MIN_LAPS_FOR_MEASURED = C.MIN_LAPS_FOR_MEASURED
 # The car finishes a lap about every 3.5 minutes, so nothing here can change
 # faster than that. Measured on the pit's own store the grouped query is
 # ~0.6 s, which must not run on every poll.
@@ -2037,7 +2234,14 @@ def api_race(body: RaceBody):
         # a stoppage does not eat into a driver's two hours.
         if body.isRacing and start is not None:
             existing = load_app_state(conn, DRIVER_STINT_KEY) or {}
-            if not existing.get("started_at"):
+            old_start = before.get("race_start_time")
+            # A stopped race started again at a DIFFERENT time is a new race,
+            # not a resume (Resume passes the stored start back unchanged).
+            # The old stint belongs to the old race: carrying its banked time
+            # over is how a fresh race opens hundreds of hours overdue.
+            new_race = not before.get("is_racing") and (
+                old_start is None or abs(float(start) - float(old_start)) > 1.0)
+            if not existing.get("started_at") or new_race:
                 # Green flag with nobody logged: driver one is in the car, and
                 # has been since the START — so a backdated race backdates the
                 # stint with it. That errs toward the two-hour change reading
@@ -2046,11 +2250,15 @@ def api_race(body: RaceBody):
                 # with "Driver changed", under-counting one loses a mandatory
                 # change. If a swap already happened in the missed window, that
                 # same button fixes it.
+                # A name typed before any stint existed belongs to driver one;
+                # a name left over from a previous race does not.
                 save_app_state(conn, DRIVER_STINT_KEY, {
-                    "started_at": start, "stint": 1, "driver": None,
+                    "started_at": start, "stint": 1,
+                    "driver": (None if existing.get("started_at")
+                               else existing.get("driver") or None),
                     "accumulated_s": 0.0, "running_since": start,
                 })
-            elif _stint_follows_race(existing, before.get("race_start_time")):
+            elif _stint_follows_race(existing, old_start):
                 # CORRECTING the start of a race already running. The stint was
                 # auto-started with the race and nothing has happened to it
                 # since, so it began when the race did and has to move with it.
@@ -2065,11 +2273,20 @@ def api_race(body: RaceBody):
                     **existing, "started_at": start,
                     "accumulated_s": 0.0, "running_since": start,
                 })
+            elif float(existing["started_at"]) < start - 1.0:
+                # A correction moved the race start past the moment this driver
+                # got in. Nobody drives before the race begins, so the stint
+                # began no earlier than the new start. Keep the stint number.
+                save_app_state(conn, DRIVER_STINT_KEY, {
+                    **existing, "started_at": start,
+                    "accumulated_s": 0.0, "running_since": start,
+                })
             else:
                 # Resume. Idempotent, so a mid-race restart changes nothing.
                 _set_stint_running(conn, True)
         elif not body.isRacing:
             _set_stint_running(conn, False)
+        _kick_public_driver()
         return {**db.load_race_state(conn), "driverStint": driver_stint(conn)}
 
 
@@ -2098,6 +2315,7 @@ def api_race_reset():
                        {"at": now, "race": race, "stint": stint})
         db.save_race_state(conn, False, None)
         save_app_state(conn, DRIVER_STINT_KEY, {})
+        _kick_public_driver()
         return {
             "ok": True,
             # What was thrown away, so the toast can say it and a mistake is
@@ -2126,6 +2344,7 @@ def api_race_reset_undo():
         save_app_state(conn, RACE_UNDO_KEY, {})
         # The stint clock has to match whatever the race clock now says.
         _set_stint_running(conn, bool(race.get("is_racing")), now)
+        _kick_public_driver()
         return {"ok": True, "race": db.load_race_state(conn),
                 "driverStint": driver_stint(conn, now)}
 
@@ -2158,7 +2377,7 @@ def api_driver_stint(body: StintBody):
         save_app_state(conn, DRIVER_STINT_KEY, {
             "started_at": now,
             "stint": int(st.get("stint", 0)) + 1,
-            "driver": (body.driver or "").strip() or None,
+            "driver": _clean_driver(body.driver),
             "accumulated_s": 0.0,
             "running_since": now if racing else None,
             # Everything needed to put it back exactly as it was.
@@ -2171,6 +2390,29 @@ def api_driver_stint(body: StintBody):
             # reports — wall time would overstate it across a stoppage.
             "previous_stint_s": _stint_elapsed(st, now) if prev_started else None,
         })
+        _kick_public_driver()
+        return driver_stint(conn, now)
+
+
+def _clean_driver(name):
+    return (name or "").strip()[:PUBLIC_DRIVER_MAX_LEN] or None
+
+
+@app.post("/api/driver_stint/name")
+def api_driver_stint_name(body: StintBody):
+    """Name (or un-name, with an empty name) the driver in the car NOW.
+
+    Touches nothing but the name: the countdown keeps running. Without this the
+    only way to name driver one, who is started automatically by the green
+    flag, would be "Driver changed", which restarts their two hours. Allowed
+    before the race too; the name is then carried into stint one.
+    """
+    now = time.time()
+    with closing(rw_conn()) as conn:
+        st = load_app_state(conn, DRIVER_STINT_KEY) or {}
+        st["driver"] = _clean_driver(body.driver)
+        save_app_state(conn, DRIVER_STINT_KEY, st)
+        _kick_public_driver()
         return driver_stint(conn, now)
 
 
@@ -2199,6 +2441,7 @@ def api_driver_stint_undo():
             restored["running_since"] = st.get("previous_running_since")
         save_app_state(conn, DRIVER_STINT_KEY, restored)
         _set_stint_running(conn, bool(db.load_race_state(conn).get("is_racing")), now)
+        _kick_public_driver()
         return driver_stint(conn, now)
 
 
@@ -2241,6 +2484,37 @@ def api_cut_lap():
     return {"ok": True, "sentAt": time.strftime("%H:%M:%S")}
 
 
+class LapSetBody(BaseModel):
+    # REQUIRED, and no default. The car reads this as `cmd.get("value") or 0`,
+    # so anything falsy zeroes the race lap count. A pit-exit button that can
+    # wipe the lap count by omitting a field is not one to have on a race
+    # dashboard, so the number has to be stated.
+    lap: int
+
+
+@app.post("/api/lap/set")
+def api_lap_set(body: LapSetBody):
+    """Start a FRESH lap on the car without counting one.
+
+    The pit-exit command. /api/cut_lap re-datums as well, but it records the
+    partial as a real lap -- part-lap time, part-lap energy, and one more on
+    the counter -- and those go on to feed the per-lap history and the
+    strategy matrix. This re-datums distance, energy and the lap clock and
+    records nothing.
+
+    `lap` is what the count should READ afterwards, not an increment. The UI
+    sends the count the car is already on, so a pit exit leaves it alone.
+    """
+    if body.lap < 0:
+        raise HTTPException(400, "lap must be 0 or more")
+    import driver_message
+    try:
+        driver_message.send_lap_set(body.lap)
+    except Exception as e:
+        raise HTTPException(502, "set lap failed: %s" % e)
+    return {"ok": True, "lap": body.lap, "sentAt": time.strftime("%H:%M:%S")}
+
+
 @app.get("/api/cut_lap/ack")
 def api_cut_lap_ack():
     """The car's acknowledgement. "Sent" and "the car is running it" are not
@@ -2260,9 +2534,21 @@ class StrategyBody(BaseModel):
 def api_strategy_select(body: StrategyBody):
     """Only the strategy NAME goes over the link: the car already holds all
     five generated profiles, so this is a few bytes rather than a 400-row
-    table, and the profile it flies is the one committed to git."""
+    table, and the profile it flies is the one committed to git.
+
+    This is also the moment the PIT's own target speed changes -- see "The
+    profile the PIT selected". The choice is stored BEFORE the radio send and
+    stays stored if that send fails: a dead link does not unmake the pit's
+    decision, and the caller is told the send failed either way. Storing it
+    after would mean a radio glitch silently left every target readout on the
+    previous profile.
+
+    Moving the dropdown alone changes nothing; pressing Send does. A target
+    speed that followed a stray scroll wheel would be a different kind of bug.
+    """
     if not any(s["key"] == body.key for s in C.STRATEGIES):
         raise HTTPException(400, "unknown strategy %r" % body.key)
+    set_pit_strategy_choice(body.key)
     import driver_message
     try:
         driver_message.send_strategy(body.key)

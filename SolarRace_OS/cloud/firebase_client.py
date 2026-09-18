@@ -442,13 +442,20 @@ def _push_directly(payload):
 #   1. A field is public because it is listed here. Nobody makes something
 #      public by accident, and adding a metric to the car does not silently
 #      publish it.
-#   2. NO POSITION. lat/lon are deliberately absent: the page places the car
-#      from lap_distance_m along the baked centreline, which puts it in the
-#      right corner without broadcasting where the car actually is. The
-#      spectator map is a schematic and does not need better.
+#   2. POSITION IS PUBLIC, BY DECISION. lat/lon used to be held back so the
+#      page placed the car from lap_distance_m along the baked centreline --
+#      right corner, no real coordinates. The team chose to publish the true
+#      position instead, because lap_distance_m is a distance since a datum and
+#      a datum that is stale (a Pi restarted mid-lap, a trip reset taken in the
+#      garage) puts the public marker somewhere the car is not.
+#
+#      Know what this means: this node has no credentials, so the live racing
+#      line, the pit stops and the exact speed through every corner are readable
+#      by anyone with the URL, rival teams included, and stay readable once
+#      copied. Removing the two lines below is all it takes to go back.
 #   3. Size. This is read by every viewer's browser every time it changes, and
 #      RTDB egress is metered. The full payload is a few hundred fields of
-#      cell voltages and thermistors; this is seven numbers.
+#      cell voltages and thermistors; this is nine numbers.
 PUBLIC_PATH = 'public/live'
 
 # Slower than the 0.5 s pit feed on purpose. The pit is making decisions off
@@ -471,12 +478,19 @@ def _public_snapshot(vehicle_state):
     """
     motor = vehicle_state.get("motor") or {}
     battery = vehicle_state.get("battery") or {}
+    gps = vehicle_state.get("gps") or {}
     return {
         # Server-independent: the page compares this against its own clock to
         # decide whether the feed is live, so it must be the moment the car
         # sampled, not the moment anything received it.
         "ts": time.time(),
         "lap": motor.get("calculated_lap"),
+        # Position, when there is a fix. gps is left EMPTY by the car until a
+        # real one arrives (main._refresh_gps), so these come out None and
+        # firebase-admin drops them -- the page then falls back to
+        # lap_distance_m rather than drawing the car at 0,0 in the Atlantic.
+        "lat": gps.get("lat"),
+        "lon": gps.get("lon"),
         "lap_distance_m": motor.get("lap_distance_m"),
         "odometer_m": motor.get("odometer_m"),
         "speed_kmh": motor.get("mms_vehicle_speed_kmh"),

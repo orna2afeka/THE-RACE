@@ -41,7 +41,8 @@ def _fetch_or_raise():
     # Latitude and longitude of the Zolder track, Belgium
     url = ("https://api.open-meteo.com/v1/forecast"
            "?latitude=50.9895&longitude=5.2568"
-           "&hourly=temperature_2m,cloudcover,direct_radiation&forecast_days=2")
+           "&hourly=temperature_2m,cloudcover,direct_radiation,precipitation,precipitation_probability"
+           "&forecast_days=2")
     response = requests.get(url, timeout=_TIMEOUT)
     # A 4xx/5xx still parses as JSON and would otherwise KeyError further down
     # with a message that says nothing about the request having failed.
@@ -51,7 +52,9 @@ def _fetch_or_raise():
         "Time": pd.to_datetime(data["hourly"]["time"]),
         "Temp (°C)": data["hourly"]["temperature_2m"],
         "Cloud Cover (%)": data["hourly"]["cloudcover"],
-        "Solar Radiation (W/m²)": data["hourly"]["direct_radiation"]
+        "Solar Radiation (W/m²)": data["hourly"]["direct_radiation"],
+        "Rain (mm)": data["hourly"]["precipitation"],
+        "Rain Chance (%)": data["hourly"]["precipitation_probability"],
     })
     # Cutting the data from the current time to 24 hours ahead
     current_time = pd.Timestamp.now().tz_localize(None)

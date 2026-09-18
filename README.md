@@ -184,6 +184,9 @@ THE RACE/                             # ← repo root
 ├── Demo Dashboard.bat                # The same dashboard on a synthetic store (port 8010) — never touches telemetry.db
 ├── Build Speed Profiles.bat          # Double-click launcher → the profile builder on port 8502
 ├── Start Pit Wall.bat                # Double-click launcher → the big-screen pit wall on port 8503
+├── Start Energy Matrix.bat           # Double-click launcher → what each speed profile COSTS, on port 8504
+├── Start HUD Demo.bat                # Double-click launcher → the driver HUD on a fake car (Windows)
+├── Start HUD Demo.sh                 # The same on the Pi — and there it drives the REAL brake light
 ├── requirements.txt                  # Shared/root-tool dependencies
 │
 ├── SolarRace_OS/                     # Edge code — runs on the Raspberry Pi
@@ -254,7 +257,8 @@ THE RACE/                             # ← repo root
 │   ├── check_limits.py               # Headless checks: gauge tiers, blink edges, no-data
 │   ├── replay_limits.py              # Replays telemetry.db: how often each tier would fire
 │   ├── generate_profiles.py          # Builds profiles/*.csv from Pit_Dashboard/210s.xlsx
-│   ├── hud_sim.py                    # Drives the driver HUD without a car, for UI work
+│   ├── hud_sim.py                    # Drives the driver HUD without a car, for UI work. On a Pi it
+│   │                                 #   also drives the real regen brake light on GPIO 17 (R holds it lit)
 │   ├── demo_seed.py / demo_feed.py   # Build and keep live the synthetic store Demo Dashboard.bat uses
 │   ├── build_zolder_track.py         # Bakes the OSM centreline → zolder_centreline.py
 │   ├── build_zolder_animation.py     # Bakes ALL THREE pages: the presentation map, the
@@ -494,10 +498,14 @@ the car keeps pushing to `telemetry_history`.
 
 **Export.** The dashboard's Export panel produces a clean, readable **Excel
 workbook** (`.xlsx`): a formatted **Data** sheet (human-friendly columns with
-units, frozen header, filter), a **Charts** sheet of history graphs, and a
-**Faults** sheet. The system chips pick which columns/charts/sheets
-appear. (Internal keys, redundant timestamps, and the raw fault columns from the
-old CSV dump are gone — no more `#NAME?` in Excel.)
+units, frozen header, filter, and a **Race Time** column counted from the race
+start), a **Laps** sheet (one row per lap: finish time, lap time, energy,
+regen, distance, average speed, plus best and average), a **Charts** sheet of
+history graphs, and a **Faults** sheet. The system chips pick which
+columns/charts/sheets appear; "Laps / Energy" adds the Laps sheet and "Errors /
+Faults" the Faults sheet. Missing readings are empty cells, never 0. (Internal
+keys, redundant timestamps, per-row "last lap" repeats, the Lap Trigger
+diagnostic and the raw fault columns are left out — no more `#NAME?` in Excel.)
 
 **From the command line** (same filters; output format follows the `--out`
 extension — `.xlsx` → workbook, anything else → raw CSV):

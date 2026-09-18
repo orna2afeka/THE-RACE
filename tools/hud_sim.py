@@ -11,17 +11,24 @@ what you see here is what the driver sees — layout, colours, thresholds and al
     python tools/hud_sim.py --profile fast_189s
     python tools/hud_sim.py --no-tour          # no automatic hazards
 
-    (or double-click "Start HUD Demo.bat" at the repo root)
+    (or double-click "Start HUD Demo.bat" on Windows, ./"Start HUD Demo.sh" on the Pi)
 
 Keys (simulator only — the HUD's own Ctrl+R / Ctrl+T / Alt+F4 still work):
-    M   send a pit message        T   force a turn warning for 6 s
-    N   clear the pit message     P   pause / resume the virtual car
+    M   send a pit message        P   pause / resume the virtual car
+    N   clear the pit message
     H   next hazard (stops tour)  X   clear the hazard
+    R   hold hard regen on/off (brake light stays lit while it is on)
+
+THE REGEN BRAKE LIGHT IS REAL HERE. On a Pi this drives the actual lamp on
+GPIO 17 through modules.regen_light.RegenLight — the same object, thresholds
+and minimum-on hold main.py uses, fed the fake car's motor power. So braking
+into a corner in the simulator lights the bench lamp, and the HUD's status line
+says BRAKE LIGHT ON at the same moment. Off the car (no gpiozero, or the pin
+already claimed by a running HUD) nothing is driven and the logic still runs:
+the startup line says which of the two you have. --no-regen-light skips it.
 
 The virtual car drives the selected speed profile with a little lag and noise,
-so the TARGET readout genuinely goes green and amber, and the corner warnings
-fire off the same profile.look_ahead() the car uses — same window, same minimum
-drop.
+so the TARGET readout genuinely goes green and amber.
 
 EVERY SCREEN HAS NUMBERS. DS003 (30 cell temperatures) and DS004 (26 cell
 voltages) are fed from the same fake pack as the headline gauges, so the hottest
@@ -43,6 +50,7 @@ import argparse
 import math
 import os
 import random
+import signal
 import sys
 import time
 
@@ -64,10 +72,7 @@ from cell_extremes import RollingExtremes                   # noqa: E402
 import speed_profile                                        # noqa: E402
 from driver_dash_v2 import RacingDashboard, RACING_QSS      # noqa: E402
 from modules import mms_parser, pt1000                      # noqa: E402
-
-# Matches main.py — the sim must warn about the same corners the car does.
-TURN_LOOKAHEAD_M = 175.0
-TURN_MIN_DROP_KMH = 15.0
+from modules.regen_light import RegenLight, REGEN_LIGHT_PIN  # noqa: E402
 
 TICK_MS = 100                      # 10 Hz, the car's profile tick rate
 
@@ -108,6 +113,11 @@ MOTOR_MAX_W = 5600.0               # the highest power the car has recorded
 # Power Limit lit a quarter of the time. The real car's 99th percentile is
 # 4.1 kW, so the limit should be an occasional event, not the normal state.
 DRIVE_W = 3900.0
+
+# What the R key feeds the light: hard regen, well below regen_light.ON_BELOW_W
+# and inside the -3.5 kW the fake car can make on its own, so the bench sees the
+# same power the car reports braking hard into a corner.
+FORCED_REGEN_W = -900.0
 
 
 def raw_rpm_for_speed(kmh: float) -> int:
@@ -207,14 +217,8 @@ def _hz_hot_cell(f):
 
 def _hz_reverse(f):
     f["map"] = (mms_parser.motor_map_name(REVERSE_MAP_RAW), REVERSE_MAP_RAW)
-    f["flags"] = dict(f["flags"], reverse=True)
     f["speed"] = 3.0
     f["power_w"] = 180.0
-    return f
-
-
-def _hz_parking_brake(f):
-    f["flags"] = dict(f["flags"], parking_brake=True)
     return f
 
 
@@ -239,7 +243,6 @@ HAZARDS = [
     ("Low battery / weak cell", _hz_low_battery, None),
     ("Hot cell in module B", _hz_hot_cell, None),
     ("Reverse selected", _hz_reverse, None),
-    ("Parking brake on while moving", _hz_parking_brake, None),
     ("Three faults at once", _hz_multi, None),
     ("CAN bus error", None, "can_error"),
     ("Car silent — no data", None, "silent"),
@@ -269,7 +272,6 @@ class FakeCar:
         self.t = 0.0                       # simulated seconds since start
         self.paused = False
         self._script_idx = 0
-        self._last_turn_key = None
 
         # Fixed per-cell character, so the grids look like a real pack (the
         # same cells run warm or low every lap) instead of flickering noise.
@@ -361,20 +363,6 @@ class FakeCar:
         self._script_idx += 1
         return payload
 
-    def turn_ahead(self):
-        """(distance, max_kmh, drop) for a corner worth warning about, or None.
-
-        Change-detected exactly like main.py._tick_profile. Returns False when
-        nothing changed since the last call.
-        """
-        ahead = self.profile.look_ahead(self.lap_distance_m, TURN_LOOKAHEAD_M,
-                                        TURN_MIN_DROP_KMH)
-        key = None if ahead is None else (round(ahead[0] / 10), round(ahead[1]))
-        if key == self._last_turn_key:
-            return False
-        self._last_turn_key = key
-        return ahead
-
 
 def natural_alerts(frame) -> list:
     """Alerts the car raises by itself from what it is doing, no hazard needed.
@@ -391,17 +379,26 @@ def natural_alerts(frame) -> list:
 
 
 def build_sim(hud: RacingDashboard, car: FakeCar, strategy: str,
-              tour: bool) -> QTimer:
-    """Wire a timer that pushes the fake car into the HUD's real slots."""
+              tour: bool, light=None) -> QTimer:
+    """Wire a timer that pushes the fake car into the HUD's real slots.
+
+    `light` is a started RegenLight (or None). It is fed the fake car's motor
+    power exactly where main.py feeds it the controller's — one call per frame
+    of power, plus a tick() every pass so the minimum-on hold and the stale
+    release run off the clock rather than off traffic.
+    """
 
     normal_status = "● SIMULATION — no CAN bus"
     state = {
         "hazard": None,            # index into HAZARDS, or None
         "tour": tour,
         "real_s": 0.0,
-        "forced_turn_until": -1.0,
         "last": {},                # last value pushed per slot, to push changes only
+        "lap_idx": None,           # laps completed, to spot a line crossing
+        "lap_start": None,         # time.monotonic() the current lap started
         "extremes_emit_t": -1.0,
+        "force_regen": False,      # R key: hold the lamp on for a wiring check
+        "lamp": False,             # last lamp state, for the console log
     }
 
     # Rule 3.5.6 screen. Driven by the SIMULATED clock, so a time-scaled run
@@ -419,6 +416,27 @@ def build_sim(hud: RacingDashboard, car: FakeCar, strategy: str,
         if state["last"].get(key, object()) != value:
             state["last"][key] = value
             fn(value)
+
+    def drive_lamp(power_w):
+        """Feed one power reading to the brake light and log any change.
+
+        Returns the lamp state. Called with None when the car is sending
+        nothing at all, which feeds the light no reading: after STALE_AFTER_S
+        the lamp releases itself, and watching that happen on the bench is the
+        point of the "car silent" hazard.
+        """
+        if light is None:
+            return False
+        lit = light.update(power_w) if power_w is not None else light.tick()
+        if lit != state["lamp"]:
+            state["lamp"] = lit
+            power = "—" if power_w is None else f"{power_w:7.0f} W"
+            print(f"[sim] brake light {'ON ' if lit else 'off'}  "
+                  f"(motor power {power}, flashes {light.flashes})")
+        return lit
+
+    def status_with_lamp(text):
+        return f"{text}   🛑 BRAKE LIGHT ON" if state["lamp"] else text
 
     def set_hazard(idx):
         prev = state["hazard"]
@@ -445,14 +463,16 @@ def build_sim(hud: RacingDashboard, car: FakeCar, strategy: str,
             "cell_t": car.cell_temps(),
             "cell_v": car.cell_voltages(),
             "map": (mms_parser.motor_map_name(NORMAL_MAP_RAW), NORMAL_MAP_RAW),
-            "flags": {"ecu_on": True, "parking_brake": False,
-                      "lights_on": True, "reverse": False},
             "alerts": None,        # None = derive from state
         }
 
     def show_silent():
+        # No power frames at all, so the light gets no reading: it releases
+        # after STALE_AFTER_S rather than staying stuck lit. See regen_light.py.
+        drive_lamp(None)
         # Exactly what main.py._emit_zeros blanks.
-        push("status", hud._on_status, "● SILENT — no data from the car")
+        push("status", hud._on_status,
+             status_with_lamp("● SILENT — no data from the car"))
         hud._on_rpm(None)
         hud._on_speed(None)
         hud._on_voltage(None)
@@ -482,6 +502,9 @@ def build_sim(hud: RacingDashboard, car: FakeCar, strategy: str,
                 set_hazard(want)
 
         if car.paused:
+            # Still tick the lamp: its minimum-on hold and its stale release are
+            # timers, and a frozen car is a car sending nothing.
+            drive_lamp(None)
             return
         car.step(TICK_MS / 1000.0 * car.time_scale)
 
@@ -494,6 +517,15 @@ def build_sim(hud: RacingDashboard, car: FakeCar, strategy: str,
         f = frame_now()
         if hz is not None and HAZARDS[hz][1] is not None:
             f = HAZARDS[hz][1](f)
+        if state["force_regen"]:
+            # R key. Set on the FRAME, not just on the light, so the power gauge
+            # shows the same regen the lamp is being driven from.
+            f["power_w"] = FORCED_REGEN_W
+
+        # The brake light, driven from the frame's motor power — the same value
+        # main.py hands it from mms_power_W, and before the HUD is touched, so
+        # the lamp is never a frame behind what the driver sees.
+        drive_lamp(f["power_w"])
 
         speed = f["speed"]
         hud._on_rpm(raw_rpm_for_speed(speed))
@@ -547,24 +579,27 @@ def build_sim(hud: RacingDashboard, car: FakeCar, strategy: str,
 
         hud._on_target_speed(car.profile.speed_kmh_at(car.lap_distance_m), strategy)
 
+        # Lap stopwatch, on the REAL clock like the car's. The first tick is the
+        # car leaving the line (clock starts, nothing held); every later wrap is
+        # a finished lap. At --speed above 1 the laps are simply shorter.
+        lap_idx = int(car.distance_m // car.profile.lap_length_m)
+        if lap_idx != state["lap_idx"]:
+            now = time.monotonic()
+            finished = (None if state["lap_start"] is None
+                        else now - state["lap_start"])
+            state["lap_idx"], state["lap_start"] = lap_idx, now
+            hud._on_lap_timer(now, finished)
+
         push("map", lambda m: hud._on_motor_map(*m), f["map"])
-        push("flags", hud._on_vehicle_flags, f["flags"])
 
         if special != "can_error":
             alerts = f["alerts"] if f["alerts"] is not None else natural_alerts(f)
             push("alerts", hud._on_alerts, alerts[:3])
             status = (normal_status if hz is None
                       else f"● SIMULATION — hazard: {HAZARDS[hz][0]}")
-            push("status", hud._on_status, status)
-
-        # Turn warning — the forced one (T key) wins while it is running.
-        if car.t >= state["forced_turn_until"]:
-            ahead = car.turn_ahead()
-            if ahead is not False:
-                if ahead is None:
-                    hud._on_turn_alert(0.0, 0.0, 0.0)
-                else:
-                    hud._on_turn_alert(*ahead)
+            if state["force_regen"]:
+                status = "● SIMULATION — REGEN HELD (R to release)"
+            push("status", hud._on_status, status_with_lamp(status))
 
         payload = car.due_pit_message()
         if payload is not False:
@@ -581,15 +616,23 @@ def build_sim(hud: RacingDashboard, car: FakeCar, strategy: str,
         hud.set_pit_message({"category": "TEST", "value":
                              "PIT MESSAGE — PRESS N TO CLEAR"})
 
-    def force_turn():
-        state["forced_turn_until"] = car.t + 6.0
-        hud._on_turn_alert(120.0, 34.0, 48.0)
-        QTimer.singleShot(6000, lambda: hud._on_turn_alert(0.0, 0.0, 0.0))
-
     def toggle_pause():
         car.paused = not car.paused
-        push("status", hud._on_status,
-             "● SIMULATION — PAUSED" if car.paused else normal_status)
+        push("status", hud._on_status, status_with_lamp(
+            "● SIMULATION — PAUSED" if car.paused else normal_status))
+
+    def toggle_regen():
+        """Hold hard regen on, so the lamp stays lit while the wiring is checked.
+
+        A corner gives a lamp that is on for a second or two — enough to see it
+        work, not enough to walk to the back of the car and look at it.
+        """
+        state["force_regen"] = not state["force_regen"]
+        if state["force_regen"]:
+            print(f"[sim] forced regen ON ({FORCED_REGEN_W:.0f} W) — "
+                  f"lamp stays lit until R again")
+        else:
+            print("[sim] forced regen off")
 
     def next_hazard():
         state["tour"] = False           # a human is driving the hazards now
@@ -602,10 +645,10 @@ def build_sim(hud: RacingDashboard, car: FakeCar, strategy: str,
 
     QShortcut(QKeySequence("M"), hud, activated=send_msg)
     QShortcut(QKeySequence("N"), hud, activated=lambda: hud.set_pit_message(None))
-    QShortcut(QKeySequence("T"), hud, activated=force_turn)
     QShortcut(QKeySequence("P"), hud, activated=toggle_pause)
     QShortcut(QKeySequence("H"), hud, activated=next_hazard)
     QShortcut(QKeySequence("X"), hud, activated=clear_hazard)
+    QShortcut(QKeySequence("R"), hud, activated=toggle_regen)
     return timer
 
 
@@ -619,6 +662,10 @@ def main() -> int:
                     help="run as it does in the car (Alt+F4 or Ctrl+Shift+Q to quit)")
     ap.add_argument("--no-tour", action="store_true",
                     help="do not cycle through the hazards automatically")
+    ap.add_argument("--no-regen-light", action="store_true",
+                    help="do not touch GPIO: the brake light is not driven")
+    ap.add_argument("--regen-pin", type=int, default=None,
+                    help=f"BCM pin for the brake light (default {REGEN_LIGHT_PIN})")
     args = ap.parse_args()
 
     available = speed_profile.available_profiles()
@@ -635,13 +682,13 @@ def main() -> int:
     # Fail at startup, not mid-demo, if a hazard names a label the car can't send.
     for _n, fn, _s in HAZARDS:
         if fn is not None:
-            fn({"flags": {}, "cell_t": {}, "cell_v": {}, "motor_c": 0.0,
+            fn({"cell_t": {}, "cell_v": {}, "motor_c": 0.0,
                 "power_w": 0.0, "map": None})
 
     print(f"[sim] profile {name}  ·  lap {profile.lap_length_m:.0f} m  ·  "
           f"{profile.lap_time_s():.0f} s  ·  time scale ×{args.speed}")
     print("[sim] keys: M pit message · N clear · T turn warning · P pause · "
-          "H next hazard · X clear hazard")
+          "H next hazard · X clear hazard · R hold regen")
     if not args.no_tour:
         print(f"[sim] hazard tour: starts after {TOUR_START_S:.0f} s, "
               f"{len(HAZARDS)} hazards, {TOUR_ON_S:.0f} s each (H takes over)")
@@ -658,13 +705,70 @@ def main() -> int:
     hud.setWindowTitle(f"EV Racing HUD — SIMULATION ({name})")
 
     car = FakeCar(profile, args.speed)
-    build_sim(hud, car, name, tour=not args.no_tour)
+
+    # The real brake light, the real pin, the real thresholds. It never raises:
+    # no gpiozero, or a pin already held by a running HUD, and status() says so
+    # while the logic carries on driving the on-screen indication.
+    light = None
+    if args.no_regen_light:
+        print("🛑 regen brake light: disabled (--no-regen-light)")
+    else:
+        light = RegenLight(pin=args.regen_pin).start()
+        print(f"🛑 {light.status()}")
+
+        # PUTTING THE LAMP OUT ON THE WAY OUT — and why it is wrapped here
+        # rather than hung on app.aboutToQuit alone.
+        #
+        # Every deliberate close of the HUD ends in RacingDashboard._fast_exit(),
+        # which finishes with os._exit(): no aboutToQuit, no atexit, no
+        # interpreter shutdown, by design (it refuses to wait on Firebase
+        # threads while a person stares at a frozen window). gpiozero never gets
+        # to release the pin, so GPIO 17 keeps whatever it was driving — and a
+        # demo quit mid-flash left the bench lamp LIT with nothing running,
+        # which is the stuck-on brake light regen_light.py exists to prevent,
+        # arrived at from the other end.
+        #
+        # So the lamp is extinguished INSIDE that path. aboutToQuit stays
+        # connected as well, for any exit that does unwind normally.
+        _hud_fast_exit = hud._fast_exit
+
+        def _fast_exit_lamp_off(code, why):
+            light.stop()
+            _hud_fast_exit(code, why)
+
+        hud._fast_exit = _fast_exit_lamp_off
+        app.aboutToQuit.connect(light.stop)
+
+    build_sim(hud, car, name, tour=not args.no_tour, light=light)
 
     if args.fullscreen:
         hud.showFullScreen()
     else:
         hud.show()
-    return app.exec()
+
+    # Ctrl+C in the terminal, or a plain `kill`, has to put the lamp out.
+    # Without this the demo dies with GPIO 17 still driven HIGH and the bench
+    # lamp stays lit with nothing running — the stuck-on brake light that
+    # regen_light.py's stale release exists to avoid, arrived at from the other
+    # end. app.quit() unwinds through aboutToQuit, which calls light.stop().
+    #
+    # The 200 ms timer is what makes the signal handler run at all: Qt's event
+    # loop sits in C between events, and Python only dispatches a caught signal
+    # when it next executes bytecode. Without something waking the interpreter,
+    # Ctrl+C is not seen until the next mouse move or keypress.
+    def _bail(_sig, _frame):
+        app.quit()
+
+    for _sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(_sig, _bail)
+    wake = QTimer(hud)
+    wake.timeout.connect(lambda: None)
+    wake.start(200)
+
+    rc = app.exec()
+    if light is not None:
+        light.stop()               # belt and braces: aboutToQuit already did it
+    return rc
 
 
 if __name__ == "__main__":
