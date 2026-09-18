@@ -316,16 +316,22 @@ else
         echo "dumps taken: ${ok} / ${SPY_DUMPS}"
         if [ "${ok}" -gt 0 ]; then
             # One line per thread per dump, classified by what its Python stack
-            # is doing. The upload markers are functions ONLY the CAN worker
-            # calls, so the three firebase-admin listener threads (which also
-            # sit in requests/ssl forever, by design) never count as blocked.
+            # is doing. "CAN thread blocked" needs BOTH a function only the CAN
+            # worker calls AND a network frame under it, so neither the three
+            # firebase-admin listener threads (in requests/ssl forever, by
+            # design) nor pi-outbox's uploader thread ever count as blocked.
             TALLY_AWK='
 function flush() {
     if (hdr == "") return
     st = (hdr ~ /\(active\)/) ? "active" : "idle"
     k = "other thread"
-    if (body ~ /push_telemetry_to_cloud|_push_directly|push_public_snapshot|ack_lap_command|ack_strategy|_send_batch_to_firebase|_publish_heartbeat/)
+    net = (body ~ /requests\/|urllib3|ssl\.py|http\/client\.py|socket\.py|google\/auth|_push_directly/)
+    if (body ~ /_send_batch|_drain \(|_sleep_backoff|_isolate_rejected/)
+        k = "uploader thread (edge-sync): sending or backing off - by design, off the CAN thread"
+    else if (body ~ /push_telemetry_to_cloud|ack_lap_command|ack_strategy|_publish_heartbeat/ && net)
         k = "CAN thread: BLOCKED inside a Firebase upload"
+    else if (body ~ /push_telemetry_to_cloud/ && body ~ /track_snapshot|edge_sync\/queue\.py|sqlite3/)
+        k = "CAN thread: saving a sample to the outbox (disk write)"
     else if (body ~ /_decode_message|recv \(/ && body ~ /main\.py/)
         k = "CAN thread: reading / decoding frames"
     else if (body ~ /_poll_bms|_request_gpio_report/)
@@ -350,11 +356,19 @@ END { flush() }
 '
             echo "thread states across all ${ok} dumps (count  what the thread was doing [py-spy state]):"
             for f in "${DUMPDIR}"/*.txt; do awk "${TALLY_AWK}" "${f}"; done | sort | uniq -c | sort -rn | sed 's/^/  /'
-            blocked="$(grep -lE 'push_telemetry_to_cloud|_push_directly|push_public_snapshot|_send_batch_to_firebase' "${DUMPDIR}"/*.txt 2>/dev/null | wc -l)"
+            # Counted from the classification above, never from a bare function
+            # name: on pi-outbox _send_batch_to_firebase is the uploader thread's
+            # job, and a name match reported 6/10 "blocked" on a healthy car.
+            blocked=0
+            for f in "${DUMPDIR}"/*.txt; do
+                awk "${TALLY_AWK}" "${f}" | grep -q 'CAN thread: BLOCKED' && blocked=$((blocked + 1))
+            done
             painting="$(grep -lE 'paintEvent|_fit_font|_fit_strip_text|sizeHint' "${DUMPDIR}"/*.txt 2>/dev/null | wc -l)"
             echo "CAN thread inside a Firebase upload in ${blocked} of ${ok} dumps; GUI thread painting/laying out in ${painting} of ${ok}."
-            echo "  Reading: with a healthy link an upload takes ~80 ms per 0.5 s, so ~1-2 dumps"
-            echo "  in 10 is normal. Most dumps = the thread lives in the upload = the freeze."
+            echo "  Reading, on main: uploads run ON the CAN thread, ~80 ms per 0.5 s when the link"
+            echo "  is healthy, so 1-2 dumps in 10 is normal; most dumps = the freeze the driver sees."
+            echo "  On pi-outbox: expect 0. The network work belongs to the edge-sync uploader thread,"
+            echo "  and seeing THAT thread in an upload in most dumps is healthy, not a fault."
             echo "first dump, verbatim:"
             sed 's/^/  /' "${DUMPDIR}/1.txt"
         fi
