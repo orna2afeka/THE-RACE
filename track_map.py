@@ -46,7 +46,7 @@ __all__ = [
     "position_at_distance", "split_at", "boundary_ticks", "is_at_zolder",
     "ZOLDER_GEOFENCE_M", "project", "track_position", "distance_to_polyline",
     "TRACK_POS_MAX_OFFSET_M", "TRACK_POS_MIN_MARGIN_M",
-    "PITLANE_XY", "PIT_ZONE_ENABLED", "lane_of",
+    "PITLANE_XY", "PIT_ZONE_ENABLED", "lane_of", "locate",
 ]
 
 # How close a REAL fix has to be to the finish line before we will believe the
@@ -192,9 +192,11 @@ def project(lat, lon):
 def track_position(lat, lon):
     """Lap distance for a fix that is unmistakably ON the track, else None."""
     s, _lateral, d, runner_up = project(lat, lon)
-    if d <= TRACK_POS_MAX_OFFSET_M and runner_up - d >= TRACK_POS_MIN_MARGIN_M:
-        return s
-    return None
+    return s if _unambiguous(d, runner_up) else None
+
+
+def _unambiguous(d, runner_up):
+    return d <= TRACK_POS_MAX_OFFSET_M and runner_up - d >= TRACK_POS_MIN_MARGIN_M
 
 
 def distance_to_polyline(xy, polyline_xy):
@@ -223,17 +225,38 @@ LANE_NEAR_M = 12.0
 LANE_MARGIN_M = 8.0
 
 
+# A verdict is DECISIVE when the other candidate is this far away, which only
+# happens where the pit lane has left the track (entry, exit). LapTracker lets
+# only decisive fixes CHANGE an established zone, so noise on the straight can
+# never flip a racing car into the pit lane and blank the driver's target speed.
+LANE_DECISIVE_M = 20.0
+
+
 def lane_of(lat, lon):
-    """"track", "pit_lane", or None when this fix cannot tell."""
+    """("track" | "pit_lane" | None, decisive) for one fix. None = can't tell."""
+    return locate(lat, lon)[1:3]
+
+
+def locate(lat, lon):
+    """Everything LapTracker wants from one fix, in one pass over the geometry.
+
+    Returns (track_pos_m, lane, decisive):
+
+    track_pos_m  lap distance, or None when the fix is not unmistakably on the
+                 track (see track_position)
+    lane         "track", "pit_lane" or None
+    decisive     True when the other lane is LANE_DECISIVE_M or more away
+    """
+    s, _lateral, d_track, runner_up = project(lat, lon)
+    pos = s if _unambiguous(d_track, runner_up) else None
     if not PIT_ZONE_ENABLED:
-        return None
-    _s, _lateral, d_track, _runner = project(lat, lon)
+        return pos, None, False
     d_pit = distance_to_polyline(to_local_xy(float(lat), float(lon)), PITLANE_XY)
     if d_pit <= LANE_NEAR_M and d_track - d_pit >= LANE_MARGIN_M:
-        return "pit_lane"
+        return None, "pit_lane", d_track >= LANE_DECISIVE_M
     if d_track <= LANE_NEAR_M and d_pit - d_track >= LANE_MARGIN_M:
-        return "track"
-    return None
+        return pos, "track", d_pit >= LANE_DECISIVE_M
+    return pos, None, False
 
 
 def split_at(boundaries):
