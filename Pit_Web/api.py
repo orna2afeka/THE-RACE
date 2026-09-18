@@ -222,6 +222,9 @@ def read_live_state(conn):
         # centre. has_gps says whether the pin is REAL: 0,0 is a real place in
         # the Atlantic, and a placeholder must never be mistakable for a fix.
         "lat": 50.9895, "lon": 5.2568, "has_gps": False,
+        # No row at all: no position, no age, no last-fix instant. Nothing here
+        # may default to a number -- "0 s ago" would read as a live fix.
+        "has_gps_point": False, "gps_age_s": None, "gps_fix_ts": None,
         "bms_has_error": 0, "bms_error_code": 0, "bms_protections": "",
         "mms_has_error": 0, "mms_error_code": 0, "mms_alerts": "",
     })
@@ -312,10 +315,39 @@ def read_live_state(conn):
     state["auto_lap"] = None if auto_lap is None else int(auto_lap)
     odo = cf("odometer_km", "odometer_m")
     state["odometer_km"] = None if odo is None else odo / 1000.0
-    state["has_gps"] = (_val(row, "lat", None) is not None
-                        and _val(row, "lon", None) is not None)
+    # POSITION, AND WHETHER IT IS LIVE.
+    #
+    # has_gps used to mean "the row has a lat", which is not the same question.
+    # The car keeps serving its last known fix after the receiver loses lock
+    # (gps_reader: a frozen dot beats an empty map on the driver's screen), so
+    # every row carries a well-formed position for as long as the car stays
+    # lost. On 2026-09-18 that was 57 minutes, with the car driving.
+    #
+    # gps_age_s is read with _val, never carried forward: like the health
+    # columns it answers "what is true right now", and a carried-forward age
+    # would be doubly stale.
+    gps_age = _val(row, "gps_age_s", None)
+    have_point = (_val(row, "lat", None) is not None
+                  and _val(row, "lon", None) is not None)
+    # A car whose build predates gps_age_s sends no age at all. Treat that as
+    # live-if-present, exactly as before, rather than blanking the map of every
+    # team member still running last week's image -- the same courtesy
+    # car_health() extends to a car that predates the heartbeat.
+    state["gps_age_s"] = gps_age
+    state["has_gps"] = have_point and (gps_age is None
+                                       or gps_age <= limits.GPS_LIVE_MAX_AGE_S)
+    # Wall-clock instant of the last usable fix, in the CAR's clock -- the same
+    # clock device_ts is in, so the subtraction is exact and no skew between the
+    # car and the pit can creep in. None when we cannot say.
+    device_ts_raw = row["device_ts"]
+    state["gps_fix_ts"] = (device_ts_raw - gps_age
+                           if (device_ts_raw and gps_age is not None) else None)
+    # The point itself is still handed over when it is old: the map draws it
+    # dimmed as "last seen here", which is more use to the crew than an empty
+    # map. has_gps is what says whether to believe it.
     state["lat"] = _val(row, "lat", 50.9895)
     state["lon"] = _val(row, "lon", 5.2568)
+    state["has_gps_point"] = have_point
     state["_field_ages"] = field_ages
 
     device_ts = row["device_ts"]
@@ -615,6 +647,8 @@ def _health_json(state):
         "canFrames": state.get("can_frames"),
         "gpsFix": state.get("gps_fix"),
         "gpsDetail": state.get("gps_detail"),
+        "gpsAgeS": state.get("gps_age_s"),
+        "gpsFixTs": state.get("gps_fix_ts"),
     }
 
 

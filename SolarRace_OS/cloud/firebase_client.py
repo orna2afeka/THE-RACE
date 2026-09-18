@@ -294,12 +294,26 @@ def _public_snapshot(vehicle_state):
         # sampled, not the moment anything received it.
         "ts": time.time(),
         "lap": motor.get("calculated_lap"),
-        # Position, when there is a fix. gps is left EMPTY by the car until a
-        # real one arrives (main._refresh_gps), so these come out None and
-        # firebase-admin drops them -- the page then falls back to
-        # lap_distance_m rather than drawing the car at 0,0 in the Atlantic.
-        "lat": gps.get("lat"),
-        "lon": gps.get("lon"),
+        # Position, when there is a CURRENT fix. Two guards, both needed:
+        #
+        #   * gps is left EMPTY until the first real fix (main._refresh_gps), so
+        #     before that these are None, firebase-admin drops them, and the
+        #     page falls back to lap_distance_m instead of drawing the car at
+        #     0,0 in the Atlantic.
+        #   * once the receiver loses lock the car KEEPS serving the last known
+        #     fix, flagged stale (gps_reader.FIX_STALE_AFTER_S) -- a frozen dot
+        #     beats an empty map on the driver's screen. Publishing that to a
+        #     page whose whole job is to show where the car is now would be a
+        #     lie that looks exactly like the truth: seen on 2026-09-18, the
+        #     marker sat still for 27 minutes while the car drove two laps.
+        #     A stale position is simply not published, and the page falls back
+        #     to lap_distance_m, which is live.
+        "lat": None if gps.get("stale") else gps.get("lat"),
+        "lon": None if gps.get("stale") else gps.get("lon"),
+        # Sent even when the position is not, and that is the point: it is how
+        # the page says "no GPS, last fix 57 minutes ago" instead of silently
+        # falling back to lap_distance_m and looking like it never had one.
+        "gps_age_s": gps.get("fix_age_s"),
         "lap_distance_m": motor.get("lap_distance_m"),
         "odometer_m": motor.get("odometer_m"),
         "speed_kmh": motor.get("mms_vehicle_speed_kmh"),

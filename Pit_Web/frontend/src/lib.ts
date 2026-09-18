@@ -56,6 +56,16 @@ export function ageText(seconds: Num): string {
   return `${Math.floor(h / 24)}d ${h % 24}h`;
 }
 
+/** Wall-clock hh:mm:ss in the VIEWER's timezone, for marking the instant
+ *  something happened rather than how long ago it was. Both are shown
+ *  together where it matters: "12:47:31 · 57m 4s ago" survives a screenshot
+ *  pasted into a chat an hour later, where "57m ago" alone does not. */
+export function clockTime(epochS: number): string {
+  const d = new Date(epochS * 1000);
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
 export function hms(totalSeconds: number): string {
   const s = Math.max(0, Math.floor(totalSeconds));
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;

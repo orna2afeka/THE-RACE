@@ -95,7 +95,10 @@ FIELDS = (
     # name matching no column as a string literal, so COUNT("gps_lat") counted
     # rows and made a column that does not exist look perfect.
     # check_fields() exists so the next one of these is caught at startup.
-    "active_strategy", "lat", "lon",
+    # gps_age_s travels WITH lat/lon and is not optional: the car keeps serving
+    # its last known fix after the receiver loses lock, so a position can be
+    # well-formed and half an hour old while the car is a kilometre away.
+    "active_strategy", "lat", "lon", "gps_age_s",
     "bms_has_error", "bms_error_code", "mms_has_error", "mms_error_code",
 )
 
