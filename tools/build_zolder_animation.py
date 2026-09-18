@@ -356,8 +356,31 @@ def build_data():
         turns.append({"n": t["n"], "dist": t["dist"],
                       "x1": x1, "y1": y1, "x": bx, "y": by})
 
+    # The projection, baked, so a page can put a GPS fix in SVG units without
+    # re-deriving anything. SVG user units ARE local metres with y flipped
+    # (see _svg_xy), and track.to_local_xy is equirectangular about the finish
+    # line, so the whole transform is two multiplies and two subtractions:
+    #
+    #     x_svg = (lon - lon0) * mPerDegLon - ox
+    #     y_svg = oy - (lat - lat0) * mPerDegLat
+    #
+    # Written out rather than shipping a formula the page has to agree with:
+    # this is the SAME to_local_xy the car's lap trigger uses, so the dot and
+    # the finish-line test can never drift apart.
+    deg = math.radians(1.0)
+    geo = {
+        "lat0": track.FINISH_LINE_LAT,
+        "lon0": track.FINISH_LINE_LON,
+        "mPerDegLat": round(deg * track._EARTH_RADIUS_M, 4),
+        "mPerDegLon": round(deg * track._EARTH_RADIUS_M
+                            * math.cos(math.radians(track.FINISH_LINE_LAT)), 4),
+        "ox": round(ox, 3),
+        "oy": round(oy, 3),
+    }
+
     return {
         "viewBox": "0 0 %.0f %.0f" % (width, height),
+        "geo": geo,
         "trackLength": track.TRACK_LENGTH_METERS,
         # Sector-document zero minus the car's zero. Only the 210 s profile is
         # read in the document's frame; sectors, posAt() and lap distance are
@@ -635,6 +658,43 @@ function posAt(d) {
   return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
 }
 
+// A GPS fix in SVG user units. DATA.geo is track.to_local_xy with the same
+// y-flip and origin the map was baked with, so this lands on the drawn track
+// rather than near it.
+function geoToSvg(lat, lon) {
+  const g = DATA.geo;
+  return [(lon - g.lon0) * g.mPerDegLon - g.ox,
+          g.oy - (lat - g.lat0) * g.mPerDegLat];
+}
+
+// How far round the lap a point is, by projecting it onto the centreline: the
+// nearest point on the nearest segment, then that segment's baked distance.
+//
+// This is what makes the map GPS-truth rather than odometer-truth. The car's
+// lap_distance_m is a distance SINCE A DATUM, so a stale datum (a Pi restarted
+// mid-lap, a trip reset in the garage) puts the marker in the wrong corner
+// while GPS knows exactly where the car is. Returns metres, or null if there
+// is no usable fix.
+function trackDistAt(lat, lon) {
+  if (lat == null || lon == null) return null;
+  const [px, py] = geoToSvg(lat, lon);
+  const line = DATA.line, cum = DATA.cum;
+  let best = null;
+  for (let i = 0; i < line.length - 1; i++) {
+    const a = line[i], b = line[i + 1];
+    const vx = b[0] - a[0], vy = b[1] - a[1];
+    const len2 = vx * vx + vy * vy;
+    const t = len2 > 0
+      ? Math.max(0, Math.min(1, ((px - a[0]) * vx + (py - a[1]) * vy) / len2))
+      : 0;
+    const dx = px - (a[0] + vx * t), dy = py - (a[1] + vy * t);
+    const d2 = dx * dx + dy * dy;
+    if (best == null || d2 < best[0]) best = [d2, cum[i] + (cum[i + 1] - cum[i]) * t];
+  }
+  return best == null ? null : ((best[1] % DATA.trackLength) + DATA.trackLength)
+                               % DATA.trackLength;
+}
+
 function sectorAt(d) {
   const L = DATA.trackLength;
   d = ((d % L) + L) % L;
@@ -683,8 +743,12 @@ function fmtClock(s) {
 let lastSector = null;
 // Moves the car and everything that follows it. Returns the sector it is in, so
 // the caller can label it without repeating the lookup.
-function paintMap(dist) {
-  const [x, y] = posAt(dist);
+function paintMap(dist, fixXY) {
+  // The marker sits on the true GPS point when there is one, and on the
+  // centreline at `dist` when there is not. Everything that follows it -- the
+  // trail, the sector, the progress bar -- is a distance concept and stays on
+  // `dist`, which the live pages already derive from the same fix.
+  const [x, y] = fixXY || posAt(dist);
   car.setAttribute("cx", x); car.setAttribute("cy", y);
   el("car-core").setAttribute("cx", x); el("car-core").setAttribute("cy", y);
 
@@ -1172,6 +1236,9 @@ const HOME_TZ = "Asia/Jerusalem";       // where most of the people watching are
 let snap = null;
 let lastRxWall = 0;        // our clock, for "how long since anything arrived"
 let dist = 0, target = null, everPainted = false;
+// The GPS marker, in SVG units: where the last fix put it, and where it is
+// drawn (eased toward the first, so a 1 Hz feed reads as motion).
+let fixTarget = null, fixShown = null;
 let race = { start: CONFIG.raceStart, end: CONFIG.raceEnd };
 let sun = null;
 
@@ -1239,7 +1306,16 @@ function applySnapshot(obj) {
   if (obj == null) return;
   snap = obj;
   lastRxWall = Date.now() / 1000;
-  const d = num(obj.lap_distance_m);
+  // POSITION, GPS FIRST. lap_distance_m is a distance since a datum, and the
+  // datum is wrong whenever the Pi restarted mid-lap or the trip was reset off
+  // the line -- the marker then sits in a corner the car is nowhere near. A fix
+  // needs no datum. It is still the fallback, because a car in a tunnel, in the
+  // garage or with a dead receiver must not take the map down with it.
+  const lat = num(obj.lat), lon = num(obj.lon);
+  const gpsDist = trackDistAt(lat, lon);
+  fixTarget = gpsDist == null ? null : geoToSvg(lat, lon);
+  if (fixTarget == null) fixShown = null;
+  const d = gpsDist != null ? gpsDist : num(obj.lap_distance_m);
   if (d != null) {
     target = ((d % DATA.trackLength) + DATA.trackLength) % DATA.trackLength;
     if (!everPainted) { dist = target; everPainted = true; }
@@ -1483,7 +1559,13 @@ function frame(t) {
     el("sector-name").textContent = "—";
     el("next-sub").textContent = "—";
   } else if (everPainted) {
-    const s = paintMap(dist);
+    if (fixTarget != null) {
+      const k = fixShown == null ? 1 : Math.min(1, dt * 2.2);
+      fixShown = fixShown == null ? fixTarget
+        : [fixShown[0] + (fixTarget[0] - fixShown[0]) * k,
+           fixShown[1] + (fixTarget[1] - fixShown[1]) * k];
+    }
+    const s = paintMap(dist, fixShown);
     el("sector-name").textContent = "S" + s.id + " · " + s.name;
     const nx = nextLandmark(dist);
     if (nx) {
@@ -1871,9 +1953,18 @@ function render() {
   fnode.classList.toggle("show", notes.length > 0);
 
   // -- the map ---------------------------------------------------------- //
-  const dist = isCarried(s, "lap_distance_m") ? null : num(s.lap_distance_m);
+  // GPS first, exactly as on the spectator page: a fix needs no datum, so it
+  // survives a Pi restart mid-lap and a trip reset taken off the line, both of
+  // which leave lap_distance_m pointing at the wrong corner. isCarried keeps a
+  // position the car has stopped sending from being redrawn as current.
+  const haveFix = !isCarried(s, "lat") && !isCarried(s, "lon");
+  const lat = haveFix ? num(s.lat) : null, lon = haveFix ? num(s.lon) : null;
+  const gpsDist = trackDistAt(lat, lon);
+  const fixXY = gpsDist == null ? null : geoToSvg(lat, lon);
+  const dist = gpsDist != null ? gpsDist
+             : (isCarried(s, "lap_distance_m") ? null : num(s.lap_distance_m));
   if (dist != null) {
-    const sec = paintMap(dist);
+    const sec = paintMap(dist, fixXY);
     el("sector").textContent = "S" + sec.id + " " + sec.name;
     const nx = nextLandmark(dist);
     el("nextcorner").textContent = nx
