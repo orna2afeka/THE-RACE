@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import * as Plotly from 'plotly.js-dist-min';
-import { CatalogueTile, MetricTile, Pill, SectionTitle } from '../components';
+import { CarControls, CatalogueTile, MetricTile, Pill, SectionTitle } from '../components';
 import { Icon } from '../icons';
 import { MISSING, ageText, fmt, getJSON, postJSON, usePoll, useResizePlot, useStored } from '../lib';
 import { config as plotConfig, layoutBase, theme } from '../plotly-theme';
@@ -103,7 +103,7 @@ export function LiveMetrics({ live, config }: { live: Live; config: Config }) {
               (throttle %, zone, raw mV) drawn as one picture, and reading it
               beside them is what makes the millivolts mean something. */}
           {g.group === 'Driver Input' && <PedalBar live={live} config={config} />}
-          {g.group === 'Lap & Distance' && <TripReset />}
+          {g.group === 'Lap & Distance' && <TripReset carLink={!config.demoStore} />}
         </div>
       ))}
       <div className="caption" style={{ marginTop: 16 }}>
@@ -592,8 +592,143 @@ function MatrixEditor({ onSaved, onCancel }:
   );
 }
 
-export function Strategy({ config, manualLap, dark, selected }:
-  { config: Config; manualLap: number; dark: boolean;
+/* --------------------------- Strategy inputs ----------------------------- */
+// DEMO DASHBOARD ONLY. The search takes three numbers — how much charge is in
+// the pack, how much of the race is left, and which lap the car is on — and on
+// race day all three come from the car and the race clock. When the Pi has
+// been silent for hours the stored SoC is whatever it was before it went
+// quiet, so the plan on the screen is a plan for a car that no longer exists.
+//
+// This panel lets those three be typed instead, on a dashboard that is not
+// reading the real store. The server decides whether to honour them (see
+// DEMO_STORE in api.py) and echoes back what it used, so this cannot label a
+// car-derived plan as typed.
+
+/** "14:00" or "840" -> 840 minutes. Null for anything that is not a duration. */
+function parseMinutes(text: string): number | null {
+  const t = text.trim();
+  if (!t) return null;
+  const parts = t.split(':');
+  if (parts.length > 2) return null;
+  const nums = parts.map((x) => Number(x));
+  if (nums.some((n) => !Number.isFinite(n) || n < 0)) return null;
+  const mins = parts.length === 2 ? nums[0] * 60 + nums[1] : nums[0];
+  return mins >= 0 ? mins : null;
+}
+
+function minutesText(mins: number): string {
+  const m = Math.round(mins);
+  const h = Math.floor(m / 60);
+  return h ? `${h} h ${String(m % 60).padStart(2, '0')} m` : `${m} m`;
+}
+
+export interface StrategyOverride { socPct: number | null; timeLeftMin: number | null }
+
+function StrategyInputs({ applied, onApply, onClear, manualLap, setManualLap, data }: {
+  applied: StrategyOverride;
+  onApply: (o: StrategyOverride) => void;
+  onClear: () => void;
+  manualLap: number;
+  setManualLap: (n: number) => void;
+  data: StrategyResp | null;
+}) {
+  const [soc, setSoc] = useState(applied.socPct == null ? '' : String(applied.socPct));
+  const [left, setLeft] = useState(applied.timeLeftMin == null ? '' : String(applied.timeLeftMin));
+  const [lap, setLap] = useState(manualLap >= 0 ? String(manualLap) : '');
+
+  const socNum = soc.trim() === '' ? null : Number(soc);
+  // Above 0, not from 0: the strategy engine reads an empty pack as an unknown
+  // one and plans a full one, so "0" here would silently become 100%.
+  const socBad = socNum !== null && (!Number.isFinite(socNum) || socNum <= 0 || socNum > 100);
+  const leftNum = parseMinutes(left);
+  // The server caps this at the race duration and serves the cap, so the
+  // number is not typed in here. More time than the race lasts is not a
+  // question the plan can answer.
+  const leftBad = left.trim() !== ''
+    && (leftNum === null || (data != null && leftNum > data.maxTimeLeftMin));
+  const lapNum = lap.trim() === '' ? null : Number(lap);
+  const lapBad = lapNum !== null && (!Number.isInteger(lapNum) || lapNum < 0);
+  const anyBad = socBad || leftBad || lapBad;
+
+  const apply = () => {
+    if (anyBad) return;
+    setManualLap(lapNum === null ? -1 : lapNum);
+    onApply({ socPct: socNum, timeLeftMin: leftNum });
+  };
+  const clear = () => {
+    setSoc(''); setLeft(''); setLap('');
+    setManualLap(-1);
+    onClear();
+  };
+
+  const bad = { borderColor: 'var(--pit-warning)' };
+  return (
+    <div className="card pad">
+      <table className="tbl">
+        <thead><tr>
+          <th>Input</th><th className="num">Plan with</th><th>Leave empty and it uses</th>
+        </tr></thead>
+        <tbody>
+          <tr>
+            <td>Battery SoC</td>
+            <td className="num">
+              <input value={soc} size={7} inputMode="decimal" placeholder="—"
+                     onChange={(e) => setSoc(e.target.value)}
+                     style={{ width: 80, textAlign: 'right', ...(socBad ? bad : {}) }} /> %
+            </td>
+            <td className="caption" style={{ margin: 0 }}>
+              {data?.carSocPct == null
+                ? 'nothing — the car has never reported one, so a full pack is assumed'
+                : <>the car's last reading, <b>{fmt(data.carSocPct, '.1f')}%</b></>}
+            </td>
+          </tr>
+          <tr>
+            <td>Time remaining</td>
+            <td className="num">
+              <input value={left} size={7} inputMode="text" placeholder="—"
+                     onChange={(e) => setLeft(e.target.value)}
+                     style={{ width: 80, textAlign: 'right', ...(leftBad ? bad : {}) }} />
+            </td>
+            <td className="caption" style={{ margin: 0 }}>
+              the race clock, <b>{data ? minutesText(data.clockTimeLeftMin) : '—'}</b>
+            </td>
+          </tr>
+          <tr>
+            <td>Lap</td>
+            <td className="num">
+              <input value={lap} size={7} inputMode="numeric" placeholder="—"
+                     onChange={(e) => setLap(e.target.value)}
+                     style={{ width: 80, textAlign: 'right', ...(lapBad ? bad : {}) }} />
+            </td>
+            <td className="caption" style={{ margin: 0 }}>
+              the car's lap count. This is the same override as the sidebar's
+              <b> Manual lap</b>, not a second one.
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <div className="caption" style={{ marginTop: 8 }}>
+        Time remaining takes <code>14:00</code> or <code>840</code>, both meaning 840 minutes left.
+        Nothing here is written anywhere: these are the arguments the plan is searched with, and
+        clearing them puts it straight back on the car's numbers. The matrix above is untouched —
+        edit that to change what a lap <i>costs</i>; edit this to change what the car <i>has</i>.
+      </div>
+      <div className="btnrow" style={{ marginTop: 10 }}>
+        <button className="btn primary" onClick={apply} disabled={anyBad}>
+          <Icon name="check" size={13} />Plan with these
+        </button>
+        <button className="btn" onClick={clear}>Back to the car's values</button>
+        <span className="caption">
+          {anyBad ? `SoC is above 0 and up to 100, time is minutes or h:mm up to ${minutesText(data?.maxTimeLeftMin ?? 0)}, lap is a whole number.`
+            : 'Demo dashboard only — the real pit dashboard always plans from the car.'}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+export function Strategy({ config, manualLap, setManualLap, dark, selected }:
+  { config: Config; manualLap: number; setManualLap: (n: number) => void; dark: boolean;
     /** The profile the pit has already chosen, from the live feed, or
      *  undefined while nobody has chosen and the target is assumed. */
     selected?: string }) {
@@ -602,7 +737,16 @@ export function Strategy({ config, manualLap, dark, selected }:
   // watching for the table to move.
   const [matrixVersion, setMatrixVersion] = useState(0);
   const [editing, setEditing] = useState(false);
-  const { data } = usePoll(() => getJSON<StrategyResp>(`/api/strategy?manual_lap=${manualLap}`), 10000, [manualLap, matrixVersion]);
+  // Demo-only typed inputs. Kept across a reload, because the reason to type
+  // them — the car is not reporting — outlives a page refresh. The server
+  // ignores them on the real store whatever is in here.
+  const [editingInputs, setEditingInputs] = useState(false);
+  const [override, setOverride] = useStored<StrategyOverride>(
+    'pit.strategyInputs', { socPct: null, timeLeftMin: null },
+    (v) => !!v && typeof v === 'object');
+  const ovQuery = (override.socPct == null ? '' : `&soc_pct=${override.socPct}`)
+    + (override.timeLeftMin == null ? '' : `&time_left_min=${override.timeLeftMin}`);
+  const { data } = usePoll(() => getJSON<StrategyResp>(`/api/strategy?manual_lap=${manualLap}${ovQuery}`), 10000, [manualLap, matrixVersion, ovQuery]);
   const [choice, setChoice] = useState(selected ?? config.defaultStrategyKey);
   // Adopt the stored selection ONCE, when the live feed first carries one. Not
   // on every poll: this tab can be open with the dropdown half-changed, and
@@ -635,6 +779,13 @@ export function Strategy({ config, manualLap, dark, selected }:
     key: s.key, label: s.label, target_s: s.lap_time_min * 60, energy_wh: s.energy_wh,
   }))).map((s) => ({ key: s.key, label: s.label, lap: lapText(s.target_s) }));
 
+  // From the payload, so it is true only once the server has actually planned
+  // with the typed values. Gated on demoStore as well, which is what keeps the
+  // real dashboard exactly as it was: there a manual lap is the only override
+  // there has ever been, and it has never raised a banner.
+  const overridden = !!data && data.demoStore
+    && (data.overrides.socPct != null || data.overrides.timeLeftMin != null
+        || manualLap >= 0);
   const cols = data?.rows.length ? Object.keys(data.rows[0]) : [];
   const isNum = (v: unknown) => typeof v === 'number';
   const measuredLabels = data ? Object.keys(data.measured) : [];
@@ -642,12 +793,18 @@ export function Strategy({ config, manualLap, dark, selected }:
     <>
       <SectionTitle icon="route" title="Active strategy" />
       <div className="card pad">
+        {/* The profile dropdown is fine to play with anywhere -- it is a local
+            choice until Send. SEND is the car command, so the whole row is
+            switched off where there is no car to reach. */}
+        <CarControls enabled={!config.demoStore}
+                     note="Pick a profile and read the plan all you like; sending it to the car needs the real pit dashboard.">
         <div className="btnrow">
           <select value={choice} onChange={(e) => setChoice(e.target.value)} style={{ maxWidth: 300 }}>
             {profiles.map((s) => <option key={s.key} value={s.key}>{s.label} · {s.lap}</option>)}
           </select>
           <button className="btn primary" onClick={send}><Icon name="send" size={13} />Send to car</button>
         </div>
+        </CarControls>
         {/* The ack line is the ONLY place the car's own answer is shown. Every
             target readout on this dashboard follows the selection above, so if
             the car disagrees, this caption is where the crew sees it. */}
@@ -666,12 +823,42 @@ export function Strategy({ config, manualLap, dark, selected }:
         <button className="btn" onClick={() => setEditing((v) => !v)}>
           <Icon name="sliders" size={13} />{editing ? 'Close editor' : 'Edit matrix'}
         </button>
-        {!editing && <span className="caption">Lap time and Wh per lap, edited here and live at the next poll — no restart.</span>}
+        {/* Only where the server will honour it. config.demoStore and the
+            payload's demoStore are the same flag; this uses config so the
+            button is there before the first plan arrives. */}
+        {config.demoStore && (
+          <button className="btn" aria-pressed={overridden} onClick={() => setEditingInputs((v) => !v)}>
+            <Icon name="target" size={13} />{editingInputs ? 'Close inputs' : 'Edit inputs'}
+          </button>
+        )}
+        {!editing && !editingInputs && <span className="caption">Lap time and Wh per lap, edited here and live at the next poll — no restart.</span>}
       </div>
       {editing && (
         <MatrixEditor
           onSaved={() => { setEditing(false); setMatrixVersion((v) => v + 1); }}
           onCancel={() => setEditing(false)} />
+      )}
+      {editingInputs && config.demoStore && (
+        <StrategyInputs applied={override} data={data}
+                        manualLap={manualLap} setManualLap={setManualLap}
+                        onApply={(o) => { setOverride(o); setEditingInputs(false); }}
+                        onClear={() => { setOverride({ socPct: null, timeLeftMin: null }); setEditingInputs(false); }} />
+      )}
+      {/* Says what the SERVER used, not what this page asked for. Stays up
+          while the panel is closed: a plan made from typed numbers must never
+          be readable as the car's. */}
+      {overridden && (
+        <Pill kind="warn">
+          <b>Planning from typed inputs, not from the car.</b>{' '}
+          {[data!.overrides.socPct != null
+              ? `SoC ${fmt(data!.overrides.socPct, '.1f')}% (car: ${data!.carSocPct == null ? 'never reported' : fmt(data!.carSocPct, '.1f') + '%'})`
+              : null,
+            data!.overrides.timeLeftMin != null
+              ? `${minutesText(data!.overrides.timeLeftMin)} remaining (race clock: ${minutesText(data!.clockTimeLeftMin)})`
+              : null,
+            manualLap >= 0 ? `lap ${manualLap}` : null,
+          ].filter(Boolean).join(' · ')}.
+        </Pill>
       )}
       {data?.assumedFullPack && (
         <Pill kind="warn">
@@ -869,7 +1056,7 @@ export function Cells() {
 // own tracked distance total. Not lap count, not energy, and not the
 // controller's hardware TRIP register, for which there is no CAN command.
 
-export function TripReset() {
+export function TripReset({ carLink }: { carLink: boolean }) {
   const [sent, setSent] = useState<string | null>(null);
   const [sentId, setSentId] = useState<number | null>(null);
   const { data: ack } = usePoll(
@@ -881,6 +1068,7 @@ export function TripReset() {
     && ack.ack.id != null && ack.ack.id === sentId;
   return (
     <div className="card pad" style={{ marginTop: 8 }}>
+      <CarControls enabled={carLink}>
       <div className="btnrow">
         <button className="btn" onClick={async () => {
           try {
@@ -896,6 +1084,7 @@ export function TripReset() {
             : "Zeroes the car's Trip distance. Does not touch the controller's odometer, lap count or energy."}
         </span>
       </div>
+      </CarControls>
     </div>
   );
 }

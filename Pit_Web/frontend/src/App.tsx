@@ -217,6 +217,16 @@ export default function App() {
   const link = linkState(live, connected, silentS);
 
 
+  // ?tab=Strategy opens straight on that tab, whatever this browser last had
+  // open — a launcher can point somebody at one screen without them hunting
+  // for it. Once only: after this the tab is the operator's, and re-applying
+  // it on every render would make the other tabs unclickable.
+  useEffect(() => {
+    const want = new URLSearchParams(window.location.search).get('tab');
+    if (want && TAB_NAMES.includes(want)) setTab(want as Tab);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   useEffect(() => {
     document.documentElement.dataset.theme = dark ? 'dark' : 'light';
     document.documentElement.style.setProperty('--pit-font-scale', String(fontScale));
@@ -295,6 +305,20 @@ export default function App() {
                  fontScale={fontScale} setFontScale={setFontScale}
                  clockOffsetMs={clockOffsetMs} />
         <main className="main">
+          {/* The single most important thing to know about this page, so it
+              is the first thing on it and it never goes away. A demo backend
+              reads a different SQLite file, but Firebase has only one car and
+              one spectator page — see api.car_link() for what is blocked. */}
+          {config.demoStore && (
+            <div className="banner demo" role="status">
+              <Icon name="sliders" size={16} />
+              <span>
+                DEMO — not the pit's store, and not connected to the car. Nothing here
+                can command the car or change the public spectator page. Every reading
+                below is demo data.
+              </span>
+            </div>
+          )}
           {frozenSince && (
             // The server's `fresh` flag cannot say this: it stops arriving too.
             <div className="banner conn" role="alert">
@@ -325,7 +349,7 @@ export default function App() {
           {tab === 'Live Metrics' && live && <ErrorBoundary name="Live Metrics"><LiveMetrics live={live} config={config} /></ErrorBoundary>}
           {tab === 'Cell Voltages' && <ErrorBoundary name="Cell Voltages"><Cells /></ErrorBoundary>}
           {tab === 'Weather' && <ErrorBoundary name="Weather"><Weather dark={dark} /></ErrorBoundary>}
-          {tab === 'Strategy' && <ErrorBoundary name="Strategy"><Strategy config={config} manualLap={manualLap} dark={dark}
+          {tab === 'Strategy' && <ErrorBoundary name="Strategy"><Strategy config={config} manualLap={manualLap} setManualLap={setManualLap} dark={dark}
                      selected={live?.activeProfile?.source === 'pit' ? live.activeProfile.key : undefined} /></ErrorBoundary>}
         </main>
       </div>

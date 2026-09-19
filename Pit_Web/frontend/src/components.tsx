@@ -170,6 +170,30 @@ export function SectorCard({ live, config }: { live: Live; config: Config }) {
   );
 }
 
+/** Wraps controls that COMMAND THE CAR and switches them off where this
+ *  dashboard has no business reaching it — a demo store, or a backend opened
+ *  on an archived copy (config.demoStore).
+ *
+ *  A real disabled <fieldset>, so the browser disables everything inside it
+ *  rather than each button remembering to check. The server refuses these
+ *  commands as well (api.car_link); this is so nobody presses a button that
+ *  was only ever going to fail, and so the demo still SHOWS the controls
+ *  instead of hiding what the real dashboard looks like.
+ */
+export function CarControls({ enabled, note, children }:
+  { enabled: boolean; note?: string; children: ReactNode }) {
+  return (
+    <>
+      <fieldset className="nocar" disabled={!enabled}>{children}</fieldset>
+      {!enabled && (
+        <div className="caption">
+          <b>Not connected to the car.</b> {note ?? 'This dashboard is on a demo store, so nothing here can command the car or reach the spectator page. Use the real pit dashboard for that.'}
+        </div>
+      )}
+    </>
+  );
+}
+
 export function Pill({ kind, children }: { kind: 'ok' | 'warn' | 'err' | 'info'; children: ReactNode }) {
   const icon = kind === 'ok' ? 'check' : kind === 'info' ? 'radio' : 'alert';
   return <div className={`pill ${kind}`}><Icon name={icon} size={14} style={{ marginTop: 2 }} /><span>{children}</span></div>;

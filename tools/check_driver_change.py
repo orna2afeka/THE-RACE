@@ -158,7 +158,8 @@ def check_published():
 
     sent = []
     driver_message.publish_driver_name = \
-        lambda name, changing_since=None: sent.append((name, changing_since))
+        lambda name, changing_since=None, estimate=None, note=None: (  # estimate: check_public_estimate.py, note: check_public_note.py
+            sent.append((name, changing_since)))
     api.PUBLIC_DRIVER_ENABLED = True
 
     def publish(driver, since):

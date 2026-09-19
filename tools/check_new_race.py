@@ -168,6 +168,13 @@ def check_when_it_fires():
     from Pit_Web import api
     import driver_message
 
+    # This check runs against a TEMP store so it cannot touch race data, and
+    # api.DEMO_STORE is "the store is not the pit's own", so the backend would
+    # correctly refuse to command the car (api.car_link) and nothing below
+    # would ever fire. What is under test here is the REAL dashboard's green
+    # flag, so say so. check_sandbox.py covers the refusal from the other side.
+    api.DEMO_STORE = False
+
     sent = []
     driver_message.send_new_race = lambda: sent.append(1) or {"id": 1}
     c = TestClient(api.app)

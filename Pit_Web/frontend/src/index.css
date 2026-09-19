@@ -785,3 +785,12 @@ details.disc .disc-body { border: 1px solid var(--line); border-top: none; borde
 	border-radius: var(--radius-sm);
 }
 .starttime .pill { margin-bottom: 0; }
+
+/* A group of controls that COMMAND THE CAR, on a dashboard that is not the
+   pit's own. A real <fieldset disabled> rather than a disabled prop on each
+   button: the browser then disables every control inside it, including ones
+   added later, so a new send button cannot be born live on the demo. Stripped
+   of the element's default box so the section looks exactly as it did. */
+.nocar { border: 0; margin: 0; padding: 0; min-width: 0; }
+.nocar[disabled] { opacity: 0.55; }
+.banner.demo { background: var(--warn-soft); color: var(--pit-warning); border-color: rgba(255, 153, 0, 0.45); }

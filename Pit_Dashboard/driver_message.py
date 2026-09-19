@@ -225,7 +225,7 @@ def send_stopwatch_reset() -> dict:
     """Restart the DRIVER's stopwatch from now. Display only.
 
     The HUD clock the driver glances at between corners, which they can already
-    restart with the button beside it (driver_dash_v2._reset_lap_timer). This is
+    restart with the button beside it (driver_dash_v2._cut_lap_from_hud). This is
     the pit's copy of that button, for the times the driver has both hands full:
     coming out of the box, after a restart, or when the clock is counting from a
     datum that stopped meaning anything.
@@ -345,7 +345,8 @@ def read_strategy_ack():
 _PUBLIC_DRIVER_URL = f"{DB_URL}/public/driver.json"
 
 
-def publish_driver_name(name, changing_since=None) -> None:
+def publish_driver_name(name, changing_since=None, estimate=None,
+                        note=None) -> None:
     """Show `name` on the spectator page, or remove it when name is empty.
 
     `changing_since` is the instant the pit said a driver change had STARTED,
@@ -356,16 +357,39 @@ def publish_driver_name(name, changing_since=None) -> None:
     whose egress is metered — the same reason the viewer count is totted up in
     the pit and not in the browser.
 
-    The node is written whenever there is EITHER a name or a change in
-    progress, and deleted only when there is neither. A swap can begin before
-    anybody has typed a name, and it still has to show.
+    The node is written whenever there is a name, a change in progress OR an
+    estimate, and deleted only when there is none of them. A swap can begin
+    before anybody has typed a name, and it still has to show.
+
+    `estimate` is {"startedAt", "lap", "distM"} while the pit has asked the
+    page to show where the car SHOULD be -- at race pace, from that lap and
+    that place, since that instant -- because the car itself is out of
+    contact. The page does the walking; this only says where and when it
+    started. It rides here for the same metered-egress reason as the swap: the
+    page already reads this node, and a node of its own is a request per viewer
+    per poll. See Pit_Web api_public_estimate.
+
+    `note` is {"text", "since"}: a line the crew typed for the page to show --
+    "Changing tyres", "Repairs in the pit" -- or None. It rides here for the
+    same reason as the two above, and it is sent as the PIT TYPED IT: whatever
+    is in `text` is what the world reads, so the trimming, the length cap and
+    the rule that it is one line all happen where it is entered
+    (Pit_Web api_public_note), and the page writes it with textContent.
     """
     name = (name or "").strip()
-    if name or changing_since:
+    if name or changing_since or estimate or note:
         payload = {"name": name, "ts": time.time()} if name else {"ts": time.time()}
         if changing_since:
             payload["changing"] = True
             payload["since"] = float(changing_since)
+        if note and note.get("text"):
+            payload["note"] = str(note["text"])
+            if note.get("since"):
+                payload["noteSince"] = float(note["since"])
+        if estimate:
+            payload["estimate"] = {"startedAt": float(estimate["startedAt"]),
+                                   "lap": int(estimate["lap"]),
+                                   "distM": float(estimate["distM"])}
         resp = requests.put(_PUBLIC_DRIVER_URL, params={"access_token": _token()},
                             json=payload, timeout=_TIMEOUT)
     else:

@@ -56,6 +56,10 @@ export interface Config {
    *  below neutralMv, acceleration above it, and idleMv is where a fully
    *  released pedal sits (maximum regen). */
   pedal: { idleMv: number; neutralMv: number; fullMv: number };
+  /** True when the backend is NOT on the pit's real store — the demo
+   *  dashboard, or a backend opened on an archive. The Strategy screen's
+   *  typed-input panel appears only then. */
+  demoStore: boolean;
 }
 
 export interface LiveState {
@@ -212,8 +216,20 @@ export interface StrategyResp {
    *  `config.strategies`, which the page fetched once on load. */
   matrix?: MatrixRow[];
   timeLeftMin: number;
+  /** The race duration — the cap on the demo screen's typed time remaining. */
+  maxTimeLeftMin: number;
   assumedFullPack: boolean;
   missing: string[];
+  /** Demo backend only. `overrides` is what the SERVER honoured, not what the
+   *  page asked for: on the real store both come back null however the URL was
+   *  written, so a typed plan can never be labelled as the car's or the other
+   *  way round. */
+  demoStore: boolean;
+  overrides: { socPct: Num; timeLeftMin: Num };
+  /** The two values the overrides replace, so the panel can show what it is
+   *  standing in for and offer the way back. */
+  carSocPct: Num;
+  clockTimeLeftMin: number;
 }
 
 /** One cell on the Cell Voltages tab, classified server-side. */

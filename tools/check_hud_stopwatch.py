@@ -100,11 +100,41 @@ txt = hud._lap_lbl.text()
 want("Wh" not in txt and "<span" not in txt,
      "a restart with nothing finished still showed a figure: %r" % txt)
 
-# ── The driver's own button still works ──────────────────────────────────── #
-hud._reset_lap_timer()
+# ── The driver's own button: HELD now, and it cuts a real lap ────────────── #
+# It used to restart the displayed clock and touch nothing. It now cuts the lap
+# the pit's Cut lap cuts, which moves the lap count -- so the two things worth
+# checking are that a TAP does nothing at all, and that a completed hold asks
+# the CAN worker for the lap rather than reaching into LapTracker from the GUI
+# thread. What the driver then SEES is _on_lap_timer's job, checked above.
+
+
+class _FakeInbox:
+    def __init__(self):
+        self.sent = []
+
+    def submit_local(self, action, value=None):
+        self.sent.append(action)
+
+
+_inbox = _FakeInbox()
+hud._worker = type("FakeWorker", (), {"lap_inbox": _inbox})()
+
+hud._on_lap_timer(time.monotonic() - 12.0, None, None)     # a clock at 0:12
+hud._lap_cut_timer.start()                                 # press...
+hud._lap_press_released()                                  # ...released too soon
+want(not _inbox.sent, "a tap cut a lap: %r" % _inbox.sent)
+want(hud._lap_reset_btn.text() == hud._LAP_BTN_HINT,
+     "a tap that did nothing gave no hint to hold: %r" % hud._lap_reset_btn.text())
 txt = hud._lap_lbl.text()
-want("Wh" not in txt, "the driver's reset button shows a stale cost: %r" % txt)
-want("0:00.0" in txt, "the driver's reset button does not zero the clock: %r" % txt)
+want("0:00.0" not in txt, "a tap zeroed the clock: %r" % txt)
+
+hud._cut_lap_from_hud()                                    # the hold completing
+want(_inbox.sent == ["cut_lap"],
+     "a completed hold did not ask for a lap: %r" % _inbox.sent)
+
+# No car behind the HUD (the Windows demo) must not raise.
+hud._worker = None
+hud._cut_lap_from_hud()
 
 print()
 if failures:

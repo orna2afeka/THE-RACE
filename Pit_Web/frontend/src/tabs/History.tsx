@@ -40,6 +40,25 @@ interface AppendMsg {
  *  it evenly). At 1 Hz that is ~8 hours of appends on a 15-minute window. */
 const POINT_CEILING = 30000;
 
+/** Milliseconds for a Plotly axis value, which is a number or a date string.
+ *  Plotly hands ranges back as "2026-09-19 16:14:20.314" — a space, not a T,
+ *  which not every browser's Date parses. */
+const axisMs = (v: unknown): number =>
+  typeof v === 'number' ? v : Date.parse(String(v).replace(' ', 'T'));
+
+/** The held zoom, but only while it still frames the data it was taken on;
+ *  null hands the axis back to autorange. See where it is called. */
+function fitsData(range: unknown[] | null, t: (string | null)[]): unknown[] | null {
+  if (!range || t.length === 0) return null;
+  const first = axisMs(t[0]), last = axisMs(t[t.length - 1]);
+  const lo = axisMs(range[0]), hi = axisMs(range[1]);
+  if (![first, last, lo, hi].every(Number.isFinite)) return null;
+  // 5 % of the window either side, and never less than a minute, so a nudge
+  // past the live end is still a view of this data and keeps its zoom.
+  const pad = Math.max((last - first) * 0.05, 60_000);
+  return lo >= first - pad && hi <= last + pad ? range : null;
+}
+
 export default function History({ config, dark, visible, fresh, age }: Props) {
   const [selected, setSelected] = useState<string[]>(config.historyDefaultMetrics);
   const [windowLabel, setWindowLabel] = useState('15 min');
@@ -109,7 +128,7 @@ export default function History({ config, dark, visible, fresh, age }: Props) {
     const sameWindow = lastWindowRef.current === windowLabel;
     lastWindowRef.current = windowLabel;
     const prevAxis = (host as Plotly.PlotlyDiv | null)?.layout?.xaxis;
-    const keepRange = sameWindow && prevAxis?.autorange === false && Array.isArray(prevAxis.range)
+    const heldRange = sameWindow && prevAxis?.autorange === false && Array.isArray(prevAxis.range)
       ? prevAxis.range : null;
 
     (async () => {
@@ -117,6 +136,21 @@ export default function History({ config, dark, visible, fresh, age }: Props) {
       if (cancelled || !host) return;
       pointsRef.current = hist.count;
       setEmpty(hist.count === 0);
+
+      // A KEPT ZOOM MUST STILL BE A VIEW OF THIS DATA. Plotly sets
+      // autorange=false after any drag, and the range then survived every
+      // later redraw of the same window -- so an afternoon's zoom-out, or a
+      // pan off the end while the car was stopped, left the window's three
+      // hours of telemetry as a sliver at one edge of an axis a day wide,
+      // every time the tab was opened after that. Nothing on the page said
+      // why, and the window buttons appeared not to work.
+      //
+      // Honouring it only when it sits INSIDE the data keeps the promise that
+      // matters -- a zoom survives adding a metric, normalising, a theme
+      // change, a reload -- and drops it exactly when it has stopped
+      // describing what is on screen. A little padding, because panning a
+      // fraction past the live end to watch new points arrive is normal.
+      const keepRange = fitsData(heldRange, hist.t);
 
       const units: string[] = [];
       chosen.forEach((m) => { if (!units.includes(m.unit)) units.push(m.unit); });
@@ -361,7 +395,7 @@ interface LapsResp {
   /** kind is the CAR's verdict; null from a car that predates it. */
   laps: { lap: number; driver: string | null; energyWh: Num; lapTimeS: Num;
           distanceM: Num; kind: string | null; flags: string[];
-          source: string | null; stoppedS: Num }[];
+          source: string | null; stoppedS: Num; started: string | null }[];
   summary: { count: number; flyingCount: number; bestS: Num; avgS: Num; avgWh: Num };
 }
 
@@ -422,11 +456,14 @@ function LapCharts({ dark, visible }: { dark: boolean; visible: boolean }) {
     const base = layoutBase(dark, 230);
     const t = theme(dark);
     const lapX = laps.map((_, i) => i);
-    const note = laps.map((l) =>
-      `lap ${l.lap}${l.driver ? ' · ' + l.driver : ''}` +
-      `${l.kind ? ' · ' + (KIND_NAME[l.kind] ?? l.kind) : ''}` +
-      `${l.stoppedS !== null && l.stoppedS >= 10 ? ` · stood ${Math.round(l.stoppedS)} s` : ''}` +
-      `${l.flags?.length ? ' · ' + l.flags.join(', ') : ''}`);
+    // HOVER IS THE LAP NUMBER AND THE VALUE, AND NOTHING ELSE.
+    //
+    // x is a position, not a lap number (see above), so the number has to be
+    // carried in customdata or the hover names the wrong lap. Everything else
+    // a lap has -- driver, kind, time stood, flags -- is a column in the Laps
+    // by driver table below, where it can be read and compared instead of
+    // chased with a mouse.
+    const lapNo = laps.map((l) => l.lap);
     // One label per lap (dtick: 1) made Plotly measure hundreds of labels: 358
     // laps took 4.5-5.4 s to draw, against 54 ms with a coarser step. Handing
     // it ~12 explicit ticks keeps that win: tickmode 'array' is what lets the
@@ -444,9 +481,15 @@ function LapCharts({ dark, visible }: { dark: boolean; visible: boolean }) {
       type: 'bar', x: lapX, y: laps.map((l) => l.energyWh),
       marker: { color: laps.map((l) => (counts(l.kind) ? '#00B3FF' : MUTED)),
                 line: { width: 0 } }, width: 0.55,
-      customdata: note, hovertemplate: '%{y:.1f} Wh<extra>%{customdata}</extra>',
+      customdata: lapNo, hovertemplate: 'lap %{customdata} · %{y:.1f} Wh<extra></extra>',
     }], { ...base, margin: { l: 50, r: 12, t: 8, b: 36 }, bargap: 0.4,
           xaxis: { ...base.xaxis, ...lapAxis },
+          // DRAG PANS, as on History, Weather and the battery forecast.
+          // layoutBase defaults to zoom; on a chart with one bar per lap a
+          // drag is nearly always "show me the laps either side of these",
+          // and a race puts hundreds of them off the end of the axis. The
+          // modebar still has zoom and reset for the times it is not.
+          dragmode: 'pan',
           showlegend: false }, plotConfig);
     // Lap time is plotted in SECONDS and labelled m:ss, never decimal minutes.
     // "4.45 min" is not a figure anyone on a pit wall thinks in; 4:27 is the
@@ -473,12 +516,13 @@ function LapCharts({ dark, visible }: { dark: boolean; visible: boolean }) {
       connectgaps: false, line: { color: '#00e0b4', width: 2 },
       marker: { size: 8, color: laps.map((l) => (counts(l.kind) ? '#00e0b4' : MUTED)),
                 line: { width: 2, color: t.card } },
-      customdata: laps.map((l, i) => [note[i], lapTimeShort(l.lapTimeS)]),
-      hovertemplate: '%{customdata[1]}<extra>%{customdata[0]}</extra>',
+      customdata: laps.map((l) => [l.lap, lapTimeShort(l.lapTimeS)]),
+      hovertemplate: 'lap %{customdata[0]} · %{customdata[1]}<extra></extra>',
     }], { ...base, margin: { l: 50, r: 12, t: 8, b: 36 },
           xaxis: { ...base.xaxis, ...lapAxis },
           yaxis: { ...base.yaxis, tickmode: 'array', tickvals,
                    ticktext: tickvals.map((v) => lapTimeShort(v)) },
+          dragmode: 'pan',
           showlegend: false }, plotConfig);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sig, dark]);
@@ -504,7 +548,7 @@ function LapCharts({ dark, visible }: { dark: boolean; visible: boolean }) {
             {someNotFlying && (
               <div className="caption" style={{ marginTop: 6 }}>
                 Best and averages use flying laps only. In-laps, out-laps and laps the car
-                marked suspect are drawn grey — hover one to see why.
+                marked suspect are drawn grey — the <b>Kind</b> column below says which.
               </div>
             )}
             <LapTable laps={laps} />
@@ -543,6 +587,7 @@ function LapTable({ laps }: { laps: LapsResp['laps'] }) {
           <thead>
             <tr>
               <th className="num">Lap</th><th>Driver</th>
+              <th className="num">Started</th>
               <th className="num">Lap time</th><th className="num">Energy (Wh)</th>
               <th className="num">Distance (m)</th><th>Kind</th>
               <th className="num">Stood (s)</th><th>Flags</th>
@@ -553,6 +598,7 @@ function LapTable({ laps }: { laps: LapsResp['laps'] }) {
               <tr key={`${l.lap}-${i}`} className={counts(l.kind) ? undefined : 'not-flying'}>
                 <td className="num mono">{l.lap}</td>
                 <td>{l.driver ?? MISSING}</td>
+                <td className="num mono">{l.started ?? MISSING}</td>
                 <td className="num mono">{lapTime(l.lapTimeS)}</td>
                 <td className="num">{fmtStat(l.energyWh)}</td>
                 <td className="num">{fmtStat(l.distanceM)}</td>

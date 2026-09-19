@@ -4,9 +4,11 @@
 import { useState, type ReactNode } from 'react';
 import { Icon } from './icons';
 import { MISSING, fmt, getJSON, localInput, postJSON, usePoll } from './lib';
-import { DateTimeField, Disclosure, Pill } from './components';
+import { CarControls, DateTimeField, Disclosure, Pill } from './components';
 import { StintPanel } from './DriverStint';
 import { StartTimePanel } from './StartTime';
+import { PublicNote } from './PublicNote';
+import { SpectatorEstimate } from './SpectatorEstimate';
 import { toast } from './toast';
 import type { Config, Live } from './types';
 
@@ -52,9 +54,14 @@ export default function Sidebar({
       // decide whether to zero the car. Say so either way: "the car kept its
       // warm-up laps" is something the pit has to find out AT the green flag,
       // not from a lap count that looks wrong twenty minutes later.
-      const r = await postJSON<{ newRace?: boolean; carError?: string | null }>(
+      const r = await postJSON<{ newRace?: boolean; carError?: string | null; carLinkDisabled?: boolean }>(
         '/api/race', startTime === undefined ? { isRacing } : { isRacing, startTime });
-      if (r.carError) {
+      if (r.carError && r.carLinkDisabled) {
+        // Not a failure. This dashboard is not on the pit's store, so the
+        // green flag deliberately stopped at the demo's own race clock and
+        // the real car was never asked to zero anything.
+        toast('Demo race clock started — the car was NOT reset, and nothing was sent to it.');
+      } else if (r.carError) {
         toast(`Race started — but the car was not reached, so it is still counting its warm-up: ${r.carError}`, 'err');
       } else {
         toast(isRacing
@@ -113,8 +120,17 @@ export default function Sidebar({
       </Sec>
 
       <CutLap carLap={live?.state?.auto_lap ?? null}
-              lapHeld={live?.lapClock?.heldAt != null} />
-      <DriverMessage />
+              lapHeld={live?.lapClock?.heldAt != null}
+              carLink={!config.demoStore} />
+      <DriverMessage carLink={!config.demoStore} />
+      {/* What the PUBLIC sees while the car is silent. Its own file: see
+          SpectatorEstimate.tsx for why it exists and what ends it. */}
+      <Sec icon="radio" title="Spectator page">
+        <SpectatorEstimate clockOffsetMs={clockOffsetMs} />
+        {/* Why the car is stopped, in the crew's own words. PublicNote.tsx. */}
+        <div style={{ height: 1, background: 'var(--line)', margin: '14px 0' }} />
+        <PublicNote clockOffsetMs={clockOffsetMs} />
+      </Sec>
       <ExportPanel config={config} />
 
       <Sec icon="sliders" title="Appearance">
@@ -145,7 +161,8 @@ function lastLapLabel(kind: string | null, stoppedS: number | null): string {
     ? `${label} · stood ${Math.round(stoppedS)} s` : label;
 }
 
-function CutLap({ carLap, lapHeld }: { carLap: number | null; lapHeld: boolean }) {
+function CutLap({ carLap, lapHeld, carLink }:
+  { carLap: number | null; lapHeld: boolean; carLink: boolean }) {
   const [sent, setSent] = useState<string | null>(null);
   const [freshSent, setFreshSent] = useState<string | null>(null);
   const [setSentAt, setSetSentAt] = useState<string | null>(null);
@@ -247,6 +264,7 @@ function CutLap({ carLap, lapHeld }: { carLap: number | null; lapHeld: boolean }
 
   return (
     <Sec icon="timer" title="Lap control">
+      <CarControls enabled={carLink}>
       <button className="btn block" onClick={async () => {
         try {
           const r = await postJSON<{ sentAt: string; id: number }>('/api/cut_lap', {});
@@ -320,11 +338,12 @@ function CutLap({ carLap, lapHeld }: { carLap: number | null; lapHeld: boolean }
             : `Sent ${holdSent} — awaiting the car's confirmation. (The wall is already ${holdAction === 'stop_stopwatch' ? 'stopped' : 'running'}.)`}
         </div>
       )}
+      </CarControls>
     </Sec>
   );
 }
 
-function DriverMessage() {
+function DriverMessage({ carLink }: { carLink: boolean }) {
   const [mode, setMode] = useState<'label' | 'text'>('label');
   const [label, setLabel] = useState('');
   const [num, setNum] = useState(0);
@@ -344,6 +363,7 @@ function DriverMessage() {
 
   return (
     <Sec icon="message" title="Driver message">
+      <CarControls enabled={carLink}>
       <div className="chips">
         <button className="chip" aria-pressed={mode === 'label'} onClick={() => setMode('label')}>Label + number</button>
         <button className="chip" aria-pressed={mode === 'text'} onClick={() => setMode('text')}>Text</button>
@@ -371,6 +391,7 @@ function DriverMessage() {
         }}>Clear</button>
       </div>
       <div className="caption">{last ? `Now showing: ${last}` : 'Nothing on the driver HUD right now.'}</div>
+      </CarControls>
     </Sec>
   );
 }

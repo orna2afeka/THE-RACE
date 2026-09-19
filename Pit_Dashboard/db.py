@@ -318,6 +318,33 @@ STATE_COLUMNS = [
 # Every data column the dashboard/exporter can name, in a stable order.
 EXPORT_COLUMNS = METRIC_COLUMNS + ERROR_COLUMNS + STATE_COLUMNS
 
+# THE COLUMNS THE HISTORY CHARTS DRAW, and the reason idx_telemetry_chart
+# exists. Every Metric.source in Pit_Dashboard/metrics.py must appear here or
+# its chart falls off the fast path -- tools/check_history.py fails if one
+# does. Ordered as metrics.py lists them, so the two read alike.
+#
+# WHY AN INDEX OVER FIFTEEN COLUMNS IS WORTH IT. A telemetry row is ~4.6 kB,
+# almost all of it raw_json, and SQLite stores rows whole: reading one number
+# out of every row still drags the entire 170 MB store through the page cache.
+# Measured on the pit's own store (36,724 rows): the History tab's widest
+# window took 2.8 s just to scan, and 35.8 s the way it was being asked. With
+# these columns carried IN the index the same query is index-only and never
+# touches the table -- 0.15 s for all fifteen metrics at once.
+#
+# It costs a few MB and one more index to maintain per insert, against a
+# collector writing about two rows a second. That is not a trade, it is a gift.
+CHART_COLUMNS = (
+    "mms_vehicle_speed_kmh", "mms_throttle_percent", "mms_throttle_mv",
+    "mms_power_W", "mms_rpm", "bms_soc_percent", "mms_measured_voltage_V",
+    "bms_current_A", "battery_temp_C", "mms_motor_temp_C",
+    "mms_temperature_C", "mms_motor_ohms", "odometer_m", "calculated_lap",
+    "total_race_energy",
+)
+_not_stored = [c for c in CHART_COLUMNS if c not in EXPORT_COLUMNS]
+if _not_stored:
+    raise RuntimeError("CHART_COLUMNS names columns the store has no room "
+                       "for: %s" % _not_stored)
+
 # Column -> SQLite declared type. Numeric metrics are REAL; flags/codes are
 # INTEGER; the protections summary is TEXT.
 _COL_TYPES = {
@@ -962,6 +989,16 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_telemetry_lap "
         "ON telemetry (device_id, calculated_lap)"
+    )
+    # COVERING INDEX FOR THE HISTORY CHARTS. (device_id, device_ts) first so
+    # it also answers the ordering and the window bounds, then every column a
+    # chart can draw -- see CHART_COLUMNS for why carrying them is worth it.
+    # Built here, after the migration, for the same reason the faults index is:
+    # an older store may not have all of these columns until the ALTER TABLE
+    # above has run. Takes about half a second on a 170 MB store, once.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_telemetry_chart ON telemetry "
+        "(device_id, device_ts, %s)" % ", ".join(CHART_COLUMNS)
     )
     # One-time correction of historical rows: motor power is signed (negative on
     # regen) but was stored as a raw uint16, so regen samples read as ~65000 W.
@@ -1836,15 +1873,22 @@ def count_samples_since(conn: sqlite3.Connection, start_ts: float,
 
 
 def time_bounds(conn: sqlite3.Connection, device_id: str = DEVICE_ID):
-    """(min_device_ts, max_device_ts) over stored samples, or (None, None)."""
-    row = conn.execute(
-        "SELECT MIN(device_ts) AS lo, MAX(device_ts) AS hi FROM telemetry "
-        "WHERE device_id = ?",
-        (device_id,),
-    ).fetchone()
-    if not row:
-        return None, None
-    return row["lo"], row["hi"]
+    """(min_device_ts, max_device_ts) over stored samples, or (None, None).
+
+    TWO STATEMENTS, NOT ONE. SQLite's index optimisation for MIN/MAX -- walk to
+    one end of the index and stop -- applies only to a LONE aggregate. Asking
+    for both in one SELECT gives up on it and scans the table, which on this
+    store means dragging 170 MB of raw_json through the page cache to read two
+    timestamps: 15.9 ms against 0.2 ms for the pair split apart. Same trap as
+    store_watermark and recent_laps, both of which are split for this reason.
+
+    Every history request calls this, so it is 15 ms on the front of each one.
+    """
+    lo = conn.execute("SELECT MIN(device_ts) AS v FROM telemetry "
+                      "WHERE device_id = ?", (device_id,)).fetchone()
+    hi = conn.execute("SELECT MAX(device_ts) AS v FROM telemetry "
+                      "WHERE device_id = ?", (device_id,)).fetchone()
+    return (lo["v"] if lo else None), (hi["v"] if hi else None)
 
 
 def fetch_samples(conn: sqlite3.Connection, start_ts: float = None,
@@ -1978,6 +2022,68 @@ def fetch_series(conn: sqlite3.Connection, columns, start_ts: float = None,
         rows = conn.execute(sql, params).fetchall()
 
     return rows, total, step
+
+
+def series_stats(conn: sqlite3.Connection, columns, start_ts: float = None,
+                 end_ts: float = None, device_id: str = DEVICE_ID):
+    """min/avg/max/count and the newest reading, per column, worked out in SQL.
+
+    Returns ({column: {min, avg, max, samples, now}}, rows_in_window).
+
+    WHY NOT IN PYTHON, WHICH IS WHERE IT WAS. The History tab's stat strip
+    polls every 10 seconds, and on the "All" window it was pulling every row
+    of the store -- all 118 columns, raw_json included -- to take three numbers
+    off fifteen of them. Thirty seconds of work, on repeat, for a strip of text
+    that fits on one line. In SQL it is one pass and it never leaves the index.
+
+    EXACT, NOT SAMPLED, and that is the point of doing it separately from the
+    chart: the chart is thinned to a few thousand points and its own extremes
+    would miss the peak. These are every sample in the window.
+
+    `samples` counts the readings that EXIST -- SQL aggregates skip NULL, which
+    is the same rule the rest of the pit follows: a metric the car never sent is
+    absent, not zero, and must not be averaged as one. Subtract it from the
+    rows figure for how many samples were missing that metric.
+
+    `now` is the newest non-null reading in the window, not the newest row's
+    value, so a metric that dropped out for the last few seconds still reports
+    what it last actually said.
+    """
+    bad = [c for c in columns if c not in _COLUMN_SET]
+    if bad:
+        raise ValueError(f"series_stats: unknown column(s) {bad}")
+
+    clauses = ["device_id = ?"]
+    params = [device_id]
+    if start_ts is not None:
+        clauses.append("device_ts >= ?")
+        params.append(start_ts)
+    if end_ts is not None:
+        clauses.append("device_ts <= ?")
+        params.append(end_ts)
+    where = " AND ".join(clauses)
+
+    select = ["COUNT(*)"]
+    args = []
+    for c in columns:
+        select += [f"MIN({c})", f"AVG({c})", f"MAX({c})", f"COUNT({c})",
+                   # The scalar subqueries sit in the SELECT list, so their
+                   # parameters bind BEFORE the outer WHERE's -- hence this
+                   # order. Each walks the index back from the newest row and
+                   # stops at the first reading, so it costs nothing on a
+                   # metric the car is sending.
+                   f"(SELECT {c} FROM telemetry WHERE {where} "
+                   f"AND {c} IS NOT NULL ORDER BY device_ts DESC LIMIT 1)"]
+        args += params
+    row = conn.execute("SELECT %s FROM telemetry WHERE %s"
+                       % (", ".join(select), where), [*args, *params]).fetchone()
+
+    out = {}
+    for i, c in enumerate(columns):
+        lo, avg, hi, n, now = row[1 + i * 5:6 + i * 5]
+        out[c] = {"min": lo, "avg": avg, "max": hi, "samples": int(n or 0),
+                  "now": now}
+    return out, int(row[0] or 0)
 
 
 def fetch_faults(conn: sqlite3.Connection, limit: int = 2000,

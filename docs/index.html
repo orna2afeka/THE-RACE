@@ -342,6 +342,15 @@
       <div class="sub" id="swap-sub" hidden></div>
     </div>
 
+    <!-- Whatever the pit has typed, and nothing when they have typed nothing.
+         There is no default line: a card that always says something would be
+         read as current even on the morning nobody has touched it. -->
+    <div class="card" id="note-card" style="display:none">
+      <div class="label">From the pit</div>
+      <div class="value small" id="note-text"></div>
+      <div class="sub" id="note-sub"></div>
+    </div>
+
     <div class="card">
       <div class="label">Where the car is</div>
       <div class="value small" id="sector-name">&mdash;</div>
@@ -899,6 +908,81 @@ function loadRace() {
 // it. textContent, never innerHTML: this is text someone typed.
 let driverName = "";
 let swapSince = null;      // when the pit said the change began, or null
+let noteText = "";         // the line the pit typed for this page, or ""
+let noteSince = null;      // when they put it up, for the age beside it
+
+// ── THE ESTIMATE: where the car SHOULD be, while nobody can hear it ──────── //
+// The car drops off the network for minutes at a time, and this page then sat
+// on a frozen marker for as long as that lasted -- which reads, to the family
+// it is for, as a car that has stopped. The pit can now say "it is still
+// lapping": it gives a lap number and a place on track, and from that instant
+// this page walks the marker round at the team's own 4:40 lap (DATA.profile,
+// the speed profile measured at Zolder), braking and accelerating where the
+// real car does.
+//
+// IT IS AN ESTIMATE AND IS NEVER SHOWN AS ANYTHING ELSE. It appears only while
+// the car is out of contact, every figure it produces carries a "~", the
+// status line says in words that it is estimated, and the first real sample
+// takes the page back without anybody pressing anything. Battery, distance and
+// the last lap are never estimated: nothing here invents a reading the car
+// did not send.
+//
+// WORKED OUT FROM ONE INSTANT, NOT ADVANCED FRAME BY FRAME, so every viewer's
+// marker is in the same place whenever they opened the page, and a phone that
+// slept for a minute wakes up in the right corner rather than a minute behind.
+//
+// It rides on the driver node (see loadDriver) rather than a path of its own:
+// that node is already polled, and a second path is a second request per
+// viewer per poll against a database whose egress is metered.
+let estimate = null;       // {startedAt, lap, distM} from the pit, or null
+const EST = (() => {
+  const prof = DATA.profile, L = DATA.trackLength;
+  // Seconds into the lap at each profile point, by the trapezoid rule.
+  const t = [0];
+  for (let i = 1; i < prof.length; i++) {
+    const v = Math.max(1, (prof[i - 1][1] + prof[i][1]) / 2) / 3.6;
+    t.push(t[i - 1] + Math.max(0, prof[i][0] - prof[i - 1][0]) / v);
+  }
+  // Scaled to the profile's own published lap time, so "4:40" on this page is
+  // the same 4:40 the pit and the driver's target speed are built on, not a
+  // second integration that disagrees with it by half a second a lap.
+  const own = t[t.length - 1];
+  const lapS = DATA.profileLapSeconds > 0 ? DATA.profileLapSeconds : own;
+  const k = own > 0 ? lapS / own : 1;
+  return { prof, L, lapS, t: t.map(x => x * k) };
+})();
+
+function estSeek(arr, x) {             // the last index whose value is <= x
+  let lo = 0, hi = arr.length - 1;
+  while (lo < hi - 1) {
+    const mid = (lo + hi) >> 1;
+    if (arr[mid] <= x) lo = mid; else hi = mid;
+  }
+  return lo;
+}
+
+function estNow(now) {
+  if (!estimate) return null;
+  const { prof, L, lapS, t } = EST;
+  const ds = prof.map(r => r[0]);
+  // Seconds into the lap at the place the pit named...
+  const d0 = ((estimate.distM % L) + L) % L;
+  const i0 = estSeek(ds, d0);
+  const span0 = ds[i0 + 1] - ds[i0];
+  const t0 = t[i0] + (span0 > 0 ? (d0 - ds[i0]) / span0 : 0) * (t[i0 + 1] - t[i0]);
+  // ...plus everything since the press.
+  const total = t0 + Math.max(0, now - estimate.startedAt);
+  const laps = Math.floor(total / lapS);
+  const inLap = total - laps * lapS;
+  const i = estSeek(t, inLap);
+  const spanT = t[i + 1] - t[i];
+  const f = spanT > 0 ? (inLap - t[i]) / spanT : 0;
+  return {
+    dist: Math.min(L - 0.01, ds[i] + (ds[i + 1] - ds[i]) * f),
+    lap: estimate.lap + laps,
+    speed: prof[i][1] + (prof[i + 1][1] - prof[i][1]) * f,
+  };
+}
 
 function loadDriver() {
   fetch(CONFIG.dbUrl + "/" + CONFIG.driverPath + ".json", { cache: "no-store" })
@@ -908,6 +992,22 @@ function loadDriver() {
       // === true, not truthy: this node is written by the pit and read by
       // strangers, and a stray string must not turn the badge on.
       swapSince = d && d.changing === true ? num(d.since) : null;
+      // Every field checked, for the reason above: this node is read by
+      // strangers' browsers, and a half-written estimate must leave the page
+      // exactly as it was rather than send the marker to NaN.
+      const e = d && d.estimate;
+      estimate = e && num(e.startedAt) != null && num(e.lap) != null
+                 && num(e.distM) != null
+        ? { startedAt: num(e.startedAt), lap: Math.round(num(e.lap)),
+            distM: num(e.distM) }
+        : null;
+      // The pit's own line. Trimmed and capped at the pit too -- this second
+      // cap is because the value arrives from a database node and lands on a
+      // page read by strangers, and a paragraph pasted by accident should
+      // shorten the card, not reflow the phone it is being read on. It goes in
+      // with textContent below, never innerHTML, so it can only ever be text.
+      noteText = d && typeof d.note === "string" ? d.note.trim().slice(0, 80) : "";
+      noteSince = noteText ? num(d.noteSince) : null;
       paintDriver(Date.now() / 1000);
     }).catch(() => {});
 }
@@ -931,6 +1031,16 @@ function paintDriver(now) {
   if (swapping) {
     el("swap-sub").textContent =
       "In the pits for a driver change · " + fmtAgeShort(Math.max(0, now - swapSince));
+  }
+
+  // The pit's line. Same rule as the swap above: it says how long it has been
+  // up rather than deciding for the crew when it has gone stale, and it is
+  // simply absent when they have not typed anything.
+  el("note-card").style.display = noteText ? "" : "none";
+  if (noteText) {
+    el("note-text").textContent = noteText;
+    el("note-sub").textContent = noteSince == null
+      ? "" : "posted " + fmtAgeShort(Math.max(0, now - noteSince)) + " ago";
   }
 }
 
@@ -1123,14 +1233,23 @@ function render() {
   const stale = age == null || age > CONFIG.staleAfterS;
   const old = isOld(now);
 
+  // Only ever while the car cannot be heard. The first real sample makes
+  // `stale` and `old` false together and the estimate is simply not consulted.
+  const est = (stale || old) ? estNow(now) : null;
+
   const pill = el("status");
-  pill.className = "pill " + (age == null || old ? "off" : stale ? "stale" : "live");
+  pill.className = "pill " + (est ? "stale"
+                              : age == null || old ? "off" : stale ? "stale" : "live");
   el("status-text").textContent =
-    age == null ? "Waiting for the car" : old ? "Car not running"
-                : stale ? "No data" : "Live";
+    est ? "No data"
+        : age == null ? "Waiting for the car" : old ? "Car not running"
+                      : stale ? "No data" : "Live";
   const sampleTs = snap ? num(snap.ts) : null;
   el("status-sub").textContent =
-    age == null ? "Nothing has arrived yet — the car may not be running."
+    est ? "The car is out of contact. Its position, lap and speed here are "
+          + "ESTIMATED at race pace (" + fmtTime(EST.lapS) + " a lap), not "
+          + "measured — the real figures return when it is heard again."
+    : age == null ? "Nothing has arrived yet — the car may not be running."
                 : old ? "Last heard from " + (sampleTs == null ? "a while"
                           : fmtClock(now - sampleTs)) + " ago. Numbers will "
                           + "appear when the car is back on track."
@@ -1142,8 +1261,12 @@ function render() {
 
   // An old reading is not shown at all: every value renders as a dash.
   const s = old ? {} : (snap || {});
-  el("lap").textContent = num(s.lap) == null ? "—" : num(s.lap);
-  el("speed").textContent = num(s.speed_kmh) == null ? "—"
+  // "~" on both while estimating: the two figures the estimate produces are
+  // the only two it marks, and it marks them every time.
+  el("lap").textContent = est ? "~" + est.lap
+                          : num(s.lap) == null ? "—" : num(s.lap);
+  el("speed").textContent = est ? "~" + Math.round(est.speed)
+                            : num(s.speed_kmh) == null ? "—"
                             : Math.round(num(s.speed_kmh));
   el("lastlap").textContent = fmtTime(num(s.last_lap_time_s));
   const odo = num(s.odometer_m);
@@ -1153,7 +1276,9 @@ function render() {
   // instant and the elapsed time: a screenshot sent to somebody an hour later
   // still answers the question.
   const gmark = el("gps-mark");
-  if (fixTarget != null) {
+  if (est) {
+    gmark.textContent = "estimated · " + fmtTime(EST.lapS) + " race pace";
+  } else if (fixTarget != null) {
     gmark.textContent = "GPS live" + (gpsSampleTs == null ? ""
                                       : " · " + fmtClockTime(gpsSampleTs));
   } else if (gpsAge != null && gpsSampleTs != null) {
@@ -1251,7 +1376,21 @@ function frame(t) {
     if (delta > L / 2) delta -= L;
     dist = ((dist + delta * Math.min(1, dt * 2.2)) % L + L) % L;
   }
-  if (everPainted && isOld(Date.now() / 1000)) {
+  // The estimate drives the marker on its own, and comes FIRST: it has to
+  // work on a page opened while the car was already dark, which has never
+  // painted anything and whose only snapshot is an old one.
+  const nowS = Date.now() / 1000;
+  const est = (!fresh || isOld(nowS)) ? estNow(nowS) : null;
+  if (est) {
+    dist = est.dist;
+    const s = paintMap(dist, null);
+    el("sector-name").textContent = "S" + s.id + " · " + s.name;
+    const nx = nextLandmark(dist);
+    if (nx) {
+      el("next-sub").textContent = "Next: " + nx[0].name + " · " +
+        Math.round(nx[1]).toLocaleString() + " m ahead";
+    }
+  } else if (everPainted && isOld(nowS)) {
     el("sector-name").textContent = "—";
     el("next-sub").textContent = "—";
   } else if (everPainted) {

@@ -106,9 +106,9 @@ TARGET_LAP_TIME_MIN = 3.5
 # what each curve integrates to. Old CSVs are in profiles/_backup/.
 # >>> PROFILE MATRIX >>>
 PROFILE_MATRIX = {
-    "dor_265s": {"label": "Fast", "energy_wh": 120.5, "target_s": 265.0},
-    "dor_280s": {"label": "Base", "energy_wh": 115.9, "target_s": 280.0},
-    "dor_300s": {"label": "Slow", "energy_wh": 110.8, "target_s": 300.0},
+    "dor_265s": {"label": "Fast", "energy_wh": 120.5, "target_s": 258.4},
+    "dor_280s": {"label": "Base", "energy_wh": 116.0, "target_s": 273.0},
+    "dor_300s": {"label": "Slow", "energy_wh": 111.0, "target_s": 292.5},
 }
 # <<< PROFILE MATRIX <<<
 DEFAULT_STRATEGY_KEY = "dor_280s"

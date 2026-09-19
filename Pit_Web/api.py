@@ -75,6 +75,68 @@ from memo import memo                                  # noqa: E402
 
 DB_PATH = os.environ.get("SOLARRACE_DB_PATH") or SQLITE_PATH
 
+# Is this backend pointed somewhere OTHER than the pit's real store? That is
+# the demo dashboard (Start Demo Dashboard.bat sets SOLARRACE_DB_PATH to
+# demo_telemetry.db), or a backend opened on an archived copy.
+#
+# Two things hang off it, and both are the same rule: nothing made up may be
+# mistaken for the car. The public driver name is never published from here,
+# and the Strategy screen's typed-in inputs (SoC, time remaining) exist ONLY
+# here — on the real dashboard the plan is always the car's own numbers.
+DEMO_STORE = os.path.abspath(DB_PATH) != os.path.abspath(SQLITE_PATH)
+
+# What a demo dashboard is told when it tries to command the car.
+CAR_LINK_REFUSED = (
+    "This dashboard is running on a demo store, so it is not connected to the "
+    "car. The command was NOT sent. Use the real pit dashboard (run_web.bat) "
+    "to command the car."
+)
+
+
+def car_link():
+    """The car's Firebase channel — or a refusal, off the pit's real store.
+
+    THE SANDBOX BOUNDARY, and the reason it is a function rather than a check
+    repeated at a dozen endpoints. Every `import driver_message` in a request
+    handler goes through here.
+
+    The demo dashboard reads a DIFFERENT SQLite file, but driver_message talks
+    to Firebase, which has only one of everything: one /lap_command, one
+    /driver_command, one /strategy_command. Pointing the backend at
+    demo_telemetry.db does nothing to that, so before this existed every send
+    button on the demo reached the REAL CAR. The green flag was the worst of
+    them: "Start race" sends new_race, which zeroes the car's laps, distance
+    and energy and rewrites its checkpoint file.
+
+    That also reached the PUBLIC PAGE. docs/index.html on GitHub Pages plots
+    /public/live, which the car itself writes — so a demo that resets the car
+    resets what every spectator is watching. Nothing on a demo dashboard is
+    allowed near it.
+
+    Raises 409 rather than returning None so a handler cannot forget to check:
+    the request fails, loudly, before anything local is written.
+    """
+    if DEMO_STORE:
+        raise HTTPException(409, CAR_LINK_REFUSED)
+    import driver_message
+    return driver_message
+
+
+def car_link_ro():
+    """Same boundary for the ACK POLLS, which read rather than command.
+
+    None on a demo store, and the caller serves a null ack. Not a 409: these
+    are polled every few seconds by every open tab, and a demo that painted an
+    error toast twice a minute would be read as a broken demo. There is also
+    nothing to report — a demo sends no commands, so it is owed no acks, and
+    showing the real car's answer to somebody else's command would be worse
+    than showing none.
+    """
+    if DEMO_STORE:
+        return None
+    import driver_message
+    return driver_message
+
 # REPLAY MODE — for developing and testing without a car or a collector.
 #
 # The dev snapshot is static, so /ws/history has nothing newer than the cursor
@@ -584,13 +646,73 @@ def _set_stint_running(conn, running, now=None):
 #
 # Only the REAL store publishes. The demo dashboard (SOLARRACE_DB_PATH pointed
 # at a demo store) must never put a made-up name in front of the public.
-PUBLIC_DRIVER_ENABLED = os.path.abspath(DB_PATH) == os.path.abspath(SQLITE_PATH)
+PUBLIC_DRIVER_ENABLED = not DEMO_STORE
 PUBLIC_DRIVER_RESYNC_S = 15
 PUBLIC_DRIVER_MAX_LEN = 40
 _NOT_SENT = object()
 _public_driver_sent = _NOT_SENT
 _public_driver_lock = threading.Lock()
 _public_driver_wake = threading.Event()
+
+
+# THE SPECTATOR ESTIMATE. While the car is out of contact the pit can ask the
+# public page to show where it SHOULD be at race pace: {"startedAt", "lap",
+# "distM"} in app_state, mirrored onto /public/driver by the loop below. The
+# page walks the marker round the 4:40 profile from that instant and marks
+# every figure it produces as estimated (tools/build_zolder_animation.py).
+#
+# Started by a press and by nothing else, and ENDED BY THE CAR: the first fresh
+# sample clears it (sync_public_driver), so an anchor typed at 14:00 cannot
+# come back to life at the next dropout an hour later and put the marker, and
+# the lap count, somewhere nobody chose.
+PUBLIC_ESTIMATE_KEY = "public_estimate"
+_public_estimate_sent = None
+
+
+def _public_estimate(conn):
+    """The estimate the page should be showing, or None."""
+    e = load_app_state(conn, PUBLIC_ESTIMATE_KEY) or {}
+    if e.get("startedAt") is None or e.get("lap") is None or e.get("distM") is None:
+        return None
+    return {"startedAt": float(e["startedAt"]), "lap": int(e["lap"]),
+            "distM": float(e["distM"])}
+
+
+# THE PIT'S OWN LINE ON THE PUBLIC PAGE. One short sentence the crew types --
+# "Changing tyres" -- shown to everyone with the URL until they take it down.
+#
+# WHY IT IS NOT A LIST OF CANNED REASONS. The page can already say the two
+# things the system KNOWS: a driver change, and the charger. This is for
+# everything else, and everything else is not a list anyone can write in
+# advance -- a puncture, a controller swap, scrutineering, a red flag. The pit
+# knows what is happening and can type it in five words.
+#
+# IT SAYS WHAT THE PIT TYPED, and nothing else: no inference, no expiry. Like
+# the driver-change flag, it stays until it is cleared, and the page prints how
+# long it has been up so a note left on after the car has gone back out is
+# visible rather than quietly wrong.
+#
+# EVERYTHING HERE IS PUBLIC. The cap and the one-line rule are applied at the
+# door, in _clean_note, so nothing downstream has to wonder: the page renders
+# it with textContent, and this never sees markup worth escaping.
+PUBLIC_NOTE_KEY = "public_note"
+PUBLIC_NOTE_MAX_LEN = 48
+_public_note_sent = None
+
+
+def _clean_note(text):
+    """One line, no runs of whitespace, no longer than a phone can show."""
+    return " ".join((text or "").split())[:PUBLIC_NOTE_MAX_LEN].strip()
+
+
+def _public_note(conn):
+    """{"text", "since"} the page should be showing, or None."""
+    n = load_app_state(conn, PUBLIC_NOTE_KEY) or {}
+    text = _clean_note(n.get("text"))
+    if not text:
+        return None
+    since = n.get("since")
+    return {"text": text, "since": float(since) if since else None}
 
 
 def _public_driver_state(st):
@@ -613,19 +735,36 @@ def public_driver_synced(state):
 
 def sync_public_driver():
     """Make /public/driver match the current stint. Returns True when in sync."""
-    global _public_driver_sent
+    global _public_driver_sent, _public_estimate_sent, _public_note_sent
     if not PUBLIC_DRIVER_ENABLED:
         return None
     with _public_driver_lock:
         try:
             with closing(ro_conn()) as conn:
                 st = load_app_state(conn, DRIVER_STINT_KEY) or {}
+                est = _public_estimate(conn)
+                note = _public_note(conn)
+                _state, age = read_live_state(conn) if est else (None, None)
+            # THE CAR IS BACK, so the estimate is over. `age` is measured on the
+            # car's own sample time, so a collector paging through an hour-old
+            # backlog does not count as the car being heard -- only a sample
+            # that is current does.
+            if est and age is not None and age <= C.DATA_STALE_AFTER_S:
+                with closing(rw_conn()) as conn:
+                    save_app_state(conn, PUBLIC_ESTIMATE_KEY, {})
+                est = None
             state = _public_driver_state(st)
-            if _public_driver_sent is not _NOT_SENT and _public_driver_sent == state:
+            if (_public_driver_sent is not _NOT_SENT
+                    and _public_driver_sent == state
+                    and _public_estimate_sent == est
+                    and _public_note_sent == note):
                 return True
             import driver_message
-            driver_message.publish_driver_name(state[0], changing_since=state[1])
+            driver_message.publish_driver_name(state[0], changing_since=state[1],
+                                               estimate=est, note=note)
             _public_driver_sent = state
+            _public_estimate_sent = est
+            _public_note_sent = note
             return True
         except Exception as e:
             print("[public driver] not published, will retry: %s" % e, flush=True)
@@ -667,7 +806,9 @@ def _token_warm_loop():
     line every two minutes -- a real send still raises where the engineer can
     see it.
     """
-    import driver_message
+    driver_message = car_link_ro()
+    if driver_message is None:
+        return          # a demo store sends nothing, so there is no token to warm
     while True:
         try:
             driver_message.warm_token()
@@ -1302,6 +1443,9 @@ def api_config():
         "liveMetricsPerRow": live_metrics.LIVE_METRICS_PER_ROW,
         # Zolder paddock — where the map centres before the car reports.
         "mapFallback": {"lat": 50.9895, "lon": 5.2568},
+        # True when this backend is NOT on the pit's real store. The Strategy
+        # screen shows its typed-input panel only then — see DEMO_STORE.
+        "demoStore": DEMO_STORE,
     }
 
 
@@ -1422,7 +1566,7 @@ def api_trip_reset():
     documented CAN command. Shares the lap-command node with Cut Lap, which is
     why the ack below filters on action.
     """
-    import driver_message
+    driver_message = car_link()
     try:
         sent = driver_message.send_trip_reset()
     except Exception as e:
@@ -1437,7 +1581,9 @@ def api_trip_reset_ack():
     /lap_command_ack is shared with Cut Lap. A Cut Lap ack landing in between
     would otherwise be mistaken for this command's own confirmation.
     """
-    import driver_message
+    driver_message = car_link_ro()
+    if driver_message is None:
+        return {"ack": None}
     try:
         ack = driver_message.read_lap_ack()
     except Exception as e:
@@ -1470,6 +1616,23 @@ def api_history(
                   lambda: _history(chosen, minutes, start, end, limit, max_points))
 
 
+def _chart_columns(conn, chosen):
+    """device_ts plus the one column each chosen metric reads.
+
+    A column this store does not have is left OUT rather than asked for: an
+    older store predates solar current, throttle, is_charging and the rest,
+    and naming a missing column is an OperationalError where today it is a
+    dash. value_from_row() returns None for a column that is not in the row,
+    which is exactly what the chart drew before.
+    """
+    have = {r[1] for r in conn.execute("PRAGMA table_info(telemetry)")}
+    cols = ["device_ts"]
+    for m in chosen:
+        if m.source in have and m.source not in cols:
+            cols.append(m.source)
+    return cols
+
+
 def _history(chosen, minutes, start, end, limit, max_points):
     with closing(ro_conn()) as conn:
         lo, hi = db.time_bounds(conn)
@@ -1499,18 +1662,26 @@ def _history(chosen, minutes, start, end, limit, max_points):
         start_ts = start
         if start_ts is None and minutes:
             start_ts = hi - minutes * 60.0
-        rows = db.fetch_samples(conn, start_ts=start_ts, end_ts=end_ts, limit=limit)
+        # THINNED IN SQL, AND ONLY THE COLUMNS DRAWN. This used to read every
+        # row in the window with SELECT * and thin it here, which meant
+        # dragging the whole store -- 4.6 kB a row, 61 % of it raw_json the
+        # chart never looks at -- into Python to draw a few thousand points
+        # from it. The "All" window measured 35.8 s on the pit's own store for
+        # two metrics; it is now 0.15 s for all fifteen (db.fetch_series, and
+        # db.CHART_COLUMNS for the index that makes it index-only).
+        #
+        # Still an even stride, not a bucket average, so every point drawn is a
+        # value the car really measured at a moment it really measured it -- and
+        # the stride counts back from the NEWEST sample, so the live end of the
+        # trace is exact and `cursor` below is the true last point served.
+        rows, in_range, step = db.fetch_series(
+            conn, _chart_columns(conn, chosen), start_ts=start_ts,
+            end_ts=end_ts, limit=limit, stride_target=max_points)
         total = db.count_samples(conn)
 
-    # Thin to ~max_points by even stride before serialising. The traces are SVG
-    # (see below), and 46,836 points x N metrics is both a slow draw and a
-    # multi-megabyte JSON over the pit LAN. Even stride rather than min/max
-    # bucketing so a thinned trace still reads as the same shape, and the true
-    # count is reported separately so nothing claims to show every sample.
-    full = len(rows)
-    if full > max_points:
-        stride = full // max_points + 1
-        rows = rows[::stride]
+    # What the window held before thinning, which is what the caption reports.
+    # `limit` caps it the same way it caps the rows themselves.
+    full = min(in_range, limit)
 
     times = [r["device_ts"] for r in rows]
     return {
@@ -1525,7 +1696,7 @@ def _history(chosen, minutes, start, end, limit, max_points):
         "total": total,
         "count": len(rows),
         "sampled": full,
-        "downsampled": full > len(rows),
+        "downsampled": step > 1,
         # Which zone the strings above are in, so the UI can say so.
         "tz": str(export_zone(hi)),
     }
@@ -1553,9 +1724,13 @@ def _rangebreaks(times, factor=8.0, max_breaks=60):
         gap = times[i] - times[i - 1]
         if gap > threshold:
             gaps.append((gap, times[i - 1], times[i]))
+    # Biggest first to pick which ones are worth eliding, then back into time
+    # order to emit: Plotly walks the breaks in the order given, and a list
+    # that jumps back and forth is at best harder to read in a payload and at
+    # worst a question about undefined behaviour nobody should have to ask.
     gaps.sort(reverse=True)
     out = []
-    for gap, a, b in gaps[:max_breaks]:
+    for gap, a, b in sorted(gaps[:max_breaks], key=lambda g: g[1]):
         # Leave a sliver of real gap at each end, or the two sessions butt
         # together and read as continuous telemetry — the very illusion this
         # exists to prevent.
@@ -1588,27 +1763,49 @@ def _history_stats(chosen, minutes, start, end):
         if hi is None:
             return {"stats": []}
         start_ts = start if start is not None else (hi - minutes * 60.0 if minutes else None)
-        rows = db.fetch_samples(conn, start_ts=start_ts, end_ts=end)
+        # ONE PASS IN SQL, over the index. This used to pull every row in the
+        # window -- SELECT *, raw_json and all -- to take three numbers off
+        # each metric, on a strip that repolls every 10 s: half a minute of
+        # work per poll on the "All" window. Same figures, exactly, over every
+        # sample in the window rather than the thinned set the chart draws.
+        have = {c for c in _chart_columns(conn, chosen) if c != "device_ts"}
+        stats, rows = db.series_stats(conn, sorted(have),
+                                      start_ts=start_ts, end_ts=end)
     out = []
     for m in chosen:
-        vals = [value_from_row(r, m) for r in rows]
-        clean = [v for v in vals if v is not None]
+        # A metric whose column this store does not have: no readings, and the
+        # whole window counted as missing -- the dash it has always drawn.
+        s = stats.get(m.source) or {"min": None, "avg": None, "max": None,
+                                    "now": None, "samples": 0}
+        d = m.divisor
         out.append({
             "key": m.key, "label": m.label, "unit": m.unit, "color": m.color,
-            "min": min(clean) if clean else None,
-            "avg": (sum(clean) / len(clean)) if clean else None,
-            "max": max(clean) if clean else None,
-            "now": clean[-1] if clean else None,
-            "samples": len(clean), "missing": len(vals) - len(clean),
+            # The divisor is applied AFTER the aggregate, which is the same
+            # arithmetic value_from_row did per row: min/avg/max all commute
+            # with dividing by a positive constant.
+            "min": _scaled(s["min"], d),
+            "avg": _scaled(s["avg"], d),
+            "max": _scaled(s["max"], d),
+            "now": _scaled(s["now"], d),
+            "samples": s["samples"], "missing": rows - s["samples"],
         })
     return {"stats": out}
+
+
+def _scaled(value, divisor):
+    """`value` in the unit the chart shows, or None. Never 0 for absent."""
+    return None if value is None else (value / divisor if divisor else value)
 
 
 @app.get("/api/samples")
 def api_samples(limit: int = Query(50, ge=1, le=500)):
     """Most recent raw samples, for the History tab's table."""
     with closing(ro_conn()) as conn:
-        rows = db.fetch_samples(conn, limit=limit)
+        # The table shows the chart metrics and nothing else, so it asks for
+        # those columns. SELECT * here was 60 rows x 4.6 kB of raw_json read
+        # off disk and thrown away, every 10 s, for fifteen numbers a row.
+        rows, _, _ = db.fetch_series(
+            conn, _chart_columns(conn, HISTORY_CHARTS), limit=limit)
     out = []
     for r in rows:
         rec = {"t": _iso(r["device_ts"])}
@@ -1649,7 +1846,16 @@ def api_laps():
     laps = [{"lap": r["lap"], "driver": r["driver"], "energyWh": r["energy_wh"],
              "lapTimeS": r["lap_time_s"], "distanceM": r["distance_m"],
              "kind": r["kind"], "flags": r["flags"], "source": r["lap_source"],
-             "stoppedS": r["stopped_s"], "finishedTs": r["finished_ts"]}
+             "stoppedS": r["stopped_s"], "finishedTs": r["finished_ts"],
+             # WHEN THE LAP BEGAN: the finish minus the car's own measured lap
+             # time. Not "the previous lap's finish" -- those differ exactly
+             # where it matters, across a Pi restart or a stop, and the lap
+             # time is the car's measurement while the gap is only an absence.
+             # Formatted HERE because the zone rule (export_local) lives here;
+             # the browser never turns an epoch into a wall clock on its own.
+             # Null when either half is missing, never a guess.
+             "started": (_clock(r["finished_ts"] - r["lap_time_s"])
+                         if r["finished_ts"] and r["lap_time_s"] else None)}
             for r in rows]
     flying = db.flying_laps(rows)
     times = [r["lap_time_s"] for r in flying if r["lap_time_s"]]
@@ -2341,6 +2547,12 @@ def _strategy_payload(time_left_min, battery_wh, active_lap, table,
     """
     rounded_left = round(time_left_min / STRATEGY_TIME_ROUND_MIN) * STRATEGY_TIME_ROUND_MIN
     rounded_wh = round(battery_wh / STRATEGY_WH_ROUND) * STRATEGY_WH_ROUND
+    # Never round a real charge down to nothing. _plan_one_strategy() reads a
+    # start of 0 Wh as "unknown" and plans a FULL pack, so a car limping in on
+    # 0.2% -- under half of one rounding step -- would be planned as if it were
+    # brimmed, which is the most dangerous direction this can be wrong in.
+    if battery_wh > 0 and rounded_wh <= 0:
+        rounded_wh = STRATEGY_WH_ROUND
     table_key = tuple((r["label"], float(r["lap_time_min"]), float(r["energy_wh"]))
                       for r in table)
     rows = _plan_strategies(rounded_left, rounded_wh, int(active_lap or 0),
@@ -2371,21 +2583,47 @@ def _strategy_payload(time_left_min, battery_wh, active_lap, table,
         "measured": measured_note or {},
         "minLapsForMeasured": MIN_LAPS_FOR_MEASURED,
         "timeLeftMin": time_left_min,
+        # The race duration, which is also the cap on the demo screen's typed
+        # "time remaining". Served so the browser holds no copy of it.
+        "maxTimeLeftMin": strategy_engine.RACE_DURATION_MIN,
     }
 
 
 @app.get("/api/strategy")
-def api_strategy(manual_lap: int = Query(-1)):
+def api_strategy(manual_lap: int = Query(-1),
+                 soc_pct: float | None = Query(None, gt=0, le=100),
+                 time_left_min: float | None = Query(
+                     None, ge=0, le=strategy_engine.RACE_DURATION_MIN)):
+    """The strategy screen. `soc_pct` and `time_left_min` are DEMO-ONLY.
+
+    On the real dashboard the plan is always made from what the car reported
+    and from the race clock in the store; both overrides are ignored there, so
+    a stray query string cannot put a typed number in front of the crew as if
+    the car had sent it. On the demo backend they replace the two inputs the
+    search actually takes, which is how the strategy can still be read when the
+    Pi has been silent for hours and the stored SoC is long out of date.
+
+    Nothing is written either way: this endpoint has always been a pure
+    read + search, and an override only changes the arguments it is given.
+    """
     with closing(ro_conn()) as conn:
         state, _ = read_live_state(conn)
-        _, _, left_min = _race_clock(conn)
-    soc = state["soc"]
+        _, _, clock_left_min = _race_clock(conn)
+    if not DEMO_STORE:
+        soc_pct = time_left_min = None
+    soc = state["soc"] if soc_pct is None else soc_pct
+    left_min = clock_left_min if time_left_min is None else time_left_min
     active_lap = manual_lap if manual_lap >= 0 else state["auto_lap"]
     # `not soc` covers both a missing reading and a reported 0: neither is a
     # usable capacity, so the matrix assumes a full pack rather than telling
     # the strategist the car is empty. FULL means 100% SoC -- the car rolls out
     # at 100% and only the charges DURING the race are capped at 95%.
-    battery_wh = (strategy_engine.BATTERY_FULL_WH if not soc
+    #
+    # An override is always believed: it cannot be 0 (the query rejects it,
+    # because the engine reads an empty pack as an unknown one and plans a full
+    # one instead), so a typed 4% is planned as 4% and not as a placeholder.
+    assumed_full = soc_pct is None and not soc
+    battery_wh = (strategy_engine.BATTERY_FULL_WH if assumed_full
                   else (soc / 100.0) * strategy_engine.BATTERY_FULL_WH)
 
     # The matrix, verbatim. A row with no stored Wh/lap (a profile the Builder
@@ -2407,7 +2645,17 @@ def api_strategy(manual_lap: int = Query(-1)):
 
     out = _strategy_payload(left_min, battery_wh, active_lap, table, measured_note)
     out.update({
-        "assumedFullPack": not soc,
+        "assumedFullPack": assumed_full,
+        # Whether the typed-input panel may be shown at all, and what of it the
+        # server actually honoured. Served rather than inferred in the browser:
+        # a page that decides for itself that an override took effect will
+        # label a car-derived plan as typed the moment the two disagree.
+        "demoStore": DEMO_STORE,
+        "overrides": {"socPct": soc_pct, "timeLeftMin": time_left_min},
+        # What the car and the race clock say, so the panel can show what is
+        # being overridden and offer the way back to it.
+        "carSocPct": state["soc"],
+        "clockTimeLeftMin": clock_left_min,
         # The profile list as it stands RIGHT NOW, so the selector beside this
         # table tracks a matrix edit on the next poll. /api/config carries the
         # same list, but the browser fetched that once when the page loaded --
@@ -2574,6 +2822,128 @@ def api_export_estimate(start: float | None = Query(None),
     return {"rows": rows}
 
 
+class EstimateBody(BaseModel):
+    # Both REQUIRED, no defaults: this puts a moving car on a public page, and
+    # "lap 0 at the start line because a field was left out" is a worse thing
+    # to publish than nothing.
+    lap: int
+    distM: float
+
+
+@app.get("/api/public/estimate")
+def api_public_estimate_get():
+    """What the spectator page has been asked to estimate, if anything.
+
+    `prefill` is the car's last known lap and place, for the two fields -- a
+    starting point for the person typing, who may well know better (that is
+    why they are typing).
+    """
+    with closing(ro_conn()) as conn:
+        est = _public_estimate(conn)
+        state, age = read_live_state(conn)
+    lap = state.get("auto_lap")
+    dist = state.get("lap_distance_m")
+    return {
+        "enabled": PUBLIC_DRIVER_ENABLED,
+        "active": est is not None,
+        "estimate": est,
+        "synced": (_public_estimate_sent == est) if PUBLIC_DRIVER_ENABLED else None,
+        "carAgeS": age,
+        "carFresh": age is not None and age <= C.DATA_STALE_AFTER_S,
+        "prefill": {"lap": None if lap is None else int(lap) + 1,
+                    "distM": None if dist is None
+                    else float(dist) % C.TRACK_LENGTH_METERS},
+        "trackLengthM": C.TRACK_LENGTH_METERS,
+    }
+
+
+@app.post("/api/public/estimate")
+def api_public_estimate_start(body: EstimateBody):
+    """Start showing the public page where the car SHOULD be.
+
+    Refused while the car is being heard: the page only shows an estimate when
+    the car is silent, the sync loop would clear it within seconds anyway, and
+    a press that appears to do nothing is worse than one that says why.
+    """
+    if not PUBLIC_DRIVER_ENABLED:
+        raise HTTPException(409, "this dashboard is not on the pit's store, so "
+                                 "it does not publish to the spectator page")
+    if body.lap < 0:
+        raise HTTPException(400, "lap must be 0 or more")
+    if not (0 <= body.distM < C.TRACK_LENGTH_METERS):
+        raise HTTPException(400, "position must be between 0 and %d m"
+                                 % C.TRACK_LENGTH_METERS)
+    with closing(rw_conn()) as conn:
+        _state, age = read_live_state(conn)
+        if age is not None and age <= C.DATA_STALE_AFTER_S:
+            raise HTTPException(409, "the car is live (%.0f s ago) - the page "
+                                     "is showing its real position" % age)
+        est = {"startedAt": time.time(), "lap": int(body.lap),
+               "distM": float(body.distM)}
+        save_app_state(conn, PUBLIC_ESTIMATE_KEY, est)
+    _kick_public_driver()
+    return {"ok": True, "estimate": est}
+
+
+@app.post("/api/public/estimate/stop")
+def api_public_estimate_stop():
+    """Stop estimating. The page goes back to "where it was last seen"."""
+    with closing(rw_conn()) as conn:
+        save_app_state(conn, PUBLIC_ESTIMATE_KEY, {})
+    _kick_public_driver()
+    return {"ok": True}
+
+
+class NoteBody(BaseModel):
+    """What to show the public. Empty text takes the note down."""
+    text: str = ""
+
+
+@app.get("/api/public/note")
+def api_public_note_get():
+    """The line the public page is showing, if any. See PUBLIC_NOTE_KEY."""
+    with closing(ro_conn()) as conn:
+        note = _public_note(conn)
+    return {
+        "enabled": PUBLIC_DRIVER_ENABLED,
+        "note": note,
+        # False while the write to Firebase is pending or failing, so the pit
+        # can see that what it typed has not reached anybody yet.
+        "synced": (_public_note_sent == note) if PUBLIC_DRIVER_ENABLED else None,
+        "maxLen": PUBLIC_NOTE_MAX_LEN,
+    }
+
+
+@app.post("/api/public/note")
+def api_public_note_set(body: NoteBody):
+    """Put a line on the public page, or take it down with empty text.
+
+    THE CLOCK BELONGS TO THE SITUATION, NOT TO THE PRESS. Re-sending the same
+    words -- the sync retrying, a second crew member pressing the same button
+    -- keeps the instant the note first went up, because what the page reports
+    is how long the car has been in this state. Different words are a
+    different thing happening, and start their own count.
+    """
+    if not PUBLIC_DRIVER_ENABLED:
+        raise HTTPException(409, "this dashboard is not on the pit's store, so "
+                                 "it does not publish to the spectator page")
+    text = _clean_note(body.text)
+    with closing(rw_conn()) as conn:
+        old = load_app_state(conn, PUBLIC_NOTE_KEY) or {}
+        if not text:
+            save_app_state(conn, PUBLIC_NOTE_KEY, {})
+        else:
+            same = _clean_note(old.get("text")) == text
+            since = old.get("since") if same else None
+            save_app_state(conn, PUBLIC_NOTE_KEY,
+                           {"text": text, "since": float(since or time.time())})
+        note = _public_note(conn)
+    # The write to Firebase is the background thread's job -- the crew is in
+    # the middle of a pit stop and must not wait on the internet.
+    _kick_public_driver()
+    return {"ok": True, "note": note}
+
+
 @app.get("/api/export/bounds")
 def api_export_bounds():
     with closing(ro_conn()) as conn:
@@ -2708,14 +3078,28 @@ def api_race(body: RaceBody):
     # it got. The command carries its own timestamp and lap_command.py refuses
     # one older than MAX_COMMAND_AGE_S, so a car that comes up long afterwards
     # adopts it without executing it -- it will not wipe a race an hour in.
+    #
+    # ON A DEMO STORE THE CLOCK STARTS AND THE CAR IS LEFT ALONE. Starting a
+    # race on the demo is a legitimate thing to do -- it is the demo's own
+    # clock, in its own SQLite file -- but new_race zeroes the REAL car's laps,
+    # distance, energy and checkpoint, and the car then republishes those zeros
+    # to /public/live, which is what the spectator page on GitHub Pages plots.
+    # A practice run on the demo must not reset the race the public is watching.
     car_error = None
     if new_race:
-        import driver_message
-        try:
-            driver_message.send_new_race()
-        except Exception as e:                               # noqa: BLE001
-            car_error = str(e)
-    return {**payload, "newRace": new_race, "carError": car_error}
+        if DEMO_STORE:
+            car_error = CAR_LINK_REFUSED
+        else:
+            import driver_message
+            try:
+                driver_message.send_new_race()
+            except Exception as e:                           # noqa: BLE001
+                car_error = str(e)
+    return {**payload, "newRace": new_race, "carError": car_error,
+            # True when carError is the demo boundary rather than a link
+            # failure: the page must not offer "try again" for a deliberate
+            # refusal, and must not call it an error.
+            "carLinkDisabled": DEMO_STORE}
 
 
 @app.post("/api/race/reset")
@@ -2932,7 +3316,7 @@ class MessageBody(BaseModel):
 @app.post("/api/driver_message")
 def api_driver_message(body: MessageBody):
     """The pit wall's ONLY Firebase write. Everything else is SQLite."""
-    import driver_message
+    driver_message = car_link()
     try:
         driver_message.send_driver_command(body.category, body.value)
     except Exception as e:
@@ -2943,7 +3327,7 @@ def api_driver_message(body: MessageBody):
 
 @app.delete("/api/driver_message")
 def api_clear_message():
-    import driver_message
+    driver_message = car_link()
     try:
         driver_message.clear_driver_command()
     except Exception as e:
@@ -2973,7 +3357,7 @@ def _note_lap_datum(at=None):
 def api_cut_lap():
     """Ask the CAR to close its lap (snapshots lap energy + time). Does not
     change the manual lap override."""
-    import driver_message
+    driver_message = car_link()
     try:
         sent = driver_message.send_lap_cut()
     except Exception as e:
@@ -3000,7 +3384,7 @@ def api_lap_set(body: LapSetBody):
     """
     if body.lap < 0:
         raise HTTPException(400, "lap must be 0 or more")
-    import driver_message
+    driver_message = car_link()
     try:
         sent = driver_message.send_lap_set(body.lap)
     except Exception as e:
@@ -3017,7 +3401,7 @@ def api_lap_restart():
     the in-lap itself when it passes the line in the pit lane. The lap number
     is not touched -- /api/lap/set corrects that, and nothing else.
     """
-    import driver_message
+    driver_message = car_link()
     try:
         sent = driver_message.send_lap_restart()
     except Exception as e:
@@ -3042,7 +3426,7 @@ def api_lap_stopwatch(body: StopwatchBody):
     beside the clock on the HUD, and the car's next real lap cut takes the
     clock back over. See driver_message.send_stopwatch_reset().
     """
-    import driver_message
+    driver_message = car_link()
     if body.action not in ("reset", "clear"):
         raise HTTPException(400, "action must be 'reset' or 'clear'")
     try:
@@ -3083,7 +3467,7 @@ def api_lap_hold(body: LapHoldBody):
     current lap's datum in _lap_clock(), and on the car the next crossing of the
     line releases it (driver_dash_v2._on_lap_timer).
     """
-    import driver_message
+    driver_message = car_link()
     with closing(rw_conn()) as conn:
         save_app_state(conn, LAP_HOLD_KEY,
                        {"heldAt": time.time()} if body.hold else {})
@@ -3111,7 +3495,9 @@ def api_cut_lap_ack():
     send returns the command's `id` and the caller must match it against
     `ack.id` before it says the word "confirmed". Action alone is not enough --
     the same button pressed yesterday has the same action."""
-    import driver_message
+    driver_message = car_link_ro()
+    if driver_message is None:
+        return {"ack": None}
     try:
         return {"ack": driver_message.read_lap_ack()}
     except Exception as e:
@@ -3248,7 +3634,7 @@ def api_strategy_select(body: StrategyBody):
     if not any(s["key"] == body.key for s in C.STRATEGIES):
         raise HTTPException(400, "unknown strategy %r" % body.key)
     set_pit_strategy_choice(body.key)
-    import driver_message
+    driver_message = car_link()
     try:
         sent = driver_message.send_strategy(body.key)
     except Exception as e:
@@ -3258,7 +3644,9 @@ def api_strategy_select(body: StrategyBody):
 
 @app.get("/api/strategy/ack")
 def api_strategy_ack():
-    import driver_message
+    driver_message = car_link_ro()
+    if driver_message is None:
+        return {"ack": None}
     try:
         return {"ack": driver_message.read_strategy_ack()}
     except Exception as e:
@@ -3447,7 +3835,11 @@ async def ws_history(ws: WebSocket):
                         if since is None:
                             return []
                     # +epsilon so the cursor row is not resent; db.py filters >=.
-                    rows = db.fetch_samples(conn, start_ts=since + 1e-6)
+                    # Only the drawn columns: a tick that appends twenty points
+                    # has no use for twenty copies of raw_json.
+                    rows, _, _ = db.fetch_series(
+                        conn, _chart_columns(conn, chosen),
+                        start_ts=since + 1e-6)
                 # NOT fetch_samples(limit=N): that helper returns the most RECENT
                 # N rows, which in replay would skip to the end of the store
                 # instead of walking forward. Slice the oldest N in Python.
