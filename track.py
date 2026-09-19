@@ -84,6 +84,31 @@ FINISH_EXIT_RADIUS_M = 60.0
 # counting continues, and tag it so the pit can see the GPS trigger missed.
 ODOMETER_FORCE_LAP_M = 4400.0
 
+# ---------------------------------------------------------------------------
+# MAY A LAP BE CUT FROM DISTANCE ALONE? No -- the pit cuts them by hand.
+#
+# OFF since the Zolder race of 2026-09-19, at the team's decision, and the two
+# reasons are the ones above this line:
+#
+#   * the odometer over-reads about 1.5 % (4060 m on a 4000 m lap), so a
+#     virtual crossing is never where the line is, and every lap it cuts puts
+#     the datum further past it;
+#   * GPS is dead whenever the car is actually running, so the gate never
+#     corrects the drift and the fallback is not a fallback -- it is the only
+#     thing cutting laps.
+#
+# What that looked like from the pit: at 20:09:26 the fallback cut lap 69 with
+# the car nowhere near the line. Nobody saw it happen, the pit cut the lap by
+# hand 9.5 s later, and the log gained a nine-second "lap" nobody drove.
+#
+# With this off, a lap is cut by a real gate crossing or by a person -- the
+# pit's Cut lap, or the driver's button -- and nothing else. NOTHING COUNTS
+# LAPS ON ITS OWN when the gate is blind, which is the price and was accepted:
+# a lap the pit did not see is better than one the car invented.
+#
+# Turning it back on is this one line, and the code it guards is untouched.
+CUT_LAP_ON_DISTANCE = False
+
 # --------------------------------------------------------------------------- #
 # The finish GATE
 # --------------------------------------------------------------------------- #

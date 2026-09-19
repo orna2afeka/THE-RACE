@@ -1038,8 +1038,31 @@ class SmartCANWorker(CANWorker):
             # a reboot would otherwise lose, and there is none here.
             display_only = False
             if action == "cut_lap":
-                self.laps.force_lap("manual")
-                print(f"🏁 {who} CUT LAP -> lap {self.laps.lap_count}")
+                # A DRIVER'S PRESS IS NOT AN OVERRIDE. force_lap counts a lap
+                # wherever the car is, which is right for the pit -- it is sent
+                # by someone reading the data who can see the count is one
+                # short. A thumb on the HUD at 60 km/h has no such context, and
+                # the one place it was most likely to be pressed, leaving the
+                # box, is the one place it was most wrong: at Zolder the gate
+                # in the pit lane has ALREADY closed that lap on the way in, so
+                # a press at pit exit added a lap nobody drove and the count
+                # never recovered.
+                #
+                # So ask the gate's own question -- been_round() is the test
+                # every real passage is judged by, not a second threshold. Too
+                # little behind it: count nothing, move nothing. Deliberately
+                # NOT a re-sync; the gate re-datums a short passage because the
+                # car is AT the line, and a thumb press is nowhere in
+                # particular.
+                if local and not self.laps.been_round():
+                    applied = False
+                    self.lap_cut_refused.emit(self.laps.lap_distance_m)
+                    print(f"🏁 DRIVER CUT LAP ignored — "
+                          f"{self.laps.lap_distance_m:.0f} m into the lap, "
+                          f"not round yet (lap stays {self.laps.lap_count})")
+                else:
+                    self.laps.force_lap("manual")
+                    print(f"🏁 {who} CUT LAP -> lap {self.laps.lap_count}")
             elif action == "set_lap":
                 # A command with no number is refused, not read as 0: `or 0`
                 # here once meant a malformed message could zero the race.

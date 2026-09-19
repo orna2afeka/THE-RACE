@@ -1101,6 +1101,13 @@ class RacingDashboard(QMainWindow):
     # without saying why is one the driver presses again, harder, at the worst
     # possible moment. Two characters because the button is 46 px at 20 px bold.
     _LAP_BTN_HINT = "1s"
+    # Flashed when a full hold was REFUSED: the lap is not round yet, so
+    # nothing was counted (main._apply_lap_commands asks LapTracker.been_round,
+    # the same test every gate passage is judged by). The press that earns this
+    # most often is at pit exit, where the gate in the pit lane has already
+    # closed the lap on the way in -- cutting there used to add a lap nobody
+    # drove. A glyph, not a number: the button is 46 px.
+    _LAP_BTN_NOT_ROUND = "✗"
     _LAP_HINT_MS = 1200
 
     # Root layout margin, in px. Named because _status_budget_px has to
@@ -1142,7 +1149,8 @@ class RacingDashboard(QMainWindow):
         # Matches the button's initial text, set in _build_lap_timer. The clock
         # starts off, so the button starts as a start arrow.
         self._lap_btn_glyph = self._LAP_BTN_START
-        # Until when the button shows the hold hint. See _LAP_BTN_HINT.
+        # Which hint the button is flashing, and until when. See _LAP_BTN_HINT.
+        self._lap_hint_glyph = self._LAP_BTN_HINT
         self._lap_hint_until = 0.0
 
         # UI scale factor (1.0 at the 800×480 design size, grows on fullscreen
@@ -1537,8 +1545,27 @@ class RacingDashboard(QMainWindow):
         """
         if self._lap_cut_timer.isActive():
             self._lap_cut_timer.stop()
-            self._lap_hint_until = time.monotonic() + self._LAP_HINT_MS / 1000.0
-            self._tick_lap_timer()
+            self._flash_lap_hint(self._LAP_BTN_HINT)
+
+    def _flash_lap_hint(self, glyph: str) -> None:
+        """Show `glyph` on the lap button for _LAP_HINT_MS, then go back."""
+        self._lap_hint_glyph = glyph
+        self._lap_hint_until = time.monotonic() + self._LAP_HINT_MS / 1000.0
+        self._tick_lap_timer()
+
+    @Slot(object)
+    def _on_lap_cut_refused(self, metres) -> None:
+        """The hold was long enough, but the lap was not.
+
+        The count did not move and neither did the datum. Saying so matters
+        more than it looks: the press LOOKS like it worked -- the driver held
+        the button and the button lit -- and a control that ignores a
+        deliberate press without a word is one they press again, harder, at the
+        worst possible moment.
+        """
+        print(f"[HUD] lap cut refused — {metres:.0f} m into the lap"
+              if metres is not None else "[HUD] lap cut refused")
+        self._flash_lap_hint(self._LAP_BTN_NOT_ROUND)
 
     def _cut_lap_from_hud(self) -> None:
         """Held long enough: cut the lap, for real.
@@ -1610,7 +1637,7 @@ class RacingDashboard(QMainWindow):
         # Still only touched when it actually changes: this runs at 10 Hz and a
         # setText on every tick would restyle the button 600 times a minute for
         # nothing.
-        glyph = (self._LAP_BTN_HINT if now < self._lap_hint_until
+        glyph = (self._lap_hint_glyph if now < self._lap_hint_until
                  else self._LAP_BTN_START if self._lap_start is None
                  else self._LAP_BTN_RESET)
         if glyph != self._lap_btn_glyph:
@@ -2191,6 +2218,10 @@ class RacingDashboard(QMainWindow):
         self._worker.bms_probe_temps_updated.connect(self._on_bms_probe_temps)
         self._worker.target_speed_updated.connect(self._on_target_speed)
         self._worker.lap_timer_updated.connect(self._on_lap_timer)
+        # Only the real CANWorker raises this; the Windows demo runs the base
+        # class, which has no lap command queue to refuse anything from.
+        if hasattr(self._worker, "lap_cut_refused"):
+            self._worker.lap_cut_refused.connect(self._on_lap_cut_refused)
         self._worker.vehicle_flags_updated.connect(self._on_vehicle_flags)
 
         self._worker.start()

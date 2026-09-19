@@ -657,14 +657,7 @@ class LapTracker:
             self.last_rejected_distance_m = travelled
             return None
 
-        # Has the car really been round? Either measure of distance will do —
-        # the odometer can be miscalibrated or frozen, the GPS path can have
-        # holes — and with neither available, time alone has to.
-        blind = self._can_is_dead(now) or self._distance_untrusted
-        been_round = (travelled >= track.MIN_LAP_DISTANCE_M
-                      or self._lap_gps_path_m >= track.MIN_LAP_DISTANCE_M
-                      or (blind and elapsed is not None))
-        if been_round:
+        if self.been_round(now, travelled=travelled, elapsed=elapsed):
             self.gps_lap_count += 1
             self._trigger_lap("gps_no_can" if self._can_is_dead(now) else "gps",
                               now, at=at)
@@ -726,7 +719,16 @@ class LapTracker:
         real passage after it arrived "3600 m into the lap" and was thrown
         away; the fallback then fired again, 400 m later still, and lap
         counting stayed on the odometer for the rest of the stint.
+
+        SWITCHED OFF at the team's decision -- track.CUT_LAP_ON_DISTANCE, and
+        the reasoning is there rather than here. The code below is left intact
+        and reachable by that one constant: the two faults that made it wrong
+        at Zolder (an odometer 1.5 % long, GPS dead while driving) are both
+        fixable, and when they are, this is how counting continues without a
+        gate.
         """
+        if not track.CUT_LAP_ON_DISTANCE:
+            return
         if not self._have_distance:
             return
         if not self._armed:
@@ -840,6 +842,38 @@ class LapTracker:
     # ------------------------------------------------------------------ #
     # Commands from the pit                                               #
     # ------------------------------------------------------------------ #
+    def been_round(self, now=None, travelled=None, elapsed=None):
+        """Has the car covered enough of a lap for this to BE one?
+
+        The gate asks this of every forward passage: one with too little
+        behind it re-syncs the datum instead of counting (see
+        _on_gate_crossing). THE DRIVER'S HUD BUTTON ASKS THE SAME QUESTION,
+        which is the whole reason this is a method rather than an expression
+        inline up there -- a second threshold somewhere else would be a second
+        idea of what a lap is.
+
+        Either measure of distance will do: the odometer can be miscalibrated
+        or frozen, the GPS path can have holes. With NEITHER available the car
+        is blind, and time alone has to answer -- which is exactly when the
+        driver's button matters most, so a bare distance test would disable it
+        in the one case it is there for.
+
+        `travelled` and `elapsed` are passed by the gate, which has already
+        worked out where and when the crossing really happened; left out, they
+        are taken as of now.
+        """
+        now = time.monotonic() if now is None else now
+        if travelled is None:
+            travelled = self.lap_distance_m
+        if elapsed is None:
+            elapsed = (now - self._lap_start_ts
+                       if self._lap_start_ts is not None else None)
+        blind = self._can_is_dead(now) or self._distance_untrusted
+        return bool((travelled is not None
+                     and travelled >= track.MIN_LAP_DISTANCE_M)
+                    or self._lap_gps_path_m >= track.MIN_LAP_DISTANCE_M
+                    or (blind and elapsed is not None))
+
     def force_lap(self, source="manual", now=None):
         """Cut a lap now — the pit's manual override of the automatic trigger.
 

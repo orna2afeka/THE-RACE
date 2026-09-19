@@ -185,6 +185,11 @@ class CANWorker(QThread):
     # what the PART-lap has cost so far (main._apply_lap_commands).
     # Signal(object, ...) throughout because every one of the three can be None.
     lap_timer_updated       = Signal(object, object, object)
+    # The DRIVER's lap button was held but the lap is not round yet, so
+    # nothing was counted. Carries the metres it has, for the HUD to show.
+    # Only ever raised for a local press: the pit's Cut lap is an override by
+    # someone reading the data, and is not second-guessed (main._apply_lap_commands).
+    lap_cut_refused         = Signal(object)
     connection_error        = Signal(str)    # Fatal error message
     status_updated          = Signal(str)    # Human-readable status string
 
