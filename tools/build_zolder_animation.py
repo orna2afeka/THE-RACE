@@ -453,6 +453,18 @@ VIEWERS_COUNT_PATH = "public/viewers_count"
 VIEWER_BEAT_MS = 20000             # how often a page says it is still here
 VIEWER_POLL_MS = 15000             # how often it asks for the total
 
+# The official classification, embedded rather than scraped. The standings are
+# Time Service B.V.'s product and arrive over SignalR, and their robots.txt
+# disallows /lt and /signalr outright -- so reading the feed and re-serving the
+# numbers ourselves is off the table. Framing the page they publish is the
+# sanctioned route, and the one the race organiser itself takes.
+#
+# Note this is the PROVIDER's url, not the ESC wrapper page. The ESC page sets
+# frame-ancestors to solarlogs.be and its own domain, so framing that would be
+# refused; it is itself only an iframe around this address.
+TIMING_URL = "https://livetiming.getraceresults.com/zolder"
+TIMING_CREDIT = "Time Service B.V."
+
 # How long after the car's last sample the page stops claiming to be live. The
 # car publishes once a second; 20 s is twenty missed updates, which is a real
 # outage and not a bad moment on a mobile network.
@@ -1121,7 +1133,7 @@ __ICON__
 __FONT_LINK__
 <style>
 __BASE_CSS__
-  body { min-height: 100%; }
+  body { min-height: 100%; height: auto; }
   #stage {
     display: grid; grid-template-columns: 360px 1fr;
     gap: 14px; padding: 16px; height: 100vh;
@@ -1205,11 +1217,45 @@ __BASE_CSS__
     z-index: 50; font-size: 0.95rem; text-align: center;
   }
   #milestone.show { transform: translateX(-50%) translateY(0); opacity: 1; }
+  /* -- official timing ---------------------------------------------------- */
+  /* The stage is a viewport-tall app; this sits under it, so the page now
+     scrolls where it did not before. Hence the cue in the rail -- a section
+     nobody scrolls to is the same as a section that is not there. */
+  #timing { padding: 0 16px 26px; max-width: 1500px; margin: 0 auto; }
+  .t-head { display: flex; align-items: flex-end; justify-content: space-between;
+            gap: 14px; flex-wrap: wrap; margin-bottom: 10px; }
+  .t-head h2 { margin: 3px 0 0; font-size: 1.25rem; font-weight: 700; }
+  .t-open { font-size: 0.8rem; font-weight: 700; color: var(--accent);
+            text-decoration: none; border: 1px solid var(--line);
+            border-radius: 999px; padding: 6px 14px; white-space: nowrap; }
+  .t-open:hover { border-color: var(--accent); }
+  /* A light surface on purpose. The provider's page is light-themed, and an
+     unannounced white rectangle on a dark page reads as a rendering fault --
+     framed as a panel with its own border, it reads as a quoted document. */
+  #t-frame { position: relative; background: #fff; border: 1px solid var(--line);
+             border-radius: 10px; overflow: hidden;
+             height: min(74vh, 880px); }
+  #t-frame iframe { display: block; width: 100%; height: 100%; border: 0; }
+  #t-note { position: absolute; inset: 0; display: flex; flex-direction: column;
+            align-items: center; justify-content: center; gap: 10px;
+            text-align: center; padding: 24px; background: var(--panel);
+            color: var(--dim); font-size: 0.9rem; font-weight: 600; }
+  .t-credit { margin-top: 9px; font-size: 0.72rem; color: #64748b;
+              line-height: 1.55; }
+  .t-credit a { color: #64748b; }
+  /* The cue that there is anything below the fold at all. */
+  #t-jump { display: inline-block; margin-top: 10px; font-size: 0.72rem;
+            font-weight: 700; letter-spacing: 2.5px; text-transform: uppercase;
+            color: var(--dim); text-decoration: none; border: 1px solid var(--line);
+            border-radius: 999px; padding: 5px 13px; }
+  #t-jump:hover { color: var(--accent); border-color: var(--accent); }
   @media (max-width: 900px) {
     #stage { grid-template-columns: 1fr; height: auto; padding: 12px; }
     #map { height: 56vh; }
     #legend { display: none; }
     .hero .value { font-size: 2.6rem; }
+    #timing { padding: 0 12px 20px; }
+    #t-frame { height: 78vh; }
   }
 </style>
 </head>
@@ -1227,6 +1273,7 @@ __BASE_CSS__
            cannot reach the count must not claim an empty grandstand, and the
            viewer reading this is themselves proof the number is never 0. -->
       <div class="sub" id="watching" style="display:none"></div>
+      <a id="t-jump" href="#timing">Official timing &darr;</a>
     </div>
 
     <div class="card hero">
@@ -1306,6 +1353,34 @@ __MAP_SVG__
     <div id="legend"></div>
   </div>
 </div>
+
+<!-- The official classification, as published by the timing provider. We frame
+     their page; we do not read their feed and republish the numbers. Two
+     reasons, and the first one settles it on its own: their robots.txt
+     disallows /lt and /signalr, which is where the standings live. And these
+     results are the race's official record -- a copy of them served from our
+     page could disagree with the real one at exactly the moment it matters,
+     and ours is the one nobody can correct. -->
+<section id="timing">
+  <div class="t-head">
+    <div>
+      <div class="eyebrow">Official classification</div>
+      <h2>iESC Live Timing &middot; Circuit Zolder</h2>
+    </div>
+    <a class="t-open" href="__TIMING_URL__" target="_blank" rel="noopener noreferrer">
+      Open the full timing &#8599;</a>
+  </div>
+  <div id="t-frame">
+    <div id="t-note">Live timing loads when you scroll here.</div>
+  </div>
+  <div class="t-credit">
+    Live timing &copy; __TIMING_CREDIT__, embedded with attribution from
+    <a href="__TIMING_URL__" target="_blank" rel="noopener noreferrer">livetiming.getraceresults.com</a>.
+    These are the official results; Afeka Solar &amp; Electric Racing neither
+    produces nor verifies them. Everything else on this page is our own car's
+    telemetry and is not official timing.
+  </div>
+</section>
 
 <script>
 const DATA = __DATA__;
@@ -1532,6 +1607,58 @@ function loadWatching() {
     })
     .catch(() => {});
 }
+
+// ── the official timing embed ──────────────────────────────────────────── //
+// Not loaded with the page. It is a third-party document plus a live SignalR
+// connection, on a page whose first rule is that it comes up on bad venue wifi
+// -- so it costs nothing until somebody actually scrolls to it.
+function mountTiming() {
+  const host = el("t-frame");
+  if (!host || host.dataset.mounted) return;
+  host.dataset.mounted = "1";
+  const note = el("t-note");
+  note.textContent = "Loading the official timing…";
+
+  const f = document.createElement("iframe");
+  f.title = "iESC live timing at Circuit Zolder, by __TIMING_CREDIT__";
+  f.loading = "lazy";
+  // No sandbox: the standings arrive over SignalR and sandboxing has to permit
+  // so much to keep that working that it protects nothing worth the risk of
+  // silently breaking their page. It is cross-origin, so it cannot read ours.
+  f.src = "__TIMING_URL__";
+
+  // A cross-origin frame will not tell us it failed, so treat silence as
+  // failure: if nothing has loaded by the time this fires, say so plainly and
+  // leave the viewer a link that definitely works. Better than a white box.
+  const giveUp = setTimeout(() => {
+    note.innerHTML = "";
+    const a = document.createElement("a");
+    a.href = "__TIMING_URL__";
+    a.target = "_blank"; a.rel = "noopener noreferrer";
+    a.className = "t-open";
+    a.textContent = "Open the official timing ↗";
+    note.appendChild(document.createTextNode(
+      "The timing provider is not answering from here."));
+    note.appendChild(a);
+  }, 20000);
+
+  f.addEventListener("load", () => { clearTimeout(giveUp); note.style.display = "none"; });
+  host.appendChild(f);
+}
+
+// IntersectionObserver where it exists; where it does not, the section simply
+// loads at once rather than never.
+if ("IntersectionObserver" in window) {
+  const io = new IntersectionObserver((entries, obs) => {
+    for (const e of entries) if (e.isIntersecting) { mountTiming(); obs.disconnect(); }
+  }, { rootMargin: "240px" });
+  io.observe(el("t-frame"));
+} else {
+  mountTiming();
+}
+// Following the rail's cue must not leave someone staring at a placeholder
+// waiting for the observer to catch up.
+el("t-jump").addEventListener("click", mountTiming);
 
 // ── weather, straight from Open-Meteo, same source the pit uses ─────────── //
 function loadWeather() {
@@ -2311,6 +2438,8 @@ def render_spectator(data, race_start, race_end):
         "lon": track.FINISH_LINE_LON,
     }
     return (SPECTATOR_TEMPLATE
+            .replace("__TIMING_URL__", TIMING_URL)
+            .replace("__TIMING_CREDIT__", TIMING_CREDIT)
             .replace("__BANNER__", BANNER)
             .replace("__FONT_LINK__", FONT_LINK)
             .replace("__ICON__", ICON_LINK)
