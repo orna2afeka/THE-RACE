@@ -1405,7 +1405,7 @@ def fetch_laps(conn: sqlite3.Connection, device_id: str = DEVICE_ID,
                since_ts: float = None, until_ts: float = None):
     """One dict per COMPLETED lap, oldest first, as the car measured and tagged it.
 
-        lap, energy_wh, regen_wh, lap_time_s, distance_m, lap_source,
+        lap, seq, energy_wh, regen_wh, lap_time_s, distance_m, lap_source,
         kind, flags (list), stopped_s, finished_ts
 
     The car holds a finished lap's figures constant on every row of the
@@ -1415,6 +1415,13 @@ def fetch_laps(conn: sqlite3.Connection, device_id: str = DEVICE_ID,
     part of the key too, so a car whose checkpoint was wiped (lap_seq back to
     1 on another evening) still yields separate laps instead of one lap with
     the MAX() of both - the defect documented above lap_traces().
+
+    A figure that CHANGES mid-lap therefore opens a second group, and the lap
+    gets listed twice. That is not hypothetical: reset_trip() on the car used
+    to null last_lap_distance_m, and reset_energy() last_lap_energy_wh, while
+    the lap they belonged to was already over. Both now leave a finished lap's
+    figures alone, and _merge_split_laps() below folds back the splits already
+    sitting in stores recorded before that fix.
 
     Rows from an older car have no lap_seq and fall back to grouping on
     calculated_lap, exactly as fetch_lap_summary() does, with kind = None.
@@ -1453,6 +1460,7 @@ def fetch_laps(conn: sqlite3.Connection, device_id: str = DEVICE_ID,
         # pit cannot move it. It is also the grouping term below, so selecting
         # it needs no aggregate to be deterministic.
         "SELECT CAST(COALESCE(MAX(last_lap_number), lap_seq) AS INTEGER) AS lap, "
+        "       CAST(lap_seq AS INTEGER) AS seq, "
         "       last_lap_energy AS energy_wh, last_lap_regen_energy AS regen_wh, "
         "       last_lap_time_s AS lap_time_s, last_lap_distance_m AS distance_m, "
         "       MAX(lap_source) AS lap_source, MAX(last_lap_kind) AS kind, "
@@ -1463,7 +1471,7 @@ def fetch_laps(conn: sqlite3.Connection, device_id: str = DEVICE_ID,
         "         last_lap_distance_m",
         args).fetchall()
     legacy = conn.execute(
-        "SELECT CAST(calculated_lap AS INTEGER) AS lap, "
+        "SELECT CAST(calculated_lap AS INTEGER) AS lap, NULL AS seq, "
         "       MAX(last_lap_energy) AS energy_wh, "
         "       MAX(last_lap_regen_energy) AS regen_wh, "
         "       MAX(last_lap_time_s) AS lap_time_s, "
@@ -1484,7 +1492,52 @@ def fetch_laps(conn: sqlite3.Connection, device_id: str = DEVICE_ID,
             lap["lap_source"] = None
         laps.append(lap)
     laps.sort(key=lambda lap: lap["finished_ts"])
-    return laps
+    return _merge_split_laps(laps)
+
+
+# What a split has to agree on before two fragments can be the same lap, and
+# below it what the first fragment may take from a later one when it never
+# carried it at all.
+_LAP_FIGURES = ("lap_time_s", "energy_wh", "regen_wh", "distance_m")
+_LAP_TAGS = ("lap", "lap_source", "kind", "stopped_s")
+
+
+def _merge_split_laps(laps):
+    """Fold fragments of ONE lap back together. `laps` must be oldest first.
+
+    Two entries are the same lap when they share a lap_seq and no figure
+    contradicts the other -- every figure equal, or missing on one side. A
+    fragment is what a mid-lap change to last_lap_* leaves behind (see
+    fetch_laps), and it must not be counted as a lap of its own: it carries the
+    same number and the same time, so the History table showed that lap twice,
+    the workbook listed it twice, and the copy went through the average as if
+    the car had driven it.
+
+    Laps that genuinely share a lap_seq -- a checkpoint wiped between sessions,
+    so the count started again at 1 -- disagree on their figures and are kept
+    apart. That is what the figures are in the group key for.
+
+    The earliest fragment wins: it holds finished_ts, the moment the pit first
+    heard the lap was over. The others only fill in what it is missing.
+    """
+    out = []
+    latest = {}                      # lap_seq -> the entry still open to merges
+    for lap in laps:
+        seq = lap.get("seq")
+        into = latest.get(seq) if seq is not None else None
+        if into is not None and all(
+                into[f] is None or lap[f] is None or into[f] == lap[f]
+                for f in _LAP_FIGURES):
+            for f in _LAP_FIGURES + _LAP_TAGS:
+                if into[f] is None:
+                    into[f] = lap[f]
+            if not into["flags"]:
+                into["flags"] = lap["flags"]
+            continue
+        out.append(lap)
+        if seq is not None:
+            latest[seq] = lap
+    return out
 
 
 def flying_laps(laps):
