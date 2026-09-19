@@ -245,7 +245,7 @@ if __name__ == "__main__":
     for key, p in profiles.items():
         print(f"  {key:<18} {p.lap_time_s():>8.1f}s {p.average_kmh():>8.1f}")
 
-    key = "dor_280s" if "dor_280s" in profiles else next(iter(profiles))
+    key = "lap33_290s" if "lap33_290s" in profiles else next(iter(profiles))
     p = profiles[key]
     print(f"\n  target speed around the lap, {key}:")
     for d in (0, 450, 650, 1500, 1850, 2450, 3200, 3900):
