@@ -1747,7 +1747,47 @@ def lap_start_energy(conn: sqlite3.Connection, lap: int,
     unmissable: on 2026-09-19 the pit wall's "this lap" energy took its
     baseline from the first use of tag 70, seven minutes and 197 Wh before the
     lap it was labelling, and simply never reset.
+
+    FOUND BY ODOMETER, NOT BY TAG, whenever the car is publishing both
+    counters. The car cuts some laps IN THE PAST -- the distance fallback
+    stamps the crossing back at datum + 4000 m, and a gate passage is dated
+    when the car actually crossed -- but the samples only start carrying the
+    new lap number from the push that follows. The first sample OF THE TAG is
+    then a couple of hundred metres into the lap, which is far enough past the
+    datum that every caller dashed the figure: the pit wall showed "This lap
+    --" for a whole race while the number it wanted sat in the previous tag's
+    rows.
+
+    The datum is known exactly -- odometer now minus lap_distance_m now, both
+    from the same sample -- so take the newest sample AT or BEFORE it, whatever
+    lap it is tagged with, and report how far from the datum it landed. That
+    second figure keeps its meaning for the callers: metres between the
+    baseline and the start of the lap, which is what they dash on.
+
+    Bounded to the last LAP_BASELINE_LOOKBACK_S so a green flag, which zeroes
+    the odometer, cannot match some row from before the reset with a larger
+    reading. Falls back to the tag when the car publishes no lap distance.
     """
+    live = conn.execute(
+        "SELECT device_ts, odometer_m, lap_distance_m FROM telemetry "
+        "WHERE device_id = ? AND odometer_m IS NOT NULL "
+        "  AND lap_distance_m IS NOT NULL "
+        "ORDER BY device_ts DESC LIMIT 1", (device_id,)).fetchone()
+    if live is not None:
+        datum = live["odometer_m"] - live["lap_distance_m"]
+        row = conn.execute(
+            "SELECT total_race_energy, odometer_m FROM telemetry "
+            "WHERE device_id = ? AND total_race_energy IS NOT NULL "
+            "  AND odometer_m IS NOT NULL AND odometer_m <= ? "
+            "  AND device_ts >= ? AND device_ts <= ? "
+            "ORDER BY odometer_m DESC LIMIT 1",
+            (device_id, datum, live["device_ts"] - LAP_BASELINE_LOOKBACK_S,
+             live["device_ts"]),
+        ).fetchone()
+        if row is not None:
+            return {"total_race_energy": row["total_race_energy"],
+                    "lap_distance_m": abs(row["odometer_m"] - datum)}
+
     since = lap_run_start_ts(conn, lap, device_id)
     return conn.execute(
         "SELECT total_race_energy, lap_distance_m FROM telemetry "
@@ -1757,6 +1797,13 @@ def lap_start_energy(conn: sqlite3.Connection, lap: int,
         (device_id, float(int(lap)), float(int(lap)) + 1.0,
          since if since is not None else -1e18),
     ).fetchone()
+
+
+# How far back the baseline search above will look for the datum. A lap is
+# about five minutes; twenty covers a slow one, a stop and a dropout, and is
+# short enough that a green flag's odometer reset cannot pull a pre-reset row
+# into the answer.
+LAP_BASELINE_LOOKBACK_S = 1200.0
 
 
 # How far back down the index recent_laps is willing to look. Four laps at the
