@@ -59,10 +59,37 @@ Firebase console → Realtime Database → Rules → paste → Publish:
   "rules": {
     ".read": false,
     ".write": false,
-    "public": { ".read": true, ".write": false }
+    "public": {
+      ".read": true,
+      ".write": false,
+      "viewers": {
+        "$viewer": {
+          ".write": "newData.exists()",
+          ".validate": "newData.isNumber() && newData.val() <= now + 1000 && newData.val() > now - 5000"
+        }
+      }
+    }
   }
 }
 ```
+
+The `viewers` branch is the one place the public may write, and it is the
+spectator page's "still here" beat. Two guards on it:
+
+* `".write": "newData.exists()"` permits a write but **refuses a delete**.
+  Without that clause the same rule that lets a visitor say "I am here" lets
+  them delete everyone else, and one person with a developer console could hold
+  the viewer count at zero all race. Only `collector.py` removes keys, and it
+  authenticates with the service account, which bypasses rules.
+* The `.validate` pins the value to the server's own clock — the page writes
+  `{".sv":"timestamp"}`, never its own `Date.now()`, so a viewer whose laptop
+  is an hour out still lands on our timeline instead of being swept on arrival
+  or lingering forever.
+
+What this branch does **not** stop is somebody writing a thousand keys to
+inflate the number; no rule can, without making viewers log in. It is a vanity
+count on a spectator page, the keys expire in 45s, and the collector sweeps
+them. Nothing downstream of it makes a race decision.
 
 This exposes **only** `/public/live` — eight fields, deliberately **no GPS
 coordinates**; the spectator page places the car from lap distance along the
