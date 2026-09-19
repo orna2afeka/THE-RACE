@@ -319,6 +319,15 @@ def _public_snapshot(vehicle_state):
         "speed_kmh": motor.get("mms_vehicle_speed_kmh"),
         "last_lap_time_s": motor.get("last_lap_time_s"),
         "soc_percent": battery.get("bms_soc_percent"),
+        # The shared stopwatch: the same clock the driver sees and the pit
+        # wall shows, so the page counts the lap in progress instead of
+        # standing on the last COMPLETED lap time. Elapsed seconds plus
+        # whether it is moving -- the page adds the age of this snapshot when
+        # it is running, and shows the number as it stands when it is not.
+        # Elapsed, not a datum: the car measures it with time.monotonic(),
+        # which no clock step can move, and this Pi has no RTC.
+        "stopwatch_s": motor.get("stopwatch_s"),
+        "stopwatch_stopped": motor.get("stopwatch_stopped"),
     }
 
 

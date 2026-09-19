@@ -51,12 +51,19 @@ MAX_COMMAND_AGE_S = 30.0
 # (no RTC, no NTP), so any age comparison would be meaningless.
 _PLAUSIBLE_EPOCH = 1_700_000_000
 
-# reset_stopwatch / clear_stopwatch are DISPLAY-ONLY (see main._apply_lap_commands):
-# they move the number on the HUD and nothing else -- no lap is cut, no count
-# moves, no energy or odometer is touched, and nothing is checkpointed. They are
-# the pit's copy of the button the driver already has beside the clock.
+# reset_stopwatch / clear_stopwatch / stop_stopwatch / resume_stopwatch are
+# DISPLAY-ONLY (see main._apply_lap_commands): they move the number on the HUD
+# and nothing else -- no lap is cut, no count moves, no energy or odometer is
+# touched, and nothing is checkpointed. They are the pit's copy of the button
+# the driver already has beside the clock.
+#
+# stop/resume park the clock where it stands rather than restarting or blanking
+# it, which is what the end of a run needs: the car has taken the flag and is
+# sitting there still powered, and a stopwatch counting a lap nobody is driving
+# is worse than no stopwatch at all.
 VALID_ACTIONS = ("cut_lap", "set_lap", "restart_lap", "reset_energy", "reset_trip",
-                 "reset_stopwatch", "clear_stopwatch")
+                 "reset_stopwatch", "clear_stopwatch",
+                 "stop_stopwatch", "resume_stopwatch")
 
 # The strategy selector uses the same machinery on its own node — see
 # CommandInbox below and firebase_client.STRATEGY_COMMAND_PATH.

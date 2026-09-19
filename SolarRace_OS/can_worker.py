@@ -23,6 +23,7 @@ Decoded parameters (LYNX / SiliXcon protocol):
 """
 
 import struct
+from collections import deque
 from typing import Optional
 
 import can
@@ -178,6 +179,11 @@ class CANWorker(QThread):
     # unknown; seconds of the lap that just FINISHED, or None when the clock
     # merely (re)started). Signal(object, object) because both can be None.
     lap_timer_updated       = Signal(object, object)
+    # Stopwatch STOPPED / released, from either side. True parks the clock on
+    # the number it is showing, False lets it run again from the same datum --
+    # it is a display hold, not a second lap timer, so nothing about the lap
+    # itself moves either way.
+    lap_timer_hold          = Signal(bool)
     connection_error        = Signal(str)    # Fatal error message
     status_updated          = Signal(str)    # Human-readable status string
 
@@ -202,6 +208,23 @@ class CANWorker(QThread):
         # motor controller cannot see them. Assigned by main.py; None here so
         # the standalone HUD still runs and simply reports them as unknown.
         self.vehicle_inputs = None
+        # Stopwatch presses from the HUD's OWN button. The button runs on the
+        # GUI thread and the shared stopwatch is owned by this one, so a press
+        # is left here and collected by the CAN loop rather than reaching
+        # across threads. deque.append and popleft are atomic, so this needs no
+        # lock. Drained by SmartCANWorker; a standalone HUD simply leaves them
+        # here, which is why the button keeps its own local effect too.
+        self.stopwatch_requests = deque()
+
+    def request_stopwatch(self, action: str) -> None:
+        """Ask for a stopwatch move. Safe to call from any thread.
+
+        The driver's button and the pit's button land in exactly the same
+        place, and whichever arrives last is the one that stands. Neither is
+        senior to the other: this is a reading, not a record, and nothing it
+        can do touches the lap count, the lap times, the energy or the odometer.
+        """
+        self.stopwatch_requests.append(action)
 
     # ================================================================== #
     # QThread entry point — executes in the worker thread                 #

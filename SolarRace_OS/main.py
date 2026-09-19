@@ -239,6 +239,12 @@ class SmartCANWorker(CANWorker):
         # them dying while the other keeps talking is a real and otherwise
         # invisible fault -- the aggregate would stay healthy the whole time.
         self._boot_ts = time.time()
+        # THE SHARED STOPWATCH. One clock, read by the driver's HUD, the pit
+        # wall and the public page, and moved from either end. Owned by this
+        # thread because this is the thread that publishes it.
+        self._sw_stopped_s = None   # elapsed it is PARKED on, None = running
+        self._sw_start = None       # explicit datum from a reset, else the lap's
+        self._sw_blank = False      # cleared: the display reads nothing at all
         self._last_frame_by_channel: dict = {}
         self._frames_by_channel: dict = {}
         self._can_state = "starting"
@@ -494,7 +500,9 @@ class SmartCANWorker(CANWorker):
             # release are timers, and a quiet bus is exactly when they matter.
             self.regen_light.tick()
             self._tick_profile()
+            self._drain_stopwatch_requests()
             self._publish_lap_timer()
+            self._publish_stopwatch()
             self._publish_gps()
             self._save_lap_checkpoint()
             self._tick_cell_extremes()
@@ -976,7 +984,92 @@ class SmartCANWorker(CANWorker):
         finished = (self.laps.last_lap_time_s
                     if start is not None
                     and self.laps.last_lap_finished_ts == start else None)
+        # A fresh lap is a running clock by definition, counted from the line.
+        # This is the referee between the two ends: every hold, every reset and
+        # every clear is released here, so no disagreement and no forgotten
+        # press outlives a single lap.
+        self._sw_stopped_s = None
+        self._sw_start = None
+        self._sw_blank = False
         self.lap_timer_updated.emit(start, finished)
+
+    # The four things either end can do to the shared stopwatch, and the word
+    # the console log uses for each.
+    _SW_VERBS = {"reset_stopwatch": "RESET", "clear_stopwatch": "CLEARED",
+                 "stop_stopwatch": "STOPPED", "resume_stopwatch": "RESUMED"}
+
+    def _apply_stopwatch(self, action) -> None:
+        """Move the shared stopwatch. The ONE implementation, whoever pressed.
+
+        The pit's buttons arrive through _apply_lap_commands and the driver's
+        through CANWorker.request_stopwatch(); both land here. Neither end is
+        senior to the other -- ordering alone decides, so whichever was pressed
+        last is the one that stands.
+
+        Display only. Nothing here touches the lap count, the recorded lap
+        times, the energy totals or the odometer, and the next crossing of the
+        line clears all of it (_publish_lap_timer), so no press survives a lap.
+        """
+        if action == "reset_stopwatch":
+            self._sw_start = time.monotonic()
+            self._sw_blank = False
+            self._sw_stopped_s = None
+            self.lap_timer_updated.emit(self._sw_start, None)
+        elif action == "clear_stopwatch":
+            self._sw_start = None
+            self._sw_blank = True
+            self._sw_stopped_s = None
+            self.lap_timer_updated.emit(None, None)
+        elif action == "stop_stopwatch":
+            self._sw_stopped_s = self._sw_elapsed()
+            self.lap_timer_hold.emit(True)
+        elif action == "resume_stopwatch":
+            self._sw_stopped_s = None
+            self.lap_timer_hold.emit(False)
+
+    def _sw_elapsed(self):
+        """What the stopwatch reads right now, or None when it reads nothing."""
+        if self._sw_blank:
+            return None
+        if self._sw_stopped_s is not None:
+            return self._sw_stopped_s
+        datum = (self._sw_start if self._sw_start is not None
+                 else self.laps.lap_start_ts)
+        return None if datum is None else time.monotonic() - datum
+
+    def _drain_stopwatch_requests(self) -> None:
+        """Presses left by the HUD's own button, applied on THIS thread.
+
+        The button handler runs on the GUI thread and must not touch the
+        stopwatch or LapTracker directly; it appends and this collects. Done
+        every loop so the driver's press publishes as fast as the pit's does.
+        """
+        q = self.stopwatch_requests
+        while q:
+            try:
+                action = q.popleft()
+            except IndexError:
+                break
+            self._apply_stopwatch(action)
+            print("⏱️ DRIVER %s STOPWATCH (display only)"
+                  % self._SW_VERBS.get(action, action.upper()))
+
+    def _publish_stopwatch(self) -> None:
+        """The shared stopwatch, as two numbers the pit and the public page can
+        render without knowing anything about this Pi's clock.
+
+        `stopwatch_s` is the elapsed time on the display and `stopwatch_stopped`
+        says whether it is moving. Deliberately NOT a wall-clock datum: this Pi
+        has no RTC and NTP steps its clock minutes at a time after boot, so a
+        datum published in time.time() reads as an hour-old lap the moment the
+        step lands (the same fault that made fix_age_s report 3444 s). An
+        elapsed time measured with time.monotonic() cannot be stepped, and a
+        reader that wants it live adds the age of the sample it arrived in.
+        """
+        elapsed = self._sw_elapsed()
+        motor = self.vehicle_state["motor"]
+        motor["stopwatch_s"] = None if elapsed is None else round(elapsed, 1)
+        motor["stopwatch_stopped"] = self._sw_stopped_s is not None
 
     def _apply_strategy_commands(self) -> None:
         """Switch the active speed profile when the pit selects a new strategy.
@@ -1038,23 +1131,25 @@ class SmartCANWorker(CANWorker):
             elif action == "reset_trip":
                 self.laps.reset_trip()
                 print("🏁 PIT RESET TRIP")
-            elif action in ("reset_stopwatch", "clear_stopwatch"):
-                # THE DRIVER'S STOPWATCH, from the pit. Deliberately routed
-                # through lap_timer_updated -- the same signal a real lap cut
-                # uses -- rather than into LapTracker: the HUD clock is a
-                # reading, not a record. The lap count, the recorded lap times,
-                # the energy totals and the odometer are all untouched, exactly
-                # as when the driver presses the button beside the clock.
+            elif action in ("reset_stopwatch", "clear_stopwatch",
+                            "stop_stopwatch", "resume_stopwatch"):
+                # THE SHARED STOPWATCH, moved from the pit. The exact call the
+                # driver's own button makes (_drain_stopwatch_requests), so the
+                # two ends run one implementation and cannot drift apart; which
+                # of them pressed last is all that decides.
+                #
+                # Display only: routed to the HUD signals rather than into
+                # LapTracker, because this clock is a reading, not a record. The
+                # lap count, the recorded lap times, the energy totals and the
+                # odometer are untouched.
                 #
                 # _lap_timer_sent is NOT updated, so the next genuine lap cut
-                # still differs from it and takes the clock back over. The pit
-                # cannot leave the stopwatch permanently out of step with the
-                # car's own lap timing.
+                # still differs from it and takes the clock back over. Neither
+                # end can leave the stopwatch out of step for longer than a lap.
                 display_only = True
-                start = time.monotonic() if action == "reset_stopwatch" else None
-                self.lap_timer_updated.emit(start, None)
-                print("⏱️ PIT %s DRIVER STOPWATCH (display only)"
-                      % ("RESET" if start is not None else "CLEARED"))
+                self._apply_stopwatch(action)
+                print("⏱️ PIT %s STOPWATCH (display only)"
+                      % self._SW_VERBS.get(action, action.upper()))
             else:
                 applied = False
             self.vehicle_state["motor"].update(self.laps.snapshot())

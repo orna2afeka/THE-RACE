@@ -272,7 +272,7 @@ QPushButton#lapResetBtn {{
     color: #5b6b78;
     border: 1px solid #33424e;
     border-radius: 6px;
-    font-size: 20px;
+    font-size: 23px;
     font-weight: bold;
 }}
 QPushButton#lapResetBtn:pressed {{
@@ -1064,10 +1064,13 @@ class RacingDashboard(QMainWindow):
     # with everything else in _scale_lap_timer.
     _LAP_TARGET_GAP = 10
 
-    # Width of the stopwatch's reset button. Small on purpose: it sits beside a
-    # number the driver reads at speed, and it must not compete with it. Wide
-    # enough to stay a usable touch target with gloves on.
-    _LAP_RESET_W = 46
+    # Width of the stopwatch's reset button. Still narrow on purpose -- it sits
+    # beside a number the driver reads at speed and must not compete with it --
+    # but 46 px was a mean target for a gloved thumb on a moving car, so it is
+    # wider than it looks like it needs to be. The row's left margin is set to
+    # this same width (see _scale_lap_timer), so widening the button does not
+    # push the clock off centre.
+    _LAP_RESET_W = 60
 
     # The same button does both jobs, so it says which one it is about to do.
     # Off -> a start arrow; running -> a reset loop. One control, because there
@@ -1108,6 +1111,11 @@ class RacingDashboard(QMainWindow):
         self._lap_start: float | None = None
         self._lap_held_s: float | None = None
         self._lap_hold_until: float = 0.0
+        # Seconds the clock is PARKED on, or None when it is free to run. Set
+        # from the pit (main._apply_lap_commands -> lap_timer_hold); cleared by
+        # the next lap and by the driver's own button, so a clock stopped at the
+        # flag cannot still be stopped when the car goes back out.
+        self._lap_stopped_s: float | None = None
         self._lap_shown = None
         # Matches the button's initial text, set in _build_lap_timer. The clock
         # starts off, so the button starts as a start arrow.
@@ -1464,12 +1472,20 @@ class RacingDashboard(QMainWindow):
     def _reset_lap_timer(self) -> None:
         """Restart the DISPLAYED clock from now.
 
-        Display only. It does not cut a lap, does not move calculated_lap, does
-        not touch the odometer or the energy totals, and tells the pit nothing:
-        the lap count is scrutineering evidence and a driver's thumb must not be
-        able to change it. This is for when the clock is counting from a datum
-        that no longer means anything -- after a pit stop, or after a restart --
-        and the driver wants a number they can actually use.
+        Display only. It does not cut a lap, does not move calculated_lap and
+        does not touch the odometer or the energy totals: the lap count is
+        scrutineering evidence and a driver's thumb must not be able to change
+        it. This is for when the clock is counting from a datum that no longer
+        means anything -- after a pit stop, or after a restart -- and the driver
+        wants a number they can actually use.
+
+        It DOES reach the pit, and that is deliberate. The stopwatch is one
+        clock shared by this screen, the pit wall and the public page; a press
+        here that moved only this screen would leave the wall showing a number
+        the driver is not looking at, which is worse than either of them being
+        wrong on its own. The pit's buttons and this one land in the same
+        place (SmartCANWorker._apply_stopwatch) and neither is senior: the last
+        press stands, and the next crossing of the line releases them both.
 
         The next real line crossing calls _on_lap_timer and takes the clock
         back over, so this cannot leave the stopwatch permanently out of step
@@ -1478,7 +1494,17 @@ class RacingDashboard(QMainWindow):
         self._lap_start = time.monotonic()
         self._lap_held_s = None
         self._lap_hold_until = 0.0
+        # A driver restarting the clock means they want a running clock, even
+        # if the pit stopped it: the thumb on the button is the one in the car.
+        self._lap_stopped_s = None
         self._tick_lap_timer()
+        # Locally first so the screen answers the thumb in the same frame, then
+        # the worker, which is what publishes it to everyone else. Guarded
+        # because the HUD runs standalone for bench work, where the worker is a
+        # plain CANWorker and there is nothing to publish to.
+        worker = getattr(self, "_worker", None)
+        if worker is not None and hasattr(worker, "request_stopwatch"):
+            worker.request_stopwatch("reset_stopwatch")
 
     @staticmethod
     def _lap_time_text(seconds: float) -> str:
@@ -1490,7 +1516,13 @@ class RacingDashboard(QMainWindow):
 
     def _tick_lap_timer(self) -> None:
         now = time.monotonic()
-        if now < self._lap_hold_until and self._lap_held_s is not None:
+        if self._lap_stopped_s is not None:
+            # Parked. Greyed as well as still, because a number that merely
+            # stops moving looks for a moment like a clock that is working and
+            # a car that is not. Takes precedence over the finished-lap freeze
+            # below: a stop pressed during those three seconds means stop.
+            text, colour = self._lap_time_text(self._lap_stopped_s), _OFF
+        elif now < self._lap_hold_until and self._lap_held_s is not None:
             text, colour = self._lap_time_text(self._lap_held_s), _LIME
         elif self._lap_start is None:
             text, colour = _NO_DATA, _NO_DATA_COLOUR
@@ -1531,6 +1563,31 @@ class RacingDashboard(QMainWindow):
         else:
             self._lap_held_s = None
             self._lap_hold_until = 0.0
+        # A fresh lap is a running clock by definition, so the line releases a
+        # stop nobody remembered to lift.
+        self._lap_stopped_s = None
+        self._tick_lap_timer()
+
+    @Slot(bool)
+    def _on_lap_timer_hold(self, held) -> None:
+        """Park the stopwatch on the number it is showing, or let it run again.
+
+        Display only, on exactly the same terms as the button beside the clock:
+        the lap count, the recorded lap times, the energy and the odometer do
+        not move. Releasing does NOT restart the clock -- the lap datum never
+        changed, so the number jumps to where the lap actually is rather than
+        to zero.
+        """
+        if not held:
+            self._lap_stopped_s = None
+        else:
+            now = time.monotonic()
+            if now < self._lap_hold_until and self._lap_held_s is not None:
+                self._lap_stopped_s = self._lap_held_s
+            elif self._lap_start is not None:
+                self._lap_stopped_s = now - self._lap_start
+            else:
+                self._lap_stopped_s = None   # no clock running: nothing to park
         self._tick_lap_timer()
 
     # ── Shared chrome (visible on every screen) ──────────────────────────── #
@@ -2068,6 +2125,7 @@ class RacingDashboard(QMainWindow):
         self._worker.bms_probe_temps_updated.connect(self._on_bms_probe_temps)
         self._worker.target_speed_updated.connect(self._on_target_speed)
         self._worker.lap_timer_updated.connect(self._on_lap_timer)
+        self._worker.lap_timer_hold.connect(self._on_lap_timer_hold)
 
         self._worker.start()
 
