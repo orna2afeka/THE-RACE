@@ -455,7 +455,7 @@ def _push_directly(payload):
 #      copied. Removing the two lines below is all it takes to go back.
 #   3. Size. This is read by every viewer's browser every time it changes, and
 #      RTDB egress is metered. The full payload is a few hundred fields of
-#      cell voltages and thermistors; this is nine numbers.
+#      cell voltages and thermistors; this is ten numbers and a flag.
 PUBLIC_PATH = 'public/live'
 
 # Slower than the 0.5 s pit feed on purpose. The pit is making decisions off
@@ -510,6 +510,21 @@ def _public_snapshot(vehicle_state):
         "speed_kmh": motor.get("mms_vehicle_speed_kmh"),
         "last_lap_time_s": motor.get("last_lap_time_s"),
         "soc_percent": battery.get("bms_soc_percent"),
+        # Whether a charger is on the car, inferred (charge_detector.py). This
+        # is a DELIBERATE disclosure, decided by the team on race morning: it
+        # tells anyone with the URL when the car is in the box and for how
+        # long, rival teams included, which is exactly the charge-stop timing
+        # a competitor would otherwise have to watch the pit lane to learn.
+        # It is here because a spectator page that shows a stopped car with no
+        # explanation reads as a broken car to the people least able to tell
+        # the difference. Delete this line to take it back — but note that the
+        # node keeps whatever was last written, so also clear public/live once.
+        #
+        # Unlike every other field here, this one is published even when False:
+        # "not charging" is a real answer the detector always has, and dropping
+        # it would make a car that is driving indistinguishable from a car
+        # whose telemetry stopped.
+        "is_charging": bool(motor.get("is_charging")),
     }
 
 

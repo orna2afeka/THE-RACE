@@ -888,7 +888,17 @@ class LapTracker:
         self._debt = None
 
     def reset_energy(self):
-        """Zero the energy totals without disturbing laps or distance."""
+        """Zero the energy totals without disturbing laps or distance.
+
+        `last_lap_energy_wh` IS LEFT ALONE, and so is its regen counterpart.
+        They are the DIFFERENCE between two totals taken on a lap that is
+        already over -- zeroing the running totals does not make that lap cost
+        any less, and the pit has no other record of what it cost. Nulling them
+        here also split that lap in two on the pit: db.fetch_laps() groups a
+        lap's rows on lap_seq TOGETHER WITH its figures, so a figure that
+        changed mid-lap started a second group, and the lap was listed twice --
+        in the History table, in the workbook, and inside the average.
+        """
         self.total_energy_wh = 0.0
         self.regen_energy_wh = 0.0
         self.energy_gap_s = 0.0
@@ -896,8 +906,6 @@ class LapTracker:
         self._lap_start_regen_energy_wh = 0.0
         self._stint_start_energy_wh = 0.0
         self._stint_start_regen_energy_wh = 0.0
-        self.last_lap_energy_wh = None
-        self.last_lap_regen_energy_wh = None
         self._trail.clear()              # it holds the old totals
 
     def reset_trip(self):
@@ -914,11 +922,15 @@ class LapTracker:
         a bogus multi-hundred-km delta against the pre-reset value.
 
         The lap in progress loses its metres, so until the next cut the gate
-        must not ask the odometer whether the car has been round."""
+        must not ask the odometer whether the car has been round.
+
+        `last_lap_distance_m` survives, for the same reason last_lap_energy_wh
+        survives reset_energy(): it is a finished lap's measured length, and
+        re-datuming the odometer now cannot unmeasure it. Nulling it was also
+        enough to make the pit list that lap twice -- see reset_energy()."""
         self.odometer_m = 0.0
         self._lap_start_odometer_m = 0.0
         self._last_trip_m = None
-        self.last_lap_distance_m = None
         self._distance_untrusted = True
         self._track_pos = None
         self._trail.clear()
@@ -949,6 +961,24 @@ class LapTracker:
     def lap_distance_m(self):
         """Metres since the current lap's datum, by the odometer."""
         return self.odometer_m - self._lap_start_odometer_m
+
+    @property
+    def lap_energy_wh(self):
+        """Wh spent since the current lap's datum, net of regen, or None.
+
+        The running counterpart of last_lap_energy_wh, and the same basis:
+        motor-side watt-hours with regen subtracting (update_energy). For the
+        driver's HUD, which shows it when the pit re-datums the stopwatch
+        mid-lap -- at that moment there is no finished lap to report, and what
+        the part-lap has already cost is the useful number.
+
+        None until something has actually fed the energy total: before that the
+        difference would be 0.0, and a confident zero is the one thing this
+        tracker never reports (see snapshot()).
+        """
+        if not self._have_energy:
+            return None
+        return self.total_energy_wh - self._lap_start_energy_wh
 
     @property
     def lap_start_ts(self):

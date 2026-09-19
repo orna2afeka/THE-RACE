@@ -1052,6 +1052,18 @@ class RacingDashboard(QMainWindow):
     _LAP_TIMER_H = 42
     _LAP_FREEZE_S = 3.0
 
+    # WHAT THE LAP COST, beside what it took, for those same 3 seconds.
+    # The car has always computed it (LapTracker.last_lap_energy_wh) and sent
+    # it to the pit; the driver never saw it. It rides the clock's own signal
+    # and its own freeze window rather than taking a line of its own -- on a
+    # 480 px screen every pixel here comes off the speedometer, and the moment
+    # a lap ends is exactly when the driver is already looking at this row.
+    #
+    # Smaller and dimmer than the time on purpose: the clock is the number
+    # being read at speed, and the Wh must not compete with it for the glance.
+    _LAP_ENERGY_SCALE = 0.62        # of the clock's font size
+    _LAP_ENERGY_COLOUR = _CYAN
+
     # The pedal bar under the DS001 gauges. Slim on purpose: it is a glance
     # readout ("which side of neutral am I on"), and every pixel it takes comes
     # straight off the speedometer above it on a 480 px screen.
@@ -1108,6 +1120,9 @@ class RacingDashboard(QMainWindow):
         self._lap_start: float | None = None
         self._lap_held_s: float | None = None
         self._lap_hold_until: float = 0.0
+        # Wh to show beside the clock while the hold lasts. Set from the same
+        # signal as _lap_held_s so the two always describe one lap.
+        self._lap_energy_wh: float | None = None
         self._lap_shown = None
         # Matches the button's initial text, set in _build_lap_timer. The clock
         # starts off, so the button starts as a start arrow.
@@ -1226,6 +1241,29 @@ class RacingDashboard(QMainWindow):
         self._map_lbl.setAlignment(Qt.AlignCenter)
         self._apply_map_style(active=False)
         layout.addWidget(self._map_lbl)
+        layout.addSpacing(12)
+
+        # CHARGING — hidden unless a charger is actually on the car.
+        #
+        # Hidden rather than unlit, which is the opposite of how NET, PIT and
+        # MAP behave beside it, and deliberately: those three answer a question
+        # the driver has all race ("is the pit hearing me", "which map"), so an
+        # unlit one is an answer. This answers a question that only exists in
+        # the box, and an always-present "CHARGING" in slate would be one more
+        # thing to read past at 90 km/h for the 23 hours it says nothing.
+        #
+        # It is on the shared bar so it shows on BOTH screens: the driver may
+        # be on any page when the crew plugs in, and it is the crew looking
+        # over their shoulder who most wants to see the car has registered it.
+        self._charging_lbl = QLabel("CHARGING")
+        self._charging_lbl.setAlignment(Qt.AlignCenter)
+        self._charging_lbl.setStyleSheet(
+            f"color: {_LIME}; font-size: {int(13 * self._sc)}px;"
+            f"font-weight: bold; letter-spacing: 1px;"
+            f"border: 2px solid {_LIME}; border-radius: 4px; padding: 1px 8px;"
+        )
+        self._charging_lbl.hide()
+        layout.addWidget(self._charging_lbl)
         layout.addSpacing(12)
 
         self._alert_lbl = QLabel("")
@@ -1488,14 +1526,31 @@ class RacingDashboard(QMainWindow):
         minutes, rest = divmod(tenths, 600)
         return f"{minutes}:{rest // 10:02d}.{rest % 10}"
 
+    @staticmethod
+    def _lap_energy_text(wh):
+        """152.4 -> '152 Wh'. Whole watt-hours: a lap costs one or two hundred
+        of them, and a decimal here is a digit the driver cannot use."""
+        return "%.0f Wh" % wh
+
     def _tick_lap_timer(self) -> None:
         now = time.monotonic()
-        if now < self._lap_hold_until and self._lap_held_s is not None:
+        holding = now < self._lap_hold_until
+        if holding and self._lap_held_s is not None:
             text, colour = self._lap_time_text(self._lap_held_s), _LIME
         elif self._lap_start is None:
             text, colour = _NO_DATA, _NO_DATA_COLOUR
         else:
             text, colour = self._lap_time_text(now - self._lap_start), _WHITE
+        # The cost rides the same window as the time. Built as rich text rather
+        # than a second widget: the row's centring is computed against the
+        # button's width (see _scale_lap_timer), and adding a widget to it
+        # would shift the clock sideways every time a lap ended -- which is the
+        # one moment the driver is looking straight at it.
+        if holding and self._lap_energy_wh is not None:
+            text = ('%s<span style="font-size:%dpx; color:%s;">  %s</span>'
+                    % (text, max(11, int(32 * self._sc * self._LAP_ENERGY_SCALE)),
+                       self._LAP_ENERGY_COLOUR,
+                       self._lap_energy_text(self._lap_energy_wh)))
         if (text, colour) == self._lap_shown:
             return
         if self._lap_shown is None or colour != self._lap_shown[1]:
@@ -1519,18 +1574,28 @@ class RacingDashboard(QMainWindow):
             self._lap_reset_btn.setText(glyph)
             self._lap_btn_glyph = glyph
 
-    @Slot(object, object)
-    def _on_lap_timer(self, lap_start, finished_s) -> None:
+    @Slot(object, object, object)
+    def _on_lap_timer(self, lap_start, finished_s, energy_wh=None) -> None:
         """A new lap clock started at `lap_start` (time.monotonic()), or None
         when unknown. `finished_s` is the lap just completed, held on screen for
-        _LAP_FREEZE_S; None means the clock only restarted, so nothing is held."""
+        _LAP_FREEZE_S; None means the clock only restarted, so nothing is held.
+        `energy_wh` is what that lap cost, net of regen -- or, when no lap
+        finished, what the part-lap has cost so far (the pit re-datuming the
+        clock mid-lap). Shown beside the time for the same window.
+
+        The energy alone is enough to open that window. A pit stopwatch reset
+        finishes no lap, so there is no time to freeze, but there IS a number
+        worth showing -- and without this the driver would see the clock jump
+        with no explanation of why."""
         self._lap_start = lap_start
+        self._lap_energy_wh = energy_wh
         if finished_s is not None and lap_start is not None:
             self._lap_held_s = finished_s
             self._lap_hold_until = time.monotonic() + self._LAP_FREEZE_S
         else:
             self._lap_held_s = None
-            self._lap_hold_until = 0.0
+            self._lap_hold_until = (time.monotonic() + self._LAP_FREEZE_S
+                                    if energy_wh is not None else 0.0)
         self._tick_lap_timer()
 
     # ── Shared chrome (visible on every screen) ──────────────────────────── #
@@ -2068,6 +2133,7 @@ class RacingDashboard(QMainWindow):
         self._worker.bms_probe_temps_updated.connect(self._on_bms_probe_temps)
         self._worker.target_speed_updated.connect(self._on_target_speed)
         self._worker.lap_timer_updated.connect(self._on_lap_timer)
+        self._worker.vehicle_flags_updated.connect(self._on_vehicle_flags)
 
         self._worker.start()
 
@@ -2274,6 +2340,21 @@ class RacingDashboard(QMainWindow):
         # name this car's reverse map actually has. The badge stayed cyan in
         # reverse. See mms_parser.REVERSE_MAP_RAWS.
         self._apply_map_style(active=True, warn=mms_parser.is_reverse_map(raw))
+
+    def _on_vehicle_flags(self, flags: dict) -> None:
+        """The indicator row from the worker. Only the charge badge, for now.
+
+        can_worker emits this change-only, so this runs a handful of times a
+        race rather than at the poll rate — which is why it can afford to
+        show/hide a widget and make the bar re-lay out.
+
+        .get(), not [], and compared with `is True`: an older worker, the HUD
+        simulator, or a standalone run with no charge detector all send a row
+        without the key, and "the flag is missing" must read as not charging
+        rather than raise inside a Qt slot, where the traceback would go to a
+        console nobody is watching on the car.
+        """
+        self._charging_lbl.setVisible(flags.get("charging") is True)
 
     def _apply_map_style(self, active: bool, warn: bool = False) -> None:
         colour = _ORANGE if warn else (_CYAN if active else _OFF)

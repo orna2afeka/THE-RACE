@@ -207,7 +207,7 @@ PROFILE_TICK_S = 0.2
 
 # Which profile the car runs until the pit says otherwise. The baseline is the
 # safe default — it is the lap the team actually measured.
-DEFAULT_STRATEGY = "base_210s"
+DEFAULT_STRATEGY = "dor_280s"
 
 # ==============================================================================
 # SMART CAN WORKER (Core Background Thread)
@@ -652,7 +652,13 @@ class SmartCANWorker(CANWorker):
         # they keep whatever the Pi can actually read.
         gpio = (self.vehicle_inputs.read() if self.vehicle_inputs is not None
                 else {"parking_brake": None, "lights_on": None})
-        self._last_flags = {"ecu_on": False, "reverse": False, **gpio}
+        # Charging is carried through for the same reason, and it matters more
+        # here than the GPIO pair: the bus most plausibly falls silent while the
+        # car sits on a charger, and that is precisely when the indicator is
+        # true. It is inferred from the BMS, not from the controller, so a dead
+        # controller is not evidence the charger was unplugged.
+        self._last_flags = {"ecu_on": False, "reverse": False,
+                            "charging": bool(self.charging_flag), **gpio}
         self.vehicle_flags_updated.emit(dict(self._last_flags))
         # Clear the power map too. A stale "Map 3" badge sitting on screen while
         # the bus is dead would tell the driver something we no longer know.
@@ -979,7 +985,13 @@ class SmartCANWorker(CANWorker):
         finished = (self.laps.last_lap_time_s
                     if start is not None
                     and self.laps.last_lap_finished_ts == start else None)
-        self.lap_timer_updated.emit(start, finished)
+        # The lap's cost goes with its time, and ONLY when a lap was actually
+        # counted. A restart that finished nothing has no Wh to report, and
+        # last_lap_energy_wh still holds the previous lap's figure -- sending
+        # it here would put the last real lap's cost beside a clock that had
+        # just been re-datumed for a different reason.
+        energy = self.laps.last_lap_energy_wh if finished is not None else None
+        self.lap_timer_updated.emit(start, finished, energy)
 
     def _apply_strategy_commands(self) -> None:
         """Switch the active speed profile when the pit selects a new strategy.
@@ -1055,7 +1067,11 @@ class SmartCANWorker(CANWorker):
                 # car's own lap timing.
                 display_only = True
                 start = time.monotonic() if action == "reset_stopwatch" else None
-                self.lap_timer_updated.emit(start, None)
+                # No lap ended, so there is no lap TIME to show -- but the
+                # part-lap driven so far has cost something, and that is the
+                # useful number at the moment the clock is re-datumed. The
+                # driver leaving the box sees what this lap has already spent.
+                self.lap_timer_updated.emit(start, None, self.laps.lap_energy_wh)
                 print("⏱️ PIT %s DRIVER STOPWATCH (display only)"
                       % ("RESET" if start is not None else "CLEARED"))
             else:
@@ -1162,6 +1178,24 @@ class SmartCANWorker(CANWorker):
                                         self._last_mms_rpm):
             self.laps.mark_stint_start()
             print("🔌 CHARGING DETECTED — stint reset")
+        # The STATE, not just its rising edge, so every screen can show it.
+        # The detector has always known this; nothing published it, so the pit
+        # could only infer a charging stop from stint_energy resetting to zero
+        # — after the fact, and only if somebody was watching that tile.
+        #
+        # Lives under "motor" because that is the bag main.py already publishes
+        # every lap/energy figure in, and the whole of it reaches the pit and
+        # the HUD without a new transport. It is a real boolean, never None:
+        # the detector treats a missing reading as "not charging" (see its
+        # update() docstring), so "we cannot tell" and "not charging" are
+        # already the same answer here, and a tri-state would promise the
+        # screens a distinction the sensors cannot make.
+        self.vehicle_state["motor"]["is_charging"] = self._charge_detector.is_charging
+        # The HUD reads this off the indicator row, which _poll_vehicle_inputs
+        # already emits at 5 Hz, change-only. Setting the attribute is the
+        # whole handoff: emitting here too would only add a GPIO read per pass
+        # and repaint no sooner than the poller already does.
+        self.charging_flag = self._charge_detector.is_charging
 
         # Log GPS state only when the summary changes, so the console shows the
         # moment a fix is acquired or lost without scrolling every second.

@@ -315,6 +315,20 @@ already running.
   matrix says which rows are real. Practice laps at Zolder are what turn it
   real — and only laps recorded from this build onward can be attributed,
   because older rows never stored which profile was active.
+- **A charge stop is between 30 and 60 minutes, never outside it.** The plan
+  never books less than 30 min in the box (that is what a stop costs even if
+  the charge is quicker) and never more than 60 min on the charger — at the
+  hour the car leaves at whatever SoC it reached, which is why **Charge To**
+  can read 95% rather than a round number. The **Charge Time** column beside it
+  is the charge for each stop, in the same order; hover it for each stop's
+  SoC before and after.
+- **Pit Time is every minute the car is not moving** — the charge stops *plus*
+  the driver changes between them. A change made at a charge stop is free (the
+  car is stopped anyway); one mid-stint costs 5 min, and those are the ones in
+  **Driver Swaps**, which now carries their total. So Pit Time is always larger
+  than Charge Time beside it, and hovering it spells the sum out. The plan is
+  ranked on laps first and on this second: between two plans that finish on the
+  same lap, the one that stood still less is the one with room for a mistake.
 - **Rule 3.5.6 report, every 2 hours**: highest/lowest cell temperature and
   highest/lowest cell voltage. Read it from the pit's **Cell Voltages** tab (top
   section) or from the HUD's last page, **R3.5.6**. Both show the cell and the
@@ -391,9 +405,9 @@ Confirm by sending the strategy from the pit and watching for the car's ack.
 git checkout -- profiles/     # on BOTH machines, then restart the HUD
 ```
 
-This works because the five original keys are never renamed. If git is not an
-option, `python tools/generate_profiles.py` rebuilds the synthetic five from
-`Pit_Dashboard/210s.xlsx`.
+This works because the committed keys are never renamed. If git is not an
+option, `python tools/build_dor_profiles.py --verify` rebuilds all three from
+`SolarRace_OS/dor 17.xlsx` — the lap they came from, which is in the repo.
 
 ---
 
@@ -408,7 +422,7 @@ process, so it cannot slow the dashboard down.
 
 ### ☐ Set the TV up before the car exists
 
-`python tools/pit_wall.py --demo` drives the page from `profiles/base_210s.csv`
+`python tools/pit_wall.py --demo` drives the page from `profiles/dor_280s.csv`
 instead of the database - a car that is not there, lapping Zolder. Use it to sort
 out the TV, the mount, the viewing angle and the LAN without waiting for a
 session. It opens no database at all, so it works on any laptop.
@@ -438,7 +452,7 @@ database cannot supply at all, which is a bug in the wall, not in the car.
 
 ### ☐ The lap delta names a strategy
 
-Bottom of the LAP card: `Last 3:29.4 · -0.6 s vs base_210s`. If it says "no
+Bottom of the LAP card: `Last 4:41.2 · +1.2 s vs dor_280s`. If it says "no
 strategy set", the car has not reported `active_strategy` and there is nothing
 to compare a lap against - the wall shows no target rather than inventing one.
 

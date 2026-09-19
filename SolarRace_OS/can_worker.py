@@ -176,8 +176,15 @@ class CANWorker(QThread):
     target_speed_updated    = Signal(object, str)
     # Lap stopwatch: (time.monotonic() the current lap started, or None when
     # unknown; seconds of the lap that just FINISHED, or None when the clock
-    # merely (re)started). Signal(object, object) because both can be None.
-    lap_timer_updated       = Signal(object, object)
+    # merely (re)started; Wh that lap cost, net of regen, or None).
+    #
+    # The energy rides the SAME signal as the time on purpose. They describe
+    # one event -- the lap that just ended -- and sending them separately is
+    # how a HUD ends up showing one lap's time beside another lap's cost.
+    # On a pit stopwatch re-datum there is no finished lap, and the Wh is then
+    # what the PART-lap has cost so far (main._apply_lap_commands).
+    # Signal(object, ...) throughout because every one of the three can be None.
+    lap_timer_updated       = Signal(object, object, object)
     connection_error        = Signal(str)    # Fatal error message
     status_updated          = Signal(str)    # Human-readable status string
 
@@ -202,6 +209,14 @@ class CANWorker(QThread):
         # motor controller cannot see them. Assigned by main.py; None here so
         # the standalone HUD still runs and simply reports them as unknown.
         self.vehicle_inputs = None
+        # Is a charger on the car right now. Written by main.py's
+        # SmartCANWorker from modules/charge_detector.py, which needs both the
+        # pack current and the motor RPM to tell a charger from regen braking
+        # — neither of which this base class tracks together, so it cannot
+        # work it out for itself. False (not None) is the honest default: the
+        # detector reports a missing reading as "not charging" too, so the
+        # standalone HUD showing no charge indicator is correct, not a guess.
+        self.charging_flag = False
 
     # ================================================================== #
     # QThread entry point — executes in the worker thread                 #
@@ -336,6 +351,11 @@ class CANWorker(QThread):
           lights_on     the Pi, not to the motor controller. None (not False)
                         whenever no pin is configured or readable, so the HUD
                         can show UNKNOWN instead of a confident "off".
+          charging      stationary AND a sustained current into the pack, from
+                        charge_detector.py. Not a bus signal: nothing on this
+                        car reports "a charger is connected", so it is inferred
+                        — see that module for why current alone would fire on
+                        every brake zone of every lap.
 
         Nothing is taken from byte 3 any more: that is a protections word, so
         those bits are zero because nothing has faulted, not because the brake
@@ -363,6 +383,13 @@ class CANWorker(QThread):
         else:
             flags.setdefault("parking_brake", None)
             flags.setdefault("lights_on", None)
+
+        # Survives the _emit_zeros path on purpose. A charge stop is exactly
+        # when the bus goes quiet — the ECU is off, nothing is decoding — so
+        # clearing this with the CAN-derived flags would blank the indicator at
+        # the one moment it is true. It is not sourced from CAN, so a silent
+        # bus is not evidence against it.
+        flags["charging"] = bool(self.charging_flag)
 
         if flags == self._last_flags:
             return          # status frame repeats constantly; only repaint on change
