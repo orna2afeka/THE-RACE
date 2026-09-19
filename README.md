@@ -256,8 +256,8 @@ THE RACE/                             # ← repo root
 │   #  d(m) counts ODOMETER metres, not surveyed ones — the car's lookup is fed
 │   #  the raw odometer, which over-reads ~1.5% (track.py:63, untested tyre
 │   #  constant). Rebuild with --axis track once that constant is measured.
-│   ├── dor_265s.csv   4:25   dor_280s.csv   4:40   (the car's default)
-│   └── dor_300s.csv   5:00
+│   └── lap33_290s.csv   4:50   the ONLY profile, and the car's default: race
+│                                  lap 33 (2026-09-19) exactly as driven
 │
 ├── tools/                            # One-off / offline utilities (not part of the live system)
 │   ├── check_limits.py               # Headless checks: gauge tiers, blink edges, no-data
@@ -273,7 +273,7 @@ THE RACE/                             # ← repo root
 │   │                                 #   spectator page and Pit_Dashboard/wall.html
 │   └── pit_wall.py                   # Serves wall.html + /live.json on the pit LAN (port 8503),
 │                                     #   telemetry.db READ-ONLY, one thread, never published.
-│                                     #   --demo drives it from dor_280s.csv with no database at all
+│                                     #   --demo drives it from lap33_290s.csv with no database at all
 │
 ├── deploy/                           # Raspberry Pi provisioning (systemd + desktop launcher)
 │   ├── README.md                     # ⭐ Pi setup guide — read this before touching the Pi
