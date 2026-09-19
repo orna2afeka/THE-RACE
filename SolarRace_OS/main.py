@@ -1025,6 +1025,12 @@ class SmartCANWorker(CANWorker):
         owns it. That is what keeps LapTracker and vehicle_state lock-free.
         """
         for cmd in self.lap_inbox.drain():
+            # WHO ASKED. A command raised on this car (the driver's button,
+            # CommandInbox.submit_local) is applied exactly like the pit's, but
+            # it is not answered on the pit's ack node and the console says
+            # which thumb moved the lap count.
+            local = bool(cmd.get("local"))
+            who = "DRIVER" if local else "PIT"
             action = cmd.get("action")
             applied = True
             # Display-only commands change the HUD and nothing the car records,
@@ -1033,7 +1039,7 @@ class SmartCANWorker(CANWorker):
             display_only = False
             if action == "cut_lap":
                 self.laps.force_lap("manual")
-                print(f"🏁 PIT CUT LAP -> lap {self.laps.lap_count}")
+                print(f"🏁 {who} CUT LAP -> lap {self.laps.lap_count}")
             elif action == "set_lap":
                 # A command with no number is refused, not read as 0: `or 0`
                 # here once meant a malformed message could zero the race.
@@ -1089,8 +1095,9 @@ class SmartCANWorker(CANWorker):
             else:
                 applied = False
             self.vehicle_state["motor"].update(self.laps.snapshot())
-            ack_lap_command(cmd.get("id"), action, applied,
-                            lap=self.laps.lap_count)
+            if not local:
+                ack_lap_command(cmd.get("id"), action, applied,
+                                lap=self.laps.lap_count)
             if applied and not display_only:
                 # A pit command is a deliberate, infrequent edit to state that
                 # a reboot must not silently undo -- don't make it wait for the

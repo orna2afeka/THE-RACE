@@ -169,6 +169,34 @@ class CommandInbox:
     # ------------------------------------------------------------------ #
     # CAN worker thread                                                   #
     # ------------------------------------------------------------------ #
+    def submit_local(self, action, value=None):
+        """Queue a command raised ON THIS CAR -- the driver's own button.
+
+        Same queue, same applier, same checkpoint: a lap cut from the HUD is
+        the lap cut the pit sends and the one the gate fires, not a third
+        implementation of what a lap is.
+
+        NEITHER IDEMPOTENCY GATE APPLIES HERE, and that is the point of a
+        separate entry. Both exist for Firebase's retained node -- the id gate
+        kills reconnect replays, the age gate stops a stale command firing at
+        boot. A thumb on a button is not retained, not replayed, and cannot
+        arrive from last Tuesday, so it goes straight on the queue with no id
+        and no age test.
+
+        `local` marks it for the applier, which does NOT write an ack for it:
+        an ack answers a command the PIT sent, and the pit matches acks against
+        the id it issued (Sidebar.applied). Answering one it never sent is
+        noise on the one channel a race-day engineer trusts.
+
+        Callable from any thread -- queue.Queue is what makes this safe, and it
+        is the same hand-off the Firebase listener uses.
+        """
+        if action not in self._valid_actions:
+            raise ValueError("%s is not a valid %s" % (action, self._label))
+        self._queue.put({"id": None, "action": action, "value": value,
+                         "ts": time.time(), "by": "driver", "local": True})
+        self.received += 1
+
     def drain(self):
         """Yield every queued command. Call from the CAN worker thread only."""
         while True:

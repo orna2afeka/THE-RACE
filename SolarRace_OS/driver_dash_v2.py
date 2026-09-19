@@ -1088,6 +1088,21 @@ class RacingDashboard(QMainWindow):
     _LAP_BTN_START = "▶"
     _LAP_BTN_RESET = "⟲"
 
+    # A press on this button CUTS A LAP: it moves calculated_lap, which is
+    # scrutineering evidence. So it is HELD, not tapped -- a knock against the
+    # panel over a kerb must not be able to add a lap to the record.
+    #
+    # No confirm dialog, deliberately. This is an 800x480 panel a driver reads
+    # at 60 km/h, and a yes/no box in front of them is worse than the mistake
+    # it prevents. The :pressed style already lights the button cyan for the
+    # whole hold, so the feedback is free.
+    _LAP_CUT_HOLD_MS = 1000
+    # Flashed after a tap too short to count. A control that ignores a press
+    # without saying why is one the driver presses again, harder, at the worst
+    # possible moment. Two characters because the button is 46 px at 20 px bold.
+    _LAP_BTN_HINT = "1s"
+    _LAP_HINT_MS = 1200
+
     # Root layout margin, in px. Named because _status_budget_px has to
     # subtract it to work out how much room the status text really has, and a
     # second copy of the number there would silently start clipping the status
@@ -1127,6 +1142,8 @@ class RacingDashboard(QMainWindow):
         # Matches the button's initial text, set in _build_lap_timer. The clock
         # starts off, so the button starts as a start arrow.
         self._lap_btn_glyph = self._LAP_BTN_START
+        # Until when the button shows the hold hint. See _LAP_BTN_HINT.
+        self._lap_hint_until = 0.0
 
         # UI scale factor (1.0 at the 800×480 design size, grows on fullscreen
         # displays) plus the current text colors, so resizeEvent can re-apply
@@ -1466,7 +1483,14 @@ class RacingDashboard(QMainWindow):
         # Never take focus: the HUD has no keyboard, and a focus ring left on a
         # button after a touch is just noise on the instrument panel.
         self._lap_reset_btn.setFocusPolicy(Qt.NoFocus)
-        self._lap_reset_btn.clicked.connect(self._reset_lap_timer)
+        # HELD, NOT CLICKED. Built before _tick_lap_timer() runs below, which
+        # reads the hint state this sets up.
+        self._lap_cut_timer = QTimer(self)
+        self._lap_cut_timer.setSingleShot(True)
+        self._lap_cut_timer.setInterval(self._LAP_CUT_HOLD_MS)
+        self._lap_cut_timer.timeout.connect(self._cut_lap_from_hud)
+        self._lap_reset_btn.pressed.connect(self._lap_cut_timer.start)
+        self._lap_reset_btn.released.connect(self._lap_press_released)
         h.addWidget(self._lap_reset_btn)
         # Heights, the button and the margins all come from here, so the row is
         # built at whatever scale we are already running at.
@@ -1499,24 +1523,50 @@ class RacingDashboard(QMainWindow):
         self._lap_row.layout().setContentsMargins(btn_w, 0, 0, gap)
         self._lap_row.setFixedHeight(clock_h + gap)
 
-    def _reset_lap_timer(self) -> None:
-        """Restart the DISPLAYED clock from now.
+    def _lap_press_released(self) -> None:
+        """Let go of the lap button.
 
-        Display only. It does not cut a lap, does not move calculated_lap, does
-        not touch the odometer or the energy totals, and tells the pit nothing:
-        the lap count is scrutineering evidence and a driver's thumb must not be
-        able to change it. This is for when the clock is counting from a datum
-        that no longer means anything -- after a pit stop, or after a restart --
-        and the driver wants a number they can actually use.
+        A hold that reached _LAP_CUT_HOLD_MS has already fired and stopped its
+        own timer; anything shorter is a tap, and a tap does NOTHING.
 
-        The next real line crossing calls _on_lap_timer and takes the clock
-        back over, so this cannot leave the stopwatch permanently out of step
-        with the car's own lap timing.
+        ONE BUTTON, ONE MEANING. It used to restart the displayed clock without
+        cutting anything, which looked identical on screen to a real cut -- the
+        clock goes to 0:00 either way -- so the driver had no way to tell
+        whether the lap had been counted. Two actions that cannot be told apart
+        on the instrument that reports them is worse than one action.
         """
-        self._lap_start = time.monotonic()
-        self._lap_held_s = None
-        self._lap_hold_until = 0.0
-        self._tick_lap_timer()
+        if self._lap_cut_timer.isActive():
+            self._lap_cut_timer.stop()
+            self._lap_hint_until = time.monotonic() + self._LAP_HINT_MS / 1000.0
+            self._tick_lap_timer()
+
+    def _cut_lap_from_hud(self) -> None:
+        """Held long enough: cut the lap, for real.
+
+        THE SAME LAP CUT THE PIT SENDS AND THE GATE FIRES -- not a third idea
+        of what a lap is. It goes on the CAN worker's command queue
+        (lap_command.CommandInbox.submit_local) instead of touching LapTracker
+        from here, because the tracker is single-thread-owned by that worker
+        and this runs on the Qt GUI thread. Touching it from here is the data
+        race that queue exists to prevent.
+
+        Everything the driver then sees arrives by the ordinary route: the
+        worker counts the lap, snapshots its time and energy, force-writes
+        lap_checkpoint.json, and publishes the new datum back through
+        lap_timer_updated -- so the frozen lap time and its Wh appear exactly
+        as they do when the car crosses the line itself.
+        """
+        inbox = getattr(self._worker, "lap_inbox", None)
+        if inbox is None:
+            # A build with no car behind it: the Windows demo runs the base
+            # CANWorker, which has no command queue. Nothing to cut.
+            return
+        try:
+            inbox.submit_local("cut_lap")
+        except Exception as exc:                              # noqa: BLE001
+            # The HUD must survive anything. A lap that could not be cut is a
+            # lap the gate will cut at the line anyway.
+            print(f"[HUD] lap cut failed: {exc}")
 
     @staticmethod
     def _lap_time_text(seconds: float) -> str:
@@ -1551,6 +1601,22 @@ class RacingDashboard(QMainWindow):
                     % (text, max(11, int(32 * self._sc * self._LAP_ENERGY_SCALE)),
                        self._LAP_ENERGY_COLOUR,
                        self._lap_energy_text(self._lap_energy_wh)))
+        # THE BUTTON IS UPDATED BEFORE THE EARLY RETURN BELOW. The glyph and
+        # the clock change for different reasons -- a tap too short to cut a
+        # lap changes the button and nothing else -- and while this block sat
+        # after that return, the hold hint never appeared: the label had not
+        # moved, so the tick went home before reaching it.
+        #
+        # Still only touched when it actually changes: this runs at 10 Hz and a
+        # setText on every tick would restyle the button 600 times a minute for
+        # nothing.
+        glyph = (self._LAP_BTN_HINT if now < self._lap_hint_until
+                 else self._LAP_BTN_START if self._lap_start is None
+                 else self._LAP_BTN_RESET)
+        if glyph != self._lap_btn_glyph:
+            self._lap_reset_btn.setText(glyph)
+            self._lap_btn_glyph = glyph
+
         if (text, colour) == self._lap_shown:
             return
         if self._lap_shown is None or colour != self._lap_shown[1]:
@@ -1565,14 +1631,6 @@ class RacingDashboard(QMainWindow):
         self._lap_lbl.setText(text)
         self._lap_shown = (text, colour)
 
-        # Only touched when it actually changes: this runs at 10 Hz and a
-        # setText on every tick would restyle the button 600 times a minute for
-        # nothing.
-        glyph = (self._LAP_BTN_START if self._lap_start is None
-                 else self._LAP_BTN_RESET)
-        if glyph != self._lap_btn_glyph:
-            self._lap_reset_btn.setText(glyph)
-            self._lap_btn_glyph = glyph
 
     @Slot(object, object, object)
     def _on_lap_timer(self, lap_start, finished_s, energy_wh=None) -> None:
