@@ -1623,11 +1623,25 @@ class RacingDashboard(QMainWindow):
         # button's width (see _scale_lap_timer), and adding a widget to it
         # would shift the clock sideways every time a lap ended -- which is the
         # one moment the driver is looking straight at it.
-        if holding and self._lap_energy_wh is not None:
+        #
+        # WHILE THE LAP RUNS it shows the running sum instead -- this lap's Wh
+        # so far, the same number the pit shows beside its lap clock. Read
+        # straight off the worker's tracker: one float property, read-only, so
+        # no queue is needed the way a lap CUT needs one. A build with no
+        # tracker behind it (the Windows demo) simply shows the clock alone,
+        # and an energy total nothing has fed yet is None, never a made-up 0.
+        wh = self._lap_energy_wh if holding else None
+        if not holding and self._lap_start is not None:
+            try:
+                wh = getattr(getattr(self._worker, "laps", None),
+                             "lap_energy_wh", None)
+            except Exception:                                 # noqa: BLE001
+                wh = None
+        if wh is not None:
             text = ('%s<span style="font-size:%dpx; color:%s;">  %s</span>'
                     % (text, max(11, int(32 * self._sc * self._LAP_ENERGY_SCALE)),
                        self._LAP_ENERGY_COLOUR,
-                       self._lap_energy_text(self._lap_energy_wh)))
+                       self._lap_energy_text(wh)))
         # THE BUTTON IS UPDATED BEFORE THE EARLY RETURN BELOW. The glyph and
         # the clock change for different reasons -- a tap too short to cut a
         # lap changes the button and nothing else -- and while this block sat
