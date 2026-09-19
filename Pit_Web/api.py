@@ -391,6 +391,25 @@ def _race_clock(conn):
                                - elapsed_min)
 
 
+def race_lap_floor(conn):
+    """The instant the pit's lap views start from, or None for the whole store.
+
+    THE GREEN FLAG. Every list of LAPS is bounded by this -- /api/laps, and the
+    per-lap workbook through export.py -- because a race start zeroes the car's
+    lap counter, so laps from before it repeat the numbers of laps after it.
+
+    The race START, not "is a race running": a race that has been stopped still
+    happened, and its laps are still the ones worth looking at afterwards. It
+    is cleared only by a race reset, which is the pit saying the race never
+    began.
+
+    Samples are NOT bounded by this. The History charts, the time-ranged
+    workbook and the store itself keep everything the car ever sent; this is
+    about which laps are THIS RACE's, not about what is worth keeping.
+    """
+    return db.load_race_state(conn).get("race_start_time")
+
+
 DRIVER_STINT_KEY = "driver_stint"
 RACE_UNDO_KEY = "race_undo"
 STRATEGY_CHOICE_KEY = "strategy_choice"
@@ -1661,7 +1680,18 @@ def api_laps():
     computed each lap's energy and time when it cut the lap, so a dropped
     telemetry link cannot punch holes in these charts."""
     with closing(ro_conn()) as conn:
-        rows = db.fetch_laps(conn)
+        # FROM THE GREEN FLAG, when there is one. The car is zeroed at the
+        # start of a race (api_race -> send_new_race), so its lap numbers begin
+        # again at 1 -- and without this bound the warm-up's lap 1 and the
+        # race's lap 1 would sit in the same list under the same number, drag
+        # each other through best/average, and land on two tabs of the per-lap
+        # workbook fighting over one name.
+        #
+        # Nothing is deleted or hidden from the store: every warm-up sample and
+        # lap is still there, and the time-ranged workbook still exports them.
+        # With no race ever started the floor is None and this is the whole
+        # store, exactly as before.
+        rows = db.fetch_laps(conn, since_ts=race_lap_floor(conn))
         # Who was in the car when each lap finished. From the stints the PIT
         # logged — the car reports no driver — so a lap driven before anyone
         # pressed "Driver changed", or by a crew that never typed a name, has
@@ -2509,6 +2539,61 @@ def api_export_xlsx(start: float | None = Query(None),
                  "X-Row-Count": str(n)})
 
 
+@app.get("/api/export/laps.xlsx")
+def api_export_laps_xlsx(firstLap: int | None = Query(None),
+                         lastLap: int | None = Query(None),
+                         groups: str = Query("")):
+    """The per-lap workbook: the Laps sheet as an index, then a tab per lap.
+
+    A SECOND EXPORT, BESIDE /api/export/telemetry.xlsx AND NOT INSTEAD OF IT.
+    That one is cut by time and is what the crew downloads at the end of a
+    session; this one is cut by lap number and answers "show me lap 87". Same
+    column groups, same openpyxl module, different question.
+
+    ValueError from export.py is the caller's mistake -- an empty lap range, or
+    more laps than MAX_LAP_SHEETS -- so it comes back as a 400 carrying the
+    sentence the panel shows, not as a 500.
+    """
+    names = [g for g in groups.split(",") if g] or list(export.METRIC_GROUPS)
+    cols = export.metrics_for_groups(names)
+    buf = io.BytesIO()
+    # Same reason write_xlsx is handed a connection: with SOLARRACE_DB_PATH set,
+    # a function opening its own would export a different store from the one
+    # the sidebar counted laps in.
+    with closing(ro_conn()) as conn:
+        try:
+            laps, rows = export.write_laps_xlsx(
+                buf, first_lap=firstLap, last_lap=lastLap, metrics=cols,
+                conn=conn)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+    data = buf.getvalue()
+    span = ("laps_%s-%s" % (firstLap, lastLap) if firstLap is not None
+            and lastLap is not None else "laps")
+    name = "telemetry_%s_%s.xlsx" % (span, datetime.now().strftime("%Y%m%d-%H%M"))
+    return Response(
+        data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="%s"' % name,
+                 "X-Row-Count": str(rows), "X-Lap-Count": str(laps)})
+
+
+@app.get("/api/export/lap_bounds")
+def api_export_lap_bounds():
+    """Which lap numbers the store holds, for the per-lap export's fields.
+
+    NOT folded into /api/export/bounds, which the panel polls every 60 s:
+    counting laps means db.fetch_laps() grouping the whole telemetry table,
+    and making the sidebar pay that every minute to fill in two fields that
+    are read once would be a poor trade. This is fetched when the per-lap
+    section is opened.
+    """
+    with closing(ro_conn()) as conn:
+        lo, hi, n = export.lap_bounds(conn=conn)
+    return {"firstLap": lo, "lastLap": hi, "laps": n,
+            "maxSheets": export.MAX_LAP_SHEETS}
+
+
 @app.get("/api/export/estimate")
 def api_export_estimate(start: float | None = Query(None),
                         end: float | None = Query(None)):
@@ -2587,6 +2672,7 @@ def api_race(body: RaceBody):
                      "cannot start later than now" % (start - now))
     if body.isRacing and start is None:
         start = now
+    new_race = False
     with closing(rw_conn()) as conn:
         before = db.load_race_state(conn)
         db.save_race_state(conn, body.isRacing, start)
@@ -2599,6 +2685,12 @@ def api_race(body: RaceBody):
             # not a resume (Resume passes the stored start back unchanged).
             # The old stint belongs to the old race: carrying its banked time
             # over is how a fresh race opens hundreds of hours overdue.
+            #
+            # THE CAR IS ZEROED ON THIS SAME TEST, below. One rule decides both
+            # "the stint starts over" and "the warm-up is discarded", because
+            # they are the same question -- and because a second, slightly
+            # different definition of "a new race" is how a resume would come
+            # to wipe a lap count mid-race.
             new_race = not before.get("is_racing") and (
                 old_start is None or abs(float(start) - float(old_start)) > 1.0)
             if not existing.get("started_at") or new_race:
@@ -2647,7 +2739,34 @@ def api_race(body: RaceBody):
         elif not body.isRacing:
             _set_stint_running(conn, False)
         _kick_public_driver()
-        return {**db.load_race_state(conn), "driverStint": driver_stint(conn)}
+        payload = {**db.load_race_state(conn), "driverStint": driver_stint(conn)}
+
+    # THE GREEN FLAG REACHES THE CAR. A new race zeroes the car's lap count,
+    # lap sequence, distance, energy and finished-lap figures, and the car
+    # rewrites its checkpoint -- so the warm-up laps are not the race's, and
+    # nobody has to delete lap_checkpoint.json on the Pi between the
+    # installation laps and the start. See driver_message.send_new_race.
+    #
+    # SENT AFTER THE STORE IS CLOSED, not inside the block above: this is a
+    # network write that gets up to five seconds, and holding the pit's only
+    # write connection across it would block every other writer for as long as
+    # Firebase felt like taking. (lap_command.py's docstring documents the same
+    # trap on the car.)
+    #
+    # A CAR THAT CANNOT BE REACHED DOES NOT FAIL THE START, exactly as with the
+    # lap-clock hold: a race that will not start because the link is down is
+    # worse than a car still counting its warm-up, and the caller is told which
+    # it got. The command carries its own timestamp and lap_command.py refuses
+    # one older than MAX_COMMAND_AGE_S, so a car that comes up long afterwards
+    # adopts it without executing it -- it will not wipe a race an hour in.
+    car_error = None
+    if new_race:
+        import driver_message
+        try:
+            driver_message.send_new_race()
+        except Exception as e:                               # noqa: BLE001
+            car_error = str(e)
+    return {**payload, "newRace": new_race, "carError": car_error}
 
 
 @app.post("/api/race/reset")

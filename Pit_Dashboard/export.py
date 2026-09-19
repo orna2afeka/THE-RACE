@@ -438,19 +438,26 @@ def _safe(v):
     return v
 
 
-def _style_header(ws, ncols, nrows):
+def _style_header(ws, ncols, nrows, header_row=1):
+    """Paint, freeze and filter a header row.
+
+    `header_row` is 1 everywhere except the per-lap sheets, whose data table
+    starts below the lap's own summary block -- the freeze then keeps both the
+    summary and the column names on screen while the samples scroll.
+    """
     from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.utils import get_column_letter
     fill = PatternFill("solid", fgColor="1F3A5F")
     font = Font(bold=True, color="FFFFFF")
     for c in range(1, ncols + 1):
-        cell = ws.cell(row=1, column=c)
+        cell = ws.cell(row=header_row, column=c)
         cell.fill = fill
         cell.font = font
         cell.alignment = Alignment(horizontal="center")
-    ws.freeze_panes = "A2"
+    ws.freeze_panes = "A%d" % (header_row + 1)
     if nrows:
-        ws.auto_filter.ref = f"A1:{get_column_letter(ncols)}{nrows + 1}"
+        ws.auto_filter.ref = (f"A{header_row}:"
+                              f"{get_column_letter(ncols)}{header_row + nrows}")
 
 
 # Selecting any of the "Laps / Energy" columns adds the per-lap sheet.
@@ -478,37 +485,53 @@ def _mean(values):
     return sum(vals) / len(vals) if vals else None
 
 
+# ONE DEFINITION OF A LAP'S SUMMARY ROW, used by the Laps sheet and by the
+# header on each lap's own sheet in the per-lap workbook. They are the same
+# thirteen facts about the same lap, and two copies of this list is how the
+# index and the tab it points at come to disagree about lap 12's energy.
+#
+# Driver is the SECOND column, beside the lap number: "who drove lap 12" is the
+# question this sheet gets asked after the race, and an answer eight columns to
+# the right of the lap is one nobody reads. Empty when no stint covered that
+# lap — an unlogged lap is not driven by nobody, it is a lap the pit never
+# recorded a name for, and a blank cell says so.
+_LAP_HEADERS = ["Lap", "Driver", "Finished (local)", "Race Time", "Lap Time",
+                "Energy (Wh)", "Regen (Wh)", "Distance (m)", "Avg Speed (km/h)",
+                "Kind", "Stood still (s)", "Cut by", "Flags"]
+_LAP_FORMATS = [None, None, "yyyy-mm-dd hh:mm:ss", "[h]:mm:ss", "[m]:ss.000",
+                "0.0", "0.0", "0", "0.0", None, "0", None, None]
+
+
+def _as_duration(sec):
+    """Seconds as an Excel duration (a fraction of a day)."""
+    return None if sec is None else sec / 86400.0
+
+
+def _lap_summary_row(lap, race_start):
+    """One lap as the _LAP_HEADERS row describes it."""
+    t, d = lap["lap_time_s"], lap["distance_m"]
+    avg = (d / 1000.0) / (t / 3600.0) if t and d is not None else None
+    ts = lap["finished_ts"]
+    return [lap["lap"], lap.get("driver"), _excel_dt(ts),
+            _race_duration(ts, race_start), _as_duration(t),
+            lap["energy_wh"], lap["regen_wh"], d, avg,
+            lap.get("kind"), lap.get("stopped_s"), lap.get("lap_source"),
+            # fetch_laps hands back a list; the cell wants one string.
+            ", ".join(lap.get("flags") or []) or None]
+
+
 def _write_laps_sheet(ls, laps, race_start):
     """Laps sheet: one row per lap, then Best and Average rows.
     Missing figures stay empty cells and are left out of the averages."""
     from openpyxl.styles import Font
     from openpyxl.utils import get_column_letter
 
-    # Driver is the SECOND column, beside the lap number: "who drove lap 12" is
-    # the question this sheet gets asked after the race, and an answer eight
-    # columns to the right of the lap is one nobody reads. Empty when no stint
-    # covered that lap — an unlogged lap is not driven by nobody, it is a lap
-    # the pit never recorded a name for, and a blank cell says so.
-    headers = ["Lap", "Driver", "Finished (local)", "Race Time", "Lap Time",
-               "Energy (Wh)", "Regen (Wh)", "Distance (m)", "Avg Speed (km/h)",
-               "Kind", "Stood still (s)", "Cut by", "Flags"]
-    formats = [None, None, "yyyy-mm-dd hh:mm:ss", "[h]:mm:ss", "[m]:ss.000",
-               "0.0", "0.0", "0", "0.0", None, "0", None, None]
+    headers, formats = _LAP_HEADERS, _LAP_FORMATS
     ls.append(headers)
-
-    def as_duration(sec):
-        return None if sec is None else sec / 86400.0
+    as_duration = _as_duration
 
     for lap in laps:
-        t, d = lap["lap_time_s"], lap["distance_m"]
-        avg = (d / 1000.0) / (t / 3600.0) if t and d is not None else None
-        ts = lap["finished_ts"]
-        ls.append([lap["lap"], lap.get("driver"), _excel_dt(ts),
-                   _race_duration(ts, race_start), as_duration(t),
-                   lap["energy_wh"], lap["regen_wh"], d, avg,
-                   lap.get("kind"), lap.get("stopped_s"), lap.get("lap_source"),
-                   # fetch_laps hands back a list; the cell wants one string.
-                   ", ".join(lap.get("flags") or []) or None])
+        ls.append(_lap_summary_row(lap, race_start))
     if not laps:
         ls.append(["No lap completed in this window."] + [None] * (len(headers) - 1))
     else:
@@ -539,6 +562,233 @@ def _write_laps_sheet(ls, laps, race_start):
     for i, h in enumerate(headers, start=1):
         ls.column_dimensions[get_column_letter(i)].width = max(12, len(h) + 2)
     _style_header(ls, len(headers), max(1, len(laps)))
+
+
+# --------------------------------------------------------------------------- #
+# The per-lap workbook: the Laps sheet as an index, then a sheet per lap.
+#
+# A SEPARATE FUNCTION, NOT A MODE OF write_xlsx(). The workbook above is cut by
+# TIME and answers "what was the car doing between 14:00 and 15:00"; this one is
+# cut by LAP and answers "show me lap 87". They share the column definitions,
+# the lap summary row and the header styling, and nothing else -- write_xlsx is
+# untouched and keeps serving the button it always served.
+# --------------------------------------------------------------------------- #
+
+# How many lap sheets one workbook may be asked for. A 24 h race is 250-300
+# laps, so this is "the whole race, and not a typo for the whole race twice":
+# the caller is refused rather than silently handed a truncated export, because
+# a workbook quietly missing laps 120 upward is worse than one that did not
+# open at all. Excel has no sheet limit beyond memory; openpyxl's per-sheet
+# overhead is what makes a thousand of them a bad idea.
+MAX_LAP_SHEETS = 300
+
+# How far past the lap's own measured time a window may stretch before it is
+# refused and rebuilt from lap_time_s. See _lap_window.
+_LAP_WINDOW_SLACK = 1.5
+
+
+def _lap_window(laps, i):
+    """(t0, t1) -- the instants lap `laps[i]` was driven between, or None.
+
+    THIS IS THE OFF-BY-ONE, AND IT IS NOT OPTIONAL READING. db.fetch_laps
+    defines `finished_ts` as the first row that CARRIED the finished lap's
+    figures -- the car holds them constant through the whole of the next lap --
+    so that row is the first row of the lap AFTER this one. Two things follow,
+    and they are the whole of this function:
+
+      t1  is this lap's finished_ts, and this lap's samples are the ones
+          strictly BEFORE it.
+      t0  is the PREVIOUS lap's finished_ts, which by the same rule is the
+          first row of this lap.
+
+    Confirmed against a store rather than argued from the comment: over the 28
+    laps of demo_telemetry.db every window holds samples whose calculated_lap
+    is exactly one below the lap number (`calculated_lap` counts laps
+    COMPLETED, so the trace of lap L is tagged L-1), and a 212 s lap comes out
+    at 419 samples against the 0.5 s push interval. tools/check_lap_export.py
+    re-proves both at runtime instead of trusting this paragraph.
+
+    THE FALLBACK. With no previous lap in the store, or with a gap between the
+    two far longer than the lap actually took -- a second session, or a spell
+    when the pit heard nothing -- the car's own measured lap_time_s is used
+    instead. A window is never allowed to stretch across a hole and collect
+    another evening's driving into lap 3.
+    """
+    lap = laps[i]
+    t1 = lap.get("finished_ts")
+    if t1 is None:
+        return None
+    measured = lap.get("lap_time_s")
+    t0 = laps[i - 1].get("finished_ts") if i > 0 else None
+    if t0 is None or (measured and t1 - t0 > measured * _LAP_WINDOW_SLACK):
+        t0 = None if not measured else t1 - measured
+    return None if t0 is None or t0 >= t1 else (t0, t1)
+
+
+def _lap_sheet_title(wb, lap):
+    """A unique sheet name for a lap: "Lap 42", or "Lap 42 (2)" if it repeats.
+
+    Lap numbers CAN repeat in one store -- the pit can set the car's lap number,
+    and a car whose checkpoint was wiped starts counting again. Excel refuses a
+    duplicate sheet name outright, so a workbook that would be fine on 364 days
+    of the year must not fail on the one race where somebody corrected the
+    count.
+    """
+    base = "Lap %s" % ("?" if lap.get("lap") is None else lap["lap"])
+    title, n = base, 1
+    while title in wb.sheetnames:
+        n += 1
+        title = "%s (%d)" % (base, n)
+    return title
+
+
+def _write_lap_sheet(ws, lap, rows, cols, race_start):
+    """One lap: its summary in a header block, then every sample it holds."""
+    from openpyxl.utils import get_column_letter
+
+    # The lap's own figures, as the SAME row the Laps sheet shows -- plus the
+    # sample count, which is this sheet's own fact and belongs nowhere else.
+    ws.append(_LAP_HEADERS + ["Samples"])
+    ws.append(_lap_summary_row(lap, race_start) + [len(rows)])
+    for cell, nf in zip(ws[2], _LAP_FORMATS):
+        if nf:
+            cell.number_format = nf
+    ws.append([])
+
+    header_row = 4
+    # "Laps completed", NOT "Lap", and only on these sheets. The raw column is
+    # calculated_lap, which counts laps FINISHED -- so every sample on the tab
+    # headed "Lap 7" carries a 6, and the two sitting one row apart is an
+    # invitation to conclude the export is off by one. It is not: 6 laps were
+    # complete while lap 7 was being driven. The Data sheet of the time-ranged
+    # workbook is not touched; there is no lap-numbered tab beside it to
+    # contradict.
+    ws.append(["Laps completed" if k == _LEAD else _XLSX_COLS[k][0]
+               for k in cols])
+    for r in rows:
+        ws.append([_cell_value(k, r, race_start) for k in cols])
+    if not rows:
+        # Never a silently empty sheet. A lap with no samples is a lap the pit
+        # did not hear, which is a fact about the race worth reading on the tab
+        # that was opened to look for it.
+        ws.append(["No samples stored for this lap -- the pit heard nothing "
+                   "between its start and its finish."])
+
+    numfmts = {i: _XLSX_COLS[k][1] for i, k in enumerate(cols, start=1)
+               if _XLSX_COLS[k][1]}
+    if numfmts and rows:
+        for row_cells in ws.iter_rows(min_row=header_row + 1,
+                                      max_row=header_row + len(rows)):
+            for i, nf in numfmts.items():
+                row_cells[i - 1].number_format = nf
+    for i, k in enumerate(cols, start=1):
+        head = len(_LAP_HEADERS[i - 1]) + 2 if i <= len(_LAP_HEADERS) else 0
+        name = "Laps completed" if k == _LEAD else _XLSX_COLS[k][0]
+        ws.column_dimensions[get_column_letter(i)].width = max(
+            12, len(name) + 2, head)
+    # Both header rows are painted; the freeze is on the data one, so the lap's
+    # summary stays in view above its samples.
+    _style_header(ws, len(_LAP_HEADERS) + 1, 0, header_row=1)
+    _style_header(ws, len(cols), len(rows), header_row=header_row)
+
+
+def write_laps_xlsx(fileobj_or_path, first_lap=None, last_lap=None,
+                    metrics=None, device_id=DEVICE_ID, conn=None):
+    """Workbook with a sheet per lap. Returns (lap count, total sample rows).
+
+    `first_lap` / `last_lap` bound the LAP NUMBERS, inclusive; None means the
+    end of the store on that side. The numbering and the summary figures are
+    db.fetch_laps() -- the same call the Laps sheet, /api/laps and the History
+    charts all make -- so a tab labelled "Lap 87" holds the lap the rest of the
+    pit calls 87, and no second lap builder exists anywhere.
+
+    Raises ValueError when the range names more sheets than MAX_LAP_SHEETS, or
+    when it selects no lap at all.
+    """
+    from openpyxl import Workbook
+
+    metrics = _resolve_metrics(metrics)
+    own_conn = conn is None
+    if own_conn:
+        conn = db.get_conn()
+    try:
+        race_start = db.load_race_state(conn).get("race_start_time")
+        # FROM THE GREEN FLAG, like /api/laps and for the same reason: a race
+        # start zeroes the car's counter, so a warm-up lap 1 and a race lap 1
+        # would be two tabs fighting over one name. The TIME-ranged workbook
+        # above is deliberately not bounded this way -- it exports the window
+        # it was asked for, warm-up and all.
+        #
+        # Unbounded WITHIN that, on purpose: the window of lap i is built from
+        # lap i-1's finished_ts, so a list clipped to the requested lap range
+        # would have no predecessor for its first lap and would fall back to
+        # lap_time_s for exactly the lap most likely to be looked at. Fetch
+        # every lap of the race, window them all, then select.
+        laps = db.fetch_laps(conn, device_id=device_id, since_ts=race_start)
+        db.attach_lap_drivers(laps, db.load_driver_stints(conn))
+
+        wanted = [(i, l) for i, l in enumerate(laps)
+                  if l.get("lap") is not None
+                  and (first_lap is None or l["lap"] >= first_lap)
+                  and (last_lap is None or l["lap"] <= last_lap)]
+        if not wanted:
+            raise ValueError("no completed lap in that range")
+        if len(wanted) > MAX_LAP_SHEETS:
+            raise ValueError("%d laps in that range; %d sheets is the limit. "
+                             "Narrow the lap range."
+                             % (len(wanted), MAX_LAP_SHEETS))
+
+        cols = _data_columns(metrics, race_start)
+        wb = Workbook()
+
+        # The index first, listing ONLY the laps this workbook has a tab for: a
+        # contents page naming laps that are not in the file sends someone
+        # looking for a tab that was never written.
+        index = wb.active
+        index.title = "Laps"
+        _write_laps_sheet(index, [l for _, l in wanted], race_start)
+
+        total = 0
+        for i, lap in wanted:
+            win = _lap_window(laps, i)
+            rows = []
+            if win:
+                t0, t1 = win
+                # fetch_samples' end is INCLUSIVE and the window is half-open:
+                # the row at t1 is the first row of the NEXT lap and belongs on
+                # the next tab, not on this one.
+                rows = db.fetch_samples(conn, start_ts=t0, end_ts=t1 - 1e-6,
+                                        device_id=device_id)
+            total += len(rows)
+            _write_lap_sheet(wb.create_sheet(_lap_sheet_title(wb, lap)),
+                             lap, rows, cols, race_start)
+    finally:
+        if own_conn:
+            conn.close()
+
+    wb.save(fileobj_or_path)
+    return len(wanted), total
+
+
+def lap_bounds(device_id=DEVICE_ID, conn=None):
+    """(first lap, last lap, how many) for the export panel's two fields.
+
+    Counts the same laps write_laps_xlsx will write -- from the green flag when
+    a race has been started -- so the range the panel offers is the range it
+    can deliver.
+    """
+    own_conn = conn is None
+    if own_conn:
+        conn = db.get_conn()
+    try:
+        race_start = db.load_race_state(conn).get("race_start_time")
+        laps = [l["lap"] for l in db.fetch_laps(conn, device_id=device_id,
+                                                since_ts=race_start)
+                if l.get("lap") is not None]
+    finally:
+        if own_conn:
+            conn.close()
+    return (min(laps), max(laps), len(laps)) if laps else (None, None, 0)
 
 
 def write_xlsx(fileobj_or_path, start_ts=None, end_ts=None, metrics=None,

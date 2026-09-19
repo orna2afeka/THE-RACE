@@ -47,8 +47,22 @@ export default function Sidebar({
   const setRace = async (isRacing: boolean, startTime?: number | null) => {
     setBusy(true);
     try {
-      await postJSON('/api/race', startTime === undefined ? { isRacing } : { isRacing, startTime });
-      toast(isRacing ? (startTime ? 'Race resumed' : 'Race started — clock running') : 'Race stopped');
+      // `newRace` comes back true only when this was a START, not a resume and
+      // not a correction to the start time — the same test the server uses to
+      // decide whether to zero the car. Say so either way: "the car kept its
+      // warm-up laps" is something the pit has to find out AT the green flag,
+      // not from a lap count that looks wrong twenty minutes later.
+      const r = await postJSON<{ newRace?: boolean; carError?: string | null }>(
+        '/api/race', startTime === undefined ? { isRacing } : { isRacing, startTime });
+      if (r.carError) {
+        toast(`Race started — but the car was not reached, so it is still counting its warm-up: ${r.carError}`, 'err');
+      } else {
+        toast(isRacing
+          ? (r.newRace
+            ? 'Race started — clock running, car reset to lap 0'
+            : (startTime ? 'Race resumed' : 'Race started — clock running'))
+          : 'Race stopped');
+      }
     } catch (e) { toast(`Race clock: ${e}`, 'err'); }
     finally { setBusy(false); }
   };
@@ -361,6 +375,123 @@ function DriverMessage() {
   );
 }
 
+/** Fetch a workbook and hand it to the browser as a download.
+ *
+ *  Shared by both export buttons so there is ONE place that reads the server's
+ *  filename, turns the body into a blob and revokes the object URL. The two
+ *  differ only in the URL they ask for and what they say afterwards.
+ */
+async function saveWorkbook(url: string) {
+  const res = await fetch(url);
+  if (!res.ok) {
+    // The per-lap export answers a bad lap range with a 400 and a sentence
+    // worth showing ("28 laps in that range; 300 sheets is the limit"). A bare
+    // status code would send the crew to the server log for something they can
+    // fix in the field.
+    const why = await res.json().then((b) => b?.detail).catch(() => null);
+    throw new Error(why || `server said ${res.status}`);
+  }
+  const rows = Number(res.headers.get('X-Row-Count') || 0);
+  const laps = Number(res.headers.get('X-Lap-Count') || 0);
+  const cd = res.headers.get('content-disposition') || '';
+  const name = /filename="([^"]+)"/.exec(cd)?.[1] ?? 'telemetry.xlsx';
+  const blob = await res.blob();
+  const href = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = href;
+  link.download = name;
+  link.click();
+  URL.revokeObjectURL(href);
+  return { name, size: blob.size, rows, laps };
+}
+
+/** The per-lap workbook: one sheet per lap, beside the time-ranged one.
+ *
+ *  Its own section because it answers a different question — "show me lap 87",
+ *  not "show me 14:00 to 15:00" — and because the lap count behind its two
+ *  fields is a whole-table group that should not run until someone opens this.
+ *  The system chips above are shared: both workbooks carry the same columns.
+ */
+function PerLapExport({ groups, busy: otherBusy }: { groups: string[]; busy: boolean }) {
+  const [open, setOpen] = useState(false);
+  const [first, setFirst] = useState('');
+  const [last, setLast] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
+  const [done, setDone] = useState<string | null>(null);
+
+  // Only once the section is opened — see the endpoint's docstring.
+  const { data } = usePoll(
+    () => getJSON<{ firstLap: number | null; lastLap: number | null; laps: number; maxSheets: number }>(
+      '/api/export/lap_bounds'), 300000, [], open);
+
+  const lo = data?.firstLap ?? null;
+  const hi = data?.lastLap ?? null;
+  const a = first === '' ? lo : Number(first);
+  const b = last === '' ? hi : Number(last);
+  const bad = a === null || b === null || !Number.isInteger(a) || !Number.isInteger(b) || a > b;
+  const count = bad ? 0 : (data?.laps ? Math.min(b - a + 1, data.laps) : 0);
+  const over = !!(data && count > data.maxSheets);
+
+  const download = async () => {
+    setBusy(true);
+    setDone(null);
+    setElapsed(0);
+    const t0 = Date.now();
+    const tick = window.setInterval(() => setElapsed((Date.now() - t0) / 1000), 200);
+    try {
+      const { name, size, rows, laps } = await saveWorkbook(
+        `/api/export/laps.xlsx?firstLap=${a}&lastLap=${b}&groups=${encodeURIComponent(groups.join(','))}`);
+      setDone(`${name} · ${(size / 1e6).toFixed(1)} MB · ${laps} laps, ${rows.toLocaleString()} rows in ${((Date.now() - t0) / 1000).toFixed(0)} s`);
+    } catch (e) {
+      toast(`Per-lap export failed: ${e}`, 'err');
+    } finally {
+      clearInterval(tick);
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Disclosure icon="flag" title="Per lap — one sheet per lap" onToggle={setOpen}>
+      <div className="caption" style={{ marginTop: 0 }}>
+        {!data
+          ? 'Counting laps…'
+          : data.laps
+            ? `Laps ${lo}–${hi} stored. A tab per lap: its summary, then every sample it holds. Same systems as above.`
+            : 'No completed lap stored yet.'}
+      </div>
+      {data && data.laps ? <>
+        <div className="btnrow" style={{ marginTop: 8 }}>
+          <input type="text" inputMode="numeric" placeholder={String(lo)} aria-label="First lap"
+                 value={first} onChange={(e) => setFirst(e.target.value)} style={{ width: 72 }} disabled={busy} />
+          <span className="caption">to</span>
+          <input type="text" inputMode="numeric" placeholder={String(hi)} aria-label="Last lap"
+                 value={last} onChange={(e) => setLast(e.target.value)} style={{ width: 72 }} disabled={busy} />
+        </div>
+        <button className="btn block" style={{ marginTop: 10 }}
+                disabled={busy || otherBusy || bad || over || !groups.length} onClick={download}>
+          {busy
+            ? <><span className="spinner" aria-hidden="true" />Building… {elapsed.toFixed(0)} s</>
+            : <><Icon name="download" size={13} />Download per-lap workbook</>}
+        </button>
+        <div className="caption" aria-live="polite">
+          {busy
+            ? `Building ${count} lap${count === 1 ? '' : 's'} — a sheet each, so this takes longer than the workbook above. Nothing arrives until it is finished.`
+            : done
+              ? `Saved ${done}`
+              : bad
+                ? 'Give a first lap and a last lap, first one no higher than the last.'
+                : over
+                  ? `${count} laps is past the ${data.maxSheets}-sheet limit. Narrow the range.`
+                  : !groups.length
+                    ? 'Pick at least one system above.'
+                    : `${count} lap${count === 1 ? '' : 's'} in this range, one sheet each.`}
+        </div>
+      </> : null}
+    </Disclosure>
+  );
+}
+
 function ExportPanel({ config }: { config: Config }) {
   const { data } = usePoll(
     () => getJSON<{ lo: number | null; hi: number | null; total: number }>('/api/export/bounds'), 60000);
@@ -405,19 +536,8 @@ function ExportPanel({ config }: { config: Config }) {
     const t0 = Date.now();
     const tick = window.setInterval(() => setElapsed((Date.now() - t0) / 1000), 200);
     try {
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(`server said ${res.status}`);
-      const rows = Number(res.headers.get('X-Row-Count') || 0);
-      const cd = res.headers.get('content-disposition') || '';
-      const name = /filename="([^"]+)"/.exec(cd)?.[1] ?? 'telemetry.xlsx';
-      const blob = await res.blob();
-      const href = URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = href;
-      link.download = name;
-      link.click();
-      URL.revokeObjectURL(href);
-      setDone(`${name} · ${(blob.size / 1e6).toFixed(1)} MB · ${rows.toLocaleString()} rows in ${((Date.now() - t0) / 1000).toFixed(0)} s`);
+      const { name, size, rows } = await saveWorkbook(url);
+      setDone(`${name} · ${(size / 1e6).toFixed(1)} MB · ${rows.toLocaleString()} rows in ${((Date.now() - t0) / 1000).toFixed(0)} s`);
     } catch (e) {
       toast(`Export failed: ${e}`, 'err');
     } finally {
@@ -462,6 +582,10 @@ function ExportPanel({ config }: { config: Config }) {
                 ? `${est.rows.toLocaleString()} rows in this range. How long it takes varies; the button counts the seconds.`
                 : 'No samples in this range.'}
       </div>
+      {/* Added BESIDE the workbook above, never in place of it: the time-ranged
+          export is what the crew downloads at the end of a session and it is
+          left exactly as it was. */}
+      <PerLapExport groups={groups} busy={busy} />
     </Sec>
   );
 }

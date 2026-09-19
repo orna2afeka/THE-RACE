@@ -184,11 +184,16 @@ export function SectionTitle({ icon, title, right }: { icon: string; title: stri
   );
 }
 
-export function Disclosure({ icon, title, count, open, children }: {
-  icon: string; title: string; count?: number | string; open?: boolean; children: ReactNode;
+/** `onToggle` reports open/closed, so a panel can put off work until it is
+ *  actually looked at — the per-lap export uses it to defer a lap count that
+ *  groups the whole telemetry table. Optional; every other caller ignores it. */
+export function Disclosure({ icon, title, count, open, onToggle, children }: {
+  icon: string; title: string; count?: number | string; open?: boolean;
+  onToggle?: (open: boolean) => void; children: ReactNode;
 }) {
   return (
-    <details className="disc" open={open}>
+    <details className="disc" open={open}
+             onToggle={(e) => onToggle?.((e.currentTarget as HTMLDetailsElement).open)}>
       <summary>
         <Icon name={icon} size={15} style={{ color: 'var(--ink-3)' }} />
         {title}

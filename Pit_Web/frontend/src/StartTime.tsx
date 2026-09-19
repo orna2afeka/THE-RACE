@@ -59,11 +59,21 @@ export function StartTimePanel({ race, stint, onDone }: {
   const submit = async () => {
     setBusy(true);
     try {
-      await postJSON('/api/race', { isRacing: true, startTime: epoch });
-      toast(running
-        ? `Start time corrected — the race has run ${runFor(elapsed)}` +
-          (stintMoves ? ', and the driver countdown with it' : '')
-        : `Race started from ${new Date(epoch).toLocaleTimeString()} — already ${runFor(elapsed)} in`);
+      // This endpoint zeroes the CAR when the press starts a race rather than
+      // correcting one, so the answer is read here exactly as the Start button
+      // reads it. A panel that said "start time corrected" while the car's lap
+      // count had just gone to zero would be the worst of both.
+      const r = await postJSON<{ newRace?: boolean; carError?: string | null }>(
+        '/api/race', { isRacing: true, startTime: epoch });
+      if (r.carError) {
+        toast(`Race started — but the car was not reached, so it is still counting its warm-up: ${r.carError}`, 'err');
+      } else {
+        toast(running
+          ? `Start time corrected — the race has run ${runFor(elapsed)}` +
+            (stintMoves ? ', and the driver countdown with it' : '')
+          : `Race started from ${new Date(epoch).toLocaleTimeString()} — already ${runFor(elapsed)} in`
+            + (r.newRace ? ', car reset to lap 0' : ''));
+      }
       setOpen(false);
       onDone?.();
     } catch (e) { toast(`Could not set the start time: ${e}`, 'err'); }
@@ -103,6 +113,25 @@ export function StartTimePanel({ race, stint, onDone }: {
               {overLong && ' — that is past the full 24 hours, so the countdown would read zero.'}
             </span>
           </div>
+          {/* THE CAR IS ZEROED BY A START, NOT BY A CORRECTION, and from this
+              panel the two look identical — the same field, the same button.
+              A race that has been STOPPED is the case that catches people: a
+              red flag, then someone tidies the start time here, and the server
+              reads that as a new race because it is not running. It would take
+              the car's lap count with it, and there is no undo for that on the
+              car. So the consequence is on the screen before the press. */}
+          {!running && (
+            <div className="pill warn" style={{ marginTop: 8 }}>
+              <Icon name="alert" size={14} style={{ marginTop: 2 }} />
+              <span>
+                This <b>starts a race</b>, so the car is reset: lap count, lap
+                distance and race energy all go back to zero.
+                {race?.startTime
+                  ? ' The race that was stopped ends here — use Resume instead to carry it on.'
+                  : ''}
+              </span>
+            </div>
+          )}
           <div className="caption" style={{ marginTop: 6 }}>
             {stintMoves ? (
               <>The driver countdown moves to this time too, so a change that is

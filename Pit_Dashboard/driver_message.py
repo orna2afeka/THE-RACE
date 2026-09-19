@@ -199,6 +199,28 @@ def send_trip_reset() -> dict:
     return send_lap_command("reset_trip")
 
 
+def send_new_race() -> dict:
+    """The green flag: ask the car to zero everything this race counted.
+
+    Lap count, lap sequence, lap distance, odometer, race energy and regen, and
+    the finished-lap figures -- and the car rewrites lap_checkpoint.json with
+    the zeroed state, so a Pi that reboots mid-race comes back into the RACE
+    rather than into the warm-up. That file used to have to be deleted by hand
+    between the installation laps and the start.
+
+    THE ONE COMMAND HERE THAT DISCARDS RECORDED NUMBERS, so it is sent from
+    exactly one place: api_race(), when a race actually STARTS. A resume and a
+    correction to the start time both leave the car alone -- see the new_race
+    flag there, which is the same test that decides whether the driver stint
+    starts over.
+
+    Nothing the PIT has stored is touched: every sample and every warm-up lap
+    stays in telemetry.db and in a time-ranged export. The lap views simply
+    start at the green flag from here on.
+    """
+    return send_lap_command("new_race")
+
+
 def send_stopwatch_reset() -> dict:
     """Restart the DRIVER's stopwatch from now. Display only.
 
