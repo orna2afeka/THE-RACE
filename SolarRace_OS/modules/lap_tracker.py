@@ -887,6 +887,75 @@ class LapTracker:
         self._armed = False
         self._debt = None
 
+    def new_race(self, now=None):
+        """GREEN FLAG: everything this race has counted goes back to zero.
+
+        The warm-up. The car rolls out, does an installation lap or three, and
+        none of it is the race -- but the lap counter, the odometer and the
+        energy totals do not know that, and until now the only way to clear
+        them was to stop the car and delete lap_checkpoint.json by hand on the
+        Pi, at the one moment nobody has a spare pair of hands. The pit sends
+        this with the green flag instead (Pit_Web api_race -> new_race), and
+        main._apply_lap_commands checkpoints straight afterwards, so a reboot
+        mid-race restores the race and not the warm-up.
+
+        THIS IS THE ONE RESET THAT CLEARS last_lap_*, and the difference from
+        reset_energy() and reset_trip() is deliberate. Those two re-datum a
+        running total and keep the finished lap's figures, because zeroing a
+        counter does not unmeasure a lap that is already over and the pit has
+        no other record of it. Here the finished lap is a WARM-UP lap being
+        thrown away on purpose: carried into the race they would be published
+        on every row of race lap 1, and the pit would record the warm-up as a
+        completed lap of the race (db.fetch_laps groups on lap_seq together
+        with those figures).
+
+        Composed from the existing resets rather than re-listing their fields,
+        so there is one definition of what zeroing energy or distance means.
+        restart_lap() goes LAST: it re-datums the lap on a zeroed odometer and
+        leaves the car un-armed, looking for the line exactly as it does on its
+        first ever sight of the gate -- which is the true state of a car on the
+        grid. It also re-datums the HUD stopwatch through the usual signal, so
+        the driver's clock starts with the race.
+
+        NOT reset: `_have_distance` / `_have_energy`, which say whether the CAN
+        bus has ever fed us and are not race state; the rolling 2 h cell-extreme
+        report, which is a scrutineering record (rule 3.5.6) and belongs to the
+        day, not the race; and the controller's own hardware TRIP counter,
+        which has no documented CAN reset -- see reset_trip().
+        """
+        self.reset_energy()
+        self.reset_trip()
+
+        self.lap_count = 0
+        self.lap_seq = 0
+        self.gps_lap_count = 0
+        self.lap_source = LAP_SOURCE_NONE
+
+        # The finished lap the other resets keep. See the docstring.
+        self.last_lap_number = None
+        self.last_lap_distance_m = None
+        self.last_lap_energy_wh = None
+        self.last_lap_regen_energy_wh = None
+        self.last_lap_time_s = None
+        self.last_lap_kind = None
+        self.last_lap_flags = None
+        self.last_lap_stopped_s = None
+        self.last_lap_finished_ts = None
+
+        # Gate diagnostics. They count what this tracker has seen and are read
+        # as "how is the gate behaving today"; carrying the warm-up's rejected
+        # crossings into the race makes that number answer the wrong question.
+        self.rejected_crossings = 0
+        self.resyncs = 0
+        self.backward_crossings = 0
+        self.last_rejected_distance_m = None
+        self.last_cross_lateral_m = None
+
+        # Last, and on the zeroed totals: a fresh lap, un-armed, looking for
+        # the line. Clears _distance_untrusted too -- metres measured from here
+        # are good, it is the metres before the reset that are not.
+        self.restart_lap(now)
+
     def reset_energy(self):
         """Zero the energy totals without disturbing laps or distance.
 

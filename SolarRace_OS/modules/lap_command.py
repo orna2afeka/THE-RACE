@@ -55,8 +55,14 @@ _PLAUSIBLE_EPOCH = 1_700_000_000
 # they move the number on the HUD and nothing else -- no lap is cut, no count
 # moves, no energy or odometer is touched, and nothing is checkpointed. They are
 # the pit's copy of the button the driver already has beside the clock.
+# new_race is the GREEN FLAG reset: lap count, lap sequence, distance, energy
+# and the finished-lap figures all go to zero, and the checkpoint is rewritten
+# so a reboot restores the race rather than the warm-up. It is the one command
+# here that throws recorded numbers away, which is why the pit only sends it
+# when a race actually STARTS -- never on a resume, never on a correction to
+# the start time. See LapTracker.new_race and Pit_Web.api_race.
 VALID_ACTIONS = ("cut_lap", "set_lap", "restart_lap", "reset_energy", "reset_trip",
-                 "reset_stopwatch", "clear_stopwatch")
+                 "reset_stopwatch", "clear_stopwatch", "new_race")
 
 # The strategy selector uses the same machinery on its own node — see
 # CommandInbox below and firebase_client.STRATEGY_COMMAND_PATH.

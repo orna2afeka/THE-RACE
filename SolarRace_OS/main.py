@@ -1047,6 +1047,18 @@ class SmartCANWorker(CANWorker):
             elif action == "restart_lap":
                 self.laps.restart_lap()
                 print("🏁 PIT RESTART LAP — nothing counted, looking for the line")
+            elif action == "new_race":
+                # THE GREEN FLAG. Everything the warm-up counted goes to zero,
+                # and the checkpoint is rewritten by the force-save below -- so
+                # this is the end of deleting lap_checkpoint.json by hand
+                # between the installation laps and the start.
+                #
+                # Nothing is emitted to the HUD here: new_race re-datums the
+                # lap through restart_lap, so _publish_lap_timer sees
+                # lap_start_ts change on the next tick and restarts the
+                # driver's stopwatch by the same route a real lap cut does.
+                self.laps.new_race()
+                print("🏁 PIT NEW RACE — laps, distance and energy zeroed")
             elif action == "reset_energy":
                 self.laps.reset_energy()
                 print("🏁 PIT RESET ENERGY")
