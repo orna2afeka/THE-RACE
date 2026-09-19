@@ -8,7 +8,7 @@ what you see here is what the driver sees — layout, colours, thresholds and al
     python tools/hud_sim.py                    # windowed, real time, hazard tour on
     python tools/hud_sim.py --speed 5          # five laps' worth per lap of clock
     python tools/hud_sim.py --fullscreen       # as it runs in the car
-    python tools/hud_sim.py --profile dor_265s
+    python tools/hud_sim.py --profile lap33_290s
     python tools/hud_sim.py --no-tour          # no automatic hazards
 
     (or double-click "Start HUD Demo.bat" on Windows, ./"Start HUD Demo.sh" on the Pi)
@@ -687,7 +687,7 @@ def build_sim(hud: RacingDashboard, car: FakeCar, strategy: str,
 def main() -> int:
     ap = argparse.ArgumentParser(description="Bench simulator for the driver HUD.")
     ap.add_argument("--profile", default=None,
-                    help="profile name from profiles/ (default: dor_280s)")
+                    help="profile name from profiles/ (default: lap33_290s)")
     ap.add_argument("--speed", type=float, default=1.0,
                     help="time scale; 5 = five simulated seconds per real second")
     ap.add_argument("--fullscreen", action="store_true",
@@ -704,7 +704,7 @@ def main() -> int:
     if not available:
         print("No profiles found in profiles/. Run tools/build_dor_profiles.py first.")
         return 1
-    name = args.profile or ("dor_280s" if "dor_280s" in available
+    name = args.profile or ("lap33_290s" if "lap33_290s" in available
                             else sorted(available)[0])
     if name not in available:
         print(f"Unknown profile {name!r}. Available: {', '.join(sorted(available))}")

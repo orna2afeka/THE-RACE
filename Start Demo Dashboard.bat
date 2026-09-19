@@ -107,7 +107,7 @@ echo        the dashed one: "we lost it" and "not there yet" are not the same.
 echo      * The LAP column carries the lap total, blank until all nine land.
 echo.
 echo    "Track position" card - the target speed now names the profile it came
-echo      from ("from dor_280s"). If the car had never reported one it would
+echo      from ("from lap33_290s"). If the car had never reported one it would
 echo      say "assuming ... car has not reported" in amber instead.
 echo.
 echo    Sidebar "Race control" - the race has been running about an hour.

@@ -41,7 +41,7 @@ if not exist "Pit_Dashboard\wall.html" (
 )
 
 REM  No car yet? Run  python tools\pit_wall.py --demo  to drive the page
-REM  from the dor_280s profile and set the TV up without a session.
+REM  from the lap33_290s profile and set the TV up without a session.
 REM  The page says DEMO - NOT LIVE DATA the whole time it runs.
 
 echo Starting the Pit Wall on http://localhost:8503

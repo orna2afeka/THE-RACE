@@ -22,7 +22,7 @@ reads:
     zolder_centreline.py     OSM provenance and attribution, label sides
     strategy_engine.py       SECTIONS_INFO (the nine sectors), TRACK_LANDMARKS
     Pit_Dashboard/constants  SECTION_NAMES (what each sector is called)
-    profiles/dor_280s.csv    the 280 s baseline lap the demo car actually drives
+    profiles/lap33_290s.csv    the 280 s baseline lap the demo car actually drives
 
 A dev-time tool may reach into Pit_Dashboard/ like this; tools/build_zolder_
 track.py already does, and for the same reason.
@@ -90,7 +90,7 @@ SPECTATOR_PATH = os.path.join(_SITE, "index.html")
 # beside the dashboard and is served by tools/pit_wall.py on the pit LAN only.
 WALL_PATH = os.path.join(_REPO, "Pit_Dashboard", "wall.html")
 PROFILES_DIR = os.path.join(_REPO, "profiles")
-PROFILE_PATH = os.path.join(_REPO, "profiles", "dor_280s.csv")
+PROFILE_PATH = os.path.join(_REPO, "profiles", "lap33_290s.csv")
 
 SECTOR_IDS = sorted(SECTIONS_INFO)
 
@@ -397,7 +397,7 @@ def build_data():
         # ZERO NOW, and DOC_TO_TRACK_OFFSET_M is no longer read here. It
         # existed because the demo drove 210s.xlsx, which counts from the sector
         # document's zero ~120 m before the car's finish line. The demo now
-        # drives profiles/dor_280s.csv, built from a lap the car logged, whose
+        # drives profiles/lap33_290s.csv, built from a lap the car logged, whose
         # distances already count from the car's own zero — so shifting it would
         # put the demo car's speed 120 m out of phase with the map.
         # strategy_engine.DOC_TO_TRACK_OFFSET_M still converts the document's

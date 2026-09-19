@@ -87,11 +87,16 @@ import track                                                # noqa: E402
 import generate_profiles as gen                             # noqa: E402
 from strategy_engine import TURN_START_TRACK_M              # noqa: E402
 
-SOURCE_XLSX = os.path.join(_REPO, "SolarRace_OS", "dor 17.xlsx")
+# lap 33 of the 2026-09-19 race is what profiles/ is built from today:
+#     python tools/build_dor_profiles.py --as-driven lap33_290s --verify
+# "dor 17.xlsx" (the practice lap the dor_* ladder came from) is still beside
+# it; pass --source to build from that, or from any later lap export.
+SOURCE_XLSX = os.path.join(_REPO, "SolarRace_OS", "lap 33.xlsx")
 OUT_DIR = os.path.join(_REPO, "profiles")
 
 # Column headings in the car's export, matched case-insensitively on a prefix
 # so a later export that renames "(km/h)" to "(kph)" still loads.
+COL_TIME = "time"
 COL_LAP = "lap"
 COL_LAP_DIST = "lap distance"
 COL_SPEED_KMH = "speed ("
@@ -147,10 +152,17 @@ def read_lap(path=SOURCE_XLSX, lap=None):
     head = rows[0]
     i_lap, i_d, i_v = (_col(head, COL_LAP), _col(head, COL_LAP_DIST),
                        _col(head, COL_SPEED_KMH))
+    # IN THE ORDER DRIVEN, not the order filed. The pit's per-lap workbook is
+    # not written in time order (lap 33's first row is its 67th sample), and
+    # everything below reads "the last sample" as "the end of the lap".
+    body = [r for r in rows[1:] if r[i_d] is not None and r[i_v] is not None]
+    try:
+        i_t = _col(head, COL_TIME)
+        body.sort(key=lambda r: r[i_t])
+    except SystemExit:
+        pass                       # a car log with no clock column is in order
     laps = {}
-    for r in rows[1:]:
-        if r[i_d] is None or r[i_v] is None:
-            continue
+    for r in body:
         laps.setdefault(r[i_lap], []).append((float(r[i_d]), float(r[i_v])))
     if lap is None:
         if len(laps) != 1:
@@ -170,11 +182,20 @@ def to_track_grid(samples, axis="odometer"):
     the previous value forward across those would flatten every braking ramp
     into a staircase that the acceleration limits below would then read as real.
     """
-    measured = samples[-1][0]
+    # A LAP DOES NOT HAVE TO START AT ZERO. Since the lap is cut by the gate
+    # or by a person and never by distance alone, the car's lap distance can
+    # run 210 -> 4190 m: the count began 210 m past the line and carried on
+    # past 4000 until the next cut. The runtime lookup folds that number into
+    # [0, lap) (speed_profile._wrap), so the file is built the same way --
+    # what the car logged at 4100 m is what it must be shown at 100 m.
+    # `measured` is the distance DRIVEN, which for a lap from zero is the last
+    # reading, as it always was.
+    measured = samples[-1][0] - samples[0][0]
     scale = (track.TRACK_LENGTH_METERS / measured) if axis == "track" else 1.0
     by_d = {}
     for d, v in samples:                       # the log repeats a distance when
-        by_d.setdefault(d * scale, []).append(v)   # two samples land in one metre
+        x = (d * scale) % track.TRACK_LENGTH_METERS
+        by_d.setdefault(x, []).append(v)       # two samples land in one metre
     xs = sorted(by_d)
     ys = [sum(by_d[x]) / len(by_d[x]) for x in xs]
 
@@ -373,6 +394,13 @@ def main():
                     help="what the d(m) column counts: the car's own odometer "
                          "(default, and what the runtime lookup uses) or "
                          "surveyed track metres. See note 1 in the docstring.")
+    ap.add_argument("--as-driven", metavar="KEY", default=None,
+                    help="write ONE profile, KEY.csv, that is the lap exactly "
+                         "as driven -- no target time, nothing scaled. For a "
+                         "lap that is already the pace the crew wants (lap 33) "
+                         "rather than raw material for a ladder of paces.")
+    ap.add_argument("--label", default="Base",
+                    help="the human label written beside --as-driven's key")
     ap.add_argument("--out", default=OUT_DIR)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--verify", action="store_true")
@@ -412,7 +440,17 @@ def main():
     print(f"\n{'profile':<12} {'target':>8} {'achieved':>9} {'k':>6} "
           f"{'avg':>7} {'max':>7}")
     results = []
-    for key, label, target_s in STRATEGIES:
+    # AS DRIVEN: the lap itself is the profile. k is 1 by construction and the
+    # "target" is simply the time the curve takes, so verify() holds it to the
+    # same closing, reloading and 402-point checks as a solved profile -- and
+    # its accel/brake check becomes "the file is the lap", which it must be.
+    ladder = STRATEGIES if not args.as_driven else []
+    if args.as_driven:
+        print(f"{args.as_driven:<12} {base_t:>7.1f}s {base_t:>8.2f}s {1.0:>6.3f} "
+              f"{(dist[-1] / base_t) * 3.6:>6.1f} {max(speed) * 3.6:>6.1f}"
+              f"   (as driven)")
+        results.append((args.as_driven, args.label, base_t, base_t, list(speed)))
+    for key, label, target_s in ladder:
         k, spd, t = gen.solve_for_target(dist, speed, corners, target_s,
                                          accel_limit, brake_limit)
         print(f"{key:<12} {target_s:>7.1f}s {t:>8.2f}s {k:>6.3f} "
