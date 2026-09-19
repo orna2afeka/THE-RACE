@@ -237,7 +237,7 @@ if __name__ == "__main__":
     profiles = load_all()
     if not profiles:
         print(f"No profiles in {PROFILE_DIR}.")
-        print("Generate them with:  python tools/generate_profiles.py")
+        print("Generate them with:  python tools/build_dor_profiles.py")
         raise SystemExit(0)
 
     print(f"{len(profiles)} profile(s) in {PROFILE_DIR}\n")
@@ -245,7 +245,7 @@ if __name__ == "__main__":
     for key, p in profiles.items():
         print(f"  {key:<18} {p.lap_time_s():>8.1f}s {p.average_kmh():>8.1f}")
 
-    key = "base_210s" if "base_210s" in profiles else next(iter(profiles))
+    key = "dor_280s" if "dor_280s" in profiles else next(iter(profiles))
     p = profiles[key]
     print(f"\n  target speed around the lap, {key}:")
     for d in (0, 450, 650, 1500, 1850, 2450, 3200, 3900):
