@@ -618,6 +618,34 @@ def _stint_follows_race(st, old_start):
 # decides whether to raise the subject at all.
 CAN_QUIET_AFTER_S = 3.0
 
+# A GPS FIX OLDER THAN THIS IS A PROBLEM, and gps_fix alone cannot tell you.
+#
+# `gps_fix` is 1 if vehicle_state["gps"] is non-empty (main._health_snapshot),
+# and _refresh_gps() only ever OVERWRITES that dict -- it never clears it. The
+# reader's get_coordinates() likewise serves the last fix forever with a
+# growing fix_age_s. So gps_fix means "this car has had a fix at some point",
+# not "it has one now", and it stayed 1 through a two-hour outage on
+# 2026-09-18 while the dashboard showed a clean LIVE badge. The one honest
+# signal the car sends is the AGE.
+#
+# 60 s, not the 15 s limits.GPS_LIVE_MAX_AGE_S the map dims its dot at. The map
+# is drawing a position and must stop trusting it quickly; this decides whether
+# to put words on the status pill, and a pill that flickers every time the car
+# passes under a bridge is one the crew learns to ignore by Saturday -- which
+# is exactly what this file says about the CAN badge three comments up.
+GPS_STALE_AFTER_S = 60.0
+
+
+def _age_words(seconds):
+    """47.3 -> '47s', 2810 -> '47m'. Short enough to sit inside a status pill."""
+    seconds = float(seconds)
+    if seconds < 120:
+        return "%.0fs" % seconds
+    if seconds < 7200:
+        return "%.0fm" % (seconds / 60.0)
+    return "%.1fh" % (seconds / 3600.0)
+
+
 _HEALTH_COLUMNS = ("pi_uptime_s", "can_state", "can_silent_s", "can_detail",
                    "can_frames", "gps_fix", "gps_detail")
 
@@ -654,8 +682,22 @@ def car_health(state):
         # second BMS) has been dead for an hour.
         problems.append(detail)
 
-    if state.get("gps_fix") == 0:
+    gps_age = state.get("gps_age_s")
+    gps_detail = (state.get("gps_detail") or "")
+    if "no receiver" in gps_detail:
+        # THE ONE WORTH NAMING SEPARATELY. gpsd holds no device at all -- the
+        # modem re-enumerated (a cable change or an LTE reset does it) and
+        # gpsd's udev hot-add rule does not match SimTech vendor IDs, so
+        # nothing ever gives the port back. See deploy/gps_up.sh. "No GPS fix"
+        # would send someone to look at the sky for a problem that is fixed
+        # with one systemctl command.
+        problems.append("gpsd has no GPS device")
+    elif state.get("gps_fix") == 0:
         problems.append("no GPS fix")
+    elif gps_age is not None and gps_age > GPS_STALE_AFTER_S:
+        # The car is still serving its last position and still says it has a
+        # fix. Only the age says the position is from another part of the race.
+        problems.append("GPS fix %s old" % _age_words(gps_age))
 
     return (not problems), problems
 

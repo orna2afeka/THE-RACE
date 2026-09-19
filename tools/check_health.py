@@ -62,6 +62,30 @@ CASES = [
      {"can_state": "starting", "can_silent_s": None, "can_detail": "can0 no frames yet",
       "gps_fix": 0},
      "Pi alive 3s ago · can0 no frames yet · no GPS fix"),
+    # THE TWO-HOUR OUTAGE, 2026-09-18. gps_fix stayed 1 for 6,347 samples while
+    # the last usable fix aged from 20:05:56 onward, so the badge read a clean
+    # LIVE the whole time. The age is the only honest signal.
+    ("GPS fix 47 minutes old, gps_fix still 1",
+     {"can_state": "live", "can_silent_s": 0.4, "can_detail": "", "gps_fix": 1,
+      "gps_age_s": 2810.0},
+     "Pi alive 3s ago · GPS fix 47m old"),
+    # Under the threshold: a dropout while the car is under a bridge must not
+    # put words on the wall, or nobody reads them when it matters.
+    ("GPS fix 12 s old",
+     {"can_state": "live", "can_silent_s": 0.4, "can_detail": "", "gps_fix": 1,
+      "gps_age_s": 12.0},
+     "LIVE · 3s ago"),
+    ("GPS never fixed: gps_fix 0 wins over the age",
+     {"can_state": "live", "can_silent_s": 0.4, "can_detail": "", "gps_fix": 0,
+      "gps_age_s": 2810.0},
+     "Pi alive 3s ago · no GPS fix"),
+    # gpsd holding no device is a different problem from a receiver that
+    # cannot see sky, and it has a different fix (systemctl restart gps-up).
+    ("gpsd has no device",
+     {"can_state": "live", "can_silent_s": 0.4, "can_detail": "", "gps_fix": 0,
+      "gps_detail": "GPS: no receiver - gpsd has no device (plug the GPS in, "
+                    "or check DEVICES= in /etc/default/gpsd)"},
+     "Pi alive 3s ago · gpsd has no GPS device"),
     ("all health fields null (old car build)",
      {"can_state": None, "can_silent_s": None, "can_detail": None, "gps_fix": None},
      "LIVE · 3s ago"),
