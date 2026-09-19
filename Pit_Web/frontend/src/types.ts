@@ -293,7 +293,7 @@ export interface Live {
    *  from the same one), 'store' when the pit estimated it from the earliest
    *  sample it holds — that reads short. `atSampleS` is the elapsed time at
    *  the newest sample, which is what to show once the car goes quiet. */
-  lapClock: { startedAt: Num; atSampleS: Num; source: 'car' | 'store' | null };
+  lapClock: { startedAt: Num; atSampleS: Num; source: 'car' | 'store' | null; heldAt: Num };
   lapDelta: Num;
   odometerKm: Num;
   /** Wh used since this lap's trigger, net of regen — the same basis as

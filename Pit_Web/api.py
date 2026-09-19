@@ -389,6 +389,7 @@ def _race_clock(conn):
 DRIVER_STINT_KEY = "driver_stint"
 RACE_UNDO_KEY = "race_undo"
 STRATEGY_CHOICE_KEY = "strategy_choice"
+LAP_HOLD_KEY = "lap_clock_hold"
 
 
 def race_undo_available(conn, now=None):
@@ -878,32 +879,65 @@ def _lap_energy_baseline(conn, lap):
     return energy, at_m
 
 def _lap_clock(conn, state, active_lap, age):
-    """{startedAt, atSampleS, source} for the lap being driven.
+    """{startedAt, atSampleS, source, heldAt} for the clock on the wall.
 
-    The car's own figure first; the store's estimate only if the car has not
-    sent one (a car on older code, or rows recorded before the pit kept the
-    column). Never invents a datum: with neither, the dashboard shows a dash
-    instead of counting from the start of the session.
+    THE SHARED STOPWATCH COMES FIRST. The car publishes the elapsed time its
+    own HUD is showing and whether that is still moving
+    (main._publish_stopwatch), and that is the one clock: the driver, the pit
+    and the public page all read the same number, and either end can move it.
+    Whichever button was pressed last is the one that stands, because the car
+    applies them in the order they arrive.
 
-    `atSampleS` is how long the lap had been running AT THE NEWEST SAMPLE, and
-    it is what the screen freezes on once the car goes quiet. A clock that
-    keeps counting through a dead link does not report a long lap, it reports a
-    dead link -- and it says so in the one font on the wall that people trust
-    to be live.
+    It is rebuilt on the PIT's clock here -- this sample's arrival time minus
+    the elapsed the car measured -- rather than taken as a timestamp. The car
+    measures with time.monotonic(), which nothing can step; its wall clock has
+    no RTC behind it and NTP shifts it minutes at a time after boot.
+
+    Falls back to the lap datum, and then to the store's estimate, for a car on
+    code older than the shared stopwatch. Never invents a datum: with none of
+    the three, the dashboard shows a dash rather than counting from the start of
+    the session.
+
+    `atSampleS` is the figure at the NEWEST SAMPLE, and it is what the screen
+    freezes on once the car goes quiet. A clock that keeps counting through a
+    dead link does not report a long lap, it reports a dead link -- and it says
+    so in the one font on the wall that people trust to be live.
     """
+    sample_at = (time.time() - age) if age is not None else None
+    # The pit's own press, shown before the car has had time to answer. Once a
+    # sample TAKEN AFTER the press arrives, the car's own flag governs and this
+    # is ignored -- so the wall feels instant without ever disagreeing with the
+    # car for longer than one sample.
+    pressed_at = (load_app_state(conn, LAP_HOLD_KEY) or {}).get("heldAt")
+    pressed_at = float(pressed_at) if pressed_at else None
+    unanswered = (pressed_at is not None and sample_at is not None
+                  and pressed_at > sample_at)
+
+    stopwatch = state.get("stopwatch_s")
+    if stopwatch is not None and sample_at is not None:
+        at_sample = max(0.0, float(stopwatch))
+        started = sample_at - at_sample
+        stopped = bool(state.get("stopwatch_stopped")) or unanswered
+        return {"startedAt": started, "source": "car", "atSampleS": at_sample,
+                "heldAt": (started + at_sample) if stopped else None}
+
     started = state.get("lap_started_ts")
     source = "car"
     if not started:
         started = db.lap_started_estimate(conn, active_lap)
         source = "store" if started else None
     if not started:
-        return {"startedAt": None, "atSampleS": None, "source": None}
+        return {"startedAt": None, "atSampleS": None, "source": None,
+                "heldAt": None}
     started = float(started)
     # The newest sample's own clock: time.time() - age is how read_live_state
     # measured it, so this stays in step with the age every tile is labelled
     # with.
-    at_sample = (time.time() - age - started) if age is not None else None
-    return {"startedAt": started, "source": source,
+    at_sample = (sample_at - started) if sample_at is not None else None
+    # A press stamped BEFORE this lap's datum belongs to a previous lap, so the
+    # next crossing of the line releases the clock on its own.
+    held = pressed_at if pressed_at and pressed_at >= started else None
+    return {"startedAt": started, "source": source, "heldAt": held,
             "atSampleS": None if at_sample is None else max(0.0, at_sample)}
 
 
@@ -2702,6 +2736,49 @@ def api_lap_stopwatch(body: StopwatchBody):
     except Exception as e:
         raise HTTPException(502, "stopwatch %s failed: %s" % (body.action, e))
     return {"ok": True, "id": sent["id"], "action": body.action,
+            "sentAt": time.strftime("%H:%M:%S")}
+
+
+class LapHoldBody(BaseModel):
+    # True parks the clock where it stands, False lets it run again. No
+    # default: a toggle that acts on a missing field is how a clock gets
+    # stopped by a request that meant to start it.
+    hold: bool
+
+
+@app.post("/api/lap/hold")
+def api_lap_hold(body: LapHoldBody):
+    """Stop the stopwatch, or let it run again -- on the wall AND in the car.
+
+    ONE clock, two buttons. The wall is parked here immediately so the press
+    feels like a press, and the same instruction goes to the car; the driver's
+    button beside the HUD clock does the same job from the other end, and
+    whichever was pressed last is the one that stands.
+
+    Display only on both sides: no lap is cut, the lap count does not move, and
+    the energy totals and the odometer are untouched -- exactly the contract the
+    stopwatch reset and clear already have.
+
+    A car that cannot be reached does NOT fail the press. The wall still stops,
+    because a pit unable to stop its own clock while the link is down is worse
+    than one whose clock disagrees with a car that is not running; the caller
+    gets `carError` and can say so.
+
+    Self-clearing at both ends: here the stored instant is compared against the
+    current lap's datum in _lap_clock(), and on the car the next crossing of the
+    line releases it (driver_dash_v2._on_lap_timer).
+    """
+    import driver_message
+    with closing(rw_conn()) as conn:
+        save_app_state(conn, LAP_HOLD_KEY,
+                       {"heldAt": time.time()} if body.hold else {})
+    try:
+        sent = (driver_message.send_stopwatch_stop() if body.hold
+                else driver_message.send_stopwatch_resume())
+    except Exception as e:
+        return {"ok": True, "hold": body.hold, "id": None, "sentAt": None,
+                "carError": str(e)}
+    return {"ok": True, "hold": body.hold, "id": sent["id"],
             "sentAt": time.strftime("%H:%M:%S")}
 
 

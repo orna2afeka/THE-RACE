@@ -194,11 +194,9 @@ export function StintPanel({ stint, clockOffsetMs, racing }: {
           <Icon name="history" size={13} />Undo last change
         </button>
       )}
-      <div className="caption">
-        Limit {hms(stint?.limitS ?? 0)} of RACE time. The countdown runs with the race clock and
-        holds whenever it stops, so a stoppage never eats into a driver's stint.
-        {!racing && n.started && ' Currently held — it resumes at the green flag.'}
-      </div>
+      {!racing && n.started && (
+        <div className="caption">Stint clock held — it resumes at the green flag.</div>
+      )}
     </>
   );
 }

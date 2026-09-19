@@ -145,10 +145,16 @@ function RaceClock({ race, clockOffsetMs }: { race: Live['race'] | undefined; cl
 function LapClock({ live, clockOffsetMs }: { live: Live | null | undefined; clockOffsetMs: number }) {
   const lc = live?.lapClock;
   const started = lc?.startedAt ?? null;
-  const serverNowS = useAlignedServerNow(clockOffsetMs, live?.fresh ? started : null);
+  // Parked by the pit (Stop lap clock). Freezing on the instant of the press
+  // rather than on the newest sample matters at the finish: the car is still
+  // sending, so "the last sample" would keep moving under a stopped clock.
+  const parked = lc?.heldAt ?? null;
+  const ticking = live?.fresh && parked === null;
+  const serverNowS = useAlignedServerNow(clockOffsetMs, ticking ? started : null);
   const elapsed = started === null ? null
+    : parked !== null ? parked - started
     : (live?.fresh ? serverNowS - started : lc?.atSampleS ?? null);
-  const held = !!started && !live?.fresh;
+  const held = !!started && (parked !== null || !live?.fresh);
   return (
     <div className={`clock lap${held ? ' held' : ''}`}
          title={lc?.source === 'store'

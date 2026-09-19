@@ -288,6 +288,19 @@ STATE_COLUMNS = [
     "can_frames",
     "gps_fix",          # 1 / 0
     "gps_detail",
+
+    # --- the shared stopwatch -------------------------------------------- #
+    # The ONE clock the driver's HUD, the pit wall and the public page all
+    # show, moved from either end. Elapsed seconds on the display, and whether
+    # it is still moving.
+    #
+    # Elapsed rather than a start timestamp on purpose: the car measures it
+    # with time.monotonic(), which nothing can step, and the Pi has no RTC --
+    # NTP shifts its wall clock minutes at a time after boot, which is exactly
+    # what made gps fix ages read 3444 s on 2026-09-18. A reader that wants it
+    # live adds the age of the row it came in.
+    "stopwatch_s",
+    "stopwatch_stopped",
 ]
 
 # Every data column the dashboard/exporter can name, in a stable order.
@@ -317,6 +330,8 @@ _COL_TYPES = {
     "gps_detail": "TEXT",
     "gps_fix": "INTEGER",
     "can_frames": "INTEGER",
+    "stopwatch_s": "REAL",
+    "stopwatch_stopped": "INTEGER",
 }
 
 _DATA_COL_DEFS = ",\n    ".join(f"{c} {_COL_TYPES[c]}" for c in EXPORT_COLUMNS)
@@ -1171,6 +1186,8 @@ def flatten_record(rtdb_key: str, record: dict, device_id: str = DEVICE_ID) -> d
         "active_strategy": _join(motor.get("active_strategy")),
         "odometer_m": _num(motor.get("odometer_m")),
         "calculated_lap": _num(motor.get("calculated_lap")),
+        "stopwatch_s": _num(motor.get("stopwatch_s")),
+        "stopwatch_stopped": _flag(motor.get("stopwatch_stopped")),
         "lat": _num(gps.get("lat")),
         "lon": _num(gps.get("lon")),
         "gps_age_s": _num(gps.get("fix_age_s")),

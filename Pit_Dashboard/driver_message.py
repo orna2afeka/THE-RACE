@@ -197,6 +197,32 @@ def send_stopwatch_clear() -> dict:
     return send_lap_command("clear_stopwatch")
 
 
+def send_stopwatch_stop() -> dict:
+    """Park the driver's stopwatch on the number it is showing.
+
+    For the flag, and for anything else that ends a run while the car is still
+    powered and still sending: a clock counting a lap nobody is driving is
+    worse than no clock. Unlike clear, the number stays readable; unlike reset,
+    it does not start again.
+
+    Same display-only contract as the rest of this group -- no lap is cut, the
+    count does not move, the energy totals and the odometer are untouched. The
+    car releases it at the next crossing of the line, and the driver's own
+    button beside the clock releases it too, so the pit cannot leave a car that
+    has gone back out running a stopped clock.
+    """
+    return send_lap_command("stop_stopwatch")
+
+
+def send_stopwatch_resume() -> dict:
+    """Let a parked stopwatch run again, from the lap datum it already had.
+
+    Not a restart: the lap did not begin again, so the number jumps to where
+    the lap actually is rather than to zero.
+    """
+    return send_lap_command("resume_stopwatch")
+
+
 def read_lap_ack():
     """The car's acknowledgement of the last lap command, or None.
 

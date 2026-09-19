@@ -92,7 +92,8 @@ export default function Sidebar({
                     racing={!!race?.isRacing} />
       </Sec>
 
-      <CutLap carLap={live?.state?.auto_lap ?? null} />
+      <CutLap carLap={live?.state?.auto_lap ?? null}
+              lapHeld={live?.lapClock?.heldAt != null} />
       <DriverMessage />
       <ExportPanel config={config} />
 
@@ -124,18 +125,20 @@ function lastLapLabel(kind: string | null, stoppedS: number | null): string {
     ? `${label} · stood ${Math.round(stoppedS)} s` : label;
 }
 
-function CutLap({ carLap }: { carLap: number | null }) {
+function CutLap({ carLap, lapHeld }: { carLap: number | null; lapHeld: boolean }) {
   const [sent, setSent] = useState<string | null>(null);
   const [freshSent, setFreshSent] = useState<string | null>(null);
   const [setSentAt, setSetSentAt] = useState<string | null>(null);
   const [wanted, setWanted] = useState('');
   const [watchSent, setWatchSent] = useState<string | null>(null);
+  const [holdSent, setHoldSent] = useState<string | null>(null);
+  const [holdAction, setHoldAction] = useState('stop_stopwatch');
   // The id of the command each button last sent, so an ack can be matched to
   // the press it belongs to.
   const [sentIds, setSentIds] = useState<Record<string, number>>({});
   const { data: ack } = usePoll(
     () => getJSON<{ ack: { applied?: boolean; lap?: number; action?: string; id?: number } | null }>('/api/cut_lap/ack'),
-    5000, [sent ?? '', freshSent ?? '', setSentAt ?? '', watchSent ?? '']);
+    5000, [sent ?? '', freshSent ?? '', setSentAt ?? '', watchSent ?? '', holdSent ?? '']);
 
   // CONFIRMED MEANS THIS PRESS, NOT THIS BUTTON. The ack node is retained and
   // holds the last ack the car ever wrote, so with the car off it can be hours
@@ -178,6 +181,24 @@ function CutLap({ carLap }: { carLap: number | null }) {
   // second way to do what the two above already did. Clearing it -- blanking
   // the clock to "--" until the next crossing -- is the one thing neither of
   // them does.
+  // ONE stopwatch, two buttons: this and the one beside the driver's clock.
+  // The wall parks immediately so the press feels like a press, and the car is
+  // sent the same instruction. Display only at both ends -- no lap is cut, no
+  // count moves -- and the next crossing of the line releases it unpressed.
+  const toggleLapHold = async () => {
+    const action = lapHeld ? 'resume_stopwatch' : 'stop_stopwatch';
+    try {
+      const r = await postJSON<{ sentAt: string | null; id: number | null; carError?: string }>(
+        '/api/lap/hold', { hold: !lapHeld });
+      if (r.id != null) setSentIds((m) => ({ ...m, [action]: r.id as number }));
+      setHoldAction(action);
+      setHoldSent(r.sentAt);
+      toast(r.carError
+        ? `Wall clock ${lapHeld ? 'running' : 'stopped'} — the car could not be reached`
+        : (lapHeld ? 'Lap clock running again' : 'Lap clock stopped'), r.carError ? 'err' : undefined);
+    } catch (e) { toast(`Lap clock failed: ${e}`, 'err'); }
+  };
+
   const clearStopwatch = async () => {
     try {
       const r = await postJSON<{ sentAt: string; id: number }>('/api/lap/stopwatch', { action: 'clear' });
@@ -197,13 +218,13 @@ function CutLap({ carLap }: { carLap: number | null }) {
           toast('Cut Lap sent to the car');
         } catch (e) { toast(`Cut Lap failed: ${e}`, "err"); }
       }}><Icon name="flag" size={13} />Cut lap now</button>
-      <div className="caption">
-        {sent
-          ? (applied('cut_lap')
-              ? `Car confirmed — now on lap ${ack?.ack?.lap} · sent ${sent}`
-              : `Sent ${sent} — awaiting the car's confirmation.`)
-          : 'Closes the lap and COUNTS it. Only for a count that is genuinely one short. Not in the box: the car counts a pit-lane pass of the line by itself.'}
-      </div>
+      {sent && (
+        <div className="caption">
+          {applied('cut_lap')
+            ? `Car confirmed — now on lap ${ack?.ack?.lap} · sent ${sent}`
+            : `Sent ${sent} — awaiting the car's confirmation.`}
+        </div>
+      )}
 
       {/* Kept next to Cut lap because the two look alike and are not: this one
           records nothing. NOT a pit-stop button any more — the car closes the
@@ -212,26 +233,26 @@ function CutLap({ carLap }: { carLap: number | null }) {
       <button className="btn block" style={{ marginTop: 8 }} onClick={freshLap}>
         <Icon name="timer" size={13} />Restart lap, don’t count it
       </button>
-      <div className="caption">
-        {freshSent
-          ? (applied('restart_lap')
-              ? `Car confirmed — fresh lap, still on lap ${ack?.ack?.lap} · sent ${freshSent}`
-              : `Sent ${freshSent} — awaiting the car's confirmation. (A car on the old lap code never answers this.)`)
-          : 'Throws the lap in progress away: zeroes lap distance, energy and clock, counts nothing, and the next pass of the line only starts the clock. For test sessions — not needed for a pit stop.'}
-      </div>
+      {freshSent && (
+        <div className="caption">
+          {applied('restart_lap')
+            ? `Car confirmed — fresh lap, still on lap ${ack?.ack?.lap} · sent ${freshSent}`
+            : `Sent ${freshSent} — awaiting the car's confirmation. (A car on the old lap code never answers this.)`}
+        </div>
+      )}
 
       <div className="btnrow" style={{ marginTop: 8 }}>
         <input type="text" inputMode="numeric" placeholder={carLap === null ? 'lap' : String(carLap)}
                value={wanted} onChange={(e) => setWanted(e.target.value)} style={{ width: 72 }} />
         <button className="btn" onClick={setLapNumber}>Set car lap number</button>
       </div>
-      <div className="caption">
-        {setSentAt
-          ? (applied('set_lap')
-              ? `Car confirmed — now on lap ${ack?.ack?.lap} · sent ${setSentAt}`
-              : `Sent ${setSentAt} — awaiting the car's confirmation.`)
-          : 'Laps COMPLETED, to match the officials. Changes the number only; the lap in progress carries on.'}
-      </div>
+      {setSentAt && (
+        <div className="caption">
+          {applied('set_lap')
+            ? `Car confirmed — now on lap ${ack?.ack?.lap} · sent ${setSentAt}`
+            : `Sent ${setSentAt} — awaiting the car's confirmation.`}
+        </div>
+      )}
 
       {/* The driver's own clock. Kept at the bottom of this section because it
           is the one control here that records NOTHING — it moves a number on
@@ -240,13 +261,27 @@ function CutLap({ carLap }: { carLap: number | null }) {
       <button className="btn block" style={{ marginTop: 8 }} onClick={clearStopwatch}>
         <Icon name="timer" size={13} />Clear driver’s stopwatch
       </button>
-      <div className="caption">
-        {watchSent
-          ? (applied('clear_stopwatch')
-              ? `Car confirmed — driver's clock blanked · sent ${watchSent}`
-              : `Sent ${watchSent} — awaiting the car's confirmation. (A car on the old HUD code never answers this.)`)
-          : 'Blanks the clock on the driver’s screen until the next pass of the line. Display only: counts no lap, moves no number the car records. Cutting or restarting a lap already restarts it, so there is no button for that.'}
-      </div>
+      {watchSent && (
+        <div className="caption">
+          {applied('clear_stopwatch')
+            ? `Car confirmed — driver's clock blanked · sent ${watchSent}`
+            : `Sent ${watchSent} — awaiting the car's confirmation. (A car on the old HUD code never answers this.)`}
+        </div>
+      )}
+
+      {/* The pit wall's own lap clock, last because it is the only control in
+          this section that touches nothing outside this building. */}
+      <button className="btn block" style={{ marginTop: 8 }} onClick={toggleLapHold}>
+        <Icon name={lapHeld ? 'play' : 'pause'} size={13} />
+        {lapHeld ? 'Start lap clock' : 'Stop lap clock'}
+      </button>
+      {holdSent && (
+        <div className="caption">
+          {applied(holdAction)
+            ? `Car confirmed — driver's clock ${holdAction === 'stop_stopwatch' ? 'stopped' : 'running'} · sent ${holdSent}`
+            : `Sent ${holdSent} — awaiting the car's confirmation. (The wall is already ${holdAction === 'stop_stopwatch' ? 'stopped' : 'running'}.)`}
+        </div>
+      )}
     </Sec>
   );
 }
