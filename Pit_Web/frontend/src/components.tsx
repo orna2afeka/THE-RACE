@@ -92,6 +92,27 @@ export function PowerMapBadge({ state }: { state: Live['state'] }) {
   );
 }
 
+/** CHARGING, when the car says a charger is on it (charge_detector.py).
+ *
+ *  Renders NOTHING unless is_charging is exactly 1. Two reasons it is not a
+ *  truthiness test: 0 is "not charging" and null is "this car's build cannot
+ *  say", and neither may light the badge — but more importantly a badge that
+ *  latched on and stayed on would be read, correctly, as the car still being
+ *  in the box. Absent is the right rendering for both.
+ *
+ *  Deliberately not a tile: a tile reading "no" in the strip for 23 of 24
+ *  hours is noise, and the one thing worth knowing here is the exception. */
+export function ChargingBadge({ state }: { state: Live['state'] }) {
+  if (state.is_charging !== 1) return null;
+  return (
+    <div className="charging">
+      <Icon name="battery" size={13} />
+      <span className="k">Charging</span>
+      <span className="v">car stopped, current into the pack</span>
+    </div>
+  );
+}
+
 /** The sector card — a port of ui.render_sector_display(). */
 export function SectorCard({ live, config }: { live: Live; config: Config }) {
   const sid = live.sectorId;

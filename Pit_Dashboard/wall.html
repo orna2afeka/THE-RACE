@@ -58,6 +58,14 @@
      where the wall could not benefit from it. Anything scoped to one page
      cannot fix a bug the pages share. */
   [hidden] { display: none !important; }
+  /* Charging badge, beside the Battery label. Safe to set `display` only
+     because the rule above is !important; read its note before copying. */
+  .chg {
+    display: inline-block; margin-left: 0.5vw; padding: 0.15vw 0.5vw;
+    border-radius: 999px; font-size: 0.8vw; letter-spacing: 0.1vw;
+    font-weight: 700; color: #0b1220; background: var(--good);
+    vertical-align: 0.1vw;
+  }
   html, body {
     margin: 0; padding: 0; height: 100%; width: 100%;
     background-color: var(--bg);
@@ -339,7 +347,7 @@
     </div>
 
     <div class="card">
-      <div class="label">Battery</div>
+      <div class="label">Battery <span id="charging" class="chg" hidden>CHARGING</span></div>
       <div class="big" id="soc">&mdash;<span class="unit">%</span></div>
       <div class="bar"><i id="socbar"></i></div>
       <div class="quad" style="margin-top:0.6vw">
@@ -683,10 +691,17 @@ function put(id, s, field, fmt) {
   return v;
 }
 
+// ROUNDED TO TENTHS ONCE, THEN SPLIT. Taking the minute off first and rounding
+// what was left put an impossible "3:60.0" on the TV: a 239.96 s lap had its
+// 3 minutes removed, and the 59.96 s remainder then rounded up to 60.0. It sat
+// there for the whole of the following lap, and the big clock flickered
+// through it at most minute boundaries. The HUD has always truncated for the
+// same reason (driver_dash_v2._lap_time_text); this is the same rule in JS.
 function fmtLapTime(sec) {
   if (sec == null || !isFinite(sec)) return "—";
-  const m = Math.floor(sec / 60), r = sec - m * 60;
-  return m + ":" + (r < 10 ? "0" : "") + r.toFixed(1);
+  const tenths = Math.round(Math.max(0, sec) * 10);
+  const r = (tenths % 600) / 10;
+  return Math.floor(tenths / 600) + ":" + (r < 10 ? "0" : "") + r.toFixed(1);
 }
 
 function fmtDelta(d) {
@@ -722,6 +737,11 @@ function render() {
   // -- speed, battery, power ------------------------------------------- //
   put("speed",  s, "mms_vehicle_speed_kmh", v => Math.round(v));
   put("target", s, "target_speed_kmh",      v => Math.round(v));
+  // Charging, from the car's own detector. isCarried() matters here as much as
+  // on any number: a charging flag held over from the last row the car sent is
+  // not evidence the car is on the charger NOW, and this badge's only job is to
+  // explain a car that is stopped at this moment.
+  el("charging").hidden = isCarried(s, "is_charging") || num(s.is_charging) !== 1;
   const soc = put("soc", s, "bms_soc_percent", v => Math.round(v) + "%");
   const bar = el("socbar");
   bar.style.width = (soc == null ? 0 : Math.max(0, Math.min(100, soc))) + "%";

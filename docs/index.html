@@ -81,6 +81,17 @@
     font-size: 0.68rem; letter-spacing: 2.5px; text-transform: uppercase;
     color: var(--dim); font-weight: 600;
   }
+  /* The charging badge, beside the Battery label. Green because it is good
+     news for the car, and filled so it reads at a glance on a phone held at
+     arm's length -- the audience for this page is a family watching from home,
+     not somebody studying a dashboard. Safe to set `display` here only because
+     [hidden] above is !important; see that note before copying this. */
+  .chg {
+    display: inline-block; margin-left: 7px; padding: 2px 7px;
+    border-radius: 999px; font-size: 0.6rem; letter-spacing: 1.5px;
+    font-weight: 700; color: #0b1220; background: var(--good);
+    vertical-align: 1px; animation: pulse 1.6s ease-in-out infinite;
+  }
   .value { font-size: 1.75rem; font-weight: 700; font-variant-numeric: tabular-nums; }
   .value.small { font-size: 1.15rem; line-height: 1.25; }
   .unit { font-size: 0.85rem; color: var(--dim); margin-left: 5px;
@@ -327,9 +338,10 @@
     </div>
 
     <div class="card">
-      <div class="label">Battery</div>
+      <div class="label">Battery <span id="charging" class="chg" hidden>CHARGING</span></div>
       <div class="value small"><span id="soc">&mdash;</span><span class="unit">%</span></div>
       <div class="bar" id="soc-bar"><i></i></div>
+      <div class="sub" id="charging-sub" hidden>The car is in the pits on the charger.</div>
     </div>
 
     <div class="card">
@@ -627,11 +639,14 @@ function fmtAgeShort(sec) {
   return h < 24 ? h + "h " + (m % 60) + "m" : Math.floor(h / 24) + "d";
 }
 
+// Rounded to tenths ONCE, then split -- see wall.html's fmtLapTime. Splitting
+// first and rounding the remainder showed a 239.96 s lap as "3:60.0", and on
+// this page it would sit there until the car finished the next one.
 function fmtTime(s) {
   if (s == null) return "—";
-  const m = Math.floor(s / 60);
-  const r = s - m * 60;
-  return m + ":" + (r < 10 ? "0" : "") + r.toFixed(1);
+  const tenths = Math.round(Math.max(0, s) * 10);
+  const r = (tenths % 600) / 10;
+  return Math.floor(tenths / 600) + ":" + (r < 10 ? "0" : "") + r.toFixed(1);
 }
 
 function fmtClock(s) {
@@ -1079,6 +1094,16 @@ function render() {
   const soc = num(s.soc_percent);
   el("soc").textContent = soc == null ? "—" : Math.round(soc);
   el("soc-bar").firstElementChild.style.width = (soc == null ? 0 : soc) + "%";
+
+  // Charging, straight from the car's own detector (charge_detector.py). Read
+  // with === true, not a truthiness test: `s` is the EMPTY object whenever the
+  // reading is old or absent, and an undefined field must render as "not
+  // charging" rather than throwing. The badge disappearing when the feed dies
+  // is the right failure -- a page that keeps saying CHARGING for an hour
+  // after the car left the box is worse than one that says nothing.
+  const charging = s.is_charging === true;
+  el("charging").hidden = !charging;
+  el("charging-sub").hidden = !charging;
 
   // Race clock. Hidden outright when nobody has published a window -- a
   // countdown to a date this page guessed would be worse than no countdown.

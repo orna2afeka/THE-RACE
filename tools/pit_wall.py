@@ -10,10 +10,12 @@ show the circuit and the numbers that matter without anybody touching it.
 
 WHY THIS IS NOT THE SPECTATOR PAGE
 docs/index.html is published to GitHub Pages for the families at home. That page
-is deliberately starved: eight whitelisted fields, no position, nothing a rival
-team could use, because anyone with the URL can read it. A pit wall wants the
-opposite — pack voltage, temperatures, the gap to the strategy — and none of
-that may be published. So this is a separate page on a separate server that
+is deliberately starved: a short whitelist, because anyone with the URL can
+read it. It is no longer true that it shows nothing a rival could use -- the
+team chose to publish live position, and on race morning the charging flag as
+well -- but everything NOT on that whitelist still stays off it. A pit wall
+wants the opposite — pack voltage, temperatures, the gap to the strategy —
+and none of that may be published. So this is a separate page on a separate server that
 never leaves the LAN.
 
 WHY IT IS NOT PART OF THE PIT DASHBOARD
@@ -57,6 +59,7 @@ for _p in (_REPO, os.path.join(_REPO, "Pit_Dashboard")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import constants as C  # noqa: E402
 import db  # noqa: E402
 
 PAGE_PATH = os.path.join(_REPO, "Pit_Dashboard", "wall.html")
@@ -79,13 +82,49 @@ REFRESH_S = 0.5
 # no consequence, because a lap takes ten times that.
 LAP_TABLE_EVERY_S = 20.0
 
+# --------------------------------------------------------------------------- #
+# Energy used so far this lap
+# --------------------------------------------------------------------------- #
+# The car publishes last_lap_energy and total_race_energy, never "this lap so
+# far", so the pit subtracts: live total minus the total at the lap's first
+# sample. Net of regen on both sides, which is what makes it comparable with
+# the Last figure beside it. Same rule as the dashboard's Current-lap tile
+# (api.py), deliberately, so the TV and the dashboard cannot disagree about
+# what the lap has cost.
+#
+# CACHED PER LAP. db.lap_start_energy() costs what the lap is big -- 0.2 ms for
+# a normal lap, 200 ms for one whose counter stalled and swallowed hours of
+# samples -- and the feed re-reads twice a second. The TTL is also what makes a
+# late baseline self-correct: if the link was down at the lap trigger the
+# earliest sample held is further in, and the collector backfills the missing
+# ones minutes later.
+LAP_ENERGY_TTL_S = 15.0
+
+# How far into a lap the baseline may sit before the figure is meaningfully
+# short. A sample lands every ~0.5 s, so a healthy baseline is a few metres in;
+# 100 m means the start of the lap was never received. The page dashes the
+# value rather than drawing a low number that is only low because of a dropout.
+LAP_ENERGY_BASELINE_MAX_M = 100.0
+
+# No lap can end this far BELOW where it started. Read off the strategy matrix
+# so it stays right if the profiles are rebuilt: net regen over a lap is a
+# fraction of the spend, never a multiple of it. Only an energy reset -- which
+# zeroes total_race_energy mid-lap while the stored first sample still holds
+# the pre-reset total -- can clear this bar.
+LAP_ENERGY_IMPLAUSIBLE_WH = max(
+    [m.get("energy_wh") or 0.0 for m in C.PROFILE_MATRIX.values()] or [100.0])
+
 # Everything the page shows. Keeping the list here rather than in the page means
 # a metric the car stops reporting arrives as null and renders as a dash,
 # instead of a stale number looking current.
 FIELDS = (
     "calculated_lap", "lap_distance_m", "odometer_m", "lap_source",
     "mms_vehicle_speed_kmh", "target_speed_kmh", "mms_power_W", "mms_rpm",
-    "mms_temperature_C", "mms_measured_voltage_V",
+    # The MOTOR's own PT1000, and the CONTROLLER's internal sensor. Two
+    # different parts and two different failure modes: the wall's temperature
+    # tile said "Motor temp" while reading mms_temperature_C for its whole life,
+    # so it was showing the controller and nobody could see the motor at all.
+    "mms_motor_temp_C", "mms_temperature_C", "mms_measured_voltage_V",
     "bms_soc_percent", "bms_voltage_V", "bms_current_A", "battery_temp_C",
     "last_lap_time_s", "last_lap_energy", "last_lap_distance_m",
     "total_race_energy", "regen_energy", "stint_energy", "stint_regen_energy",
@@ -98,6 +137,12 @@ FIELDS = (
     # gps_age_s travels WITH lat/lon and is not optional: the car keeps serving
     # its last known fix after the receiver loses lock, so a position can be
     # well-formed and half an hour old while the car is a kilometre away.
+    # 1/0/NULL: a charger on the car, inferred by charge_detector.py from a
+    # stationary car plus sustained current into the pack. NULL on rows from a
+    # build older than 2026-09-19, which the page renders as no badge at all --
+    # the same as "not charging", and right for a wall: the badge is there to
+    # explain a stopped car, not to assert anything when it is moving.
+    "is_charging",
     "active_strategy", "lat", "lon", "gps_age_s",
     "bms_has_error", "bms_error_code", "mms_has_error", "mms_error_code",
 )
@@ -133,11 +178,11 @@ def check_fields(db_path=None):
             for n in FIELDS if n not in cols and n not in metrics]
 
 
-DEMO_PROFILE = os.path.join(_REPO, "profiles", "base_210s.csv")
+DEMO_PROFILE = os.path.join(_REPO, "profiles", "dor_280s.csv")
 
 
 class DemoFeed:
-    """A car that is not there, driving the base_210s profile round and round.
+    """A car that is not there, driving the dor_280s profile round and round.
 
     So the TV, the LAN, the mount and the viewing angle can all be set up and
     argued about in the garage before anyone has driven a lap -- and so the wall
@@ -236,6 +281,10 @@ class DemoFeed:
             "target_speed_kmh": kmh,
             "mms_power_W": power,
             "mms_rpm": kmh / 0.020355,
+            # Motor hotter than the controller, as on the car: the two tiles
+            # must not read alike, or the demo hides a tile wired to the wrong
+            # sensor -- which is exactly how this one went unnoticed.
+            "mms_motor_temp_C": 52.0 + kmh / 14.0,
             "mms_temperature_C": 46.0 + kmh / 22.0,
             "mms_measured_voltage_V": 48.4,
             "bms_soc_percent": max(8.0, 92.0 - elapsed / 180.0),
@@ -245,10 +294,14 @@ class DemoFeed:
             "last_lap_time_s": recent[0]["time_s"] if recent else None,
             "last_lap_energy": recent[0]["energy_wh"] if recent else None,
             "last_lap_distance_m": 4000.0 if recent else None,
-            "total_race_energy": round((lap - self.start_lap) * 0.038 + 1.6, 3),
-            "regen_energy": round((lap - self.start_lap) * 0.004, 3),
+            # WATT-HOURS, the unit the car actually stores. These were kWh
+            # once, which made a wall that printed Wh values under a "kWh"
+            # label look perfectly correct in the demo for its whole life.
+            "total_race_energy": round((lap - self.start_lap) * 38.0 + 1600.0, 1),
+            "regen_energy": round((lap - self.start_lap) * 4.0, 1),
+            "lap_energy_wh": round(38.0 * (lap_t / self._lap_s), 1),
             "stint_energy": None, "stint_regen_energy": None,
-            "active_strategy": "base_210s",
+            "active_strategy": "dor_280s",
             "lat": None, "lon": None,
             "bms_has_error": 0, "bms_error_code": 0,
             "mms_has_error": 0, "mms_error_code": 0,
@@ -277,6 +330,7 @@ class Feed:
         self._value = {"error": "no reading yet"}
         self._laps = []
         self._laps_at = None
+        self._lap_base = None        # (lap, read_at, energy_wh, at_m)
         self._stop = threading.Event()
         self._thread = None
 
@@ -375,6 +429,8 @@ class Feed:
         out["is_racing"] = race.get("is_racing")
         out["race_start_time"] = race.get("race_start_time")
         out["lap_started_ts"] = self._lap_start(conn, out.get("calculated_lap"))
+        out["lap_energy_wh"] = self._lap_energy(
+            conn, out.get("calculated_lap"), out.get("total_race_energy"))
 
         with self._lock:
             out["recent_laps"] = list(self._laps)
@@ -401,6 +457,48 @@ class Feed:
         except Exception:
             return None
         return row[0] if row and row[0] else None
+
+    def _lap_energy(self, conn, lap, total_energy):
+        """Wh used so far on the lap the car is on, or None.
+
+        None -- a dash on the wall -- rather than a number, whenever the figure
+        would be a guess: no lap yet, no energy total, no stored sample of this
+        lap, a baseline too far into the lap to mean anything, or a baseline
+        taken before an energy reset. A short number on a pit wall is read as a
+        good lap, so it must never be produced by a dropout.
+
+        Runs on the Feed thread only, like every other read here.
+        """
+        if lap is None or total_energy is None:
+            return None
+        try:
+            lap = int(lap)
+        except (TypeError, ValueError):
+            return None
+
+        hit = self._lap_base
+        if hit is None or hit[0] != lap or (time.time() - hit[1]) >= LAP_ENERGY_TTL_S:
+            try:
+                row = db.lap_start_energy(conn, lap)
+            except Exception:
+                return None
+            hit = (lap, time.time(),
+                   row["total_race_energy"] if row is not None else None,
+                   row["lap_distance_m"] if row is not None else None)
+            self._lap_base = hit
+
+        _, _, base, at_m = hit
+        if base is None:
+            return None
+        # The baseline is not the start of the lap: the beginning was never
+        # received and subtracting understates the lap by whatever was missed.
+        if at_m is not None and at_m > LAP_ENERGY_BASELINE_MAX_M:
+            return None
+        used = float(total_energy) - float(base)
+        # A mildly negative lap is REAL -- energy is net of regen and may
+        # legitimately decrease on a descent. Only a drop bigger than any lap
+        # could physically regen is the energy reset it actually is.
+        return None if used < -LAP_ENERGY_IMPLAUSIBLE_WH else used
 
     def _refresh_laps(self, conn):
         """The last few completed laps, newest first.
@@ -511,7 +609,7 @@ def main():
     ap.add_argument("--once", action="store_true",
                     help="print one snapshot and exit, without serving")
     ap.add_argument("--demo", action="store_true",
-                    help="drive the page from profiles/base_210s.csv instead of "
+                    help="drive the page from profiles/dor_280s.csv instead of "
                          "the database, for setting up the TV before the car "
                          "exists. The page says DEMO in large letters.")
     args = ap.parse_args()

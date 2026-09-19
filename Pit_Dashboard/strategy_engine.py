@@ -1,3 +1,4 @@
+import bisect
 import math
 import os
 import pandas as pd
@@ -102,8 +103,27 @@ CHARGING_CURVE = {          # SoC % -> charging power, kW
     80: 7.6,  85: 5.6,  90: 3.9,  95: 3.4,  100: 2.5,
 }
 CHARGING_CURVE_IS_MEASURED = True     # flip when the curve is replaced
-BATTERY_FULL_WH = 8550.0
-BATTERY_FLOOR_WH = 450.0       # never plan to go below this
+
+# THE PACK, AND THE TWO SoC LIMITS EVERY PLAN IS MADE INSIDE.
+#
+# BATTERY_FULL_WH is the pack AT 100% SoC -- the number the BMS percentage is a
+# percentage OF. It read 8550 until the crew stated the pack: 9000 Wh. 8550 was
+# the 95% ceiling all along, entered as though it were the capacity, and two
+# things were wrong because of it. A reported 100% SoC came back as 8550 Wh, a
+# whole 5% light, and the 450 Wh "5% floor" was really 5.3% of what the engine
+# thought the pack was. Both are now derived from one number, so they cannot
+# drift apart again.
+BATTERY_FULL_WH = 9000.0       # 100% SoC
+# CREW RULE, not the regulations': no charge ever goes past 95%. It is a
+# CEILING ON THE TARGET, not a target itself -- the optimiser may stop lower,
+# it may never plan higher. This is why the Charge To column tops out at 95%
+# and never says 100%.
+MAX_CHARGE_SOC_PCT = 95.0
+BATTERY_CEILING_WH = BATTERY_FULL_WH * MAX_CHARGE_SOC_PCT / 100.0   # 8550 Wh
+# The other end of the same rule: never plan to arrive below 5% SoC. The car
+# may of course be driven lower; no PLAN plans it.
+MIN_SOC_PCT = 5.0
+BATTERY_FLOOR_WH = BATTERY_FULL_WH * MIN_SOC_PCT / 100.0            # 450 Wh
 
 # Race rules, confirmed by the team. These are the reason the merged model is
 # not simply her optimiser: hers has none of them, so its lap counts are
@@ -115,6 +135,14 @@ BATTERY_FLOOR_WH = 450.0       # never plan to go below this
 # it.
 RACE_DURATION_MIN = 1440.0     # 24 hours
 MIN_STOP_DURATION_MIN = 30.0   # a stop costs this even if charging is quicker
+# The other end of the same rule, and the crew's, not the regulations': nobody
+# leaves the car on the charger longer than an hour. It is a CEILING ON THE
+# STOP, not a target the planner may skip: the charge runs for at most this
+# long and the car leaves at whatever SoC it reached, so a stop is always
+# between MIN and MAX minutes. Before this, the best 24 h plans charged 5->100%
+# in one 68-minute sitting -- a stop nobody was going to actually stand there
+# and make.
+MAX_STOP_DURATION_MIN = 60.0
 DRIVER_STINT_LIMIT_MIN = 120.0 # continuous driving before a driver must change
 DRIVER_CHANGE_TIME_MIN = 5.0   # cost of that change
 # REGULATION, not a guess: a car that charges more than 3 times is classified
@@ -122,12 +150,22 @@ DRIVER_CHANGE_TIME_MIN = 5.0   # cost of that change
 # A fourth stop can therefore never win a place, so the planner never offers one.
 MAX_STOPS = 3
 
-# Targets the optimiser may pick from, independently at each stop. 95 and 100
-# used to be left out on the grounds that the top of the curve is too slow to
-# pay. That holds only while stops are free: with the 3-charge cap, a car that
-# runs dry sits out the rest of the race, and a slow top-off beats sitting.
-# Dropping them cost up to 30 laps over 24 h, so the search decides, not us.
-CHARGE_TARGETS_PCT = (55, 60, 65, 70, 75, 80, 85, 90, 95, 100)
+# Targets the optimiser may pick from, independently at each stop. 95 used to
+# be left out on the grounds that the top of the curve is too slow to pay. That
+# holds only while stops are free: with the 3-charge cap, a car that runs dry
+# sits out the rest of the race, and a slow top-off beats sitting. Dropping it
+# cost up to 30 laps over 24 h, so the search decides, not us.
+#
+# IT STOPS AT MAX_CHARGE_SOC_PCT. 100 used to be the last entry; the crew's
+# ceiling took it off the menu, and nothing here may put it back -- a plan the
+# crew will not carry out is not a plan.
+#
+# A target above what MAX_STOP_DURATION_MIN buys is not dropped, it is CUT
+# DOWN to where the hour ends (see the search). So the top of this tuple still
+# earns its place: from a low SoC an hour reaches past 90%, and from a high one
+# every entry above the cut collapses into the same "charge for the full hour"
+# option.
+CHARGE_TARGETS_PCT = (55, 60, 65, 70, 75, 80, 85, 90, 95)
 
 
 def get_charging_power(soc_pct):
@@ -193,13 +231,46 @@ def charging_time_min(start_soc, target_soc, capacity_wh=BATTERY_FULL_WH):
             return clock[last]
         return clock[i] + (x - i) * (clock[i + 1] - clock[i])
 
-    return max(0.0, at(target_soc) - at(max(start_soc, 5.0)))
+    return max(0.0, at(target_soc) - at(max(start_soc, MIN_SOC_PCT)))
+
+
+def charge_soc_after_min(start_soc, minutes, capacity_wh=BATTERY_FULL_WH):
+    """Where a charge of this many minutes gets to -- charging_time_min inverted.
+
+    Reads the same clock, with the same interpolation, so the round trip holds:
+    charging_time_min(a, charge_soc_after_min(a, m)) == m to the grid. That is
+    what lets the search offer "charge for the full hour" as a target like any
+    other, instead of dropping the targets an hour cannot reach.
+    Stops at MAX_CHARGE_SOC_PCT, never 100%. The search uses this as the top
+    of its target list ("charge for the full hour"), so an uncapped answer here
+    would smuggle a 100% charge back into plans the crew has ruled out. A pack
+    already above the ceiling is left where it is rather than dragged down.
+    """
+    start = min(max(float(start_soc), 0.0), 100.0)
+    if minutes <= 0:
+        return start
+    ceiling = max(start, MAX_CHARGE_SOC_PCT)
+    clock = _charge_clock(capacity_wh)
+    last = len(clock) - 1
+    x0 = max(start, MIN_SOC_PCT) * 10.0              # the 0.1% grid, as at() reads it
+    i0 = min(int(x0), last)
+    base = clock[i0] + (x0 - i0) * (clock[min(i0 + 1, last)] - clock[i0])
+    goal = base + float(minutes)
+    if goal >= clock[last]:
+        return ceiling
+    i = bisect.bisect_right(clock, goal) - 1
+    if i >= last:
+        return ceiling
+    span = clock[i + 1] - clock[i]
+    x = i + ((goal - clock[i]) / span if span > 0 else 0.0)
+    return min(ceiling, max(start, x / 10.0))        # 0.1% grid -> percent
 
 
 def stop_duration_min(start_soc, target_soc, capacity_wh=BATTERY_FULL_WH):
-    """What the stop actually costs: charging, but never less than the floor."""
-    return max(MIN_STOP_DURATION_MIN,
-               charging_time_min(start_soc, target_soc, capacity_wh))
+    """What the stop actually costs: charging, but inside the floor and ceiling."""
+    return min(MAX_STOP_DURATION_MIN,
+               max(MIN_STOP_DURATION_MIN,
+                   charging_time_min(start_soc, target_soc, capacity_wh)))
 
 
 def _plan_one_strategy(label, lap_time_min, energy_per_lap_wh, speed_kmh,
@@ -274,7 +345,10 @@ def _plan_one_strategy(label, lap_time_min, energy_per_lap_wh, speed_kmh,
     best = {}
     memo = {}
 
-    def search(t0, e0, n0, d0, stops, pit_min, swaps0):
+    # `charge_min` here is the CHARGING stops only, which is what the search
+    # itself decides. What the plan reports as pit time is that plus the
+    # driver changes -- see the key below.
+    def search(t0, e0, n0, d0, stops, charge_stop_min, swaps0):
         # Admissible bound: even driving flat out with free energy and no
         # further stops, the laps still available are (time left) / lap time.
         # If that cannot beat the best plan found so far, nothing below this
@@ -287,23 +361,45 @@ def _plan_one_strategy(label, lap_time_min, energy_per_lap_wh, speed_kmh,
 
         t, e, n, d, swaps = drive(t0, e0, n0, d0, swaps0)
 
+        # PIT TIME IS EVERY MINUTE THE CAR IS NOT MOVING: the charging stops
+        # plus the driver changes. A change made at a charging stop is already
+        # in the stop (the car is stationary anyway, and `swaps` does not count
+        # it); a change mid-stint costs DRIVER_CHANGE_TIME_MIN of its own, and
+        # those minutes are just as gone as the ones spent on the charger.
+        # Ranking on the total, not on charging alone, is the same rule it
+        # always was -- between two plans that finish on the same lap, take the
+        # one that stood still less.
+        swap_total = swaps * swap_min
+        pit_min = charge_stop_min + swap_total
         key = (n, -pit_min, -len(stops))
         if not best or key > best["_key"]:
             best.update({"_key": key, "laps": n, "stops": list(stops),
-                         "pit_min": pit_min, "swaps": swaps,
+                         "pit_min": pit_min, "charge_stop_min": charge_stop_min,
+                         "swap_min": swap_total, "swaps": swaps,
                          "final_wh": e, "time_used": t})
 
         if t >= time_left_min or len(stops) >= MAX_STOPS:
             return
 
         soc_now = (e / capacity_wh) * 100.0
-        for target in CHARGE_TARGETS_PCT:
+        # Everything above where an hour on the charger ends is the SAME stop:
+        # plug in, wait MAX_STOP_DURATION_MIN, leave at whatever SoC that is.
+        # Cutting the targets down to it (rather than throwing them away) keeps
+        # that stop on the menu, and collapses the ones above into one branch.
+        soc_cap = charge_soc_after_min(soc_now, MAX_STOP_DURATION_MIN, capacity_wh)
+        tried = []
+        for want in CHARGE_TARGETS_PCT:
+            target = min(float(want), soc_cap)
             if target <= soc_now + 1.0:
                 continue
+            if any(abs(target - x) < 1e-9 for x in tried):
+                continue
+            tried.append(target)
             target_wh = capacity_wh * target / 100.0
             if target_wh - energy_per_lap_wh < floor:
                 continue
-            charge = charging_time_min(soc_now, target, capacity_wh)
+            charge = min(charging_time_min(soc_now, target, capacity_wh),
+                         MAX_STOP_DURATION_MIN)
             dur = max(MIN_STOP_DURATION_MIN, charge)
             # A stop that does not finish before the flag is pure loss.
             if t + dur >= time_left_min:
@@ -326,7 +422,7 @@ def _plan_one_strategy(label, lap_time_min, energy_per_lap_wh, speed_kmh,
                              "soc_after": float(target),
                              "charge_min": charge,
                              "stop_min": dur}],
-                   pit_min + dur, swaps)
+                   charge_stop_min + dur, swaps)
 
     search(0.0, start_wh, 0, 0.0, [], 0.0, 0)
 
@@ -430,7 +526,8 @@ def calculate_all_strategies(time_left_min, current_available_wh, current_lap,
                 'Label': label, 'Lap Time': format_lap_time(lap_time_min),
                 'Speed (km/h)': "-", 'Total Laps': 0,
                 'Energy/Lap (Wh)': round(energy_per_lap, 1),
-                'Pit Strategy': "-", 'Charge To': "-", 'Pit Time': "-",
+                'Pit Strategy': "-", 'Charge To': "-", 'Charge Time': "-",
+                'Pit Time': "-",
                 'Driver Swaps': "-", 'Final SoC': "-", '_graph_data': None,
             })
             continue
@@ -460,9 +557,23 @@ def calculate_all_strategies(time_left_min, current_available_wh, current_lap,
             'Pit Strategy': pit_label,
             'Charge To': (" / ".join(f"{s['soc_after']:.0f}%" for s in stops)
                           if stops else "-"),
-            'Pit Time': f"{plan['pit_min']:.0f} m" if stops else "-",
-            'Driver Swaps': (f"{plan['swaps']} Swaps" if plan["swaps"]
-                             else "0 Swaps"),
+            # One entry per stop, in the same order as Charge To beside it, so
+            # the crew reads "65% in 34 m" across the row. This is the CHARGE,
+            # not the stop: a charge under the floor still costs a 30 min stop,
+            # and Pit Time is where that shows up. The two columns differing is
+            # the floor doing its job, not a mistake.
+            'Charge Time': (" / ".join(f"{s['charge_min']:.0f} m" for s in stops)
+                            if stops else "-"),
+            # EVERY stationary minute: the charge stops and the driver changes
+            # between them. It read charging-only until the crew pointed out
+            # that a column called Pit Time, on a plan with eight driver
+            # changes in it, was 40 minutes short of the time the car actually
+            # spends standing still. Driver Swaps beside it carries its own
+            # share, so the sum stays legible.
+            'Pit Time': (f"{plan['pit_min']:.0f} m"
+                         if (stops or plan["swaps"]) else "-"),
+            'Driver Swaps': (f"{plan['swaps']} Swaps ({plan['swap_min']:.0f} m)"
+                             if plan["swaps"] else "0 Swaps"),
             'Final SoC': f"{final_soc:.0f}%",
             '_graph_data': plan,
         })
@@ -510,6 +621,14 @@ def create_combined_graph(graph_data_list):
 
     ax.axhline(y=BATTERY_FLOOR_WH, color='#e74c3c', linestyle='--',
                linewidth=1.5, label=f"{BATTERY_FLOOR_WH:.0f} Wh Floor")
+    # The ceiling is drawn for the same reason as the floor: every charge in
+    # the picture stops there, and without the line it reads as the plan being
+    # timid rather than as the rule it is. The start of the race is the one
+    # point allowed above it -- the car rolls out at 100%.
+    ax.axhline(y=BATTERY_CEILING_WH, color='#2ecc71', linestyle=':',
+               linewidth=1.2,
+               label=f"{MAX_CHARGE_SOC_PCT:.0f}% charge ceiling "
+                     f"({BATTERY_CEILING_WH:.0f} Wh)")
     ax.set_ylim(0, BATTERY_FULL_WH * 1.05)
     ax.invert_xaxis()
     # The taper is in the data but is not visible at this zoom -- a 46 minute
@@ -717,6 +836,36 @@ if __name__ == "__main__":
           "against %.0f Wh/min for the first 50%%"
           % (_wh_per_min(90, 100), _wh_per_min(5, 55)))
 
+    # The hour cap, and the inverse the search plans it with. If the round trip
+    # drifts, the planner books a stop of one length and the trace draws
+    # another -- the table/graph split this file exists to prevent.
+    print("the %.0f min ceiling, from each starting SoC:" % MAX_STOP_DURATION_MIN)
+    for _s0 in (5, 20, 40, 60, 80, 95):
+        _to = charge_soc_after_min(_s0, MAX_STOP_DURATION_MIN)
+        _back = charging_time_min(_s0, _to)
+        print("    %2d%% -> %5.1f%% in %.1f min" % (_s0, _to, _back))
+        _want(_back <= MAX_STOP_DURATION_MIN + 1e-6,
+              "an hour from %d%% reaches %.1f%%, which takes %.2f min"
+              % (_s0, _to, _back))
+        _want(_to >= MAX_CHARGE_SOC_PCT - 1e-3
+              or abs(_back - MAX_STOP_DURATION_MIN) < 1e-3,
+              "the charge clock does not invert at %d%%: %.1f%% costs %.3f min"
+              % (_s0, _to, _back))
+    _want(charge_soc_after_min(70, 0) == 70.0, "a zero-minute charge moves the SoC")
+    _want(charge_soc_after_min(100, MAX_STOP_DURATION_MIN) == 100.0,
+          "charging a full pack goes over 100%")
+    # THE CREW'S CEILING, checked where it is easiest to lose: the hour cap is
+    # the one path that picks a target the CHARGE_TARGETS_PCT tuple never
+    # names.
+    _want(charge_soc_after_min(5, 24 * 60.0) == MAX_CHARGE_SOC_PCT,
+          "a whole day on the charger goes past %.0f%%" % MAX_CHARGE_SOC_PCT)
+    _want(max(CHARGE_TARGETS_PCT) == MAX_CHARGE_SOC_PCT,
+          "the target list tops out at %d%%, not the %.0f%% ceiling"
+          % (max(CHARGE_TARGETS_PCT), MAX_CHARGE_SOC_PCT))
+    _want(abs(BATTERY_FLOOR_WH - BATTERY_FULL_WH * 0.05) < 1e-9,
+          "the floor is %.1f%% of the pack, not 5%%"
+          % (100.0 * BATTERY_FLOOR_WH / BATTERY_FULL_WH))
+
     for _label, _left, _start in (("full 24 h, full pack", 24 * 60.0, BATTERY_FULL_WH),
                                   ("6 h left, part charged", 360.0, 3000.0),
                                   ("45 min, no stop fits", 45.0, BATTERY_FULL_WH),
@@ -748,19 +897,45 @@ if __name__ == "__main__":
                   "%s: goes below the %.0f Wh floor" % (_nm, BATTERY_FLOOR_WH))
             _want(max(w for _, w, _ in _tr) <= _p["capacity_wh"] + 1e-6,
                   "%s: goes above capacity" % _nm)
+            # Above the ceiling only where the race started there. Everything
+            # after the first stop is a charge, and no charge may reach it.
+            _want(all(x["soc_after"] <= MAX_CHARGE_SOC_PCT + 1e-9
+                      for x in _p["stops"]),
+                  "%s: a stop charges past %.0f%%" % (_nm, MAX_CHARGE_SOC_PCT))
+            _want(all(w <= BATTERY_CEILING_WH + 1e-6
+                      for t, w, k in _tr if t > 0.0 and k in ("charge", "hold")),
+                  "%s: a charge goes above the %.0f Wh ceiling"
+                  % (_nm, BATTERY_CEILING_WH))
             _want(all(_tr[i][0] >= _tr[i - 1][0] - 1e-9 for i in range(1, len(_tr))),
                   "%s: time runs backwards" % _nm)
             for _st in _p["stops"]:
                 _want(_st["stop_min"] >= MIN_STOP_DURATION_MIN - 1e-6,
                       "%s: a stop is under the %.0f min minimum"
                       % (_nm, MIN_STOP_DURATION_MIN))
+                _want(_st["stop_min"] <= MAX_STOP_DURATION_MIN + 1e-6,
+                      "%s: a %.1f min stop is over the %.0f min maximum"
+                      % (_nm, _st["stop_min"], MAX_STOP_DURATION_MIN))
                 _want(_st["stop_min"] >= _st["charge_min"] - 1e-6,
                       "%s: a stop is shorter than its own charge" % _nm)
-            _want(abs(_pit - _p["pit_min"]) < 1e-6, "%s: pit time does not add up" % _nm)
-            _want(abs((_row["Total Laps"] * _p["lap_time_min"]
-                       + _p["swaps"] * DRIVER_CHANGE_TIME_MIN + _pit)
+            # The Charge Time column is one entry per stop, aligned with
+            # Charge To. A row where they cannot be read across is worse than
+            # no column at all.
+            _want(_row["Charge Time"] ==
+                  (" / ".join("%.0f m" % _st["charge_min"] for _st in _p["stops"])
+                   if _p["stops"] else "-"),
+                  "%s: Charge Time column disagrees with the plan" % _nm)
+            # Pit time is the charge stops AND the driver changes, so the
+            # race splits in two: driving, and standing still.
+            _want(abs(_pit - _p["charge_stop_min"]) < 1e-6,
+                  "%s: the stops do not add up to the charging time" % _nm)
+            _want(abs(_p["swap_min"] - _p["swaps"] * DRIVER_CHANGE_TIME_MIN) < 1e-6,
+                  "%s: swap time is not %d changes at %.0f min"
+                  % (_nm, _p["swaps"], DRIVER_CHANGE_TIME_MIN))
+            _want(abs(_p["pit_min"] - (_pit + _p["swap_min"])) < 1e-6,
+                  "%s: pit time is not charging plus driver changes" % _nm)
+            _want(abs((_row["Total Laps"] * _p["lap_time_min"] + _p["pit_min"])
                       - _p["time_used"]) < 1e-6,
-                  "%s: drive + swaps + pit != time used" % _nm)
+                  "%s: driving + pit != time used" % _nm)
             # no driver may exceed the stint limit
             _run = _worst = 0.0
             for _, _, _k in _tr:
@@ -773,8 +948,9 @@ if __name__ == "__main__":
                   "%s: a driver runs %.1f min, over the %.0f limit"
                   % (_nm, _worst, DRIVER_STINT_LIMIT_MIN))
 
-            print("    %-16s %3d laps | %-26s | pit %5.1f | %d swaps"
-                  % (_nm, _row["Total Laps"], _row["Pit Strategy"], _pit, _p["swaps"]))
+            print("    %-16s %3d laps | %-26s | pit %5.1f (charge %5.1f + %d swaps)"
+                  % (_nm, _row["Total Laps"], _row["Pit Strategy"],
+                     _p["pit_min"], _pit, _p["swaps"]))
 
     import time as _time
     # BEST OF THREE, not one cold run. On this laptop the same unchanged code

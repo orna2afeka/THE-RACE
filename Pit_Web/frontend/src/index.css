@@ -323,6 +323,18 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .powermap.reverse .v { color: var(--pit-warning); }
 .powermap.none .v { color: var(--ink-3); font-weight: 500; }
 
+/* The charging badge. Sits beside the power map, same pill geometry, green
+   because it is the car doing what the plan asked. Only ever on screen while
+   the car is actually on the charger, so it can afford to be loud. */
+.charging {
+	display: inline-flex; align-items: center; gap: 10px;
+	padding: 5px 12px 5px 10px; border-radius: 999px; margin: 0 0 12px 10px;
+	background: var(--ok-soft); border: 1px solid rgba(53, 199, 111, 0.3);
+	color: var(--ok); font-size: calc(12px * var(--pit-font-scale));
+}
+.charging .k { font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; font-size: calc(10.5px * var(--pit-font-scale)); }
+.charging .v { color: var(--ink-3); }
+
 /* --------------------------------------------------------------------------
    Sector card
    -------------------------------------------------------------------------- */
@@ -583,6 +595,10 @@ table.tbl td.num, table.tbl th.num { text-align: right; font-family: var(--mono)
 table.tbl tbody tr:nth-child(even) { background: rgba(255, 255, 255, 0.015); }
 [data-theme='light'] table.tbl tbody tr:nth-child(even) { background: rgba(15, 23, 42, 0.02); }
 table.tbl tbody tr:hover { background: var(--card-2); }
+/* Laps the car did not tag as flying, in the Laps-by-driver table: the same
+   grey the per-lap charts draw them in, so an in-lap's 15 minutes reads as a
+   pit stop rather than as the race falling apart. */
+table.tbl tbody tr.not-flying td { color: var(--ink-3); }
 .scroll { overflow: auto; max-height: 360px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--card); }
 .hscroll { overflow-x: auto; }
 

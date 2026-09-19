@@ -5,7 +5,7 @@ import Sidebar from './Sidebar';
 import Driver from './tabs/Driver';
 import History from './tabs/History';
 import { Cells, LiveMetrics, Strategy, Weather } from './tabs/Rest';
-import { FaultBanner, MetricTile, PowerMapBadge } from './components';
+import { ChargingBadge, FaultBanner, MetricTile, PowerMapBadge } from './components';
 import { ErrorBoundary } from './ErrorBoundary';
 import { StintBanner, StintClock, stintNow } from './DriverStint';
 import { Icon } from './icons';
@@ -63,6 +63,7 @@ function TopStrip({ live }: { live: Live }) {
     <>
       <FaultBanner live={live} />
       <PowerMapBadge state={s} />
+      <ChargingBadge state={s} />
       <div className="grid g7">
         <MetricTile title="Speed" value={fmt(s.speed_kmh, '.1f')} unit="km/h" trend={trend.Speed} />
         {s.motor_temp === null
@@ -159,6 +160,8 @@ function LapClock({ live, clockOffsetMs }: { live: Live | null | undefined; cloc
     <div className={`clock lap${held ? ' held' : ''}`}
          title={lc?.source === 'store'
            ? 'Estimated from the earliest sample the pit holds for this lap — it can read short. The car itself reports the exact datum once it is running code that sends lap_started_ts.'
+           : lc?.source === 'pit'
+           ? "Counting from the press in this room. The car has not answered it yet; the clock hands back to the car's own datum at the next sample."
            : "The car's own lap datum — the same one the driver's stopwatch counts from."}>
       <span className="k">{held ? 'Lap clock · held' : 'Lap clock'}</span>
       <span className="v">{elapsed === null ? '--:--' : hms(Math.max(0, Math.floor(elapsed)))}</span>

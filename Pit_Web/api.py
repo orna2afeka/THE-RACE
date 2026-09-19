@@ -183,6 +183,11 @@ _STATE_COLUMNS = {
     "total_race_energy": "total_race_energy",
     "last_lap_regen_energy": "last_lap_regen_energy",
     "stint_energy": "stint_energy", "stint_regen_energy": "stint_regen_energy",
+    # 1/0/None: is a charger on the car (charge_detector.py). Carried forward
+    # like any other reading, which is right here because the car sends it on
+    # EVERY sample -- so a carried value only ever appears for rows from a
+    # build that predates the field, and reads None, not a confident 0.
+    "is_charging": "is_charging",
     "last_lap_time_s": "last_lap_time_s", "lap_distance_m": "lap_distance_m",
     # The car's own lap tags (gate-based tracker). last_lap_kind and
     # last_lap_stopped_s describe a FINISHED lap, which stays true however old
@@ -390,6 +395,12 @@ DRIVER_STINT_KEY = "driver_stint"
 RACE_UNDO_KEY = "race_undo"
 STRATEGY_CHOICE_KEY = "strategy_choice"
 LAP_HOLD_KEY = "lap_clock_hold"
+# The instant the PIT last re-datumed the lap clock (Cut lap / Restart lap).
+# The car answers a press in its own time -- the command has to reach it, be
+# applied, and come back inside a telemetry sample -- and until it does, the
+# wall would go on counting the lap the engineer has just ended. This is what
+# the wall counts from in the meantime. See _lap_clock().
+LAP_DATUM_KEY = "lap_clock_datum"
 
 
 def race_undo_available(conn, now=None):
@@ -491,6 +502,33 @@ def driver_stint(conn, now=None):
     }
 
 
+# --- The stint log: who drove, and between which two instants --------------- #
+# The countdown only ever needed the CURRENT driver, so that is all the record
+# held — and a lap finished an hour ago had no way back to a name. `log` is the
+# list of stints already FINISHED, appended to at each driver change; the stint
+# in progress is the record itself and is deliberately NOT in the list, so
+# "Name current driver" has one place to write and nothing to keep in sync.
+#
+# It rides inside the same app_state record on purpose. Everything that already
+# takes the record as a whole — the race-reset snapshot, its undo, the
+# new-race branch that starts from a bare dict — then carries the log with it,
+# correctly, without knowing it exists. A separate table would have had to be
+# taught each of those cases one at a time.
+#
+# db.load_driver_stints() reads it back for /api/laps and for the workbook.
+def _stint_log(st, ended_at):
+    """`st`'s log with the stint it describes closed at `ended_at`.
+
+    A record with no started_at is a race that never began — nothing to close,
+    so the log passes through unchanged.
+    """
+    log = list(st.get("log") or [])
+    if st.get("started_at") is not None:
+        log.append({"stint": st.get("stint"), "driver": st.get("driver") or None,
+                    "started_at": st["started_at"], "ended_at": ended_at})
+    return log
+
+
 def _set_stint_running(conn, running, now=None):
     """Start or hold the stint clock, banking whatever has run so far.
 
@@ -569,6 +607,39 @@ def _public_driver_loop():
         _public_driver_wake.clear()
         sync_public_driver()
         _public_driver_wake.wait(PUBLIC_DRIVER_RESYNC_S)
+
+
+# How often the OAuth token used to send commands to the car is topped up.
+# Under google-auth's own 300 s refresh threshold, so a press never finds an
+# expired one. See _token_warm_loop.
+TOKEN_WARM_S = 120.0
+
+
+def _token_warm_loop():
+    """Keep the pit's OAuth token fresh, off the button's thread.
+
+    driver_message._token() refreshes INLINE, on whichever thread is serving
+    the press. So about once an hour one unlucky press also paid for a full
+    OAuth round trip to oauth2.googleapis.com before its command went anywhere
+    -- and that call gets ten seconds before it gives up.
+
+    That is one answer to "sometimes the lap clock takes five seconds": nothing
+    to do with the car, the command or the link to it, just a token that
+    expired under an engineer's finger. Refreshing it here means every press
+    finds a valid one and goes straight out.
+
+    Failures are ignored on purpose. There is no service account on a laptop
+    running the demo, and a warm-up that cannot run is not a reason to log a
+    line every two minutes -- a real send still raises where the engineer can
+    see it.
+    """
+    import driver_message
+    while True:
+        try:
+            driver_message.warm_token()
+        except Exception:
+            pass
+        time.sleep(TOKEN_WARM_S)
 
 
 def _stint_follows_race(st, old_start):
@@ -923,7 +994,11 @@ def _lap_energy_baseline(conn, lap):
 def _lap_clock(conn, state, active_lap, age):
     """{startedAt, atSampleS, source, heldAt} for the clock on the wall.
 
-    THE SHARED STOPWATCH COMES FIRST. The car publishes the elapsed time its
+    THE PIT'S OWN PRESS COMES FIRST, and only while the car has not answered it
+    yet -- see LAP_DATUM_KEY below. Everything after this paragraph is what the
+    clock reads the rest of the time, which is almost all of it.
+
+    THE SHARED STOPWATCH COMES NEXT. The car publishes the elapsed time its
     own HUD is showing and whether that is still moving
     (main._publish_stopwatch), and that is the one clock: the driver, the pit
     and the public page all read the same number, and either end can move it.
@@ -954,6 +1029,36 @@ def _lap_clock(conn, state, active_lap, age):
     pressed_at = float(pressed_at) if pressed_at else None
     unanswered = (pressed_at is not None and sample_at is not None
                   and pressed_at > sample_at)
+
+    # THE PIT'S OWN RE-DATUM, ahead of everything the car has said. Cut lap and
+    # Restart lap both start the lap again, and the round trip that proves it --
+    # up to Firebase, down to the car over LTE, applied, and back inside the
+    # next telemetry sample -- measured four to five seconds on a bad link. The
+    # wall spent those seconds still counting the lap that had just been ended,
+    # which is the one number on the screen an engineer presses that button to
+    # see change.
+    #
+    # Same handover rule as the hold above, and the same reason to trust it: the
+    # moment a sample TAKEN AFTER the press arrives, the car's own datum governs
+    # and this is ignored, so the wall can never disagree with the car for
+    # longer than one sample. It is a head start, not a second opinion.
+    # A STORE WITH NO SAMPLES AT ALL IS NOT "the car has not answered yet", it
+    # is a pit that has never heard from the car -- a fresh database, or the
+    # morning before anything is switched on. The press stays in app_state
+    # across a restart, and without this it would be the newest thing the pit
+    # knew about for as long as that lasted. The wall says nothing instead, as
+    # it did before any of this.
+    datum_at = (load_app_state(conn, LAP_DATUM_KEY) or {}).get("atS")
+    datum_at = float(datum_at) if datum_at else None
+    if datum_at is not None and sample_at is not None and datum_at > sample_at:
+        # atSampleS is 0.0, not the elapsed at the last sample: that sample is
+        # OLDER than the press, so its figure belongs to the lap just ended. A
+        # car that goes quiet across a press freezes the wall on 0:00, which is
+        # what the pit just asked for, rather than on the time it was trying to
+        # clear.
+        return {"startedAt": datum_at, "source": "pit", "atSampleS": 0.0,
+                "heldAt": pressed_at if (pressed_at is not None
+                                         and pressed_at >= datum_at) else None}
 
     stopwatch = state.get("stopwatch_s")
     if stopwatch is not None and sample_at is not None:
@@ -1153,12 +1258,19 @@ def build_live(conn, manual_lap=-1):
 # --------------------------------------------------------------------------- #
 @asynccontextmanager
 async def _lifespan(_app):
+    global _live_loop
+    # The loop the websocket pushers run on, so a button pressed on a threadpool
+    # worker can wake them. See nudge_live().
+    _live_loop = asyncio.get_running_loop()
     # Started here, not at import: the tools/check_*.py scripts import this
     # module and must not start writing to Firebase.
     if PUBLIC_DRIVER_ENABLED:
         threading.Thread(target=_public_driver_loop, name="public-driver",
                          daemon=True).start()
+    threading.Thread(target=_token_warm_loop, name="token-warm",
+                     daemon=True).start()
     yield
+    _live_loop = None
 
 
 app = FastAPI(title="Afeka Pit Wall — React backend", lifespan=_lifespan)
@@ -1550,11 +1662,16 @@ def api_laps():
     telemetry link cannot punch holes in these charts."""
     with closing(ro_conn()) as conn:
         rows = db.fetch_laps(conn)
+        # Who was in the car when each lap finished. From the stints the PIT
+        # logged — the car reports no driver — so a lap driven before anyone
+        # pressed "Driver changed", or by a crew that never typed a name, has
+        # driver null. Null, never "unknown": a missing reading is missing.
+        db.attach_lap_drivers(rows, db.load_driver_stints(conn))
     # `kind` is the car's own verdict: flying | in | out | in_out | start |
     # suspect, or None from a car that predates it. Every lap is LISTED; only
     # flying laps feed best / average, because an in-lap's time holds a pit
     # stop and an out-lap starts from the pit lane.
-    laps = [{"lap": r["lap"], "energyWh": r["energy_wh"],
+    laps = [{"lap": r["lap"], "driver": r["driver"], "energyWh": r["energy_wh"],
              "lapTimeS": r["lap_time_s"], "distanceM": r["distance_m"],
              "kind": r["kind"], "flags": r["flags"], "source": r["lap_source"],
              "stoppedS": r["stopped_s"], "finishedTs": r["finished_ts"]}
@@ -2212,7 +2329,12 @@ def _trace_json(plan):
         "lapTimeMin": plan["lap_time_min"],
         "totalTimeMin": plan["total_time_min"],
         "timeUsedMin": plan["time_used"],
+        # Stationary time, and the two things it is made of. Served split so
+        # the page can show the arithmetic instead of restating the 5 min a
+        # driver change costs -- a constant the browser must not hold a copy of.
         "pitMin": plan["pit_min"],
+        "chargeStopMin": plan["charge_stop_min"],
+        "swapMin": plan["swap_min"],
         "capacityWh": plan["capacity_wh"],
         "startWh": plan["start_wh"],
         "finalWh": plan["final_wh"],
@@ -2250,7 +2372,18 @@ def _strategy_payload(time_left_min, battery_wh, active_lap, table,
         "traces": [_trace_json(r.get("_graph_data")) for r in rows],
         "floorWh": strategy_engine.BATTERY_FLOOR_WH,
         "capacityWh": strategy_engine.BATTERY_FULL_WH,
+        # The crew's 95% rule, on the wire beside the floor and for the same
+        # reason: the page states the limits the plan was made under instead
+        # of holding numbers of its own. capacityWh is the pack at 100% SoC
+        # (9000 Wh); no charge in any plan here goes above ceilingWh.
+        "ceilingWh": strategy_engine.BATTERY_CEILING_WH,
+        "maxChargeSocPct": strategy_engine.MAX_CHARGE_SOC_PCT,
+        "minSocPct": strategy_engine.MIN_SOC_PCT,
         "minStopMin": strategy_engine.MIN_STOP_DURATION_MIN,
+        # The hour ceiling, served for the same reason as the floor: the page
+        # states the rule the plan was made under, and reads it off the engine
+        # rather than printing a number of its own.
+        "maxStopMin": strategy_engine.MAX_STOP_DURATION_MIN,
         "maxStops": strategy_engine.MAX_STOPS,
         # Carried across from the engine so the screen shows its warning: the
         # curve's shape is right, its numbers
@@ -2271,7 +2404,8 @@ def api_strategy(manual_lap: int = Query(-1)):
     active_lap = manual_lap if manual_lap >= 0 else state["auto_lap"]
     # `not soc` covers both a missing reading and a reported 0: neither is a
     # usable capacity, so the matrix assumes a full pack rather than telling
-    # the strategist the car is empty.
+    # the strategist the car is empty. FULL means 100% SoC -- the car rolls out
+    # at 100% and only the charges DURING the race are capped at 95%.
     battery_wh = (strategy_engine.BATTERY_FULL_WH if not soc
                   else (soc / 100.0) * strategy_engine.BATTERY_FULL_WH)
 
@@ -2606,6 +2740,8 @@ def api_driver_stint(body: StintBody):
             "driver": _clean_driver(body.driver),
             "accumulated_s": 0.0,
             "running_since": now if racing else None,
+            # The stint that just ended, closed at this instant. See _stint_log.
+            "log": _stint_log(st, now),
             # Everything needed to put it back exactly as it was.
             "previous_started_at": prev_started,
             "previous_stint": st.get("stint"),
@@ -2659,6 +2795,9 @@ def api_driver_stint_undo():
             "started_at": prev,
             "stint": st.get("previous_stint") or max(1, int(st.get("stint", 1)) - 1),
             "driver": st.get("previous_driver"),
+            # Drop the entry the change just appended: that stint is the one
+            # being put back into the car, so it is current again, not history.
+            "log": list(st.get("log") or [])[:-1],
         }
         # Put the banked/running split back as it was, then re-sync it to the
         # race clock — the race may have been started or stopped in between.
@@ -2698,6 +2837,24 @@ def api_clear_message():
     return {"ok": True}
 
 
+def _note_lap_datum(at=None):
+    """Start the wall's lap clock from NOW, without waiting for the car.
+
+    The two buttons that re-datum the lap -- Cut lap and Restart lap -- call
+    this after the command is away. It is the wall's copy of what the car is
+    about to do, and it lives only until the car's own answer comes back inside
+    a telemetry sample; _lap_clock() does that handover.
+
+    Display only, like the hold beside it: no lap is cut here, no count moves,
+    nothing is recorded. The car cuts the lap; this moves a number on a screen
+    in the pit a few seconds earlier than the round trip allows.
+    """
+    with closing(rw_conn()) as conn:
+        save_app_state(conn, LAP_DATUM_KEY,
+                       {"atS": time.time() if at is None else at})
+    nudge_live()
+
+
 @app.post("/api/cut_lap")
 def api_cut_lap():
     """Ask the CAR to close its lap (snapshots lap energy + time). Does not
@@ -2707,6 +2864,7 @@ def api_cut_lap():
         sent = driver_message.send_lap_cut()
     except Exception as e:
         raise HTTPException(502, "cut lap failed: %s" % e)
+    _note_lap_datum()
     return {"ok": True, "id": sent["id"], "sentAt": time.strftime("%H:%M:%S")}
 
 
@@ -2750,6 +2908,7 @@ def api_lap_restart():
         sent = driver_message.send_lap_restart()
     except Exception as e:
         raise HTTPException(502, "restart lap failed: %s" % e)
+    _note_lap_datum()
     return {"ok": True, "id": sent["id"], "sentAt": time.strftime("%H:%M:%S")}
 
 
@@ -2818,8 +2977,10 @@ def api_lap_hold(body: LapHoldBody):
         sent = (driver_message.send_stopwatch_stop() if body.hold
                 else driver_message.send_stopwatch_resume())
     except Exception as e:
+        nudge_live()
         return {"ok": True, "hold": body.hold, "id": None, "sentAt": None,
                 "carError": str(e)}
+    nudge_live()
     return {"ok": True, "hold": body.hold, "id": sent["id"],
             "sentAt": time.strftime("%H:%M:%S")}
 
@@ -3022,6 +3183,47 @@ FAST_TICK_S = float(os.environ.get("SOLARRACE_FAST_TICK", "2.0"))
 LIVE_MIN_PUSH_S = float(os.environ.get("SOLARRACE_LIVE_MIN_PUSH", "0.25"))
 
 
+# Every open /ws/live pusher's wake event, and the loop they all run on.
+#
+# A PRESS IN THE PIT CHANGES WHAT THE WALL SHOULD SHOW BEFORE THE CAR CAN
+# ANSWER IT -- the lap clock is re-datumed, or parked, in SQLite by the button's
+# own request. Without this the next push is up to FAST_TICK_S away, so a change
+# the pit made itself took two seconds to appear on the screen of the person who
+# made it, on top of whatever the car's round trip costs. Waking the pushers
+# sends it within LIVE_MIN_PUSH_S instead.
+#
+# It reaches EVERY open device, not just the one that pressed: the engineer on
+# the timing stand and the one on the pit wall are looking at the same clock.
+#
+# Cheap and self-limiting. A press is a human action, and the pushers' existing
+# LIVE_MIN_PUSH_S floor already caps how close together two payloads can be, so
+# this cannot become the message storm the cadence comment above describes.
+_live_wakers = set()
+_live_loop = None
+
+
+def nudge_live():
+    """Push the live payload to every open screen now. Safe from any thread.
+
+    The endpoints run in FastAPI's threadpool, not on the event loop, so the
+    events are set through the loop rather than touched directly. A no-op
+    before the loop exists (an import by tools/check_*.py) and a no-op if it
+    has gone -- a failed nudge only means the ordinary tick shows the change.
+    """
+    loop = _live_loop
+    if loop is None:
+        return
+
+    def wake():
+        for ev in _live_wakers:
+            ev.set()
+
+    try:
+        loop.call_soon_threadsafe(wake)
+    except RuntimeError:
+        pass
+
+
 @app.websocket("/ws/live")
 async def ws_live(ws: WebSocket):
     """Pushes the whole fast tier every FAST_TICK_S: tiles, faults, sectors, map.
@@ -3071,6 +3273,8 @@ async def ws_live(ws: WebSocket):
             changed.set()             # do not let the pusher wait out a whole tick
 
     reader_task = asyncio.create_task(reader())
+    # Also woken by a press in the pit -- see nudge_live().
+    _live_wakers.add(changed)
     try:
         while not gone:
             # Cleared BEFORE the read, so a change arriving while this builds or
@@ -3097,6 +3301,7 @@ async def ws_live(ws: WebSocket):
     except (WebSocketDisconnect, RuntimeError):
         pass
     finally:
+        _live_wakers.discard(changed)
         reader_task.cancel()
 
 

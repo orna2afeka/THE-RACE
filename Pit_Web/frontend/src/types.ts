@@ -65,6 +65,13 @@ export interface LiveState {
   motor_temp: Num; motor_ohms: Num;
   motor_map: string | null; motor_map_raw: Num;
   last_lap_energy: Num; total_race_energy: Num; last_lap_time_s: Num;
+  /** Is a charger on the car right now, from charge_detector.py on the car.
+   *  1/0, NOT a boolean - it crosses as the SQLite column, and null means the
+   *  car's build predates the field (every row before 2026-09-19) rather than
+   *  "not charging". Inferred from a stationary car plus sustained current
+   *  into the pack: nothing on this car reports a charger directly, and
+   *  current alone cannot be told from regen braking. */
+  is_charging: Num;
   lap_distance_m: Num; lap_source: string | null;
   auto_lap: Num; odometer_km: Num;
   /** The car's own lap tags (gate-based tracker). All null from an older car.
@@ -178,7 +185,11 @@ export interface StrategyStop {
 }
 export interface StrategyTrace {
   label: string; laps: number; swaps: number; lapTimeMin: number;
-  totalTimeMin: number; timeUsedMin: number; pitMin: number;
+  totalTimeMin: number; timeUsedMin: number;
+  /** Every stationary minute: `chargeStopMin` on the charger plus `swapMin`
+   *  of mid-stint driver changes. A change made at a charge stop is inside
+   *  the stop and counts in neither `swaps` nor `swapMin`. */
+  pitMin: number; chargeStopMin: number; swapMin: number;
   capacityWh: number; startWh: number; finalWh: number;
   stops: StrategyStop[];
   points: { minute: number; wh: number; kind: 'start' | 'lap' | 'swap' | 'stop' | 'charge' | 'hold' }[];
@@ -187,7 +198,10 @@ export interface StrategyResp {
   rows: Record<string, string | number>[];
   /** Index-aligned with rows; null where a strategy could not plan. */
   traces: (StrategyTrace | null)[];
-  floorWh: number; capacityWh: number; minStopMin: number; maxStops: number;
+  floorWh: number; capacityWh: number;
+  /** A stop lasts at least `minStopMin` and at most `maxStopMin`: the charge
+   *  stops at the ceiling wherever the SoC got to. */
+  minStopMin: number; maxStopMin: number; maxStops: number;
   chargingCurveIsMeasured: boolean;
   /** Label -> what the car actually paid on that profile, BESIDE the matrix
    *  and never inside it: the table always shows `storedWh`. Absent for a
@@ -293,7 +307,9 @@ export interface Live {
    *  from the same one), 'store' when the pit estimated it from the earliest
    *  sample it holds — that reads short. `atSampleS` is the elapsed time at
    *  the newest sample, which is what to show once the car goes quiet. */
-  lapClock: { startedAt: Num; atSampleS: Num; source: 'car' | 'store' | null; heldAt: Num };
+  /** `pit` means the clock is counting from a press here that the car has
+   *  not answered yet — it hands back to `car` at the next sample. */
+  lapClock: { startedAt: Num; atSampleS: Num; source: 'car' | 'store' | 'pit' | null; heldAt: Num };
   lapDelta: Num;
   odometerKm: Num;
   /** Wh used since this lap's trigger, net of regen — the same basis as

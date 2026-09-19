@@ -1,12 +1,28 @@
 """
-generate_profiles.py — one speed profile per race strategy
-===========================================================
-Reads the team's baseline lap (Pit_Dashboard/210s.xlsx, 210.0 s) and produces a
-target-speed profile for every strategy in the strategy matrix, writing them to
-profiles/ for the car and the pit to load.
+generate_profiles.py — SUPERSEDED. The solver lives on; the baseline does not.
+==============================================================================
+!! DO NOT RUN THIS TO PRODUCE THE RACE PROFILES. Use:
 
-    python tools/generate_profiles.py            # generate
-    python tools/generate_profiles.py --verify   # generate + check the results
+    python tools/build_dor_profiles.py --verify
+
+Its baseline, Pit_Dashboard/210s.xlsx, is a desk model: it commands 92 km/h down
+the main straight for a 210 s lap, and the car's own log says 50 km/h average and
+a 285 s lap. The five profiles this script wrote (fast_189s, med_fast_199s,
+base_210s, med_slow_220s, slow_231s) were retired on 2026-09-19 and replaced by
+three built from a lap the car actually drove. Copies are in profiles/_backup/.
+
+Running it would write those five files back into profiles/, where the car scans
+the whole directory at startup and the pit's dropdown lists whatever it finds —
+so the crew would be offered five undrivable strategies again, mid-race, with no
+warning. Hence the --resurrect-the-old-five flag below.
+
+WHAT IS STILL USED, AND BY WHOM
+Everything below the baseline loading: find_corners, peak_accel_decel,
+scale_profile, solve_for_target, lap_time and write_profile are imported by
+tools/build_dor_profiles.py and are the solver for the real profiles. This file
+is not dead code; only its main() is.
+
+    python tools/generate_profiles.py --resurrect-the-old-five [--verify]
 
 THE IDEA: CORNERS ARE NOT STRATEGY
 The naive way to make a "10 % faster" lap is to multiply every speed by 1.1.
@@ -317,7 +333,16 @@ def main():
     ap.add_argument("--out", default=OUT_DIR)
     ap.add_argument("--verify", action="store_true",
                     help="check each generated profile against its target")
+    ap.add_argument("--resurrect-the-old-five", action="store_true",
+                    help="write the retired 189-231 s profiles back into "
+                         "profiles/ (see the module docstring — you almost "
+                         "certainly want tools/build_dor_profiles.py instead)")
     args = ap.parse_args()
+
+    if not args.resurrect_the_old_five:
+        print(__doc__.strip())
+        print("\nRefusing to run. Nothing was written.")
+        return 2
 
     df = load_baseline(args.baseline)
     dist = [float(x) for x in df[speed_profile.COL_DIST]]

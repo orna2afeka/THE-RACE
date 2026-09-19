@@ -16,12 +16,13 @@ WHAT A PROFILE IS, ON DISK
                              matrix, plus which lap each built curve came from.
 
 NEW CURVES ARE SCALED, NOT INVENTED
-A new profile, or a changed target time, is generated from the team's baseline
-lap (Pit_Dashboard/210s.xlsx) by tools/generate_profiles.py's own solver:
-corners stay at or under the baseline apex, straights are scaled, and braking
-and acceleration never exceed the baseline's. So an added profile is exactly as
-trustworthy as the original five — modelled, drivable, never measured. Building
-it from a real lap in the builder replaces it the same way it replaces those.
+A new profile, or a changed target time, is generated from the base profile
+(profiles/<DEFAULT_STRATEGY_KEY>.csv — see BASELINE_PATH) by
+tools/generate_profiles.py's own solver: corners stay at or under the baseline
+apex, straights are scaled, and braking and acceleration never exceed the
+baseline's. Since that base is itself built from a lap the car drove, an added
+profile is that lap re-paced. Building one from a real lap in the builder is
+still better, and replaces it the same way.
 
 KEYS ARE NEVER RENAMED
 The key is the filename, the string the car acknowledges, and what every
@@ -55,7 +56,15 @@ from constants import DEFAULT_STRATEGY_KEY                  # noqa: E402
 
 PROFILE_DIR = os.path.join(_REPO_ROOT, "profiles")
 BACKUP_DIR = os.path.join(PROFILE_DIR, "_backup")
-BASELINE_XLSX = os.path.join(_HERE, "210s.xlsx")
+# What a new or retargeted profile is scaled FROM. It used to be 210s.xlsx, the
+# desk model, which meant every curve the builder produced inherited a 92 km/h
+# main straight the car has never reached. It is now the committed base profile
+# itself — which is built from a lap the car drove (tools/build_dor_profiles.py)
+# — so an added strategy is a real lap re-paced, not a model re-scaled.
+#
+# It follows DEFAULT_STRATEGY_KEY on purpose: rebuild the base from a newer lap
+# and everything scaled afterwards comes off that newer lap too.
+BASELINE_PATH = os.path.join(PROFILE_DIR, f"{DEFAULT_STRATEGY_KEY}.csv")
 CONSTANTS_PATH = os.path.join(_HERE, "constants.py")
 MATRIX_BEGIN = "# >>> PROFILE MATRIX >>>"
 MATRIX_END = "# <<< PROFILE MATRIX <<<"
@@ -70,7 +79,8 @@ PROTECTED_KEYS = {DEFAULT_STRATEGY_KEY}
 KEY_RE = re.compile(r"^[a-z][a-z0-9_]{1,39}$")
 
 # Outside this the solver either cannot reach the target or produces a lap
-# nobody would drive; 210 s is the baseline.
+# nobody would drive. The base is 280 s, and the fixed corners mean the solver
+# cannot get under about 208 s however hard it scales the straights.
 MIN_TARGET_S = 150.0
 MAX_TARGET_S = 330.0
 # Two targets closer than this put two columns on top of each other in the
@@ -85,7 +95,8 @@ def _generator():
 
     By path because tools/ is not a package and this runs from Pit_Dashboard/.
     Imported rather than copied: one solver means an added profile and the
-    original five can never be scaled by two slightly different rules.
+    committed ones can never be scaled by two slightly different rules. Only
+    that script's main() is retired — see its docstring.
     """
     path = os.path.join(_REPO_ROOT, "tools", "generate_profiles.py")
     spec = importlib.util.spec_from_file_location("generate_profiles", path)
@@ -241,19 +252,27 @@ def target_problem(target_s, other_targets):
 # --------------------------------------------------------------------------- #
 # Curves
 # --------------------------------------------------------------------------- #
-def scaled_curve(target_s, baseline_xlsx=BASELINE_XLSX):
+def scaled_curve(target_s, baseline_path=BASELINE_PATH):
     """The baseline lap scaled to `target_s`. Returns (speeds_ms, sections, info).
 
     Raises ValueError when the solver cannot land within TARGET_TOLERANCE_S or
     the baseline is not on the standard 10 m grid.
+
+    Takes a profile CSV or, still, an .xlsx — the loader is chosen by extension
+    so a baseline spreadsheet keeps working if anyone points this back at one.
     """
     gen = _generator()
-    df = gen.load_baseline(baseline_xlsx)
-    dist = [float(x) for x in df[speed_profile.COL_DIST]]
-    speed = [float(x) for x in df[speed_profile.COL_SPEED_MS]]
-    section = [str(x) for x in df[speed_profile.COL_SECTION]]
+    if baseline_path.lower().endswith((".xlsx", ".xls")):
+        df = gen.load_baseline(baseline_path)
+        dist = [float(x) for x in df[speed_profile.COL_DIST]]
+        speed = [float(x) for x in df[speed_profile.COL_SPEED_MS]]
+        section = [str(x) for x in df[speed_profile.COL_SECTION]]
+    else:
+        base = speed_profile.load_csv(baseline_path, lap_length_m=pb.LAP_M)
+        dist, speed, section = (list(base.distances_m), list(base.speeds_ms),
+                                list(base.sections))
     if dist != pb.GRID_M.tolist():
-        raise ValueError(f"{os.path.basename(baseline_xlsx)} is not on the "
+        raise ValueError(f"{os.path.basename(baseline_path)} is not on the "
                          f"standard 10 m grid ({len(dist)} points)")
 
     corners = gen.find_corners(dist, speed, section)
@@ -281,14 +300,14 @@ def _backup(key, profile_dir, backup_dir, tag=""):
 
 
 def write_scaled(key, target_s, profile_dir=PROFILE_DIR, backup_dir=BACKUP_DIR,
-                 baseline_xlsx=BASELINE_XLSX):
+                 baseline_path=BASELINE_PATH):
     """Generate and install profiles/<key>.csv at `target_s`.
 
     Staged and read back through the car's own loader before it replaces
     anything, like the builder's write. Returns info incl. `backup` (the old
     file's copy, or None for a new key).
     """
-    speeds, sections, info = scaled_curve(target_s, baseline_xlsx)
+    speeds, sections, info = scaled_curve(target_s, baseline_path)
     os.makedirs(profile_dir, exist_ok=True)
     final = os.path.join(profile_dir, f"{key}.csv")
     staged = final + ".staged"
@@ -334,14 +353,14 @@ def _self_check():
     print("keys")
     want(suggest_key("Eco Push", 205.4) == "eco_push_205s", "suggest_key slug")
     want(suggest_key("2 fast", 190) == "p_2_fast_190s", "suggest_key leading digit")
-    want(key_problem("eco_205s", ["base_210s"]) is None, "valid key accepted")
-    want(key_problem("Base_210s", ["base_210s"]) is not None, "uppercase refused")
-    want(key_problem("base_210s", ["base_210s"]) is not None, "duplicate refused")
+    want(key_problem("eco_290s", ["dor_280s"]) is None, "valid key accepted")
+    want(key_problem("Dor_280s", ["dor_280s"]) is not None, "uppercase refused")
+    want(key_problem("dor_280s", ["dor_280s"]) is not None, "duplicate refused")
     want(key_problem("a/b", []) is not None, "path characters refused")
 
     print("targets")
-    want(target_problem(205.0, {"base_210s": 210.0}) is None, "205 s accepted")
-    want(target_problem(209.5, {"base_210s": 210.0}) is not None, "too close refused")
+    want(target_problem(290.0, {"dor_280s": 280.0}) is None, "290 s accepted")
+    want(target_problem(279.5, {"dor_280s": 280.0}) is not None, "too close refused")
     want(target_problem(100.0, {}) is not None, "out of range refused")
 
     print("constants.py matrix")
@@ -384,35 +403,40 @@ def _self_check():
     print("files")
     with tempfile.TemporaryDirectory() as tmp:
         prof, bak = os.path.join(tmp, "profiles"), os.path.join(tmp, "backup")
-        info = write_scaled("eco_205s", 205.0, prof, bak)
-        p = speed_profile.load_csv(os.path.join(prof, "eco_205s.csv"),
+        info = write_scaled("eco_290s", 290.0, prof, bak)
+        p = speed_profile.load_csv(os.path.join(prof, "eco_290s.csv"),
                                    lap_length_m=pb.LAP_M)
         want(len(p) == len(pb.GRID_M), f"new profile has {len(p)} points")
-        want(abs(p.lap_time_s() - 205.0) <= TARGET_TOLERANCE_S,
+        want(abs(p.lap_time_s() - 290.0) <= TARGET_TOLERANCE_S,
              f"new profile laps in {p.lap_time_s():.2f} s")
         want(info["backup"] is None, "a new key makes no backup")
 
-        # The same curve the original five came from: regenerating base_210s
-        # at 210 s must reproduce the committed file.
-        write_scaled("base_210s", 210.0, prof, bak)
-        committed = speed_profile.load_csv(
-            os.path.join(PROFILE_DIR, "base_210s.csv"), lap_length_m=pb.LAP_M)
-        regen = speed_profile.load_csv(os.path.join(prof, "base_210s.csv"),
-                                       lap_length_m=pb.LAP_M)
+        # Scaling the base to its OWN lap time must give the base back: the
+        # solver's k lands on 1.0 and nothing moves. That is the round trip
+        # which proves BASELINE_PATH and the grid still agree — and it is worth
+        # more than the old version of this check, which regenerated base_210s
+        # from 210s.xlsx and could only ever confirm the model matched itself.
+        committed = speed_profile.load_csv(BASELINE_PATH, lap_length_m=pb.LAP_M)
+        base_s = committed.lap_time_s()
+        write_scaled(DEFAULT_STRATEGY_KEY, base_s, prof, bak)
+        regen = speed_profile.load_csv(
+            os.path.join(prof, f"{DEFAULT_STRATEGY_KEY}.csv"),
+            lap_length_m=pb.LAP_M)
         diff = max(abs(a - b) for a, b in zip(committed.speeds_ms, regen.speeds_ms))
-        print(f"        (max difference to the committed base_210s.csv: "
-              f"{diff:.2e} m/s — nonzero if it was rebuilt from a real lap)")
+        want(diff < 0.05, f"rescaling {DEFAULT_STRATEGY_KEY} to its own "
+                          f"{base_s:.1f} s returns it unchanged "
+                          f"(max {diff:.2e} m/s)")
 
-        info = write_scaled("eco_205s", 220.0, prof, bak)
+        info = write_scaled("eco_290s", 275.0, prof, bak)
         want(info["backup"] is not None and os.path.exists(info["backup"]),
              "changing the target backs up the old curve")
-        p = speed_profile.load_csv(os.path.join(prof, "eco_205s.csv"),
+        p = speed_profile.load_csv(os.path.join(prof, "eco_290s.csv"),
                                    lap_length_m=pb.LAP_M)
-        want(abs(p.lap_time_s() - 220.0) <= TARGET_TOLERANCE_S,
+        want(abs(p.lap_time_s() - 275.0) <= TARGET_TOLERANCE_S,
              f"retargeted profile laps in {p.lap_time_s():.2f} s")
 
-        backup = remove_profile("eco_205s", prof, bak)
-        want(not os.path.exists(os.path.join(prof, "eco_205s.csv")), "removed")
+        backup = remove_profile("eco_290s", prof, bak)
+        want(not os.path.exists(os.path.join(prof, "eco_290s.csv")), "removed")
         want(backup is not None and os.path.exists(backup), "removal backed up")
         try:
             remove_profile(DEFAULT_STRATEGY_KEY, prof, bak)

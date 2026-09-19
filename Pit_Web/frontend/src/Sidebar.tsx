@@ -10,6 +10,12 @@ import { StartTimePanel } from './StartTime';
 import { toast } from './toast';
 import type { Config, Live } from './types';
 
+// How the lap-command ack is polled: fast while a press is in flight, slow the
+// rest of the time. See the poll in CutLap for why.
+const ACK_FAST_MS = 1000;
+const ACK_SLOW_MS = 5000;
+const ACK_WATCH_MS = 20000;
+
 function KV({ k, v, mono, wide }: { k: string; v: string; mono?: boolean; wide?: boolean }) {
   return (
     <div className={wide ? 'wide' : ''}>
@@ -136,9 +142,22 @@ function CutLap({ carLap, lapHeld }: { carLap: number | null; lapHeld: boolean }
   // The id of the command each button last sent, so an ack can be matched to
   // the press it belongs to.
   const [sentIds, setSentIds] = useState<Record<string, number>>({});
+  // WHEN THE ACK IS WORTH READING OFTEN. The car answers a press in a second or
+  // two; at a flat 5 s poll the caption could sit on "awaiting the car's
+  // confirmation" for most of another five after the answer was already there,
+  // which reads in the pit as the CAR being slow. So the poll runs at 1 s for
+  // the few seconds a press is actually in flight and drops back to 5 s after.
+  //
+  // The window is short and bounded by the press, not by the answer: an
+  // unanswered command is unanswered because the car is not listening, and
+  // polling it hard for minutes would not change that — it would just spend
+  // every open device's network on it.
+  const [pressedAt, setPressedAt] = useState(0);
+  const watching = pressedAt > 0 && Date.now() - pressedAt < ACK_WATCH_MS;
   const { data: ack } = usePoll(
     () => getJSON<{ ack: { applied?: boolean; lap?: number; action?: string; id?: number } | null }>('/api/cut_lap/ack'),
-    5000, [sent ?? '', freshSent ?? '', setSentAt ?? '', watchSent ?? '', holdSent ?? '']);
+    watching ? ACK_FAST_MS : ACK_SLOW_MS,
+    [sent ?? '', freshSent ?? '', setSentAt ?? '', watchSent ?? '', holdSent ?? '']);
 
   // CONFIRMED MEANS THIS PRESS, NOT THIS BUTTON. The ack node is retained and
   // holds the last ack the car ever wrote, so with the car off it can be hours
@@ -153,6 +172,7 @@ function CutLap({ carLap, lapHeld }: { carLap: number | null; lapHeld: boolean }
   const freshLap = async () => {
     try {
       const r = await postJSON<{ sentAt: string; id: number }>('/api/lap/restart', {});
+      setPressedAt(Date.now());
       setSentIds((m) => ({ ...m, restart_lap: r.id }));
       setFreshSent(r.sentAt);
       toast('Restart lap sent — nothing will be counted');
@@ -166,6 +186,7 @@ function CutLap({ carLap, lapHeld }: { carLap: number | null; lapHeld: boolean }
     }
     try {
       const r = await postJSON<{ sentAt: string; id: number }>('/api/lap/set', { lap });
+      setPressedAt(Date.now());
       setSentIds((m) => ({ ...m, set_lap: r.id }));
       setSetSentAt(r.sentAt);
       toast(`Lap number ${lap} sent — the tile moves when the car reports it`);
@@ -190,6 +211,7 @@ function CutLap({ carLap, lapHeld }: { carLap: number | null; lapHeld: boolean }
     try {
       const r = await postJSON<{ sentAt: string | null; id: number | null; carError?: string }>(
         '/api/lap/hold', { hold: !lapHeld });
+      setPressedAt(Date.now());
       if (r.id != null) setSentIds((m) => ({ ...m, [action]: r.id as number }));
       setHoldAction(action);
       setHoldSent(r.sentAt);
@@ -202,6 +224,7 @@ function CutLap({ carLap, lapHeld }: { carLap: number | null; lapHeld: boolean }
   const clearStopwatch = async () => {
     try {
       const r = await postJSON<{ sentAt: string; id: number }>('/api/lap/stopwatch', { action: 'clear' });
+      setPressedAt(Date.now());
       setSentIds((m) => ({ ...m, clear_stopwatch: r.id }));
       setWatchSent(r.sentAt);
       toast("Clear stopwatch sent to the car");
@@ -213,6 +236,7 @@ function CutLap({ carLap, lapHeld }: { carLap: number | null; lapHeld: boolean }
       <button className="btn block" onClick={async () => {
         try {
           const r = await postJSON<{ sentAt: string; id: number }>('/api/cut_lap', {});
+          setPressedAt(Date.now());
           setSentIds((m) => ({ ...m, cut_lap: r.id }));
           setSent(r.sentAt);
           toast('Cut Lap sent to the car');

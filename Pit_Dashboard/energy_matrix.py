@@ -177,7 +177,7 @@ else:
                    label_visibility="collapsed")
 
     keys = list(profiles)
-    default_key = "base_210s" if "base_210s" in profiles else keys[0]
+    default_key = "dor_280s" if "dor_280s" in profiles else keys[0]
     dist_m = laps = None
     if how.startswith("I know the distance"):
         # Defaults to the distance base pace would have covered, so the

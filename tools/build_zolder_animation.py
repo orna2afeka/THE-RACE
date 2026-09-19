@@ -22,7 +22,7 @@ reads:
     zolder_centreline.py     OSM provenance and attribution, label sides
     strategy_engine.py       SECTIONS_INFO (the nine sectors), TRACK_LANDMARKS
     Pit_Dashboard/constants  SECTION_NAMES (what each sector is called)
-    profiles/base_210s.csv   the 210 s baseline lap the demo car actually drives
+    profiles/dor_280s.csv    the 280 s baseline lap the demo car actually drives
 
 A dev-time tool may reach into Pit_Dashboard/ like this; tools/build_zolder_
 track.py already does, and for the same reason.
@@ -90,7 +90,7 @@ SPECTATOR_PATH = os.path.join(_SITE, "index.html")
 # beside the dashboard and is served by tools/pit_wall.py on the pit LAN only.
 WALL_PATH = os.path.join(_REPO, "Pit_Dashboard", "wall.html")
 PROFILES_DIR = os.path.join(_REPO, "profiles")
-PROFILE_PATH = os.path.join(_REPO, "profiles", "base_210s.csv")
+PROFILE_PATH = os.path.join(_REPO, "profiles", "dor_280s.csv")
 
 SECTOR_IDS = sorted(SECTIONS_INFO)
 
@@ -394,10 +394,15 @@ def build_data():
         "viewBox": "0 0 %.0f %.0f" % (width, height),
         "geo": geo,
         "trackLength": track.TRACK_LENGTH_METERS,
-        # Sector-document zero minus the car's zero. Only the 210 s profile is
-        # read in the document's frame; sectors, posAt() and lap distance are
-        # all counted from the start/finish line.
-        "docOffset": DOC_TO_TRACK_OFFSET_M,
+        # ZERO NOW, and DOC_TO_TRACK_OFFSET_M is no longer read here. It
+        # existed because the demo drove 210s.xlsx, which counts from the sector
+        # document's zero ~120 m before the car's finish line. The demo now
+        # drives profiles/dor_280s.csv, built from a lap the car logged, whose
+        # distances already count from the car's own zero — so shifting it would
+        # put the demo car's speed 120 m out of phase with the map.
+        # strategy_engine.DOC_TO_TRACK_OFFSET_M still converts the document's
+        # turn distances in track_m(); only the profile lookup stops using it.
+        "docOffset": 0.0,
         "line": line,
         "cum": cum,
         "sectors": sectors,
@@ -1005,12 +1010,13 @@ __MAP_JS__
 
 el("foot").innerHTML =
   DATA.attribution +
-  "<br>Demo lap driven by the team's 210 s baseline velocity profile &mdash; " +
-  "modelled lap " + DATA.profileLapSeconds.toFixed(1) + " s.";
+  "<br>Demo lap driven by the team's base velocity profile, built from a lap " +
+  "the car logged at Zolder &mdash; lap " +
+  DATA.profileLapSeconds.toFixed(1) + " s.";
 
 function speedAt(d) {
   const p = DATA.profile, L = DATA.trackLength;
-  d += DATA.docOffset;                // the profile counts from the document's zero
+  d += DATA.docOffset;                // 0: the profile counts from the car's own zero
   d = ((d % L) + L) % L;
   let lo = 0, hi = p.length - 1;
   while (lo < hi - 1) {

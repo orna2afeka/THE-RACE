@@ -40,8 +40,13 @@ export function fmtStat(value: Num): string {
 export function lapTime(seconds: Num): string {
   if (seconds === null || seconds === undefined || !Number.isFinite(seconds) || seconds < 0)
     return MISSING;
-  const m = Math.floor(seconds / 60);
-  return `${m}:${(seconds - m * 60).toFixed(3).padStart(6, '0')}`;
+  // Rounded to milliseconds ONCE, then split. Taking the minute off first and
+  // rounding the remainder can print "3:60.000" -- the same defect that showed
+  // 239.96 s as "3:60.0" on the pit wall and the public page. Far rarer at this
+  // precision, and no less wrong when it lands.
+  const ms = Math.round(seconds * 1000);
+  const r = (ms % 60000) / 1000;
+  return `${Math.floor(ms / 60000)}:${r.toFixed(3).padStart(6, '0')}`;
 }
 
 /** Seconds -> M:SS, whole seconds, no fraction. The form the charts use: an

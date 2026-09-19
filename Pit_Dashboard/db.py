@@ -301,6 +301,18 @@ STATE_COLUMNS = [
     # live adds the age of the row it came in.
     "stopwatch_s",
     "stopwatch_stopped",
+
+    # --- is a charger on the car right now -------------------------------- #
+    # 1/0, from charge_detector.py on the car: stationary AND a sustained
+    # current into the pack. Inferred, not reported -- nothing on this car has
+    # a "charger connected" signal -- so read it as the car's best evidence,
+    # not as a contact closure.
+    #
+    # NULL on every row from a car that predates this column, which is every
+    # row recorded before 2026-09-19. That is NOT "not charging": treat NULL as
+    # unknown and show nothing, or the history charts will grow a confident
+    # flat "never charged" line across the whole of practice.
+    "is_charging",
 ]
 
 # Every data column the dashboard/exporter can name, in a stable order.
@@ -332,6 +344,7 @@ _COL_TYPES = {
     "can_frames": "INTEGER",
     "stopwatch_s": "REAL",
     "stopwatch_stopped": "INTEGER",
+    "is_charging": "INTEGER",
 }
 
 _DATA_COL_DEFS = ",\n    ".join(f"{c} {_COL_TYPES[c]}" for c in EXPORT_COLUMNS)
@@ -1188,6 +1201,10 @@ def flatten_record(rtdb_key: str, record: dict, device_id: str = DEVICE_ID) -> d
         "calculated_lap": _num(motor.get("calculated_lap")),
         "stopwatch_s": _num(motor.get("stopwatch_s")),
         "stopwatch_stopped": _flag(motor.get("stopwatch_stopped")),
+        # _flag, so a car that does not send the key at all stores NULL rather
+        # than a confident 0 -- the difference between "not charging" and "this
+        # build cannot tell you". See the column's comment in STATE_COLUMNS.
+        "is_charging": _flag(motor.get("is_charging")),
         "lat": _num(gps.get("lat")),
         "lon": _num(gps.get("lon")),
         "gps_age_s": _num(gps.get("fix_age_s")),
@@ -1385,7 +1402,7 @@ FLYING = "flying"
 
 
 def fetch_laps(conn: sqlite3.Connection, device_id: str = DEVICE_ID,
-               since_ts: float = None):
+               since_ts: float = None, until_ts: float = None):
     """One dict per COMPLETED lap, oldest first, as the car measured and tagged it.
 
         lap, energy_wh, regen_wh, lap_time_s, distance_m, lap_source,
@@ -1404,15 +1421,38 @@ def fetch_laps(conn: sqlite3.Connection, device_id: str = DEVICE_ID,
 
     `finished_ts` is the first row that carried the lap, i.e. when the pit
     first heard it was over. Ordering is by that, never by lap number.
+
+    `since_ts` / `until_ts` bound the ROWS considered, which is how the Excel
+    export asks for the laps inside its window. The export sheet and the pit's
+    per-lap charts are the same list bounded differently -- they must never be
+    two counts of the same race, so there is no second lap builder anywhere.
     """
     where = "device_id = ?"
     args = [device_id]
     if since_ts is not None:
         where += " AND device_ts >= ?"
         args.append(since_ts)
+    if until_ts is not None:
+        where += " AND device_ts <= ?"
+        args.append(until_ts)
     tags = has_lap_tags(conn)
     tagged = [] if not tags else conn.execute(
-        "SELECT CAST(COALESCE(last_lap_number, calculated_lap) AS INTEGER) AS lap, "
+        # last_lap_number is set once, when the lap is cut, so it is constant
+        # across the group and MAX() of it is simply that value -- the point of
+        # the aggregate is that a BARE column here is whatever row SQLite
+        # happened to stop on.
+        #
+        # THE FALLBACK IS lap_seq, NOT calculated_lap. A FINISHED LAP IS NEVER
+        # LAP 0: _close_lap() increments the count and only then records the
+        # number, so the car's own laps run 1, 2, 3... calculated_lap is the
+        # count of laps completed SO FAR, and the pit can set it to anything --
+        # a store here had 525 rows with lap_seq 11 (an eleventh lap really was
+        # cut), no last_lap_number, and calculated_lap reset to 0, so the
+        # workbook and the charts both opened on a "lap 0" that never happened.
+        # lap_seq counts the same thing last_lap_number does, from 1, and the
+        # pit cannot move it. It is also the grouping term below, so selecting
+        # it needs no aggregate to be deterministic.
+        "SELECT CAST(COALESCE(MAX(last_lap_number), lap_seq) AS INTEGER) AS lap, "
         "       last_lap_energy AS energy_wh, last_lap_regen_energy AS regen_wh, "
         "       last_lap_time_s AS lap_time_s, last_lap_distance_m AS distance_m, "
         "       MAX(lap_source) AS lap_source, MAX(last_lap_kind) AS kind, "
@@ -1878,3 +1918,86 @@ def load_race_state(conn: sqlite3.Connection) -> dict:
         except (ValueError, TypeError):
             pass
     return {"is_racing": False, "race_start_time": None}
+
+
+# --------------------------------------------------------------------------- #
+# Who was driving — stints, and the lap each one covers
+# --------------------------------------------------------------------------- #
+# The pit logs a driver change on the wall (Pit_Web's "Driver changed" button),
+# which is the ONLY record anywhere of who was in the car. The car reports no
+# driver: nothing on the CAN bus knows one, so a lap's driver can never be
+# recovered from telemetry.db alone — it has to come from what the pit logged.
+#
+# Read here, not in Pit_Web, because BOTH readers need it: /api/laps for the
+# per-lap table and export.py for the workbook's Driver column. Two readers of
+# one record is the same rule fetch_laps() is under — the charts and the
+# spreadsheet must never be two different accounts of the same race.
+#
+# The record lives in app_state under 'driver_stint', written by Pit_Web/api.py
+# (same place the race clock lives, read by load_race_state above). It holds
+# the CURRENT stint at the top level plus `log`, the stints already finished.
+# A stint that was never named has driver None — an unnamed stint is not an
+# error and must not read as one, so it stays None and shows as "—".
+def load_driver_stints(conn: sqlite3.Connection) -> list:
+    """Every stint this race, oldest first, as the pit logged it.
+
+        [{"stint": 1, "driver": "Noa"|None,
+          "started_at": 1.7e9, "ended_at": 1.7e9|None}, ...]
+
+    `ended_at` is None on the last one — that driver is still in the car.
+    Empty when no stint has ever been logged (no race started yet, or a car
+    running without the pit wall). Never raises on a malformed record: a
+    missing driver list must not take the lap table down with it.
+    """
+    row = conn.execute(
+        "SELECT value FROM app_state WHERE key = 'driver_stint'").fetchone()
+    if not row or not row["value"]:
+        return []
+    try:
+        st = json.loads(row["value"]) or {}
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(st, dict):
+        return []
+    out = []
+    for e in (st.get("log") or []):
+        if isinstance(e, dict) and e.get("started_at") is not None:
+            out.append({"stint": e.get("stint"), "driver": e.get("driver") or None,
+                        "started_at": float(e["started_at"]),
+                        "ended_at": (None if e.get("ended_at") is None
+                                     else float(e["ended_at"]))})
+    # The stint in progress is not in the log — it is the record itself, so a
+    # rename ("Name current driver") lands on it with nothing to keep in sync.
+    if st.get("started_at") is not None:
+        out.append({"stint": st.get("stint"), "driver": st.get("driver") or None,
+                    "started_at": float(st["started_at"]), "ended_at": None})
+    out.sort(key=lambda s: s["started_at"])
+    return out
+
+
+def driver_at(stints: list, ts) -> str:
+    """The driver in the car at `ts`, or None if nobody was logged then.
+
+    A lap is credited to whoever was driving when it FINISHED, which is what
+    `fetch_laps` gives as finished_ts. A driver change is logged during the pit
+    stop, after the in-lap is already over: the in-lap therefore falls before
+    the change and stays with the driver who drove it, and the out-lap falls
+    after and goes to the new one. That is the intended reading.
+
+    Laps completed before any stint was logged get None, not the first driver —
+    inventing an attribution for a lap nobody was logged for would put a name
+    against a lap that name may not have driven.
+    """
+    if ts is None:
+        return None
+    for s in stints:
+        if s["started_at"] <= ts and (s["ended_at"] is None or ts < s["ended_at"]):
+            return s["driver"]
+    return None
+
+
+def attach_lap_drivers(laps: list, stints: list) -> list:
+    """Add a `driver` key to each lap from `fetch_laps`. Mutates and returns."""
+    for lap in laps:
+        lap["driver"] = driver_at(stints, lap.get("finished_ts"))
+    return laps

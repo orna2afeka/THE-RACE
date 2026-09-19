@@ -95,16 +95,23 @@ TARGET_LAP_TIME_MIN = 3.5
 # THE BLOCK BETWEEN THE MARKERS IS REWRITTEN by the Save button in the Speed
 # Profile Builder (profile_manage.write_saved_matrix). Editing it by hand is
 # fine — keep it a plain literal, and keep the two marker lines.
+#
+# THESE THREE COME FROM A LAP THE CAR DROVE, not from a desk model. They replace
+# the five fast_189s..slow_231s rows, which were scaled from Pit_Dashboard/
+# 210s.xlsx and commanded 92 km/h down the main straight — a target this car has
+# never reached, so the HUD's target line and its Δ were noise all lap.
+# tools/build_dor_profiles.py rebuilds them from SolarRace_OS/dor 17.xlsx
+# (Zolder, 2026-09-18); run it with --verify after replacing that lap.
+# energy_wh is energy_model fitted to that lap's own 116.3 Wh, and target_s is
+# what each curve integrates to. Old CSVs are in profiles/_backup/.
 # >>> PROFILE MATRIX >>>
 PROFILE_MATRIX = {
-    "fast_189s": {"label": "Fast", "energy_wh": 138.6, "target_s": 252.9},
-    "med_fast_199s": {"label": "Med-Fast", "energy_wh": 133.5, "target_s": 267.0},
-    "base_210s": {"label": "Base", "energy_wh": 129.2, "target_s": 280.9},
-    "med_slow_220s": {"label": "Med-Slow", "energy_wh": 125.5, "target_s": 294.9},
-    "slow_231s": {"label": "Slow", "energy_wh": 122.2, "target_s": 309.1},
+    "dor_265s": {"label": "Fast", "energy_wh": 120.5, "target_s": 265.0},
+    "dor_280s": {"label": "Base", "energy_wh": 115.9, "target_s": 280.0},
+    "dor_300s": {"label": "Slow", "energy_wh": 110.8, "target_s": 300.0},
 }
 # <<< PROFILE MATRIX <<<
-DEFAULT_STRATEGY_KEY = "base_210s"
+DEFAULT_STRATEGY_KEY = "dor_280s"
 
 # Returned whenever the profiles cannot be read, so this module can never fail
 # to import — collector.py and export.py import it too, and neither has any

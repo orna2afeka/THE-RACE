@@ -628,7 +628,7 @@ export function Strategy({ config, manualLap, dark, selected }:
       </div>
 
       <SectionTitle icon="table" title="Strategy matrix"
-                    right={data ? `${data.timeLeftMin.toFixed(0)} min remaining · max ${data.maxStops} charges (regulation) · each at least ${data.minStopMin.toFixed(0)} min` : undefined} />
+                    right={data ? `${data.timeLeftMin.toFixed(0)} min remaining · max ${data.maxStops} charges (regulation) · each ${data.minStopMin.toFixed(0)}–${data.maxStopMin.toFixed(0)} min` : undefined} />
       <div className="btnrow" style={{ marginBottom: 8 }}>
         <button className="btn" onClick={() => setEditing((v) => !v)}>
           <Icon name="sliders" size={13} />{editing ? 'Close editor' : 'Edit matrix'}
@@ -653,7 +653,28 @@ export function Strategy({ config, manualLap, dark, selected }:
             {(data?.rows ?? []).map((r, i) => (
               <tr key={i}>
                 {cols.map((c) => (
-                  <td key={c} className={isNum(r[c]) ? 'num' : ''}>
+                  <td key={c} className={isNum(r[c]) ? 'num' : ''}
+                      /* Stop by stop, from the same trace the chart draws: what
+                         the charge does, and what the box actually costs once
+                         the floor is paid. The column stays short; the detail
+                         is here. */
+                      title={c === 'Charge Time' && data?.traces[i]?.stops.length
+                        ? data.traces[i]!.stops.map((s) =>
+                            `stop ${s.number} (after lap ${s.afterLap}): `
+                            + `${s.socBefore.toFixed(0)}% → ${s.socAfter.toFixed(0)}% `
+                            + `in ${s.chargeMin.toFixed(0)} min, ${s.stopMin.toFixed(0)} min in the box`)
+                            .join('\n')
+                        /* The sum, spelled out. Pit Time is stationary time,
+                           so it is larger than the charging in Charge Time
+                           beside it, and the difference is the changes. */
+                        : c === 'Pit Time' && data?.traces[i]
+                        ? `${data.traces[i]!.pitMin.toFixed(0)} min stationary = `
+                          + `${data.traces[i]!.chargeStopMin.toFixed(0)} min at ${data.traces[i]!.stops.length} charge `
+                          + `stop${data.traces[i]!.stops.length === 1 ? '' : 's'} + `
+                          + `${data.traces[i]!.swapMin.toFixed(0)} min of ${data.traces[i]!.swaps} mid-stint driver `
+                          + `change${data.traces[i]!.swaps === 1 ? '' : 's'}. `
+                          + `A change made at a charge stop is free — the car is stopped anyway.`
+                        : undefined}>
                     {String(r[c])}
                     {c === 'Energy/Lap (Wh)' && data?.measured[String(r.Label)] != null
                       ? <span className={Math.abs(data.measured[String(r.Label)].wh - data.measured[String(r.Label)].storedWh)
@@ -692,7 +713,7 @@ export function Strategy({ config, manualLap, dark, selected }:
       {data && (
         <div className="caption">
           {data.chargingCurveIsMeasured
-            ? <><span className="ok-text">Charge times from the measured pack curve.</span> Each stop costs at least {data.minStopMin.toFixed(0)} min.</>
+            ? <><span className="ok-text">Charge times from the measured pack curve.</span> <b>Charge Time</b> is one entry per stop, in the order of <b>Charge To</b>; a stop costs at least {data.minStopMin.toFixed(0)} min however quick the charge, and the charge stops at {data.maxStopMin.toFixed(0)} min wherever the SoC has got to. <b>Pit Time</b> is every stationary minute — the charge stops plus the mid-stint driver changes in <b>Driver Swaps</b>; a change made at a stop is free. Hover it for the sum.</>
             : <><span className="warn-text">Charge times are MODELLED, not measured.</span> The SoC curve came from the charging branch marked <i>example data</i> and has never been checked against this charger or pack — its shape is right, its numbers are not ours. Lap counts are sound; treat <b>Pit Time</b> as an estimate until someone times a real charge.</>}
         </div>
       )}

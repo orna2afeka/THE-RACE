@@ -43,7 +43,8 @@ SCENARIOS = [
     ("24 h from the floor",    24 * 60.0, 500.0),
 ]
 COLUMNS = ["Label", "Lap Time", "Speed (km/h)", "Total Laps", "Energy/Lap (Wh)",
-           "Pit Strategy", "Charge To", "Pit Time", "Driver Swaps", "Final SoC"]
+           "Pit Strategy", "Charge To", "Charge Time", "Pit Time", "Driver Swaps",
+           "Final SoC"]
 
 failures = []
 
@@ -85,6 +86,22 @@ for name, left, start_wh in SCENARIOS:
     want(len(out["rows"]) == len(out["traces"]), "rows and traces not aligned")
     want(out["floorWh"] == se.BATTERY_FLOOR_WH and out["capacityWh"] == se.BATTERY_FULL_WH,
          "served constants disagree with the engine")
+    want(out["ceilingWh"] == se.BATTERY_CEILING_WH
+         and out["maxChargeSocPct"] == se.MAX_CHARGE_SOC_PCT
+         and out["minSocPct"] == se.MIN_SOC_PCT,
+         "served charge limits disagree with the engine")
+    # The two SoC rules, stated as percentages of the pack the page is told
+    # about. A capacity entered as the 95% ceiling (which is how 8550 Wh got
+    # in) makes both of these come out wrong, and nothing else here notices.
+    want(abs(out["floorWh"] / out["capacityWh"] * 100.0 - 5.0) < 1e-9,
+         "the served floor is %.2f%% of the served capacity, not 5%%"
+         % (out["floorWh"] / out["capacityWh"] * 100.0))
+    want(abs(out["ceilingWh"] / out["capacityWh"] * 100.0 - 95.0) < 1e-9,
+         "the served ceiling is %.2f%% of the served capacity, not 95%%"
+         % (out["ceilingWh"] / out["capacityWh"] * 100.0))
+    want(out["minStopMin"] == se.MIN_STOP_DURATION_MIN
+         and out["maxStopMin"] == se.MAX_STOP_DURATION_MIN,
+         "served stop limits disagree with the engine")
 
     for row, tr in zip(out["rows"], out["traces"]):
         nm = row["Label"]
@@ -104,7 +121,8 @@ for name, left, start_wh in SCENARIOS:
              "%s: trace %d laps, table %d" % (nm, laps, row["Total Laps"]))
         want(stops == len(tr["stops"]), "%s: stop count disagrees" % nm)
         want(swaps == tr["swaps"], "%s: swap count disagrees" % nm)
-        want(row["Driver Swaps"] == ("%d Swaps" % tr["swaps"]),
+        want(row["Driver Swaps"] == (("%d Swaps (%.0f m)" % (tr["swaps"], tr["swapMin"]))
+                                     if tr["swaps"] else "0 Swaps"),
              "%s: swap column disagrees with trace" % nm)
 
         # 3-5: the race must be legal
@@ -113,6 +131,11 @@ for name, left, start_wh in SCENARIOS:
              "%s: goes below the floor" % nm)
         want(max(p["wh"] for p in pts) <= tr["capacityWh"] + 1e-6,
              "%s: goes above capacity" % nm)
+        # No CHARGE passes the ceiling. The start of the race may sit above it
+        # -- the car rolls out at 100% -- so this asks about the stops, which
+        # is where the crew's rule actually applies.
+        want(all(s["socAfter"] <= se.MAX_CHARGE_SOC_PCT + 1e-9 for s in tr["stops"]),
+             "%s: a stop charges past %.0f%%" % (nm, se.MAX_CHARGE_SOC_PCT))
         want(all(pts[i]["minute"] >= pts[i - 1]["minute"] - 1e-9
                  for i in range(1, len(pts))), "%s: time runs backwards" % nm)
 
@@ -120,20 +143,36 @@ for name, left, start_wh in SCENARIOS:
         for st in tr["stops"]:
             want(st["stopMin"] >= se.MIN_STOP_DURATION_MIN - 1e-6,
                  "%s: a stop is under the minimum" % nm)
+            want(st["stopMin"] <= se.MAX_STOP_DURATION_MIN + 1e-6,
+                 "%s: a %.1f min stop is over the %.0f min maximum"
+                 % (nm, st["stopMin"], se.MAX_STOP_DURATION_MIN))
             want(st["stopMin"] >= st["chargeMin"] - 1e-6,
                  "%s: a stop is shorter than its own charge" % nm)
-        want(abs(pit - tr["pitMin"]) < 1e-6, "%s: pit time does not add up" % nm)
-        if tr["stops"]:
+        # Pit time is STATIONARY time: the charge stops and the mid-stint
+        # driver changes. The two parts are served separately so the page can
+        # show the sum; they must still be the sum.
+        want(abs(pit - tr["chargeStopMin"]) < 1e-6,
+             "%s: the stops do not add up to the charging time" % nm)
+        want(abs(tr["swapMin"] - tr["swaps"] * se.DRIVER_CHANGE_TIME_MIN) < 1e-6,
+             "%s: swap time is not %d changes at %.0f min"
+             % (nm, tr["swaps"], se.DRIVER_CHANGE_TIME_MIN))
+        want(abs(tr["pitMin"] - (pit + tr["swapMin"])) < 1e-6,
+             "%s: pit time is not charging plus driver changes" % nm)
+        if tr["stops"] or tr["swaps"]:
             want(row["Pit Time"] == ("%.0f m" % tr["pitMin"]),
                  "%s: Pit Time column disagrees with trace" % nm)
+        if tr["stops"]:
             want(row["Charge To"] == " / ".join("%.0f%%" % s["socAfter"] for s in tr["stops"]),
                  "%s: Charge To column disagrees with trace" % nm)
+            # Charge Time is read ACROSS from Charge To -- same stops, same
+            # order. Served separately, so check it against the served trace.
+            want(row["Charge Time"] == " / ".join("%.0f m" % s["chargeMin"] for s in tr["stops"]),
+                 "%s: Charge Time column disagrees with trace" % nm)
 
-        # 8: the time budget balances
-        want(abs((row["Total Laps"] * tr["lapTimeMin"]
-                  + tr["swaps"] * se.DRIVER_CHANGE_TIME_MIN + pit)
+        # 8: the time budget balances -- driving, or standing still
+        want(abs((row["Total Laps"] * tr["lapTimeMin"] + tr["pitMin"])
                  - tr["timeUsedMin"]) < 1e-6,
-             "%s: drive + swaps + pit != time used" % nm)
+             "%s: driving + pit != time used" % nm)
 
         # 9: no driver over the stint limit
         run = worst = 0.0
@@ -152,8 +191,9 @@ for name, left, start_wh in SCENARIOS:
         want(set(kinds) <= {"start", "lap", "swap", "stop", "charge", "hold"},
              "%s: unknown point kind %s" % (nm, set(kinds)))
 
-        print("    %-16s %3d laps | %-26s | pit %5.1f | %d swaps | %d points"
-              % (nm, row["Total Laps"], row["Pit Strategy"], pit, tr["swaps"], len(pts)))
+        print("    %-16s %3d laps | %-26s | pit %5.1f (charge %5.1f + %d swaps) | %d points"
+              % (nm, row["Total Laps"], row["Pit Strategy"], tr["pitMin"], pit,
+                 tr["swaps"], len(pts)))
 
 # --------------------------------------------------------------------------- #
 # The matrix editor's arithmetic, which is now a thing the crew presses mid-race

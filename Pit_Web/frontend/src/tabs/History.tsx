@@ -359,9 +359,9 @@ export default function History({ config, dark, visible, fresh, age }: Props) {
 // --------------------------------------------------------------------------- //
 interface LapsResp {
   /** kind is the CAR's verdict; null from a car that predates it. */
-  laps: { lap: number; energyWh: Num; lapTimeS: Num; distanceM: Num;
-          kind: string | null; flags: string[]; source: string | null;
-          stoppedS: Num }[];
+  laps: { lap: number; driver: string | null; energyWh: Num; lapTimeS: Num;
+          distanceM: Num; kind: string | null; flags: string[];
+          source: string | null; stoppedS: Num }[];
   summary: { count: number; flyingCount: number; bestS: Num; avgS: Num; avgWh: Num };
 }
 
@@ -398,31 +398,55 @@ function LapCharts({ dark, visible }: { dark: boolean; visible: boolean }) {
   const summary = data?.summary;
   const someNotFlying = summary != null && summary.flyingCount !== summary.count;
   const last = laps.length ? laps[laps.length - 1] : null;
-  const sig = data ? `${laps.length}:${last?.lap}:${last?.energyWh}:${last?.lapTimeS}:${last?.kind}` : '';
+  const sig = data ? `${laps.length}:${last?.lap}:${last?.energyWh}:${last?.lapTimeS}:${last?.kind}`
+    // A rename lands on every lap of the stint at once, so the drivers
+    // are part of the signature — otherwise the hover keeps the old name
+    // until the next lap happens to redraw the chart.
+    + ':' + laps.map((l) => l.driver ?? '').join('|') : '';
 
   useEffect(() => {
     if (!laps.length || !eRef.current || !tRef.current) return;
-    // Lap NUMBERS repeat (a counter reset, a pit correction), and a repeated x
-    // stacks two laps on one bar. Use them only while they strictly increase.
-    const increasing = laps.every((l, i) => i === 0 || l.lap > laps[i - 1].lap);
-    const lapX = laps.map((l, i) => (increasing ? l.lap : i + 1));
+    // ONE BAR PER LAP, LABELLED WITH THE CAR'S OWN LAP NUMBER.
+    //
+    // x is the lap's POSITION in finish order, never its number: lap numbers
+    // repeat and can go backwards (the pit corrects the count with set_lap, or
+    // a checkpoint is wiped), and a repeated x stacks two laps on one bar.
+    // The numbers come back as tick TEXT, so the axis still reads 11, 12, 13.
+    //
+    // This used to fall back to 1..N whenever the numbers were not strictly
+    // increasing -- which silently renumbered the whole race the moment one
+    // correction landed, while the exported workbook's Lap column kept the
+    // car's numbers. The axis and the spreadsheet then disagreed about which
+    // lap was which, with nothing on screen to say so. Positions with real
+    // labels never drift from the workbook, whatever the numbers do.
+    const base = layoutBase(dark, 230);
+    const t = theme(dark);
+    const lapX = laps.map((_, i) => i);
     const note = laps.map((l) =>
-      `lap ${l.lap}${l.kind ? ' · ' + (KIND_NAME[l.kind] ?? l.kind) : ''}` +
+      `lap ${l.lap}${l.driver ? ' · ' + l.driver : ''}` +
+      `${l.kind ? ' · ' + (KIND_NAME[l.kind] ?? l.kind) : ''}` +
       `${l.stoppedS !== null && l.stoppedS >= 10 ? ` · stood ${Math.round(l.stoppedS)} s` : ''}` +
       `${l.flags?.length ? ' · ' + l.flags.join(', ') : ''}`);
     // One label per lap (dtick: 1) made Plotly measure hundreds of labels: 358
-    // laps took 4.5-5.4 s to draw, against 54 ms with a coarser step. About a
-    // dozen integer labels, whatever the lap count.
-    const dtick = Math.max(1, Math.ceil(lapX.length / 12));
-    const base = layoutBase(dark, 230);
-    const t = theme(dark);
+    // laps took 4.5-5.4 s to draw, against 54 ms with a coarser step. Handing
+    // it ~12 explicit ticks keeps that win: tickmode 'array' is what lets the
+    // label say the lap number while the position stays the coordinate.
+    const step = Math.max(1, Math.ceil(lapX.length / 12));
+    const lapTicks: number[] = [];
+    for (let i = 0; i < laps.length; i += step) lapTicks.push(i);
+    const lapAxis = {
+      title: { text: 'lap', font: { size: 11, color: t.ink3 } },
+      tickmode: 'array' as const,
+      tickvals: lapTicks,
+      ticktext: lapTicks.map((i) => String(laps[i].lap)),
+    };
     void Plotly.newPlot(eRef.current, [{
       type: 'bar', x: lapX, y: laps.map((l) => l.energyWh),
       marker: { color: laps.map((l) => (counts(l.kind) ? '#00B3FF' : MUTED)),
                 line: { width: 0 } }, width: 0.55,
       customdata: note, hovertemplate: '%{y:.1f} Wh<extra>%{customdata}</extra>',
     }], { ...base, margin: { l: 50, r: 12, t: 8, b: 36 }, bargap: 0.4,
-          xaxis: { ...base.xaxis, title: { text: 'lap', font: { size: 11, color: t.ink3 } }, dtick },
+          xaxis: { ...base.xaxis, ...lapAxis },
           showlegend: false }, plotConfig);
     // Lap time is plotted in SECONDS and labelled m:ss, never decimal minutes.
     // "4.45 min" is not a figure anyone on a pit wall thinks in; 4:27 is the
@@ -452,7 +476,7 @@ function LapCharts({ dark, visible }: { dark: boolean; visible: boolean }) {
       customdata: laps.map((l, i) => [note[i], lapTimeShort(l.lapTimeS)]),
       hovertemplate: '%{customdata[1]}<extra>%{customdata[0]}</extra>',
     }], { ...base, margin: { l: 50, r: 12, t: 8, b: 36 },
-          xaxis: { ...base.xaxis, title: { text: 'lap', font: { size: 11, color: t.ink3 } }, dtick },
+          xaxis: { ...base.xaxis, ...lapAxis },
           yaxis: { ...base.yaxis, tickmode: 'array', tickvals,
                    ticktext: tickvals.map((v) => lapTimeShort(v)) },
           showlegend: false }, plotConfig);
@@ -483,8 +507,63 @@ function LapCharts({ dark, visible }: { dark: boolean; visible: boolean }) {
                 marked suspect are drawn grey — hover one to see why.
               </div>
             )}
+            <LapTable laps={laps} />
           </>
         )}
+    </Disclosure>
+  );
+}
+
+/** Every lap with the name of whoever drove it, newest first.
+ *
+ *  THE DRIVER COMES FROM THE PIT, NOT THE CAR. Nothing on the CAN bus knows who
+ *  is in the seat, so a lap's driver is whichever stint the pit had logged when
+ *  that lap finished. A lap driven before anyone pressed "Driver changed", or
+ *  by a crew that never typed a name, therefore shows — and that is the honest
+ *  answer: it is a lap nobody recorded a name for, not a lap with no driver.
+ *
+ *  Newest first, because during a race the laps being read are the last few.
+ *  The workbook's Laps sheet runs the other way (oldest first, as the race was
+ *  driven); the columns are deliberately the same ones in the same order, so a
+ *  row here and a row there are read as the same record.
+ */
+function LapTable({ laps }: { laps: LapsResp['laps'] }) {
+  const rows = [...laps].reverse();
+  const named = laps.some((l) => l.driver);
+  return (
+    <Disclosure icon="table" title="Laps by driver" count={laps.length}>
+      {!named && (
+        <Pill kind="info">
+          No driver logged for these laps. Names come from the driver stint on the
+          sidebar — press “Name current driver”, and every lap from then on is credited.
+        </Pill>
+      )}
+      <div className="scroll" style={{ marginTop: named ? 0 : 8 }}>
+        <table className="tbl">
+          <thead>
+            <tr>
+              <th className="num">Lap</th><th>Driver</th>
+              <th className="num">Lap time</th><th className="num">Energy (Wh)</th>
+              <th className="num">Distance (m)</th><th>Kind</th>
+              <th className="num">Stood (s)</th><th>Flags</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((l, i) => (
+              <tr key={`${l.lap}-${i}`} className={counts(l.kind) ? undefined : 'not-flying'}>
+                <td className="num mono">{l.lap}</td>
+                <td>{l.driver ?? MISSING}</td>
+                <td className="num mono">{lapTime(l.lapTimeS)}</td>
+                <td className="num">{fmtStat(l.energyWh)}</td>
+                <td className="num">{fmtStat(l.distanceM)}</td>
+                <td>{l.kind ? (KIND_NAME[l.kind] ?? l.kind) : MISSING}</td>
+                <td className="num">{l.stoppedS === null ? MISSING : Math.round(l.stoppedS)}</td>
+                <td>{l.flags?.length ? l.flags.join(', ') : ''}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </Disclosure>
   );
 }

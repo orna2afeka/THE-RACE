@@ -71,6 +71,29 @@ def _token() -> str:
     return _creds.token
 
 
+def warm_token() -> None:
+    """Refresh the token BEFORE a press needs it. Called on a timer by Pit_Web.
+
+    _token() refreshes in place when it finds an expired one, which means the
+    refresh happens on the thread serving whichever button was pressed at the
+    wrong moment -- so roughly once an hour, one command waited for an OAuth
+    round trip (up to ten seconds, per _TimedAuthRequest) before it was even
+    sent. Run often enough to stay inside google-auth's own 300 s refresh
+    threshold, this makes that press find a valid token like every other one.
+
+    A no-op the rest of the time: _token() only does work when the credentials
+    are actually near expiry.
+    """
+    _token()
+
+
+# A send that takes longer than this says the PIT's uplink is the slow part,
+# not the car. Worth a line in the console: from the dashboard the two look
+# identical -- the clock just moves late -- and they have completely different
+# fixes.
+_SLOW_SEND_S = 1.0
+
+
 def send_driver_command(category: str, value) -> dict:
     """Write {category, value, ts} to /driver_command (overwrite). Returns the
     payload sent. Raises on HTTP/credential errors so the UI can show a toast."""
@@ -108,9 +131,21 @@ def send_lap_command(action: str, value=None) -> dict:
     """
     payload = {"id": int(time.time() * 1000), "action": str(action),
                "value": value, "ts": time.time(), "by": "pit"}
+    started = time.monotonic()
     resp = requests.put(_LAP_URL, params={"access_token": _token()},
                         json=payload, timeout=_TIMEOUT)
     resp.raise_for_status()
+    took = time.monotonic() - started
+    if took >= _SLOW_SEND_S:
+        # ASCII ONLY, and that is not a style preference. This runs on the pit
+        # LAPTOP, where a console left on cp1252 raises UnicodeEncodeError on
+        # anything outside it -- and it would raise HERE, after the PUT had
+        # already succeeded, so a command that genuinely reached the car would
+        # come back to the dashboard as "cut lap failed". A log line that can
+        # fail the thing it is reporting on is worse than no log line.
+        # (tools/check_outbox.py dies on exactly this, printing a box emoji.)
+        print("SLOW: lap command '%s' took %.1fs to reach Firebase - the "
+              "pit's own uplink, before the car has seen it" % (action, took))
     return payload
 
 

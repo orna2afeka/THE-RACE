@@ -149,7 +149,7 @@ def main():
                 " gps_fix, gps_detail, bms_string_count, " + ",".join(ccols) + ")"
                 " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
                 "?,?,?,?,?,?,?" + ",?" * len(ccols) + ")",
-                (time.time(), "solarcar", dist, tag, "base_210s",
+                (time.time(), "solarcar", dist, tag, "dor_280s",
                  speed_ms * 3.6, lat, lon, soc, soc - 0.6,
                  117.4 - (START_SOC - soc) * 0.21, 117.0 - (START_SOC - soc) * 0.21,
                  power / 117.0, power / 117.0 * 0.98, power,

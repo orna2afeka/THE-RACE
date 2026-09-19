@@ -32,6 +32,7 @@ _KNOWN_DERIVED = {
     "delta_to_target", "relative_regen_total",
     "relative_regen_stint", "relative_regen_lap", "active_lap",
     "lap_source", "controller_odometer_km", "throttle_zone_label",
+    "charging_label",
 }
 
 LIVE_METRIC_GROUPS = [
@@ -81,6 +82,8 @@ LIVE_METRIC_GROUPS = [
              note="recovered while power was negative, whole race"),
         dict(label="Total Relative Regen", unit="%", spec=".1f", derived="relative_regen_total",
              note="share of drive energy recovered, whole race"),
+        dict(label="Charging", unit="", spec=".0f", derived="charging_label", text=True,
+             note="car stopped with current into the pack for 5 s - inferred, nothing reports it directly"),
         dict(label="Current Stint Energy", unit="Wh", spec=".1f", field="state.stint_energy",
              note="since the last charging stop the car detected - race total until the first"),
         dict(label="Current Stint Regen Energy", unit="Wh", spec=".1f", field="state.stint_regen_energy",
@@ -186,6 +189,12 @@ def resolve(entry, state, ctx):
             import efficiency
             z = state.get("throttle_zone")
             return None if z is None else efficiency.ZONE_LABELS.get(z, z)
+        if d == "charging_label":
+            # None (tile shows a dash) for a car that never sent the field, so
+            # practice rows recorded before 2026-09-19 do not claim the car was
+            # sitting there not charging. Only a real 1/0 becomes words.
+            c = state.get("is_charging")
+            return None if c is None else ("CHARGING" if c else "no")
         if d == "controller_odometer_km":
             m = state.get("trip_m")
             return None if m is None else m / 1000.0

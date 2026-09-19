@@ -7,10 +7,12 @@ Streamlit in it so every step can be exercised headlessly:
     python Pit_Dashboard/profile_build.py        # self-check on synthetic laps
 
 WHAT THIS IS FOR
-The five profiles/*.csv the car follows are synthetic: tools/generate_profiles.py
-scales one modelled lap (Pit_Dashboard/210s.xlsx) to five target times. Nobody
-has ever driven them. This turns a lap the car really drove into the same file
-format, so the target the driver chases is a lap that actually happened.
+profiles/*.csv used to be synthetic: tools/generate_profiles.py scaled one
+modelled lap (Pit_Dashboard/210s.xlsx) to five target times and nobody had ever
+driven them. Those five were retired on 2026-09-19 for three built from a real
+lap by tools/build_dor_profiles.py. This module is how ANOTHER real lap becomes
+one — it turns a lap the car drove into the same file format, so the target the
+driver chases is a lap that actually happened.
 
 THE ONE THING THAT WILL BITE WHOEVER READS THIS NEXT
 `calculated_lap` is the number of laps COMPLETED, so the samples tagged with it
@@ -46,9 +48,9 @@ import speed_profile  # noqa: E402  (path set up immediately above)
 import track          # noqa: E402
 
 # ── The grid ──────────────────────────────────────────────────────────────── #
-# 0..4010 every 10 m: 402 points, byte-for-byte the same axis the existing five
-# files use. The last two rows overshoot the 4000 m lap on purpose — they are the
-# lap wrapping round, and base_210s.csv's own values confirm it (d=4000 repeats
+# 0..4010 every 10 m: 402 points, byte-for-byte the same axis every committed
+# profile uses. The last two rows overshoot the 4000 m lap on purpose — they are the
+# lap wrapping round, and the committed profiles confirm it (d=4000 repeats
 # d=0's speed to three decimals). Matching the axis exactly is what lets a
 # generated profile inherit the baseline's section labels index-for-index
 # instead of trying to classify corners from a noisy measurement.
@@ -1220,7 +1222,9 @@ def _synthetic_trace(power_w=1000.0, seconds=200.0, dt=0.5, lap_m=4000.0,
 
 
 def _self_check():
-    base_path = os.path.join(_REPO_ROOT, "profiles", "base_210s.csv")
+    from constants import DEFAULT_STRATEGY_KEY
+    base_path = os.path.join(_REPO_ROOT, "profiles",
+                             f"{DEFAULT_STRATEGY_KEY}.csv")
     baseline = speed_profile.load_csv(base_path, lap_length_m=LAP_M)
     print(f"baseline: {len(baseline)} points, "
           f"integrated lap {baseline.lap_time_s():.1f}s")

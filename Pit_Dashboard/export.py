@@ -457,50 +457,20 @@ def _style_header(ws, ncols, nrows):
 _LAP_COLUMNS = set(METRIC_GROUPS["Laps / Energy"])
 
 
-def _laps_from_rows(rows):
-    """One dict per lap completed inside the exported window, in finish order.
-
-    The car holds each lap's figures (last_lap_*) constant for the whole of the
-    following lap, so every row of lap N+1 carries the same (time, energy,
-    distance) for lap N. A lap is therefore one DISTINCT set of those figures,
-    listed at the first row that carries it.
-
-    Keyed on the figures rather than on "the lap number changed": stores that
-    hold more than one stream (a replay beside the car, two collectors) have
-    rows from different laps interleaved second by second, and watching for a
-    change emitted the same lap on nearly every row. Keying on the figures also
-    keeps two laps apart when the car's lap counter restarts, which GROUP BY
-    lap would merge.
-    """
-    laps = []
-    seen = set()
-    for r in rows:
-        lap = r["calculated_lap"]
-        t, e = r["last_lap_time_s"], r["last_lap_energy"]
-        if lap is None or (t is None and e is None):
-            continue
-        key = (lap, t, e, r["last_lap_distance_m"])
-        if key in seen:
-            continue
-        seen.add(key)
-        # The car's own tags, absent on rows from a car (or a store) that
-        # predates them. last_lap_number is the lap these figures belong to;
-        # calculated_lap is only right until someone corrects the lap number.
-        have = r.keys()
-        number = r["last_lap_number"] if "last_lap_number" in have else None
-        laps.append({
-            "lap": int(number if number is not None else lap),
-            "ts": r["device_ts"],
-            "time_s": t,
-            "energy_wh": e,
-            "regen_wh": r["last_lap_regen_energy"],
-            "distance_m": r["last_lap_distance_m"],
-            "kind": r["last_lap_kind"] if "last_lap_kind" in have else None,
-            "flags": r["last_lap_flags"] if "last_lap_flags" in have else None,
-            "stopped_s": r["last_lap_stopped_s"] if "last_lap_stopped_s" in have else None,
-            "source": r["lap_source"] if "lap_source" in have else None,
-        })
-    return laps
+# NO LAP BUILDER LIVES HERE ANY MORE.
+#
+# There used to be a `_laps_from_rows` that rebuilt the lap list out of the
+# exported rows, keyed on (calculated_lap, time, energy, distance). It agreed
+# with the pit's per-lap charts right up until the pit corrected the lap count:
+# set_lap moves the car's lap_count and deliberately leaves lap_seq alone, so
+# the rows carrying one finished lap's figures split across two values of
+# calculated_lap and the workbook listed that lap TWICE -- 26 rows against the
+# chart's 25 bars, with the duplicate quietly dragged through the Average row.
+#
+# db.fetch_laps() groups on lap_seq, which the pit cannot set, and it is what
+# /api/laps serves to the History charts. The workbook now asks the same
+# function for the same laps, bounded to the export window. Two builders is
+# how the two views came to disagree; one builder is the fix.
 
 
 def _mean(values):
@@ -514,10 +484,15 @@ def _write_laps_sheet(ls, laps, race_start):
     from openpyxl.styles import Font
     from openpyxl.utils import get_column_letter
 
-    headers = ["Lap", "Finished (local)", "Race Time", "Lap Time",
+    # Driver is the SECOND column, beside the lap number: "who drove lap 12" is
+    # the question this sheet gets asked after the race, and an answer eight
+    # columns to the right of the lap is one nobody reads. Empty when no stint
+    # covered that lap — an unlogged lap is not driven by nobody, it is a lap
+    # the pit never recorded a name for, and a blank cell says so.
+    headers = ["Lap", "Driver", "Finished (local)", "Race Time", "Lap Time",
                "Energy (Wh)", "Regen (Wh)", "Distance (m)", "Avg Speed (km/h)",
                "Kind", "Stood still (s)", "Cut by", "Flags"]
-    formats = [None, "yyyy-mm-dd hh:mm:ss", "[h]:mm:ss", "[m]:ss.000",
+    formats = [None, None, "yyyy-mm-dd hh:mm:ss", "[h]:mm:ss", "[m]:ss.000",
                "0.0", "0.0", "0", "0.0", None, "0", None, None]
     ls.append(headers)
 
@@ -525,13 +500,15 @@ def _write_laps_sheet(ls, laps, race_start):
         return None if sec is None else sec / 86400.0
 
     for lap in laps:
-        t, d = lap["time_s"], lap["distance_m"]
+        t, d = lap["lap_time_s"], lap["distance_m"]
         avg = (d / 1000.0) / (t / 3600.0) if t and d is not None else None
-        ls.append([lap["lap"], _excel_dt(lap["ts"]),
-                   _race_duration(lap["ts"], race_start), as_duration(t),
+        ts = lap["finished_ts"]
+        ls.append([lap["lap"], lap.get("driver"), _excel_dt(ts),
+                   _race_duration(ts, race_start), as_duration(t),
                    lap["energy_wh"], lap["regen_wh"], d, avg,
-                   lap.get("kind"), lap.get("stopped_s"), lap.get("source"),
-                   lap.get("flags")])
+                   lap.get("kind"), lap.get("stopped_s"), lap.get("lap_source"),
+                   # fetch_laps hands back a list; the cell wants one string.
+                   ", ".join(lap.get("flags") or []) or None])
     if not laps:
         ls.append(["No lap completed in this window."] + [None] * (len(headers) - 1))
     else:
@@ -542,13 +519,13 @@ def _write_laps_sheet(ls, laps, race_start):
         tagged = any(l.get("kind") for l in laps)
         pool = [l for l in laps if l.get("kind") == "flying"] if tagged else laps
         label = " (flying laps)" if tagged else ""
-        times = [l["time_s"] for l in pool if l["time_s"]]
+        times = [l["lap_time_s"] for l in pool if l["lap_time_s"]]
         ls.append([])
-        ls.append(["Best" + label, None, None,
+        ls.append(["Best" + label, None, None, None,
                    as_duration(min(times) if times else None),
                    None, None, None, None])
-        ls.append(["Average" + label, None, None,
-                   as_duration(_mean(l["time_s"] for l in pool)),
+        ls.append(["Average" + label, None, None, None,
+                   as_duration(_mean(l["lap_time_s"] for l in pool)),
                    _mean(l["energy_wh"] for l in pool),
                    _mean(l["regen_wh"] for l in pool),
                    _mean(l["distance_m"] for l in pool), None])
@@ -583,6 +560,15 @@ def write_xlsx(fileobj_or_path, start_ts=None, end_ts=None, metrics=None,
         race_start = db.load_race_state(conn).get("race_start_time")
         include_faults = any(m in _FAULT_COLUMNS for m in metrics)
         include_laps = any(m in _LAP_COLUMNS for m in metrics)
+        # The SAME call /api/laps makes, over this export's window, so the Laps
+        # sheet and the History per-lap charts number their laps identically.
+        laps = db.fetch_laps(conn, device_id=device_id,
+                             since_ts=start_ts, until_ts=end_ts) if include_laps else []
+        # Who drove each lap, from the stints the pit logged. Same two calls
+        # /api/laps makes, so the Driver column and the dashboard's per-lap
+        # table cannot credit one lap to two different people.
+        if include_laps:
+            db.attach_lap_drivers(laps, db.load_driver_stints(conn))
         fault_rows = []
         if include_faults:
             # limit=None: the default keeps only the newest 2000 fault rows,
@@ -618,7 +604,7 @@ def write_xlsx(fileobj_or_path, start_ts=None, end_ts=None, metrics=None,
 
     # --- Laps sheet --------------------------------------------------------- #
     if include_laps:
-        _write_laps_sheet(wb.create_sheet("Laps"), _laps_from_rows(rows), race_start)
+        _write_laps_sheet(wb.create_sheet("Laps"), laps, race_start)
 
     # --- Charts sheet (from a hidden, downsampled data block) ------------- #
     chart_keys = [k for k in cols
