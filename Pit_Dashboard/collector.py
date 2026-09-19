@@ -31,6 +31,7 @@ Resilience model
 """
 
 import json
+import threading
 import time
 
 import requests
@@ -50,6 +51,11 @@ from pit_config import (
     INITIAL_BACKFILL_LIMIT,
     CATCHUP_PAGE_SIZE,
     DATA_SILENCE_TIMEOUT,
+    VIEWERS_PATH,
+    VIEWERS_COUNT_PATH,
+    VIEWER_STALE_MS,
+    VIEWER_SWEEP_S,
+    VIEWER_HTTP_TIMEOUT,
 )
 
 STREAM_URL = f"{DB_URL}/{TELEMETRY_PATH}.json"
@@ -464,6 +470,94 @@ def _dispatch(conn, event_type: str, data_str: str) -> bool:
 # --------------------------------------------------------------------------- #
 # Main supervisor loop
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# Spectator viewer count
+# --------------------------------------------------------------------------- #
+# Each open spectator page refreshes its own key under VIEWERS_PATH every ~20s,
+# with the SERVER's clock as the value (the page PUTs {".sv":"timestamp"}, so a
+# viewer whose laptop clock is ten minutes out still lands on our timeline).
+# This thread is what turns those keys into a number: it counts the fresh ones,
+# sweeps away the dead ones, and publishes a single integer the pages read.
+#
+# Why here and not in the browser: a page that counted for itself would have to
+# download every other viewer's key on every refresh -- quadratic in viewers,
+# and enough to threaten the free tier's monthly transfer by mid-race. Writes
+# stay O(viewers); the read each page does is one integer.
+#
+# Why not in the car: the CAN thread has stalled behind a synchronous Firebase
+# call before. Nothing about a spectator vanity number goes near the car.
+#
+# Nothing in here may take the collector down. The pit wall's telemetry is the
+# job; this is decoration, so every failure is logged and slept off.
+def _viewer_sweep_once(creds) -> int:
+    """Count live viewers, delete the dead keys, publish the total. -> count."""
+    headers = {"Authorization": f"Bearer {fresh_token(creds)}"}
+    resp = requests.get(
+        f"{DB_URL}/{VIEWERS_PATH}.json", headers=headers, timeout=VIEWER_HTTP_TIMEOUT
+    )
+    resp.raise_for_status()
+    node = resp.json()
+    # An empty node reads back as null, not {}.
+    if not isinstance(node, dict):
+        node = {}
+
+    now_ms = time.time() * 1000.0
+    live = 0
+    dead = {}
+    for key, ts in node.items():
+        # A timestamp in the future is not a viewer, it is junk somebody wrote
+        # by hand: the database rule pins the value to the server's own clock,
+        # but this sweep does not get to assume the rule was pasted correctly.
+        age = now_ms - ts if isinstance(ts, (int, float)) else None
+        if age is not None and -5_000 <= age <= VIEWER_STALE_MS:
+            live += 1
+        else:
+            dead[key] = None
+
+    # One PATCH of nulls, not one DELETE per key: a spam burst of a thousand
+    # keys is then one request to clean up instead of a thousand.
+    if dead:
+        requests.patch(
+            f"{DB_URL}/{VIEWERS_PATH}.json",
+            headers=headers,
+            data=json.dumps(dead),
+            timeout=VIEWER_HTTP_TIMEOUT,
+        ).raise_for_status()
+
+    requests.put(
+        f"{DB_URL}/{VIEWERS_COUNT_PATH}.json",
+        headers=headers,
+        data=json.dumps(live),
+        timeout=VIEWER_HTTP_TIMEOUT,
+    ).raise_for_status()
+    return live
+
+
+def _viewer_sweeper() -> None:
+    """Recount forever. Own credentials on purpose: google-auth refreshes the
+    token in place, and the streaming thread must never find its own token
+    half-replaced by this one."""
+    try:
+        creds = load_credentials()
+    except Exception as e:
+        _log(f"viewer count off ({e.__class__.__name__}: {e})")
+        return
+
+    last = None
+    while True:
+        try:
+            live = _viewer_sweep_once(creds)
+            # Only on change: at one line per 10s this would be 8,640 lines of
+            # noise across a 24h race, in the window someone watches for the
+            # telemetry warnings that matter.
+            if live != last:
+                _log(f"viewers watching: {live}")
+                last = live
+        except Exception as e:
+            _log(f"viewer sweep failed: {e.__class__.__name__}: {e}")
+        time.sleep(VIEWER_SWEEP_S)
+
+
 def run():
     _log(f"sqlite: {SQLITE_PATH}")
     _log(f"stream: {STREAM_URL}")
@@ -475,6 +569,10 @@ def run():
 
     creds = load_credentials()
     backoff = RECONNECT_BACKOFF_START
+
+    # Daemon: this thread must never hold the process open at shutdown, and it
+    # has no state worth draining.
+    threading.Thread(target=_viewer_sweeper, name="viewers", daemon=True).start()
 
     while True:
         # Fall back to the persisted cursor when the table is empty (e.g. just

@@ -149,7 +149,15 @@ TRACK_CORE_M = 11.0
 GATE_HALF_M = 17.0
 FINISH_HALF_M = 24.0
 SECTOR_LABEL_OFFSET_M = 46.0
-CAR_RADIUS_M = 13.0
+# The car marker, and it has to win against the sector it is standing on. At
+# 13 m it was barely wider than the 17 m track casing and drawn in cyan --
+# which is very close to S6 (#38bdf8) and S7 (#818cf8), so for two of the nine
+# sectors the car all but vanished into the track. Bigger, and sat on a dark
+# disc (see MAP_SVG) so the separation no longer depends on the colour
+# underneath it at all.
+CAR_RADIUS_M = 20.0
+CAR_HALO_SCALE = 1.38     # dark disc under the car, as a multiple of its radius
+CAR_PULSE_SCALE = 2.4     # how far the ping travels before it fades out
 TRAIL_M = 170.0       # how much track the car's tail covers
 SECTOR_FONT_M = 30.0
 # Numbered turn badges, one per ETCR turn, like the circles on the ETCR map.
@@ -405,6 +413,7 @@ def build_data():
         "style": {
             "casing": TRACK_CASING_M, "core": TRACK_CORE_M,
             "car": CAR_RADIUS_M, "trail": TRAIL_M,
+            "carHalo": CAR_HALO_SCALE, "carPulse": CAR_PULSE_SCALE,
             "sFont": SECTOR_FONT_M,
             "turnR": TURN_BADGE_R_M, "turnFont": TURN_BADGE_FONT_M,
         },
@@ -435,6 +444,14 @@ DB_URL = "https://solar-race-telemetry-default-rtdb.europe-west1.firebasedatabas
 PUBLIC_PATH = "public/live"
 RACE_PATH = "public/race"
 DRIVER_PATH = "public/driver"      # written by Pit_Dashboard/driver_message.py
+# Who else is watching. Every open page refreshes its own key under
+# VIEWERS_PATH; Pit_Dashboard/collector.py counts the fresh ones and publishes
+# the total to VIEWERS_COUNT_PATH, which is all a page ever reads. See the
+# comment on the sweeper there for why the counting is not done in the browser.
+VIEWERS_PATH = "public/viewers"
+VIEWERS_COUNT_PATH = "public/viewers_count"
+VIEWER_BEAT_MS = 20000             # how often a page says it is still here
+VIEWER_POLL_MS = 15000             # how often it asks for the total
 
 # How long after the car's last sample the page stops claiming to be live. The
 # car publishes once a second; 20 s is twenty missed updates, which is a real
@@ -463,6 +480,20 @@ BASE_CSS = """
     --bad: #f87171;
   }
   * { box-sizing: border-box; }
+  /* REQUIRED, and not redundant, and it lives HERE so that every page built
+     from this file gets it.
+
+     The browser hides [hidden] with a USER-AGENT rule, and ANY author rule
+     beats a user-agent one -- so a later `display:` on the same element
+     silently defeats el(...).hidden. It did exactly that to `.pill { display:
+     inline-flex }`, and the pit wall spent its life showing the orange
+     DEMO - NOT LIVE DATA badge over real race telemetry: precisely the failure
+     the badge exists to prevent, and one that teaches the team to ignore it.
+
+     The rule was written once already, in the spectator page's own CSS block,
+     where the wall could not benefit from it. Anything scoped to one page
+     cannot fix a bug the pages share. */
+  [hidden] { display: none !important; }
   html, body {
     margin: 0; padding: 0; height: 100%; width: 100%;
     background-color: var(--bg);
@@ -545,6 +576,24 @@ MAP_SVG = """
       <g id="g-turns"></g>
       <g id="g-slabels"></g>
       <path id="trail" fill="none" stroke-linecap="round"></path>
+      <!-- Four circles, drawn outward-in, because a single bright dot on a
+           nine-colour track is only reliably visible on some of it:
+             car-pulse  a ping that expands and fades, so the eye is caught by
+                        MOVEMENT and does not have to find the dot first
+             car-halo   a dark disc the car sits on. This is what makes the
+                        marker independent of the sector underneath it -- the
+                        car used to be cyan on a sky-blue S6 and an indigo S7
+             car        the car colour itself, with the glow
+             car-core   a white centre, the one thing on the map that is pure
+                        white, so the exact position is unambiguous -->
+      <circle id="car-pulse" r="0" fill="none">
+        <animate id="car-ping-r" attributeName="r" dur="1.9s"
+                 repeatCount="indefinite" calcMode="spline"
+                 keyTimes="0;1" keySplines="0.2 0.6 0.4 1"/>
+        <animate attributeName="opacity" values="0.6;0" dur="1.9s"
+                 repeatCount="indefinite"/>
+      </circle>
+      <circle id="car-halo" r="0"></circle>
       <circle id="car" r="0" filter="url(#glow)"></circle>
       <circle id="car-core" r="0" fill="#ffffff"></circle>
     </svg>
@@ -611,9 +660,24 @@ DATA.sectorLabels.forEach(s => {
 });
 
 const car = el("car");
-car.setAttribute("r", DATA.style.car);
+const CAR_R = DATA.style.car;
+car.setAttribute("r", CAR_R);
 car.setAttribute("fill", DATA.carColor);
-el("car-core").setAttribute("r", DATA.style.car * 0.36);
+el("car-core").setAttribute("r", CAR_R * 0.34);
+// The dark disc under the car. Near-opaque rather than solid so the track
+// still reads faintly through it and the marker looks like it is ON the
+// circuit rather than punched through it.
+el("car-halo").setAttribute("r", CAR_R * (DATA.style.carHalo || 1.38));
+el("car-halo").setAttribute("fill", "rgba(3, 7, 13, 0.82)");
+el("car-halo").setAttribute("stroke", "rgba(255, 255, 255, 0.28)");
+el("car-halo").setAttribute("stroke-width", CAR_R * 0.07);
+// The ping. Sized here rather than in the markup because the radii are in
+// track metres and only DATA knows the scale.
+const pulse = el("car-pulse");
+pulse.setAttribute("stroke", DATA.carColor);
+pulse.setAttribute("stroke-width", CAR_R * 0.16);
+el("car-ping-r").setAttribute(
+  "values", (CAR_R * 1.05) + ";" + (CAR_R * (DATA.style.carPulse || 2.4)));
 el("trail").setAttribute("stroke-width", DATA.style.core);
 
 const legend = el("legend");
@@ -770,8 +834,13 @@ function paintMap(dist, fixXY) {
   // trail, the sector, the progress bar -- is a distance concept and stays on
   // `dist`, which the live pages already derive from the same fix.
   const [x, y] = fixXY || posAt(dist);
-  car.setAttribute("cx", x); car.setAttribute("cy", y);
-  el("car-core").setAttribute("cx", x); el("car-core").setAttribute("cy", y);
+  // All four circles of the marker move together. The pulse is animating its
+  // own `r` in SMIL while this sets its centre; the two do not collide.
+  ["car", "car-core", "car-halo", "car-pulse"].forEach(id => {
+    const n = el(id);
+    if (!n) return;
+    n.setAttribute("cx", x); n.setAttribute("cy", y);
+  });
 
   const s = sectorAt(dist);
   el("trail").setAttribute("stroke", s.color);
@@ -1080,11 +1149,6 @@ __BASE_CSS__
      real. Filled, not outlined, so it cannot be mistaken for a status pill. */
   .pill.demo { color: #0b1220; background: var(--warn); border-color: var(--warn);
                font-weight: 700; }
-  /* REQUIRED, and not redundant. The browser hides [hidden] with a USER-AGENT
-     rule, and any author rule beats it -- so `.pill { display: inline-flex }`
-     above silently defeated el("demo").hidden and the DEMO badge showed on the
-     live wall too. Exactly the failure the badge exists to prevent. */
-  .pill[hidden] { display: none !important; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.25; } }
   .hero { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
   .hero .value { font-size: 3.1rem; line-height: 1;
@@ -1159,6 +1223,10 @@ __BASE_CSS__
       <div style="margin-top:10px"><span class="pill off" id="status">
         <span class="dot"></span><span id="status-text">Connecting</span></span></div>
       <div class="sub" id="status-sub">&mdash;</div>
+      <!-- Hidden until the count is both known and non-zero. A page that
+           cannot reach the count must not claim an empty grandstand, and the
+           viewer reading this is themselves proof the number is never 0. -->
+      <div class="sub" id="watching" style="display:none"></div>
     </div>
 
     <div class="card hero">
@@ -1412,6 +1480,59 @@ function loadDriver() {
     }).catch(() => {});
 }
 
+// ── who else is watching ───────────────────────────────────────────────── //
+// This page writes ONE key saying "still here", and reads ONE integer saying
+// how many such keys are fresh. It never reads the other viewers' keys: that
+// would be every viewer downloading every other viewer, which is quadratic and
+// would eat the database's monthly transfer allowance by mid-race. The pit
+// collector does the counting and the sweeping.
+const VIEWER_ID = (() => {
+  // Per tab, kept across a refresh. Without the sessionStorage half, a viewer
+  // pressing F5 leaves their old key behind and counts twice until it expires.
+  let id = null;
+  try { id = sessionStorage.getItem("viewerId"); } catch (e) {}
+  if (!id) {
+    id = Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+    try { sessionStorage.setItem("viewerId", id); } catch (e) {}
+  }
+  return id;
+})();
+const VIEWER_URL = CONFIG.dbUrl + "/" + CONFIG.viewersPath + "/" + VIEWER_ID + ".json";
+
+// {".sv":"timestamp"} is the server's clock, not ours. It matters: a phone an
+// hour out of sync would otherwise be swept as stale the moment it arrived, or
+// linger long after it left.
+function beat() {
+  fetch(VIEWER_URL, { method: "PUT", body: '{".sv":"timestamp"}' }).catch(() => {});
+}
+
+// There is deliberately no "goodbye" delete on pagehide. It would drop a closed
+// tab out of the count in a second rather than in VIEWER_STALE_MS -- but the
+// only rule that permits it is one that lets ANY visitor delete ANY key, and
+// then one person with the developer console can hold the whole grandstand at
+// zero. A number that can be silently pushed down is worth less than a number
+// that lags a closed tab by forty seconds, on a page people leave open for
+// hours. So the collector's sweep is the only way a key ever goes away, and
+// the database rule refuses deletes from the browser outright.
+
+function loadWatching() {
+  fetch(CONFIG.dbUrl + "/" + CONFIG.viewersCountPath + ".json", { cache: "no-store" })
+    .then(r => r.ok ? r.json() : null)
+    .then(n => {
+      const card = el("watching");
+      // Not a number means the collector is not running or we could not ask;
+      // either way we do not know, and "0 watching" would be a lie told to at
+      // least one person -- the one reading it.
+      if (typeof n !== "number" || !isFinite(n) || n < 1) {
+        card.style.display = "none";
+        return;
+      }
+      card.textContent = n === 1 ? "1 person watching" : n + " people watching";
+      card.style.display = "";
+    })
+    .catch(() => {});
+}
+
 // ── weather, straight from Open-Meteo, same source the pit uses ─────────── //
 function loadWeather() {
   const u = "https://api.open-meteo.com/v1/forecast?latitude=" + CONFIG.lat +
@@ -1623,6 +1744,10 @@ startStream();
 loadRace();
 loadDriver();
 loadWeather();
+beat();
+loadWatching();
+setInterval(beat, CONFIG.viewerBeatMs);
+setInterval(loadWatching, CONFIG.viewerPollMs);
 setInterval(render, 1000);          // keeps the ages and the race clock moving
 setInterval(loadWeather, 900000);
 setInterval(renderDayNight, 60000);
@@ -1702,6 +1827,17 @@ __BASE_CSS__
   }
   .pill .dot { width: 0.65vw; height: 0.65vw; min-width: 6px; min-height: 6px;
                border-radius: 50%; background: currentColor; }
+  /* The age ticks once a second forever, so it gets a box of its own that is
+     already wide enough for the biggest number it will hold. Without this the
+     pill re-measured on every tick and the whole strip twitched sideways --
+     and it was worse than one nudge a second, because the age was printed to
+     a tenth and so redrew ten times a second. tabular-nums stops the digits
+     themselves changing width as they roll. Wide enough for four digits: past
+     that the feed has been dead over an hour and one reflow is not the
+     problem. */
+  #statusage { display: inline-block; min-width: 6.5ch; text-align: left;
+               font-variant-numeric: tabular-nums; }
+  #statusage:empty { display: none; }
   .pill.live { color: var(--good); border-color: var(--good); }
   .pill.live .dot { animation: pulse 1.6s ease-in-out infinite; }
   .pill.stale { color: var(--warn); border-color: var(--warn); }
@@ -1734,6 +1870,9 @@ __BASE_CSS__
   .bad  { color: var(--bad); }
   /* A value that is not current is never drawn as if it were. */
   .stale-val { color: var(--dim); opacity: 0.45; }
+  /* Stopped from the pit or the car, not stale: dimmed so the number
+     reads as parked rather than as a page that has stopped updating. */
+  .held-val { opacity: 0.62; }
   /* -- battery bar ----------------------------------------------------- */
   .bar { position: relative; height: 0.9vw; min-height: 8px; border-radius: 0.45vw;
          background: #0f172a; overflow: hidden; margin-top: 0.5vw; }
@@ -1765,6 +1904,9 @@ __BASE_CSS__
   /* The whole screen fades when the car stops talking: visible from across
      the garage without anyone having to read a word of it. */
   #stage.dead #left, #stage.dead #rail { opacity: 0.34; filter: grayscale(0.75); }
+  /* A pulsing marker says "this is live". On a dead feed it is a lie told in
+     motion, which is the hardest kind to ignore, so it stops. */
+  #stage.dead #car-pulse { display: none; }
   #stage.dead { transition: none; }
   #map { flex: 1 1 auto; min-height: 0; }
   #legend { font-size: clamp(9px, 0.78vw, 17px); right: 1vw; bottom: 1vw;
@@ -1785,7 +1927,7 @@ __BASE_CSS__
       <div class="spacer"></div>
       <div id="demo" class="pill demo" hidden>Demo &mdash; not live data</div>
       <div id="race" class="pill">Race <span id="raceclock">&mdash;</span></div>
-      <div id="status" class="pill off"><span class="dot"></span><span id="statustext">Connecting</span></div>
+      <div id="status" class="pill off"><span class="dot"></span><span id="statustext">Connecting</span><span id="statusage"></span></div>
     </div>
     <div id="faults"></div>
     <div class="card grow" id="map">
@@ -1820,7 +1962,8 @@ __BASE_CSS__
           <div class="big" id="laptime">&mdash;</div>
         </div>
       </div>
-      <div class="sub">Last <span id="lastlap">&mdash;</span> &middot; <span id="lapdelta">&mdash;</span></div>
+      <div class="sub">Last <span id="lastlap">&mdash;</span> &middot; <span id="lastwh">&mdash;</span>
+           &nbsp;&middot;&nbsp; This lap <span id="lapwh">&mdash;</span></div>
     </div>
 
     <div class="card">
@@ -1924,12 +2067,18 @@ function render() {
 
   const pill = el("status");
   pill.className = "pill " + (dead ? (failures > 2 ? "off" : "stale") : "live");
+  // Word and number are separate elements: the number is the only part that
+  // changes on a tick, and it redraws inside a fixed box, so nothing on the
+  // strip moves. Whole seconds -- a tenth of a second is not a fact anyone
+  // acts on, and it made the readout flicker at 10 Hz.
+  const showAge = s != null && failures <= 2 && age != null;
   el("statustext").textContent =
     s == null        ? "Connecting"
     : failures > 2   ? "Pit wall server unreachable"
     : age == null    ? "No reading"
-    : dead           ? "No signal · " + Math.round(age) + "s"
-                     : "Live · " + age.toFixed(1) + "s";
+    : dead           ? "No signal"
+                     : "Live";
+  el("statusage").textContent = showAge ? " · " + Math.round(age) + "s" : "";
 
   if (!s) return;
   el("demo").hidden = !s.demo;
@@ -1946,46 +2095,68 @@ function render() {
   put("packv", s, "bms_voltage_V",    v => v.toFixed(1) + " V");
   put("packa", s, "bms_current_A",    v => v.toFixed(1) + " A");
   put("power", s, "mms_power_W",      v => (v / 1000).toFixed(2) + " kW");
-  put("mtemp", s, "mms_temperature_C", v => Math.round(v) + "°C");
+  // The MOTOR's own PT1000. This read mms_temperature_C -- the CONTROLLER's
+  // internal sensor -- under a "Motor temp" label for its whole life, so the
+  // one number on the wall that says how hard the motor is working was never
+  // the motor's.
+  put("mtemp", s, "mms_motor_temp_C", v => Math.round(v) + "°C");
   put("btemp", s, "battery_temp_C",    v => Math.round(v) + "°C");
-  put("energy", s, "total_race_energy", v => v.toFixed(2) + " kWh");
-  put("regen",  s, "regen_energy",      v => v.toFixed(2) + " kWh");
+  // WATT-HOURS. lap_tracker sends total_energy_wh and the store keeps Wh, so
+  // printing " kWh" beside the raw value put a 4238 Wh race on the wall as
+  // "4238.27 kWh". No decimals either: a whole-race total is four digits, and
+  // the hundredths were only ever noise on a screen read from ten feet away.
+  put("energy", s, "total_race_energy", v => Math.round(v) + " Wh");
+  put("regen",  s, "regen_energy",      v => Math.round(v) + " Wh");
 
   // -- lap -------------------------------------------------------------- //
   const lap = num(s.calculated_lap);
   el("lap").textContent = lap == null ? "—" : Math.round(lap);
 
-  // The running lap clock advances on the CAR's timeline: device_ts is when
-  // the car sampled, lap_started_ts when it crossed the line, and the wall
-  // adds only the time since this browser received the payload. A stopped feed
-  // therefore freezes the clock instead of running it up while the car is
-  // parked in the pit box.
-  let running = null;
-  if (s.lap_started_ts != null && s.device_ts != null) {
+  // THE SHARED STOPWATCH. The car publishes the elapsed time its own HUD is
+  // showing and whether that is still moving, and this page reads the same one
+  // -- so the wall, the driver's screen and the spectator page cannot disagree,
+  // and either end can stop it. Only the time since this browser received the
+  // payload is added, so a stopped feed freezes the clock rather than running
+  // it up while the car sits in the box.
+  //
+  // The fallback, for a car on code older than the shared stopwatch, subtracts
+  // two of the CAR's own wall-clock stamps -- which is exactly why it is the
+  // fallback: that Pi has no RTC and NTP steps its clock after boot.
+  let running = null, swStopped = false;
+  const sw = num(s.stopwatch_s);
+  if (sw != null) {
+    swStopped = !!s.stopwatch_stopped;
+    running = swStopped ? sw : sw + (performance.now() - snapAt) / 1000;
+  } else if (s.lap_started_ts != null && s.device_ts != null) {
     running = (s.device_ts - s.lap_started_ts) + (performance.now() - snapAt) / 1000;
     if (running < 0 || running > CONFIG.maxLapS) running = null;
   }
   el("laptime").textContent = dead ? "—" : fmtLapTime(running);
   el("laptime").classList.toggle("stale-val", dead || running == null);
+  // A clock that merely stops moving reads as a frozen page, so it says which.
+  el("laptime").classList.toggle("held-val", swStopped && !dead);
 
   const last = isCarried(s, "last_lap_time_s") ? null : num(s.last_lap_time_s);
   el("lastlap").textContent = fmtLapTime(last);
 
-  // Delta is against the profile the car says it is following, and only that.
-  // Guessing a target when active_strategy is unset would put a number on the
-  // wall that the car is not trying to hit.
-  const key = s.active_strategy;
-  const targetLap = key && CONFIG.profiles[key] != null ? CONFIG.profiles[key] : null;
-  el("strategy").textContent = key ? key : "";
-  const dnode = el("lapdelta");
-  if (targetLap != null && last != null) {
-    const d = last - targetLap;
-    dnode.textContent = fmtDelta(d) + " vs " + key;
-    dnode.className = "sub " + (Math.abs(d) < 2 ? "good" : d > 0 ? "warn" : "accent");
-  } else {
-    dnode.textContent = key ? "no target for " + key : "no strategy set";
-    dnode.className = "sub";
-  }
+  // The strategy is NAMED on the wall but no longer SCORED against: the lap
+  // list used to print every lap's delta to the active profile's target, which
+  // made the profile the yardstick even when the pit was deliberately off it.
+  el("strategy").textContent = s.active_strategy ? s.active_strategy : "";
+
+  // What this lap has cost so far, beside the clock counting it. The pit
+  // subtracts a baseline for this (pit_wall.Feed._lap_energy) and sends null
+  // whenever the answer would be a guess -- so a dash here means "not known",
+  // never "cheap lap".
+  const lapWh = num(s.lap_energy_wh);
+  el("lapwh").textContent = (dead || lapWh == null) ? "—" : lapWh.toFixed(1) + " Wh";
+
+  // What the lap that just finished cost, beside the time it took. Guarded
+  // like the lap time next to it and NOT blanked on a dead feed: a completed
+  // lap is a fact that stays true while the link is down, unlike the running
+  // lap above, which is still being measured and so goes to a dash.
+  const lastWh = isCarried(s, "last_lap_energy") ? null : num(s.last_lap_energy);
+  el("lastwh").textContent = lastWh == null ? "—" : lastWh.toFixed(1) + " Wh";
 
   // -- faults ----------------------------------------------------------- //
   const notes = [];
@@ -2050,14 +2221,22 @@ function render() {
   const box = el("laps");
   const rows = s.recent_laps || [];
   box.innerHTML = rows.length ? "" : '<div class="sub">No completed laps yet.</div>';
-  rows.forEach(r => {
+  // The car against ITSELF: each lap's delta to the lap before it, which is
+  // the one on the row below (the list is newest first). No profile involved,
+  // so the column keeps meaning something when the pit is deliberately off the
+  // strategy. The oldest row shown has nothing below it and gets no delta --
+  // it is not a zero.
+  rows.forEach((r, i) => {
     const d = document.createElement("div");
     d.className = "lap-row";
-    const delta = (targetLap != null && r.time_s != null)
-                  ? fmtDelta(r.time_s - targetLap) : "";
+    const prev = rows[i + 1];
+    const gap = (r.time_s != null && prev && prev.time_s != null)
+                ? r.time_s - prev.time_s : null;
+    const cls = gap == null ? "sub" : gap > 0 ? "sub warn" : "sub accent";
     d.innerHTML = "<b>" + r.lap + "</b>" +
                   '<span class="t">' + fmtLapTime(r.time_s) + "</span>" +
-                  '<span class="sub" style="margin:0">' + delta + "</span>";
+                  '<span class="' + cls + '" style="margin:0">' +
+                  (gap == null ? "" : fmtDelta(gap)) + "</span>";
     box.appendChild(d);
   });
   // Drop whole rows rather than let the card clip one through the middle. The
@@ -2120,6 +2299,10 @@ def render_spectator(data, race_start, race_end):
         "publicPath": PUBLIC_PATH,
         "racePath": RACE_PATH,
         "driverPath": DRIVER_PATH,
+        "viewersPath": VIEWERS_PATH,
+        "viewersCountPath": VIEWERS_COUNT_PATH,
+        "viewerBeatMs": VIEWER_BEAT_MS,
+        "viewerPollMs": VIEWER_POLL_MS,
         "staleAfterS": STALE_AFTER_S,
         "oldAfterS": OLD_AFTER_S,
         "raceStart": race_start,
@@ -2145,7 +2328,9 @@ def render_wall(data):
         "pollMs": 1000,
         "staleAfterS": STALE_AFTER_S,
         "gpsMaxAgeS": GPS_LIVE_MAX_AGE_S,
-        "profiles": _all_profile_lap_seconds(),
+        # No "profiles" map any more. It existed solely to give the lap list a
+        # target to subtract from, and the wall no longer scores laps against a
+        # profile -- each lap is compared with the one before it instead.
         # A running lap longer than this is not a lap, it is a stopped feed or a
         # car sitting in the box, and the clock is blanked rather than counted.
         "maxLapS": 900,

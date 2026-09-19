@@ -26,6 +26,27 @@ DB_URL = "https://solar-race-telemetry-default-rtdb.europe-west1.firebasedatabas
 # it NEVER reads live_telemetry (that single node has no history to catch up on).
 TELEMETRY_PATH = "telemetry_history"
 
+# ── Spectator viewer count ───────────────────────────────────────────────── #
+# Every open spectator page (docs/index.html) refreshes one key under
+# VIEWERS_PATH with the SERVER's timestamp. The collector is what counts them:
+# if each page counted for itself it would have to download every other page's
+# key, which is quadratic in viewers and would eat the free tier by mid-race.
+# So the browsers write, this process counts, and each page reads one integer.
+VIEWERS_PATH = "public/viewers"        # one key per open page, value = ms epoch
+VIEWERS_COUNT_PATH = "public/viewers_count"   # the single number pages read
+
+# A key older than this is a page that was closed, slept or lost its network.
+# Comfortably longer than the page's beat (20s) so one missed beat on bad wifi
+# does not make somebody blink out of the count.
+VIEWER_STALE_MS = 45_000
+
+# How often the collector recounts. Also the delay before a closed tab that
+# missed its farewell drops out.
+VIEWER_SWEEP_S = 10.0
+
+# A recount that hangs must never wedge the sweeper.
+VIEWER_HTTP_TIMEOUT = 10.0
+
 # Service-account JSON (Firebase Admin key). Gitignored — keep it out of git.
 # Used to mint an OAuth2 access token for the REST streaming endpoint.
 SERVICE_ACCOUNT_PATH = os.path.join(_HERE, "serviceAccountKey.json")
