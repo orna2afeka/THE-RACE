@@ -205,9 +205,9 @@ VEHICLE_INPUT_POLL_S = 0.2
 # tracks the car down a straight, slow enough to be free.
 PROFILE_TICK_S = 0.2
 
-# Which profile the car runs until the pit says otherwise. The baseline is the
-# safe default — it is the lap the team actually measured.
-DEFAULT_STRATEGY = "dor_280s"
+# Which profile the car runs until the pit says otherwise. It is also the ONLY
+# one in profiles/ today: lap 33 of the 2026-09-19 race, exactly as driven.
+DEFAULT_STRATEGY = "lap33_290s"
 
 # ==============================================================================
 # SMART CAN WORKER (Core Background Thread)
