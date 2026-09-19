@@ -61,6 +61,12 @@ for _p in (_REPO, os.path.join(_REPO, "Pit_Dashboard")):
 
 import constants as C  # noqa: E402
 import db  # noqa: E402
+# THE lap clock. The dashboard's header and this page show the same number, so
+# they work it out with the same function rather than each having a go -- see
+# Pit_Dashboard/lap_clock.py. Importing it costs this process nothing and does
+# NOT tie it to the dashboard: the module holds the rule and no state, and
+# this program still reads its own database on its own thread.
+from lap_clock import LAP_DATUM_KEY, LAP_HOLD_KEY, lap_clock  # noqa: E402
 
 PAGE_PATH = os.path.join(_REPO, "Pit_Dashboard", "wall.html")
 DEFAULT_PORT = 8503          # 8000 dashboard, 8502 builder, 8504 energy matrix
@@ -145,6 +151,16 @@ FIELDS = (
     "is_charging",
     "active_strategy", "lat", "lon", "gps_age_s",
     "bms_has_error", "bms_error_code", "mms_has_error", "mms_error_code",
+    # The car's OWN lap datum, the wall clock it set when it crossed the line.
+    # This page used to derive its own from the earliest sample held for the
+    # lap, which is the fallback the dashboard reaches for only when the car
+    # publishes nothing -- so on a lap whose first samples were lost, the TV
+    # counted from where the link came back and the dashboard did not. Both
+    # now take the car's figure first and fall back the same way (lap_clock).
+    # Carried forward like any other reading, as the dashboard carries it: it
+    # stays true for the whole lap, and a clock that blanked between samples
+    # would be unreadable.
+    "lap_started_ts",
 )
 
 
@@ -308,6 +324,12 @@ class DemoFeed:
             "is_racing": True,
             "race_start_time": self._t0 - 3 * 3600,
             "lap_started_ts": now - lap_t,
+            # The same shape the live feed serves, so the page has one way of
+            # reading the clock and the demo cannot drift away from it.
+            # source "car" because that is what a car on the line would give:
+            # the demo exists to show the finished screen, not the fallbacks.
+            "lap_clock": {"startedAt": now - lap_t, "atSampleS": lap_t,
+                          "source": "car", "heldAt": None},
             "recent_laps": recent,
             "recent_laps_built_ts": now,
         }
@@ -428,7 +450,22 @@ class Feed:
         race = db.load_race_state(conn)
         out["is_racing"] = race.get("is_racing")
         out["race_start_time"] = race.get("race_start_time")
-        out["lap_started_ts"] = self._lap_start(conn, out.get("calculated_lap"))
+        out["driver_change_since"] = self._driver_change(conn)
+        # THE LAP CLOCK IS NOT WORKED OUT HERE. The same function answers the
+        # dashboard's header (Pit_Web/api._lap_clock), so the TV and the
+        # dashboard cannot show two different lap times, and the TV now sees
+        # the pit's own presses -- Stop lap clock parks it, Cut lap re-datums
+        # it -- instead of waiting the four to five seconds for the car to
+        # confirm. `device_ts` is what the dashboard passes too: it measures
+        # the sample's instant as time.time() minus the age it labels every
+        # tile with, which is that same stamp.
+        out["lap_clock"] = lap_clock(
+            out, out.get("device_ts"),
+            hold_at=self._press(conn, LAP_HOLD_KEY, "heldAt"),
+            datum_at=self._press(conn, LAP_DATUM_KEY, "atS"),
+            estimate=lambda: db.lap_started_estimate(
+                conn, out.get("calculated_lap")),
+        )
         out["lap_energy_wh"] = self._lap_energy(
             conn, out.get("calculated_lap"), out.get("total_race_energy"))
 
@@ -438,25 +475,58 @@ class Feed:
         return out
 
     @staticmethod
-    def _lap_start(conn, lap):
-        """When the car crossed the line into the lap it is on now.
+    def _driver_change(conn):
+        """When the pit said a driver change began, or None.
 
-        Index-backed by idx_telemetry_lap (device_id, calculated_lap), so the
-        cost does not grow with the race. Returning None is normal before the
-        first crossing — the page then shows a dash for the running lap time
-        rather than counting up from the start of the session.
+        Read from app_state, the same row Pit_Web writes and the same instant
+        the public page is showing — the wall must not have an opinion of its
+        own about a swap. Read-only and one indexed row, so it costs nothing
+        beside the queries above it.
+
+        Returns None rather than raising when there is no app_state table:
+        that is a database seeded for the demo, or one from before the web
+        dashboard existed, and neither is a reason for a blank pit wall.
         """
-        if lap is None:
-            return None
+        since = Feed._app_state(conn, "driver_stint").get("change_started_at")
+        return float(since) if since else None
+
+    @staticmethod
+    def _press(conn, key, field):
+        """One instant the pit stamped in app_state under `key`, or None.
+
+        The lap clock's two presses -- Stop lap clock and Cut/Restart lap --
+        are written by Pit_Web and read here, so the TV answers a press at the
+        same moment the dashboard does. Which keys and which fields is not
+        this program's opinion: lap_clock.py names them for both readers.
+        """
+        at = Feed._app_state(conn, key).get(field)
+        return float(at) if at else None
+
+    @staticmethod
+    def _app_state(conn, key):
+        """The dict the pit stored under `key`, or {}.
+
+        One indexed row of the key/value table beside the race clock, never
+        telemetry, so this stays inside the rule that the CAR's data is read
+        through db.py alone.
+
+        {} rather than raising when there is no app_state table: that is a
+        database seeded for the demo, or one from before the web dashboard
+        existed, and neither is a reason for a blank pit wall.
+        """
         try:
             row = conn.execute(
-                "SELECT MIN(device_ts) FROM telemetry "
-                "WHERE device_id = ? AND CAST(calculated_lap AS INTEGER) = ?",
-                (db.DEVICE_ID, int(lap)),
+                "SELECT value FROM app_state WHERE key = ?", (key,)
             ).fetchone()
         except Exception:
-            return None
-        return row[0] if row and row[0] else None
+            return {}
+        if not row or not row["value"]:
+            return {}
+        try:
+            value = json.loads(row["value"])
+        except (ValueError, TypeError):
+            return {}
+        return value if isinstance(value, dict) else {}
 
     def _lap_energy(self, conn, lap, total_energy):
         """Wh used so far on the lap the car is on, or None.

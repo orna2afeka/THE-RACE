@@ -56,7 +56,9 @@ export function stintEpoch(stint: Stint | undefined): number | null {
 function label(n: Now): string {
   if (!n.started) return 'Driver stint';
   if (!n.running) return n.elapsed && n.elapsed > 0 ? 'Holding · race stopped' : 'Starts with the race';
-  return n.remaining !== null && n.remaining < 0 ? 'Change overdue by' : 'Driver change in';
+  // No "by": the clock itself now carries the minus, and "overdue by -5m"
+  // reads as a contradiction at the moment nobody has time to parse one.
+  return n.remaining !== null && n.remaining < 0 ? 'Change overdue' : 'Driver change in';
 }
 
 /** The app-bar clock, beside the race clock. */
@@ -101,6 +103,26 @@ export function StintBanner({ stint, clockOffsetMs }: { stint: Stint | undefined
   );
 }
 
+/** The swap itself, while it is happening — and the reason it is a BANNER and
+ *  not a quiet line in the sidebar: nothing expires it. The crew asked for a
+ *  flag that stays until they take it down, so the one thing it must never do
+ *  is sit on the public page unnoticed. It counts up, in front of everyone. */
+export function SwapBanner({ stint, clockOffsetMs }: { stint: Stint | undefined; clockOffsetMs: number }) {
+  const since = stint?.changeStartedAt ?? null;
+  const serverNowS = useAlignedServerNow(clockOffsetMs, since);
+  if (!since) return null;
+  return (
+    <div className="banner stint-swap" role="status">
+      <Icon name="timer" size={18} />
+      <span>DRIVER CHANGE IN PROGRESS · {hms(Math.max(0, serverNowS - since))}</span>
+      <span className="list">
+        Shown on the public page and the pit wall · clears when you press
+        &ldquo;Driver changed&rdquo;
+      </span>
+    </div>
+  );
+}
+
 /** Sidebar control: who is in, how long left, and the one button pressed at a
  *  driver change. One click, no confirmation — this gets pressed during a pit
  *  stop with people shouting. The undo covers a mis-click. */
@@ -112,6 +134,7 @@ export function StintPanel({ stint, clockOffsetMs, racing }: {
   const [busy, setBusy] = useState(false);
   const n = stintNow(stint, serverNowS);
   const overdue = n.remaining !== null && n.remaining < 0;
+  const swapping = stint?.changeStartedAt ?? null;
 
   const logChange = async () => {
     setBusy(true);
@@ -143,6 +166,19 @@ export function StintPanel({ stint, clockOffsetMs, racing }: {
     finally { setBusy(false); }
   };
 
+  // Pressed when the car stops in the box, BEFORE the swap. The change press
+  // below ends it, so in a normal stop this is the only extra press.
+  const toggleChanging = async () => {
+    const on = !swapping;
+    setBusy(true);
+    try {
+      await postJSON<Stint>('/api/driver_stint/changing', { on });
+      toast(on ? 'Driver change showing on the public page and the wall'
+               : 'Driver change cleared', 'info');
+    } catch (e) { toast(`Driver change flag failed: ${e}`, 'err'); }
+    finally { setBusy(false); }
+  };
+
   const undo = async () => {
     setBusy(true);
     try {
@@ -157,7 +193,7 @@ export function StintPanel({ stint, clockOffsetMs, racing }: {
       <div className={`stint-readout ${n.tier}${overdue ? ' overdue' : ''}${n.started && !n.running ? ' held' : ''}`}>
         <div className="k">
           {n.started && !n.running ? <Icon name="pause" size={10} style={{ marginRight: 4 }} /> : null}
-          {!n.started ? 'No stint logged' : !n.running ? 'Held · race stopped' : overdue ? 'Overdue by' : 'Time left'}
+          {!n.started ? 'No stint logged' : !n.running ? 'Held · race stopped' : overdue ? 'Overdue' : 'Time left'}
         </div>
         <div className="v">{n.remaining === null ? '--:--:--' : hmsSigned(n.remaining)}</div>
         <div className="sub">
@@ -171,6 +207,7 @@ export function StintPanel({ stint, clockOffsetMs, racing }: {
             Public page: {stint.publicSynced
               ? (stint.driver ? `shows ${stint.driver}` : 'no driver shown')
               : 'sending…'}
+            {swapping ? ' · driver change showing' : ''}
           </div>
         )}
       </div>
@@ -179,8 +216,13 @@ export function StintPanel({ stint, clockOffsetMs, racing }: {
       <input type="text" value={next} placeholder="e.g. Noa" autoComplete="off"
              onChange={(e) => setNext(e.target.value)}
              onKeyDown={(e) => e.key === 'Enter' && !busy && logChange()} />
+      <button className={`btn block ${swapping ? 'warn-solid' : ''}`}
+              style={{ marginTop: 10 }} disabled={busy} onClick={toggleChanging}>
+        <Icon name={swapping ? 'history' : 'timer'} size={13} />
+        {swapping ? 'Cancel — no change after all' : 'Driver change started'}
+      </button>
       <button className={`btn block ${overdue || n.tier === 'critical' ? 'danger-solid' : 'primary'}`}
-              style={{ marginTop: 10 }} disabled={busy} onClick={logChange}>
+              style={{ marginTop: 8 }} disabled={busy} onClick={logChange}>
         <Icon name="timer" size={13} />
         {n.started ? 'Driver changed — reset timer' : 'Start driver stint'}
       </button>

@@ -286,6 +286,10 @@ export interface DriverStint {
    *  False while the write is pending or failing; null in the demo, which
    *  never publishes. */
   publicSynced: boolean | null;
+  /** When the pit said a driver change STARTED, or null when none is in
+   *  progress. Nothing expires it: it stays until the crew clears it or
+   *  logs the change, which is why every screen shows how old it is. */
+  changeStartedAt: Num;
 }
 
 export interface Live {

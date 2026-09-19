@@ -1627,16 +1627,78 @@ def lap_start_energy(conn: sqlite3.Connection, lap: int,
     ).fetchone()
 
 
+# How far back down the index recent_laps is willing to look. Four laps at the
+# car's 0.5 s push is ~3,400 samples, so this covers them with room to spare --
+# and it is also a horizon: 8,192 samples is about 68 minutes of a car that is
+# reporting, so a lap whose last sample is further back than that is not
+# returned. That is the intended answer rather than a limitation. A previous
+# lap an hour and a half ago means the car has been standing still since, and
+# its sector times are not what the grid is being read for.
+RECENT_LAPS_SCAN = 8192
+
+
 def recent_laps(conn: sqlite3.Connection, count: int = 2,
-                device_id: str = DEVICE_ID):
-    """The newest `count` lap numbers that have samples, newest first."""
-    rows = conn.execute(
-        "SELECT DISTINCT CAST(calculated_lap AS INTEGER) AS lap FROM telemetry "
-        "WHERE device_id = ? AND calculated_lap IS NOT NULL "
-        "ORDER BY lap DESC LIMIT ?",
-        (device_id, int(count)),
-    ).fetchall()
-    return [r["lap"] for r in rows]
+                device_id: str = DEVICE_ID, since_ts: float = None):
+    """The `count` lap tags with the newest SAMPLES, newest first.
+
+    ORDERED BY TIME, NOT BY LAP NUMBER, and the difference is not academic:
+    calculated_lap is not unique. It restarts whenever the car's counter does
+    -- the green-flag reset, a pit set_lap, a checkpoint wiped between sessions
+    -- which is the defect documented above lap_traces().
+
+    Ordering by number picked the HIGHEST tag in the store and called it the
+    lap being driven. After a race start zeroes the car that is a WARM-UP lap:
+    the sector grid sat on two laps from before the green flag, comparing one
+    to its neighbour from the warm-up, and never moved again however far the
+    race got. Ordering by the newest sample answers the question that was
+    actually being asked -- which lap is the car on now.
+
+    `since_ts` bounds it to the race, which is how the sector grid asks, so a
+    lap driven before the flag cannot be shown as the current one. It is the
+    same rule _fold_bests already applies to the purple cell: a lap that
+    predates the race is not part of it.
+
+    WALKS BACK FROM THE NEWEST SAMPLE, and does NOT group. The obvious
+    spelling -- GROUP BY lap ORDER BY MAX(device_ts) DESC -- gives the right
+    answer and costs what a full scan costs, because SQLite's index-max
+    optimisation applies only to a LONE aggregate (see store_watermark, which
+    is split in two for the same reason). Walking the tail of
+    idx_telemetry_dev_ts and taking the tags in the order they appear is the
+    same answer, read lazily and stopped at the last tag wanted.
+
+    Measured over four laps, this endpoint being the most polled in the app:
+
+        demo_telemetry.db   11,812 rows, laps of ~420 samples
+                            0.9 ms walked | 3.1 ms by number | 38 ms grouped
+
+    The walk is fastest where the store looks like a race, because it stops as
+    soon as it has four tags. Where one tag covers tens of thousands of samples
+    -- an August test store with 5k rows tagged lap 0 -- it walks the full
+    window at 165 ms, which a 0.5 s push over four real laps never reaches.
+
+    Fewer than `count` tags come back when the window holds no more -- see
+    RECENT_LAPS_SCAN for the horizon and why stopping there is the answer and
+    not a shortfall.
+    """
+    where = "device_id = ? AND calculated_lap IS NOT NULL"
+    args = [device_id]
+    if since_ts is not None:
+        where += " AND device_ts >= ?"
+        args.append(float(since_ts))
+    sql = ("SELECT CAST(calculated_lap AS INTEGER) AS lap FROM telemetry "
+           "WHERE " + where + " ORDER BY device_ts DESC LIMIT ?")
+
+    # ONE PASS, walked rather than fetchall()'d: the tags are wanted in the
+    # order they appear and the walk stops at the last one, so a car that is
+    # lapping costs the rows of `count` laps and no more.
+    want = int(count)
+    seen = []
+    for row in conn.execute(sql, args + [max(RECENT_LAPS_SCAN, want * 1024)]):
+        if row[0] not in seen:
+            seen.append(row[0])
+            if len(seen) >= want:
+                break
+    return seen
 
 
 def latest_sample(conn: sqlite3.Connection, device_id: str = DEVICE_ID):

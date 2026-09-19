@@ -88,11 +88,17 @@ export function hms(totalSeconds: number): string {
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
 }
 
-/** hh:mm:ss with a leading sign once the value goes negative, for a
- *  countdown that keeps counting after it passes zero. */
+/** hh:mm:ss with a MINUS once the value goes negative, for a countdown that
+ *  keeps counting after it passes zero.
+ *
+ *  It said "+" for its first life, on the reading "overdue BY five minutes".
+ *  A countdown that reaches zero and shows +00:05:00 is the one thing this
+ *  clock must not look like — a fresh timer that has just started running up
+ *  — and at a glance, across a pit box, that is exactly what it looked like.
+ *  It is a countdown, so it goes below zero and says so. */
 export function hmsSigned(totalSeconds: number): string {
   const neg = totalSeconds < 0;
-  return (neg ? '+' : '') + hms(Math.abs(totalSeconds));
+  return (neg ? '-' : '') + hms(Math.abs(totalSeconds));
 }
 
 /** A local wall-clock value for <input type="datetime-local">. NOT

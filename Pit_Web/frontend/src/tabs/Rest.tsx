@@ -256,6 +256,12 @@ export function Weather({ dark }: { dark: boolean }) {
 
 const STRATEGY_COLOURS = ['#e74c3c', '#e67e22', '#f1c40f', '#3498db', '#9b59b6'];
 
+/** Minutes the way the crew says them out loud: "3h 34m", "47m". */
+const hm = (min: number) => {
+  const m = Math.max(0, Math.round(min));
+  return m >= 60 ? `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, '0')}m` : `${m}m`;
+};
+
 // Everything the chart draws. Two polls with the same signature are the same
 // picture, so an unchanged plan does not redraw at all.
 const chartSig = (d: StrategyResp) => JSON.stringify([d.traces, d.floorWh, d.capacityWh]);
@@ -302,11 +308,31 @@ function BatteryChart({ data, dark }: { data: StrategyResp; dark: boolean }) {
     const base = layoutBase(dark, 340);
     const t = theme(dark);
     const traces: Parameters<typeof Plotly.newPlot>[1] = [];
-    let maxT = 0;
+    // Every plan is simulated over the SAME window -- the engine gives each one
+    // the time that is left -- so one clock serves them all.
+    const maxT = data.traces.reduce((m, tr) => Math.max(m, tr?.totalTimeMin ?? 0), 0);
+
+    // WHEN, not only how much. The hover box is unified, and Plotly builds its
+    // title from the x value and nothing else: no number format turns 213.6
+    // into "3h 34m left, 1h 26m in", and none can reach a second number. So the
+    // clock rides in as a trace of its own -- no line, out of the legend, one
+    // point per minute of the window, carrying both readings as its hover text.
+    // It draws nothing and is first in the list, so it is the first row of the
+    // box. It is also why the title is blanked in the layout below: with the
+    // clock row there, the raw minute count above it is noise.
+    const clock = Array.from({ length: Math.floor(maxT) + 1 }, (_, m) => m);
+    traces.push({
+      type: 'scatter', mode: 'lines', name: '', showlegend: false,
+      x: clock, y: clock.map(() => 0),
+      line: { color: 'rgba(0,0,0,0)', width: 0 },
+      // x is minutes REMAINING, so the elapsed side is the rest of the window.
+      text: clock.map((m) => `${hm(m)} left · ${hm(maxT - m)} in`),
+      hovertemplate: '%{text}<extra></extra>',
+    });
+
     data.traces.forEach((tr, i) => {
       if (!tr) return;
       const c = STRATEGY_COLOURS[i % STRATEGY_COLOURS.length];
-      maxT = Math.max(maxT, tr.totalTimeMin);
       // Minutes REMAINING on x, so the race runs left to right and the flag
       // is at x = 0. Every point is the engine's own; charge segments are
       // sampled along the real curve, so they are genuinely concave.
@@ -336,7 +362,14 @@ function BatteryChart({ data, dark }: { data: StrategyResp; dark: boolean }) {
     const react = (Plotly as unknown as { react: typeof Plotly.newPlot }).react;
     void react(ref.current, traces, {
       ...base, margin: { l: 56, r: 16, t: 28, b: 42 },
-      xaxis: { ...base.xaxis, autorange: 'reversed', title: { text: 'minutes remaining', font: { size: 11, color: t.ink3 } } },
+      xaxis: {
+        ...base.xaxis, autorange: 'reversed',
+        title: { text: 'minutes remaining', font: { size: 11, color: t.ink3 } },
+        // Blank, because the clock trace above already opens the box with the
+        // time in words. A single space, not '': Plotly reads an empty string
+        // as "unset" and puts the raw x value back.
+        unifiedhovertitle: { text: ' ' },
+      },
       yaxis: { ...base.yaxis, range: [0, data.capacityWh * 1.05], title: { text: 'Wh', font: { size: 11, color: t.ink3 } } },
       shapes: [{
         type: 'line', xref: 'x', yref: 'y', x0: 0, x1: Math.max(maxT, 1), y0: data.floorWh, y1: data.floorWh,

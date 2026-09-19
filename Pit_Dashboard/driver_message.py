@@ -345,13 +345,29 @@ def read_strategy_ack():
 _PUBLIC_DRIVER_URL = f"{DB_URL}/public/driver.json"
 
 
-def publish_driver_name(name) -> None:
-    """Show `name` on the spectator page, or remove it when name is empty."""
+def publish_driver_name(name, changing_since=None) -> None:
+    """Show `name` on the spectator page, or remove it when name is empty.
+
+    `changing_since` is the instant the pit said a driver change had STARTED,
+    or None when no change is in progress. The page turns that into a badge
+    and the minutes it has been running. It rides on this node rather than on
+    one of its own because the page already polls this one every 15 s, and a
+    second path is a second request per viewer per poll against a database
+    whose egress is metered — the same reason the viewer count is totted up in
+    the pit and not in the browser.
+
+    The node is written whenever there is EITHER a name or a change in
+    progress, and deleted only when there is neither. A swap can begin before
+    anybody has typed a name, and it still has to show.
+    """
     name = (name or "").strip()
-    if name:
+    if name or changing_since:
+        payload = {"name": name, "ts": time.time()} if name else {"ts": time.time()}
+        if changing_since:
+            payload["changing"] = True
+            payload["since"] = float(changing_since)
         resp = requests.put(_PUBLIC_DRIVER_URL, params={"access_token": _token()},
-                            json={"name": name, "ts": time.time()},
-                            timeout=_TIMEOUT)
+                            json=payload, timeout=_TIMEOUT)
     else:
         resp = requests.delete(_PUBLIC_DRIVER_URL,
                                params={"access_token": _token()},

@@ -31,6 +31,15 @@ What it is actually guarding against, in order of how much it would hurt:
   4. PURPLE POISONED BY A GLITCH. A session best that is not a real lap time
      never goes away on its own, and every later comparison is measured
      against it.
+
+  5. THE WRONG TWO LAPS ON THE GRID. The geometry can be perfect and the
+     feature still useless if "current" and "last" name laps from before the
+     race. calculated_lap is not unique -- the green flag zeroes the car's
+     counter -- so the warm-up holds the HIGHEST tags in the store, and
+     picking laps by number put two warm-up laps on the grid and left them
+     there for the whole race, comparing one to its neighbour from before the
+     start. Nothing about the cells looks wrong when this happens; they are
+     real sector times of real laps, just not of this race.
 """
 
 import os
@@ -209,7 +218,71 @@ check("a complete lap does have one", row["total"] is not None,
       "%.2f s" % row["total"])
 
 # --------------------------------------------------------------------------- #
-print("\n7. The real store")
+print("\n7. Which two laps the grid shows, when the counter restarts")
+# --------------------------------------------------------------------------- #
+# A race start zeroes the car (LapTracker.new_race), so a store holds warm-up
+# laps 0..5 and then race laps 0..2 with the same tags and higher ones left
+# behind. The grid must follow TIME, not the lap number.
+import sqlite3                                                   # noqa: E402
+import tempfile                                                  # noqa: E402
+
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Pit_Dashboard"))
+import db as _db                                                 # noqa: E402
+
+_store = os.path.join(tempfile.mkdtemp(prefix="sectorsel_"), "t.db")
+_conn = _db.get_conn(_store)
+_db.init_db(_conn)
+_cols = ["device_id", "rtdb_key", "device_ts", "ingested_ts",
+         "calculated_lap", "lap_seq", "lap_distance_m", "mms_vehicle_speed_kmh",
+         "lap_source"]
+_sql = "INSERT INTO telemetry (%s) VALUES (%s)" % (
+    ",".join(_cols), ",".join("?" * len(_cols)))
+_t, _k = 1789560000.0, 0
+
+
+def _write_lap(tag):
+    """One constant-speed lap tagged `tag`, at the current cursor."""
+    global _t, _k
+    # [:-1] because lap_samples closes on the line AND the next lap opens on
+    # it: one continuous stream, no instant belonging to two laps.
+    for ts, dist, _n in lap_samples(_t)[:-1]:
+        _conn.execute(_sql, ["solarcar", "-K%07d" % _k, ts, ts, float(tag),
+                             float(tag), dist, 55.0, "gps"])
+        _k += 1
+    _t += LAP_S
+
+
+for _tag in range(6):                     # the warm-up: tags 0..5
+    _write_lap(_tag)
+GREEN = _t                                # the green flag zeroes the car
+for _tag in range(3):                     # the race: tags 0..2 again
+    _write_lap(_tag)
+_conn.commit()
+
+by_number = [r["lap"] for r in _conn.execute(
+    "SELECT DISTINCT CAST(calculated_lap AS INTEGER) AS lap FROM telemetry "
+    "WHERE calculated_lap IS NOT NULL ORDER BY lap DESC LIMIT 4")]
+print("      by lap number: %s   <- what the grid used to follow" % by_number)
+
+picked = _db.recent_laps(_conn, 4, since_ts=GREEN)
+print("      by time, from the green flag: %s" % picked)
+check("the grid follows the race, not the highest lap number",
+      picked[:3] == [2, 1, 0],
+      "current=%s last=%s (by number it was current=%s last=%s, both warm-up)"
+      % (picked[0] if picked else None, picked[1] if len(picked) > 1 else None,
+         by_number[0], by_number[1]))
+check("no lap from before the green flag is offered",
+      all(t <= 2 for t in picked),
+      "tags %s - the race has only three, and asking for four does not "
+      "reach back past the flag for a fourth" % picked)
+check("unbounded, it still answers by time and not by number",
+      _db.recent_laps(_conn, 1) == [2],
+      "newest tag is 2, driven last; 5 is the highest number in the store")
+_conn.close()
+
+# --------------------------------------------------------------------------- #
+print("\n8. The real store")
 # --------------------------------------------------------------------------- #
 try:
     from contextlib import closing

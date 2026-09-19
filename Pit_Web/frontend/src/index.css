@@ -719,6 +719,10 @@ details.disc .disc-body { border: 1px solid var(--line); border-top: none; borde
 
 .banner.stint-due { background: var(--warn-soft); color: var(--pit-warning); border-color: rgba(255, 153, 0, 0.45); }
 .banner.stint-over { background: var(--crit-soft); color: var(--pit-critical); border-color: rgba(255, 32, 32, 0.55); animation: pulse-bg 1.4s ease-in-out infinite; }
+/* A swap in progress. Accent, not warning: nothing is wrong, the crew is
+   working -- but it is a banner and it counts up, because nothing expires the
+   flag and the failure mode is forgetting it is on. */
+.banner.stint-swap { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
 
 .stint-readout {
 	background: var(--card); border: 1px solid var(--line);
@@ -737,6 +741,10 @@ details.disc .disc-body { border: 1px solid var(--line); border-top: none; borde
    the most important control on the page and should not look optional. */
 .btn.danger-solid { background: var(--pit-critical); color: #fff; border-color: transparent; font-weight: 600; }
 .btn.danger-solid:hover:not(:disabled) { filter: brightness(1.1); background: var(--pit-critical); }
+/* Solid while a driver change is flagged, so the way OUT of that state is as
+   easy to find as the way in was. */
+.btn.warn-solid { background: var(--pit-warning); color: #10131a; border-color: transparent; font-weight: 600; }
+.btn.warn-solid:hover:not(:disabled) { filter: brightness(1.1); background: var(--pit-warning); }
 
 @media (max-width: 900px) {
 	.clock.stint .v { font-size: calc(17px * var(--pit-font-scale)); }
@@ -753,6 +761,12 @@ details.disc .disc-body { border: 1px solid var(--line); border-top: none; borde
 .clock.lap .v { font-size: calc(20px * var(--pit-font-scale)); }
 .clock.lap.held .v { opacity: 0.55; }
 .clock.lap.held .k { opacity: 0.9; }
+/* Running on the pit's clock with nothing coming from the car. Dimmer than a
+   live clock so it is visibly not confirmed, brighter than a parked one
+   because it IS still counting, and the label takes the warning colour so the
+   difference reads from across the garage. */
+.clock.lap.quiet .v { opacity: 0.8; }
+.clock.lap.quiet .k { color: var(--pit-warning); opacity: 1; }
 .clock.stint.held .k { opacity: 0.9; }
 .stint-readout.held .v { opacity: 0.65; }
 .stint-readout.held { border-left-style: dashed; }

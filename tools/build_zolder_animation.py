@@ -66,7 +66,7 @@ from zolder_centreline import (BUILT_UTC, OSM_ATTRIBUTION,    # noqa: E402
 from strategy_engine import (DOC_TO_TRACK_OFFSET_M,           # noqa: E402
                              SECTIONS_INFO, TRACK_LANDMARKS,
                              TURN_START_TRACK_M)
-from constants import SECTION_NAMES                           # noqa: E402
+from constants import DATA_STALE_AFTER_S, SECTION_NAMES       # noqa: E402
 # How long a displayed position stays "live". limits.py owns it, and the pit's
 # own API reads the same constant -- two answers to "is this position current"
 # is how the wall and the dashboard end up disagreeing in front of the crew.
@@ -533,6 +533,29 @@ BASE_CSS = """
     font-size: 0.68rem; letter-spacing: 2.5px; text-transform: uppercase;
     color: var(--dim); font-weight: 600;
   }
+  /* A badge beside a label: CHARGING on the battery, DRIVER CHANGE on the
+     driver. Filled, not outlined, so it reads at a glance on a phone held at
+     arm's length and on a TV across the garage -- neither audience is
+     studying the page.
+
+     IT LIVES HERE, in the shared block, because it did not once: the charging
+     badge was written straight into docs/index.html and Pit_Dashboard/wall.html
+     after they were generated, in two slightly different versions, and this
+     generator never learned about either. Re-running it deleted the badge from
+     both pages. Anything the pages share belongs in this file or it does not
+     survive the next build.
+
+     Safe to set `display` here only because [hidden] above is !important; see
+     that note before copying this. */
+  .chg {
+    display: inline-block; margin-left: 7px; padding: 2px 7px;
+    border-radius: 999px; font-size: 0.6rem; letter-spacing: 1.5px;
+    font-weight: 700; color: #0b1220; background: var(--good);
+    vertical-align: 1px;
+  }
+  /* The swap. Cyan rather than green: charging is good news for the car, a
+     driver change is neither good nor bad, it is just what is happening. */
+  .chg.swap { background: var(--accent); }
   .value { font-size: 1.75rem; font-weight: 700; font-variant-numeric: tabular-nums; }
   .value.small { font-size: 1.15rem; line-height: 1.25; }
   .unit { font-size: 0.85rem; color: var(--dim); margin-left: 5px;
@@ -828,11 +851,14 @@ function fmtAgeShort(sec) {
   return h < 24 ? h + "h " + (m % 60) + "m" : Math.floor(h / 24) + "d";
 }
 
+// Rounded to tenths ONCE, then split -- see the wall's fmtLapTime. Splitting
+// first and rounding the remainder showed a 239.96 s lap as "3:60.0", and on
+// this page it would sit there until the car finished the next one.
 function fmtTime(s) {
   if (s == null) return "—";
-  const m = Math.floor(s / 60);
-  const r = s - m * 60;
-  return m + ":" + (r < 10 ? "0" : "") + r.toFixed(1);
+  const tenths = Math.round(Math.max(0, s) * 10);
+  const r = (tenths % 600) / 10;
+  return Math.floor(tenths / 600) + ":" + (r < 10 ? "0" : "") + r.toFixed(1);
 }
 
 function fmtClock(s) {
@@ -1150,6 +1176,25 @@ __BASE_CSS__
     background: var(--panel); border: 1px solid var(--line);
     border-radius: 10px; padding: 13px 15px;
   }
+  /* Only on the phone page: a badge that pulses is how a card nobody is
+     watching catches the corner of an eye. The wall does not, because on a TV
+     that runs for 24 hours it is just movement. */
+  .chg { animation: pulse 1.6s ease-in-out infinite; }
+  /* The IN THE PIT sign. Big enough to be the first thing read after the car
+     stops, and in the page's own accent rather than a warning colour: a pit
+     stop is the plan, not a problem. */
+  #pitsign {
+    margin-top: 10px; padding: 8px 12px; border-radius: 10px;
+    background: rgba(0, 229, 255, 0.12); border: 1px solid var(--accent);
+  }
+  #pitsign .mark {
+    display: block; color: var(--accent); font-weight: 700;
+    font-size: 0.95rem; letter-spacing: 3px; text-transform: uppercase;
+  }
+  #pitsign .why {
+    display: block; color: var(--dim); font-size: 0.8rem; font-weight: 600;
+    margin-top: 2px;
+  }
   .pill {
     display: inline-flex; align-items: center; gap: 8px;
     border-radius: 999px; padding: 5px 13px; font-size: 0.72rem;
@@ -1275,6 +1320,18 @@ __BASE_CSS__
       <div style="margin-top:10px"><span class="pill off" id="status">
         <span class="dot"></span><span id="status-text">Connecting</span></span></div>
       <div class="sub" id="status-sub">&mdash;</div>
+      <!-- IN THE PIT. The one line on this page written for somebody who does
+           not follow racing: a car that has stopped moving is the moment a
+           family watching from home starts to worry, and "in the pit" is the
+           answer in three words. It is DERIVED, never typed: the reasons
+           underneath are the two things the system actually knows -- a driver
+           change the crew flagged, and the charger the car itself detects. No
+           third button to remember in the box, and nothing here can claim the
+           car is in the pits on its own. -->
+      <div id="pitsign" hidden>
+        <span class="mark">IN THE PIT</span>
+        <span class="why" id="pitwhy"></span>
+      </div>
       <!-- Hidden until the count is both known and non-zero. A page that
            cannot reach the count must not claim an empty grandstand, and the
            viewer reading this is themselves proof the number is never 0. -->
@@ -1293,10 +1350,12 @@ __BASE_CSS__
       </div>
     </div>
 
-    <!-- Hidden until the pit types a name. There is no default driver. -->
+    <!-- Hidden until the pit types a name OR flags a driver change. There is
+         no default driver, and a swap can begin before anyone has typed one. -->
     <div class="card" id="driver-card" style="display:none">
-      <div class="label">Driving now</div>
+      <div class="label">Driving now <span id="swap" class="chg swap" hidden>DRIVER CHANGE</span></div>
       <div class="value small" id="driver-name"></div>
+      <div class="sub" id="swap-sub" hidden></div>
     </div>
 
     <div class="card">
@@ -1340,9 +1399,10 @@ __BASE_CSS__
     </div>
 
     <div class="card">
-      <div class="label">Battery</div>
+      <div class="label">Battery <span id="charging" class="chg" hidden>CHARGING</span></div>
       <div class="value small"><span id="soc">&mdash;</span><span class="unit">%</span></div>
       <div class="bar" id="soc-bar"><i></i></div>
+      <div class="sub" id="charging-sub" hidden>The car is in the pits on the charger.</div>
     </div>
 
     <div class="card">
@@ -1551,14 +1611,41 @@ function loadRace() {
 // The driver's name, typed in at the pit (Pit_Web writes /public/driver). Only
 // a real name shows the card; no name, a deleted node or a failed read hides
 // it. textContent, never innerHTML: this is text someone typed.
+let driverName = "";
+let swapSince = null;      // when the pit said the change began, or null
+
 function loadDriver() {
   fetch(CONFIG.dbUrl + "/" + CONFIG.driverPath + ".json", { cache: "no-store" })
     .then(r => r.ok ? r.json() : null)
     .then(d => {
-      const name = d && typeof d.name === "string" ? d.name.trim() : "";
-      el("driver-name").textContent = name;
-      el("driver-card").style.display = name ? "" : "none";
+      driverName = d && typeof d.name === "string" ? d.name.trim() : "";
+      // === true, not truthy: this node is written by the pit and read by
+      // strangers, and a stray string must not turn the badge on.
+      swapSince = d && d.changing === true ? num(d.since) : null;
+      paintDriver(Date.now() / 1000);
     }).catch(() => {});
+}
+
+// Who is driving, and whether they are being swapped out right now.
+//
+// The swap half exists because this page used to show the old driver and a car
+// sitting still, with nothing to say why -- which reads as a broken car to the
+// family this page is for. The pit says when a change starts; the same press
+// that starts the next driver's stint ends it.
+//
+// NOTHING HERE EXPIRES IT. The team asked for a flag that stays up until they
+// take it down, so the page states how long it has been up instead of quietly
+// deciding the crew must have forgotten.
+function paintDriver(now) {
+  const swapping = swapSince != null;
+  el("driver-name").textContent = driverName || (swapping ? "Changing over" : "");
+  el("driver-card").style.display = (driverName || swapping) ? "" : "none";
+  el("swap").hidden = !swapping;
+  el("swap-sub").hidden = !swapping;
+  if (swapping) {
+    el("swap-sub").textContent =
+      "In the pits for a driver change · " + fmtAgeShort(Math.max(0, now - swapSince));
+  }
 }
 
 // ── who else is watching ───────────────────────────────────────────────── //
@@ -1794,6 +1881,33 @@ function render() {
   el("soc").textContent = soc == null ? "—" : Math.round(soc);
   el("soc-bar").firstElementChild.style.width = (soc == null ? 0 : soc) + "%";
 
+  // Charging, straight from the car's own detector (charge_detector.py). Read
+  // with === true, not a truthiness test: `s` is the EMPTY object whenever the
+  // reading is old or absent, and an undefined field must render as "not
+  // charging" rather than throwing. The badge disappearing when the feed dies
+  // is the right failure -- a page that keeps saying CHARGING for an hour
+  // after the car left the box is worse than one that says nothing.
+  const charging = s.is_charging === true;
+  el("charging").hidden = !charging;
+  el("charging-sub").hidden = !charging;
+
+  // The driver card counts its swap up here rather than in loadDriver, which
+  // only runs every 15 s: the badge says how long the change has been running,
+  // and a minute counter that moves in fifteen-second steps looks broken.
+  paintDriver(now);
+
+  // IN THE PIT, from the two things that are known rather than guessed. A car
+  // simply reading 0 km/h is NOT one of them: a car stopped out on the circuit
+  // reads exactly the same, and telling the family it is in the pits when it
+  // is stranded at Turn 12 is a worse answer than saying nothing.
+  const why = [];
+  if (swapSince != null) {
+    why.push("driver change · " + fmtAgeShort(Math.max(0, now - swapSince)));
+  }
+  if (charging) why.push("on the charger");
+  el("pitsign").hidden = why.length === 0;
+  el("pitwhy").textContent = why.join(" · ");
+
   // Race clock. Hidden outright when nobody has published a window -- a
   // countdown to a date this page guessed would be worse than no countdown.
   // Three states, because for most of the time this page exists the race has
@@ -1921,7 +2035,11 @@ __ICON__
 __FONT_LINK__
 <style>
 __BASE_CSS__
-  /* Everything scales off the viewport so one file fits any panel. */
+  /* Everything scales off the viewport so one file fits any panel -- the
+     shared badge included, which is sized in rem for a phone. No animation on
+     it here: on a TV that runs for 24 hours a pulsing badge is just movement. */
+  .chg { margin-left: 0.5vw; padding: 0.15vw 0.5vw; font-size: 0.8vw;
+         letter-spacing: 0.1vw; vertical-align: 0.1vw; }
   html, body { height: 100%; overflow: hidden; }
   #stage {
     display: grid; grid-template-columns: 1fr minmax(300px, 27vw);
@@ -1975,6 +2093,13 @@ __BASE_CSS__
   .pill.live .dot { animation: pulse 1.6s ease-in-out infinite; }
   .pill.stale { color: var(--warn); border-color: var(--warn); }
   .pill.off { color: var(--bad); border-color: var(--bad); }
+  /* Filled, like DEMO: this one is not a state of the FEED, it is a thing the
+     crew is doing, and it has to be tellable apart from the status pill
+     beside it at the length of a garage. */
+  .pill.swap { color: #0b1220; background: var(--accent); border-color: var(--accent); }
+  /* Ticks once a second, same as #statusage above -- same treatment, for the
+     same reason: the strip must not twitch sideways as the digits roll. */
+  #swapage { font-variant-numeric: tabular-nums; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.25; } }
   /* -- the numbers ----------------------------------------------------- */
   .label { font-size: clamp(9px, min(0.72vw, 1.5vh), 16px);
@@ -2059,6 +2184,10 @@ __BASE_CSS__
       </div>
       <div class="spacer"></div>
       <div id="demo" class="pill demo" hidden>Demo &mdash; not live data</div>
+      <!-- Up while the pit has a driver change flagged, and it says for how
+           long. Nothing expires it: the crew asked for a flag that stays until
+           they clear it, so the wall states its age rather than second-guess. -->
+      <div id="swap" class="pill swap" hidden>Driver change <span id="swapage"></span></div>
       <div id="race" class="pill">Race <span id="raceclock">&mdash;</span></div>
       <div id="status" class="pill off"><span class="dot"></span><span id="statustext">Connecting</span><span id="statusage"></span></div>
     </div>
@@ -2091,7 +2220,7 @@ __BASE_CSS__
           <div class="big accent" id="lap">&mdash;</div>
         </div>
         <div>
-          <div class="label">This lap</div>
+          <div class="label" id="laptime-label">This lap</div>
           <div class="big" id="laptime">&mdash;</div>
         </div>
       </div>
@@ -2100,7 +2229,7 @@ __BASE_CSS__
     </div>
 
     <div class="card">
-      <div class="label">Battery</div>
+      <div class="label">Battery <span id="charging" class="chg" hidden>CHARGING</span></div>
       <div class="big" id="soc">&mdash;<span class="unit">%</span></div>
       <div class="bar"><i id="socbar"></i></div>
       <div class="quad" style="margin-top:0.6vw">
@@ -2156,6 +2285,15 @@ function ageOf(s) {
   return (s.served_ts - s.device_ts) + (performance.now() - snapAt) / 1000;
 }
 
+// The PIT SERVER's clock, carried forward since the snapshot arrived. Used for
+// anything stamped by the pit rather than by the car: the TV this runs on may
+// have no network time at all, and a wall clock an hour out would age a
+// two-minute driver change into an hour-long one.
+function serverNow(s) {
+  if (!s || s.served_ts == null) return null;
+  return s.served_ts + (performance.now() - snapAt) / 1000;
+}
+
 // A field the car is no longer sending. carried_ts only holds fields that came
 // from last_known instead of the newest row, so this is exactly "the car has
 // gone quiet about this one thing" -- a dead sensor on an otherwise live car.
@@ -2180,10 +2318,17 @@ function put(id, s, field, fmt) {
   return v;
 }
 
+// ROUNDED TO TENTHS ONCE, THEN SPLIT. Taking the minute off first and rounding
+// what was left put an impossible "3:60.0" on the TV: a 239.96 s lap had its
+// 3 minutes removed, and the 59.96 s remainder then rounded up to 60.0. It sat
+// there for the whole of the following lap, and the big clock flickered
+// through it at most minute boundaries. The HUD has always truncated for the
+// same reason (driver_dash_v2._lap_time_text); this is the same rule in JS.
 function fmtLapTime(sec) {
   if (sec == null || !isFinite(sec)) return "—";
-  const m = Math.floor(sec / 60), r = sec - m * 60;
-  return m + ":" + (r < 10 ? "0" : "") + r.toFixed(1);
+  const tenths = Math.round(Math.max(0, sec) * 10);
+  const r = (tenths % 600) / 10;
+  return Math.floor(tenths / 600) + ":" + (r < 10 ? "0" : "") + r.toFixed(1);
 }
 
 function fmtDelta(d) {
@@ -2216,9 +2361,24 @@ function render() {
   if (!s) return;
   el("demo").hidden = !s.demo;
 
+  // A driver change the pit has flagged (Pit_Web writes it, pit_wall.py reads
+  // it back out of app_state). The wall and the public page are showing the
+  // same instant, so they cannot disagree about whether a swap is on.
+  const swapSince = num(s.driver_change_since);
+  const swapNow = serverNow(s);
+  el("swap").hidden = swapSince == null;
+  el("swapage").textContent =
+    swapSince == null || swapNow == null
+      ? "" : "· " + fmtAgeShort(Math.max(0, swapNow - swapSince));
+
   // -- speed, battery, power ------------------------------------------- //
   put("speed",  s, "mms_vehicle_speed_kmh", v => Math.round(v));
   put("target", s, "target_speed_kmh",      v => Math.round(v));
+  // Charging, from the car's own detector. isCarried() matters here as much as
+  // on any number: a charging flag held over from the last row the car sent is
+  // not evidence the car is on the charger NOW, and this badge's only job is to
+  // explain a car that is stopped at this moment.
+  el("charging").hidden = isCarried(s, "is_charging") || num(s.is_charging) !== 1;
   const soc = put("soc", s, "bms_soc_percent", v => Math.round(v) + "%");
   const bar = el("socbar");
   bar.style.width = (soc == null ? 0 : Math.max(0, Math.min(100, soc))) + "%";
@@ -2245,29 +2405,38 @@ function render() {
   const lap = num(s.calculated_lap);
   el("lap").textContent = lap == null ? "—" : Math.round(lap);
 
-  // THE SHARED STOPWATCH. The car publishes the elapsed time its own HUD is
-  // showing and whether that is still moving, and this page reads the same one
-  // -- so the wall, the driver's screen and the spectator page cannot disagree,
-  // and either end can stop it. Only the time since this browser received the
-  // payload is added, so a stopped feed freezes the clock rather than running
-  // it up while the car sits in the box.
+  // THE LAP CLOCK IS NOT WORKED OUT HERE, and that is the point. The
+  // dashboard's header asks Pit_Dashboard/lap_clock.py for it and pit_wall.py
+  // hands this page that same function's answer, so the TV and the dashboard
+  // cannot show two different lap times -- which they could, and did, while
+  // this page subtracted two of the car's own wall-clock stamps in JavaScript
+  // and the header followed a rule nothing here had ever heard of.
   //
-  // The fallback, for a car on code older than the shared stopwatch, subtracts
-  // two of the CAR's own wall-clock stamps -- which is exactly why it is the
-  // fallback: that Pi has no RTC and NTP steps its clock after boot.
-  let running = null, swStopped = false;
-  const sw = num(s.stopwatch_s);
-  if (sw != null) {
-    swStopped = !!s.stopwatch_stopped;
-    running = swStopped ? sw : sw + (performance.now() - snapAt) / 1000;
-  } else if (s.lap_started_ts != null && s.device_ts != null) {
-    running = (s.device_ts - s.lap_started_ts) + (performance.now() - snapAt) / 1000;
-    if (running < 0 || running > CONFIG.maxLapS) running = null;
-  }
-  el("laptime").textContent = dead ? "—" : fmtLapTime(running);
-  el("laptime").classList.toggle("stale-val", dead || running == null);
+  // What arrives with it: the pit's own presses, at the instant they are made.
+  // Stop lap clock parks this clock and Cut lap sends it back to 0:00 without
+  // the TV sitting out the four to five seconds the car takes to confirm.
+  //
+  // IT DOES NOT STOP WHEN THE FEED DOES. The lap did not pause because the
+  // telemetry did, and on this link a clock that stopped with it is a clock
+  // nobody can use. The LABEL carries what the freeze used to say -- that the
+  // car has confirmed nothing for a while, and for how long -- so a number
+  // counting on the pit's clock alone is never read as one the car sent.
+  const lc = (s && s.lap_clock) || {};
+  const started = num(lc.startedAt), parked = num(lc.heldAt);
+  const pitNow = serverNow(s);
+  const running = started == null ? null
+                : parked != null ? parked - started
+                : pitNow == null ? null : pitNow - started;
+  const quiet = started != null && parked == null
+                && (age == null || age > CONFIG.dataStaleAfterS);
+  el("laptime").textContent = fmtLapTime(running);
+  el("laptime").classList.toggle("stale-val", running == null);
   // A clock that merely stops moving reads as a frozen page, so it says which.
-  el("laptime").classList.toggle("held-val", swStopped && !dead);
+  el("laptime").classList.toggle("held-val", parked != null);
+  el("laptime-label").textContent =
+      parked != null ? "This lap · held"
+    : quiet ? "This lap · no data " + fmtAgeShort(age)
+    : "This lap";
 
   const last = isCarried(s, "last_lap_time_s") ? null : num(s.last_lap_time_s);
   el("lastlap").textContent = fmtLapTime(last);
@@ -2463,12 +2632,19 @@ def render_wall(data):
         "pollMs": 1000,
         "staleAfterS": STALE_AFTER_S,
         "gpsMaxAgeS": GPS_LIVE_MAX_AGE_S,
+        # When the lap clock starts saying it is counting on the pit's clock
+        # alone. THE DASHBOARD'S OWN THRESHOLD (constants.DATA_STALE_AFTER_S,
+        # shipped to its frontend as dataStaleAfterS), not this page's 20 s
+        # dimming one: the two screens show the same clock and must say the
+        # same thing about it at the same moment.
+        "dataStaleAfterS": DATA_STALE_AFTER_S,
         # No "profiles" map any more. It existed solely to give the lap list a
         # target to subtract from, and the wall no longer scores laps against a
         # profile -- each lap is compared with the one before it instead.
-        # A running lap longer than this is not a lap, it is a stopped feed or a
-        # car sitting in the box, and the clock is blanked rather than counted.
-        "maxLapS": 900,
+        #
+        # No "maxLapS" either. It blanked a running lap over 15 minutes as "not
+        # a lap, a stopped feed" -- the clock now keeps counting through a dead
+        # feed by design and says so in its label, so a long one is a long one.
     }
     return (WALL_TEMPLATE
             .replace("__BANNER__", BANNER)

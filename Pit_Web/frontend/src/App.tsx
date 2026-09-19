@@ -7,7 +7,7 @@ import History from './tabs/History';
 import { Cells, LiveMetrics, Strategy, Weather } from './tabs/Rest';
 import { ChargingBadge, FaultBanner, MetricTile, PowerMapBadge } from './components';
 import { ErrorBoundary } from './ErrorBoundary';
-import { StintBanner, StintClock, stintNow } from './DriverStint';
+import { StintBanner, StintClock, SwapBanner, stintNow } from './DriverStint';
 import { Icon } from './icons';
 import { MISSING, ageText, fmt, hms, lapTime, useAlignedServerNow, useConfig, useLive, useStored } from './lib';
 import { useSparklines } from './Sparkline';
@@ -140,30 +140,67 @@ function RaceClock({ race, clockOffsetMs }: { race: Live['race'] | undefined; cl
  *
  *  Counts from the instant the car says the lap began, so it matches the
  *  stopwatch on the HUD rather than being a second, slightly different
- *  measurement of the same thing. It FREEZES when the car goes quiet: a clock
- *  still running through a dead link reports a long lap, which is not what has
- *  happened. */
-function LapClock({ live, clockOffsetMs }: { live: Live | null | undefined; clockOffsetMs: number }) {
+ *  measurement of the same thing.
+ *
+ *  IT KEEPS RUNNING WHEN THE CAR GOES QUIET. It used to freeze on the last
+ *  sample, on the argument that a clock counting through a dead link reports a
+ *  long lap rather than a dead link. That argument holds for a MEASUREMENT and
+ *  not for a stopwatch: the lap did not pause because the telemetry did, and on
+ *  this car the link drops often enough that a clock which stops whenever it
+ *  does is a clock nobody can use. The pit asked for one that always runs.
+ *
+ *  What the old freeze was protecting is kept, in the label rather than in the
+ *  number: while the car is quiet the clock says so and how long for, so the
+ *  figure is never read as something the car has confirmed. The pit's own Stop
+ *  button still parks it — that is a deliberate press, not a missing link. */
+function LapClock({ live, link, clockOffsetMs }: {
+  live: Live | null | undefined; link: Link; clockOffsetMs: number;
+}) {
   const lc = live?.lapClock;
   const started = lc?.startedAt ?? null;
   // Parked by the pit (Stop lap clock). Freezing on the instant of the press
   // rather than on the newest sample matters at the finish: the car is still
   // sending, so "the last sample" would keep moving under a stopped clock.
   const parked = lc?.heldAt ?? null;
-  const ticking = live?.fresh && parked === null;
+  // The ONLY thing that stops it now.
+  const ticking = parked === null;
   const serverNowS = useAlignedServerNow(clockOffsetMs, ticking ? started : null);
   const elapsed = started === null ? null
     : parked !== null ? parked - started
-    : (live?.fresh ? serverNowS - started : lc?.atSampleS ?? null);
-  const held = !!started && (parked !== null || !live?.fresh);
+    : serverNowS - started;
+  const held = !!started && parked !== null;
+  // Running, but on the pit's clock alone: nothing has come from the car since
+  // `live.age`. lapClock.atSampleS is what the car last confirmed, and it goes
+  // in the tooltip so the two numbers are both available without the big one
+  // pretending to be the smaller.
+  // `link`, not live.fresh: fresh is the SERVER's verdict at the moment it
+  // pushed, so with the socket down it would go on saying the car is live for
+  // as long as the link stayed down. linkState already folds in the socket and
+  // the silence, and it is what the badge beside this clock reads.
+  const quiet = !!started && !held && link !== 'live';
+  // How old the newest sample is NOW, counted here. live.age is the age AT THE
+  // PUSH and freezes with it, so a dead socket would leave this clock claiming
+  // "no data 4s" for the rest of the afternoon.
+  const sampleAt = live && live.age != null ? live.ts - live.age : null;
+  const quietFor = sampleAt !== null ? Math.max(0, serverNowS - sampleAt) : null;
+  const confirmed = lc?.atSampleS;
+  const datum = lc?.source === 'store'
+    ? 'Estimated from the earliest sample the pit holds for this lap — it can read short. The car itself reports the exact datum once it is running code that sends lap_started_ts.'
+    : lc?.source === 'pit'
+    ? "Counting from the press in this room. The car has not answered it yet; the clock hands back to the car's own datum at the next sample."
+    : "The car's own lap datum — the same one the driver's stopwatch counts from.";
   return (
-    <div className={`clock lap${held ? ' held' : ''}`}
-         title={lc?.source === 'store'
-           ? 'Estimated from the earliest sample the pit holds for this lap — it can read short. The car itself reports the exact datum once it is running code that sends lap_started_ts.'
-           : lc?.source === 'pit'
-           ? "Counting from the press in this room. The car has not answered it yet; the clock hands back to the car's own datum at the next sample."
-           : "The car's own lap datum — the same one the driver's stopwatch counts from."}>
-      <span className="k">{held ? 'Lap clock · held' : 'Lap clock'}</span>
+    <div className={`clock lap${held ? ' held' : ''}${quiet ? ' quiet' : ''}`}
+         title={quiet
+           ? `Still counting, on the pit's clock. Nothing has arrived from the car for ${ageText(quietFor)}`
+             + (confirmed != null ? `; the last figure it confirmed was ${hms(Math.max(0, Math.floor(confirmed)))}` : '')
+             + `. ${datum}`
+           : datum}>
+      <span className="k">
+        {held ? 'Lap clock · held'
+          : quiet ? `Lap clock · no data ${ageText(quietFor)}`
+          : 'Lap clock'}
+      </span>
       <span className="v">{elapsed === null ? '--:--' : hms(Math.max(0, Math.floor(elapsed)))}</span>
     </div>
   );
@@ -242,7 +279,7 @@ export default function App() {
           <span className="clock-sep" />
           <StintClock stint={live?.driverStint} clockOffsetMs={clockOffsetMs} />
           <span className="clock-sep" />
-          <LapClock live={live} clockOffsetMs={clockOffsetMs} />
+          <LapClock live={live} link={link} clockOffsetMs={clockOffsetMs} />
         </div>
         <div className="bar-right">
           <StatusPill link={link} live={live} silentS={silentS} />
@@ -265,6 +302,7 @@ export default function App() {
               <span>CONNECTION LOST — every number on this page is frozen at {frozenSince}. Reconnecting…</span>
             </div>
           )}
+          <SwapBanner stint={live?.driverStint} clockOffsetMs={clockOffsetMs} />
           <StintBanner stint={live?.driverStint} clockOffsetMs={clockOffsetMs} />
           {live ? <TopStrip live={live} /> : <div className="caption">waiting for the first sample…</div>}
 

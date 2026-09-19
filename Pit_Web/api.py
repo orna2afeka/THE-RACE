@@ -45,6 +45,11 @@ for _p in (_ROOT, _PIT):
 
 import db                                              # noqa: E402
 import export                                          # noqa: E402
+# THE lap clock, shared with the pit wall so the TV and this dashboard cannot
+# show two different lap times. _lap_clock() below is the thin reader that
+# hands it what the web backend has already read.
+from lap_clock import (                                # noqa: E402
+    LAP_DATUM_KEY, LAP_HOLD_KEY, lap_clock)
 import limits                                          # noqa: E402
 import live_metrics                                    # noqa: E402
 from metrics import HISTORY_CHARTS, value_from_row     # noqa: E402
@@ -413,13 +418,10 @@ def race_lap_floor(conn):
 DRIVER_STINT_KEY = "driver_stint"
 RACE_UNDO_KEY = "race_undo"
 STRATEGY_CHOICE_KEY = "strategy_choice"
-LAP_HOLD_KEY = "lap_clock_hold"
-# The instant the PIT last re-datumed the lap clock (Cut lap / Restart lap).
-# The car answers a press in its own time -- the command has to reach it, be
-# applied, and come back inside a telemetry sample -- and until it does, the
-# wall would go on counting the lap the engineer has just ended. This is what
-# the wall counts from in the meantime. See _lap_clock().
-LAP_DATUM_KEY = "lap_clock_datum"
+# LAP_HOLD_KEY and LAP_DATUM_KEY are imported from lap_clock.py, where the rule
+# that reads them lives. This file still owns the WRITES -- both are stamped by
+# the endpoints at the bottom -- but the pit wall reads them too, and a key
+# name spelled in two places is a screen that silently never sees a press.
 
 
 def race_undo_available(conn, now=None):
@@ -474,7 +476,10 @@ def driver_stint(conn, now=None):
         "warnS": DRIVER_STINT_WARN_S,
         "critS": DRIVER_STINT_CRIT_S,
     }
-    base["publicSynced"] = public_driver_synced(st.get("driver") or None)
+    base["publicSynced"] = public_driver_synced(_public_driver_state(st))
+    # When the pit said the swap began, or None. NOT auto-expired anywhere:
+    # it stays until somebody clears it, by choice — see the endpoint below.
+    base["changeStartedAt"] = st.get("change_started_at") or None
     if not started:
         # A name typed before the green flag is kept here and carried into
         # stint one when the race starts.
@@ -588,12 +593,22 @@ _public_driver_lock = threading.Lock()
 _public_driver_wake = threading.Event()
 
 
-def public_driver_synced(name):
-    """True when the public page shows `name` (or no name, for None), False
-    while a write is pending or failing, None when publishing is off."""
+def _public_driver_state(st):
+    """What /public/driver should say for stint record `st`: (name, since).
+
+    `since` is when the pit said a driver change began, or None. The pair is
+    what gets compared and published, so a change that starts while the name
+    is unchanged is still a difference worth a write.
+    """
+    return (st.get("driver") or None, st.get("change_started_at") or None)
+
+
+def public_driver_synced(state):
+    """True when the public page shows `state` — the (name, since) pair above.
+    False while a write is pending or failing, None when publishing is off."""
     if not PUBLIC_DRIVER_ENABLED:
         return None
-    return _public_driver_sent is not _NOT_SENT and _public_driver_sent == name
+    return _public_driver_sent is not _NOT_SENT and _public_driver_sent == state
 
 
 def sync_public_driver():
@@ -605,12 +620,12 @@ def sync_public_driver():
         try:
             with closing(ro_conn()) as conn:
                 st = load_app_state(conn, DRIVER_STINT_KEY) or {}
-            name = st.get("driver") or None
-            if _public_driver_sent is not _NOT_SENT and _public_driver_sent == name:
+            state = _public_driver_state(st)
+            if _public_driver_sent is not _NOT_SENT and _public_driver_sent == state:
                 return True
             import driver_message
-            driver_message.publish_driver_name(name)
-            _public_driver_sent = name
+            driver_message.publish_driver_name(state[0], changing_since=state[1])
+            _public_driver_sent = state
             return True
         except Exception as e:
             print("[public driver] not published, will retry: %s" % e, flush=True)
@@ -1011,100 +1026,30 @@ def _lap_energy_baseline(conn, lap):
     return energy, at_m
 
 def _lap_clock(conn, state, active_lap, age):
-    """{startedAt, atSampleS, source, heldAt} for the clock on the wall.
+    """The header's lap clock, from the shared rule in lap_clock.py.
 
-    THE PIT'S OWN PRESS COMES FIRST, and only while the car has not answered it
-    yet -- see LAP_DATUM_KEY below. Everything after this paragraph is what the
-    clock reads the rest of the time, which is almost all of it.
+    THE RULE ITSELF IS NOT HERE, deliberately: the garage TV shows the same
+    clock and now works it out with the same function, so the two screens
+    cannot disagree -- see that file's header for what it cost when they
+    could. All this does is read what the rule needs from this request's
+    connection and hand it over.
 
-    THE SHARED STOPWATCH COMES NEXT. The car publishes the elapsed time its
-    own HUD is showing and whether that is still moving
-    (main._publish_stopwatch), and that is the one clock: the driver, the pit
-    and the public page all read the same number, and either end can move it.
-    Whichever button was pressed last is the one that stands, because the car
-    applies them in the order they arrive.
-
-    It is rebuilt on the PIT's clock here -- this sample's arrival time minus
-    the elapsed the car measured -- rather than taken as a timestamp. The car
-    measures with time.monotonic(), which nothing can step; its wall clock has
-    no RTC behind it and NTP shifts it minutes at a time after boot.
-
-    Falls back to the lap datum, and then to the store's estimate, for a car on
-    code older than the shared stopwatch. Never invents a datum: with none of
-    the three, the dashboard shows a dash rather than counting from the start of
-    the session.
-
-    `atSampleS` is the figure at the NEWEST SAMPLE, and it is what the screen
-    freezes on once the car goes quiet. A clock that keeps counting through a
-    dead link does not report a long lap, it reports a dead link -- and it says
-    so in the one font on the wall that people trust to be live.
+    Kept as a wrapper rather than inlined at the one call site because
+    tools/check_lap_clock.py drives it with a stubbed load_app_state, which is
+    how the handover and hold rules are checked with no database at all.
     """
-    sample_at = (time.time() - age) if age is not None else None
-    # The pit's own press, shown before the car has had time to answer. Once a
-    # sample TAKEN AFTER the press arrives, the car's own flag governs and this
-    # is ignored -- so the wall feels instant without ever disagreeing with the
-    # car for longer than one sample.
-    pressed_at = (load_app_state(conn, LAP_HOLD_KEY) or {}).get("heldAt")
-    pressed_at = float(pressed_at) if pressed_at else None
-    unanswered = (pressed_at is not None and sample_at is not None
-                  and pressed_at > sample_at)
-
-    # THE PIT'S OWN RE-DATUM, ahead of everything the car has said. Cut lap and
-    # Restart lap both start the lap again, and the round trip that proves it --
-    # up to Firebase, down to the car over LTE, applied, and back inside the
-    # next telemetry sample -- measured four to five seconds on a bad link. The
-    # wall spent those seconds still counting the lap that had just been ended,
-    # which is the one number on the screen an engineer presses that button to
-    # see change.
-    #
-    # Same handover rule as the hold above, and the same reason to trust it: the
-    # moment a sample TAKEN AFTER the press arrives, the car's own datum governs
-    # and this is ignored, so the wall can never disagree with the car for
-    # longer than one sample. It is a head start, not a second opinion.
-    # A STORE WITH NO SAMPLES AT ALL IS NOT "the car has not answered yet", it
-    # is a pit that has never heard from the car -- a fresh database, or the
-    # morning before anything is switched on. The press stays in app_state
-    # across a restart, and without this it would be the newest thing the pit
-    # knew about for as long as that lasted. The wall says nothing instead, as
-    # it did before any of this.
-    datum_at = (load_app_state(conn, LAP_DATUM_KEY) or {}).get("atS")
-    datum_at = float(datum_at) if datum_at else None
-    if datum_at is not None and sample_at is not None and datum_at > sample_at:
-        # atSampleS is 0.0, not the elapsed at the last sample: that sample is
-        # OLDER than the press, so its figure belongs to the lap just ended. A
-        # car that goes quiet across a press freezes the wall on 0:00, which is
-        # what the pit just asked for, rather than on the time it was trying to
-        # clear.
-        return {"startedAt": datum_at, "source": "pit", "atSampleS": 0.0,
-                "heldAt": pressed_at if (pressed_at is not None
-                                         and pressed_at >= datum_at) else None}
-
-    stopwatch = state.get("stopwatch_s")
-    if stopwatch is not None and sample_at is not None:
-        at_sample = max(0.0, float(stopwatch))
-        started = sample_at - at_sample
-        stopped = bool(state.get("stopwatch_stopped")) or unanswered
-        return {"startedAt": started, "source": "car", "atSampleS": at_sample,
-                "heldAt": (started + at_sample) if stopped else None}
-
-    started = state.get("lap_started_ts")
-    source = "car"
-    if not started:
-        started = db.lap_started_estimate(conn, active_lap)
-        source = "store" if started else None
-    if not started:
-        return {"startedAt": None, "atSampleS": None, "source": None,
-                "heldAt": None}
-    started = float(started)
-    # The newest sample's own clock: time.time() - age is how read_live_state
-    # measured it, so this stays in step with the age every tile is labelled
-    # with.
-    at_sample = (sample_at - started) if sample_at is not None else None
-    # A press stamped BEFORE this lap's datum belongs to a previous lap, so the
-    # next crossing of the line releases the clock on its own.
-    held = pressed_at if pressed_at and pressed_at >= started else None
-    return {"startedAt": started, "source": source, "heldAt": held,
-            "atSampleS": None if at_sample is None else max(0.0, at_sample)}
+    return lap_clock(
+        state,
+        # The newest sample's instant, measured the way read_live_state
+        # measured the age every tile is labelled with, so the clock and those
+        # ages cannot drift apart.
+        (time.time() - age) if age is not None else None,
+        hold_at=(load_app_state(conn, LAP_HOLD_KEY) or {}).get("heldAt"),
+        datum_at=(load_app_state(conn, LAP_DATUM_KEY) or {}).get("atS"),
+        # Only consulted when the car has published no datum of its own, and
+        # not run at all on the path that does not need it.
+        estimate=lambda: db.lap_started_estimate(conn, active_lap),
+    )
 
 
 
@@ -2176,7 +2121,11 @@ def api_sectors():
             return {"racing": False, "sectors": SECTOR_IDS, "rows": [],
                     "best": [], "note": "Sector times start with the race "
                                         "clock. Press Start race."}
-        laps = db.recent_laps(conn, 4)
+        # Bounded to the race, like the purple fold below it. The car's lap
+        # counter goes back to 0 at the green flag, so without this the
+        # warm-up holds the highest tags in the store and the grid shows two
+        # laps from before the race, for the whole race.
+        laps = db.recent_laps(conn, 4, since_ts=start)
         return cached(("sectors", laps[0] if laps else None, start),
                       lambda: _build_sectors(conn, laps, start),
                       ttl=SECTOR_CACHE_TTL_S)
@@ -2867,6 +2816,11 @@ def api_driver_stint(body: StintBody):
             "previous_driver": st.get("driver"),
             "previous_accumulated_s": st.get("accumulated_s"),
             "previous_running_since": st.get("running_since"),
+            # A change in progress ENDS here: this press is the new driver
+            # being in the car, which is the end of the swap the pit flagged.
+            # The new record simply does not carry change_started_at forward;
+            # the previous_ copy is only so the undo can put it back.
+            "previous_change_started_at": st.get("change_started_at"),
             # The RACE time the finished stint ran, which is what the toast
             # reports — wall time would overstate it across a stoppage.
             "previous_stint_s": _stint_elapsed(st, now) if prev_started else None,
@@ -2897,6 +2851,44 @@ def api_driver_stint_name(body: StintBody):
         return driver_stint(conn, now)
 
 
+class ChangingBody(BaseModel):
+    """True when a driver change has just STARTED, False when it has not."""
+    on: bool = True
+
+
+@app.post("/api/driver_stint/changing")
+def api_driver_stint_changing(body: ChangingBody):
+    """Say that a driver change is under way — the car is in the box, swapping.
+
+    This exists because the system knew the END of a swap and never the start.
+    "Driver changed - reset timer" is pressed when the new driver is in and
+    their clock starts; until then the public page showed the old driver and a
+    car sitting still with no explanation, which reads as a broken car to the
+    families the page is for. Same argument as the charging badge.
+
+    The SERVER stamps the time, like every other clock here, so a tablet with
+    a wrong clock cannot make a two-minute swap look like twenty.
+
+    NOTHING EXPIRES THIS. By the team's decision it stays up until somebody
+    takes it down — either this endpoint with on=false, or the "Driver
+    changed" press, which is the swap ending. So that a flag left on is
+    visible rather than silent, every screen shows how long it has been up.
+    """
+    now = time.time()
+    with closing(rw_conn()) as conn:
+        st = load_app_state(conn, DRIVER_STINT_KEY) or {}
+        if body.on:
+            # Pressing it twice must not restart the count: the interesting
+            # number is how long this swap has run, not how long since the
+            # last press.
+            st["change_started_at"] = st.get("change_started_at") or now
+        else:
+            st.pop("change_started_at", None)
+        save_app_state(conn, DRIVER_STINT_KEY, st)
+        _kick_public_driver()
+        return driver_stint(conn, now)
+
+
 @app.post("/api/driver_stint/undo")
 def api_driver_stint_undo():
     """Put the previous stint back — for the mis-click during a pit stop.
@@ -2917,6 +2909,9 @@ def api_driver_stint_undo():
             # Drop the entry the change just appended: that stint is the one
             # being put back into the car, so it is current again, not history.
             "log": list(st.get("log") or [])[:-1],
+            # A mis-click during a swap: the swap was still running, so the
+            # badge on the public page and the wall comes back with it.
+            "change_started_at": st.get("previous_change_started_at"),
         }
         # Put the banked/running split back as it was, then re-sync it to the
         # race clock — the race may have been started or stopped in between.
