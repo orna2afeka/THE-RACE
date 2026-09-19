@@ -797,6 +797,13 @@ details.disc .disc-body { border: 1px solid var(--line); border-top: none; borde
 
 /* A select that sits in a table cell without turning the row into a form: no
    box until hovered or focused, the cell's own type, and it can be changed. */
-.cellselect { background: transparent; color: inherit; font: inherit; border: 1px solid transparent; border-radius: 6px; padding: 2px 4px; cursor: pointer; }
+/* width:auto + a min-width, against the global `select { width: 100% }`: in a
+   table cell 100% means "as wide as the column", and the column is only as wide
+   as the word DRIVER, so every name was cut to two letters. auto sizes a select
+   to its longest option, which is what a list of names wants. */
+.cellselect { width: auto; min-width: 104px; background: transparent; color: inherit; font: inherit; border: 1px solid transparent; border-radius: 6px; padding: 3px 26px 3px 8px; cursor: pointer; }
+/* The range row's picker: its natural width on the SAME line as the fields,
+   not a full-width bar that pushes Apply onto a row of its own. */
+.rangeselect { width: auto; min-width: 140px; flex: none; }
 .cellselect:hover, .cellselect:focus { border-color: var(--line); outline: none; }
 .cellselect option { color: #111; background: #fff; }

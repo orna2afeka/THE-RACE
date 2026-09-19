@@ -630,7 +630,7 @@ function LapTable({ laps, drivers, onEdited }: {
         <span className="caption" style={{ margin: 0 }}>to</span>
         <input type="text" inputMode="numeric" placeholder="to" aria-label="To lap" value={to}
                onChange={(e) => setTo(e.target.value)} style={{ width: 64 }} disabled={busy} />
-        <select value={who} onChange={(e) => setWho(e.target.value)} disabled={busy} aria-label="Driver">
+        <select className="rangeselect" value={who} onChange={(e) => setWho(e.target.value)} disabled={busy} aria-label="Driver">
           <option value="">driver…</option>
           {drivers.map((d) => <option key={d} value={d}>{d}</option>)}
         </select>

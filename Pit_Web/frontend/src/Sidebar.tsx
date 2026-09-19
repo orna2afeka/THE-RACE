@@ -7,6 +7,7 @@ import { MISSING, fmt, getJSON, localInput, postJSON, usePoll } from './lib';
 import { CarControls, DateTimeField, Disclosure, Pill } from './components';
 import { StintPanel } from './DriverStint';
 import { StartTimePanel } from './StartTime';
+import { DiscardedLap } from './DiscardedLap';
 import { PublicNote } from './PublicNote';
 import { SpectatorEstimate } from './SpectatorEstimate';
 import { ChargePanel } from './ChargeClock';
@@ -303,6 +304,10 @@ function CutLap({ carLap, lapHeld, carLink }:
             : `Sent ${freshSent} — awaiting the car's confirmation. (A car on the old lap code never answers this.)`}
         </div>
       )}
+
+      {/* A full lap discarded by the button above, and the way back. Shows
+          nothing unless the samples say it happened. DiscardedLap.tsx. */}
+      <DiscardedLap />
 
       <div className="btnrow" style={{ marginTop: 8 }}>
         <input type="text" inputMode="numeric" placeholder={carLap === null ? 'lap' : String(carLap)}

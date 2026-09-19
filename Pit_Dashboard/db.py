@@ -1573,7 +1573,156 @@ def fetch_laps(conn: sqlite3.Connection, device_id: str = DEVICE_ID,
             lap["lap_source"] = None
         laps.append(lap)
     laps.sort(key=lambda lap: lap["finished_ts"])
-    return _drop_double_cuts(_merge_split_laps(laps))
+    laps = _drop_double_cuts(_merge_split_laps(laps))
+
+    # LAPS THE PIT PUT BACK. "Restart lap, don't count it" pressed at the line
+    # in place of "Cut lap now" throws a whole driven lap away, and the car
+    # publishes nothing for it -- so by the rule above it could never be
+    # listed. The pit restores it by hand (Pit_Web api_laps_restore) from what
+    # the samples say, and it joins the list HERE, in the one lap builder, so
+    # the table, the TV, the charts and the workbook all gain it together.
+    # After the merge and the phantom filter, on purpose: neither may eat it.
+    # Tagged so nothing mistakes it for a lap the car measured, and with no
+    # `kind`, which keeps it out of the flying-lap statistics.
+    for r in load_restored_laps(conn):
+        ts = r["finished_ts"]
+        if since_ts is not None and ts < since_ts:
+            continue
+        if until_ts is not None and ts > until_ts:
+            continue
+        laps.append({"lap": r["lap"], "seq": None,
+                     "energy_wh": r["energy_wh"], "regen_wh": r["regen_wh"],
+                     "lap_time_s": r["lap_time_s"], "distance_m": r["distance_m"],
+                     "lap_source": "restored", "kind": None,
+                     "flags": ["restored_by_pit"], "stopped_s": None,
+                     "finished_ts": ts})
+    laps.sort(key=lambda lap: lap["finished_ts"])
+
+    # THE LAPS THE CAR NUMBERED BEFORE ITS COUNT WAS CORRECTED. Until the pit
+    # presses Set car lap number, the car goes on one short, so the lap after
+    # a restored 76 is published as 76 too and the list would hold two 76s and
+    # no 77. After a restored lap, a car lap whose number has not moved past
+    # the one before it is shown one higher; the first lap numbered properly
+    # means the count was fixed, and the car's numbers are taken as they are.
+    catching_up, last_n = False, None
+    for lap in laps:
+        if lap["lap_source"] == "restored":
+            catching_up = True
+        elif catching_up and last_n is not None and lap.get("lap") is not None:
+            if lap["lap"] <= last_n:
+                lap["lap"] = last_n + 1
+            else:
+                catching_up = False
+        if lap.get("lap") is not None:
+            last_n = lap["lap"]
+    return laps
+
+
+RESTORED_LAPS_KEY = "restored_laps"
+
+
+def load_restored_laps(conn: sqlite3.Connection) -> list:
+    """The laps the pit restored by hand for THIS race, or [].
+
+    Scoped to the race start, like the per-lap driver edits: a lap put back
+    last week must not turn up in tonight's list. [] rather than raising when
+    there is no app_state table -- a demo store has none.
+    """
+    try:
+        row = conn.execute("SELECT value FROM app_state WHERE key = ?",
+                           (RESTORED_LAPS_KEY,)).fetchone()
+    except sqlite3.Error:
+        return []
+    if not row or not row["value"]:
+        return []
+    try:
+        rec = json.loads(row["value"]) or {}
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(rec, dict):
+        return []
+    if rec.get("race_start") != load_race_state(conn).get("race_start_time"):
+        return []
+    laps = rec.get("laps")
+    return [r for r in laps if isinstance(r, dict) and r.get("finished_ts")] \
+        if isinstance(laps, list) else []
+
+
+# How far back find_discarded_laps looks. The mistake it exists for is noticed
+# within a lap or two; an hour covers that with room, and the scan reads
+# lap_distance_m off the table (it is in no index), so the window IS the cost.
+DISCARD_LOOKBACK_S = 3600.0
+
+
+def find_discarded_laps(conn: sqlite3.Connection, min_m: float,
+                        lookback_s: float = DISCARD_LOOKBACK_S,
+                        device_id: str = DEVICE_ID) -> list:
+    """Whole laps thrown away by a restart, newest last, with their figures.
+
+    A discard is unmistakable in the samples: lap_distance_m falls back to
+    zero while lap_seq DOES NOT MOVE. Every counted cut -- gate, distance,
+    pit, driver -- advances lap_seq; only restart_lap re-datums without it.
+    With at least `min_m` behind it, what was thrown away was a lap.
+
+    The figures are the car's own wherever it published them: the lap's
+    metres are the last lap_distance_m before the press, and its time is the
+    difference between the two lap_started_ts datums either side, which is
+    the same clock the HUD was showing. Energy is total_race_energy at the
+    press minus the total at the lap's datum ODOMETER, found the way
+    lap_start_energy finds it and for the same reason.
+
+    Returned, never applied: putting a lap back is the pit's decision.
+    """
+    hi = conn.execute("SELECT MAX(device_ts) AS v FROM telemetry "
+                      "WHERE device_id = ?", (device_id,)).fetchone()["v"]
+    if hi is None:
+        return []
+    edges = conn.execute(
+        "SELECT * FROM ("
+        " SELECT device_ts, lap_distance_m, lap_seq, lap_started_ts,"
+        "  LAG(device_ts) OVER w AS p_ts,"
+        "  LAG(lap_distance_m) OVER w AS p_m,"
+        "  LAG(lap_seq) OVER w AS p_seq,"
+        "  LAG(lap_started_ts) OVER w AS p_started,"
+        "  LAG(odometer_m) OVER w AS p_odo,"
+        "  LAG(total_race_energy) OVER w AS p_wh,"
+        "  LAG(regen_energy) OVER w AS p_regen"
+        " FROM telemetry WHERE device_id = ? AND device_ts >= ?"
+        " WINDOW w AS (ORDER BY device_ts)) "
+        "WHERE p_m >= ? AND lap_distance_m < p_m - 50 AND lap_seq IS p_seq "
+        "ORDER BY device_ts",
+        (device_id, hi - lookback_s, float(min_m))).fetchall()
+
+    out = []
+    for e in edges:
+        start = None
+        if e["p_odo"] is not None:
+            start = conn.execute(
+                "SELECT device_ts, total_race_energy, regen_energy FROM telemetry "
+                "WHERE device_id = ? AND odometer_m IS NOT NULL "
+                "  AND odometer_m <= ? AND device_ts >= ? AND device_ts <= ? "
+                "ORDER BY odometer_m DESC, device_ts DESC LIMIT 1",
+                (device_id, e["p_odo"] - e["p_m"],
+                 e["p_ts"] - LAP_BASELINE_LOOKBACK_S, e["p_ts"])).fetchone()
+        if e["lap_started_ts"] and e["p_started"]:
+            time_s = float(e["lap_started_ts"]) - float(e["p_started"])
+        elif start is not None:
+            time_s = float(e["p_ts"]) - float(start["device_ts"])
+        else:
+            time_s = None
+
+        def spent(now_v, col):
+            then = start[col] if start is not None else None
+            return None if now_v is None or then is None else now_v - then
+
+        out.append({
+            "finished_ts": float(e["device_ts"]),
+            "lap_time_s": time_s if time_s and time_s > 0 else None,
+            "distance_m": float(e["p_m"]),
+            "energy_wh": spent(e["p_wh"], "total_race_energy"),
+            "regen_wh": spent(e["p_regen"], "regen_energy"),
+        })
+    return out
 
 
 # A "lap" this short, cut by hand, that the CAR ITSELF marked distance_suspect

@@ -2033,6 +2033,98 @@ def api_laps():
     }
 
 
+# --------------------------------------------------------------------------- #
+# A lap thrown away by mistake, put back
+# --------------------------------------------------------------------------- #
+# "Restart lap, don't count it" sits one button below "Cut lap now", and at the
+# line, with the car going past, they get confused: 2026-09-19 20:43:28, a full
+# 4060 m lap discarded uncounted. The car publishes nothing for a lap it was
+# told to forget, so the lap list -- built only from what the car publishes --
+# could never show it, however plainly the samples did.
+#
+# The pit decides; nothing here restores by itself. The samples say what was
+# thrown away (db.find_discarded_laps), this records the pit's decision in
+# app_state, and db.fetch_laps merges it into the one lap list everything
+# reads. The COUNT on the car is a separate press -- Set car lap number -- and
+# the answer says which number, because the record and the count are two
+# different facts and only one of them lives here.
+DISCARDED_LAP_MIN_M = 0.95 * C.TRACK_LENGTH_METERS
+
+
+def _discarded_laps(conn):
+    """Candidates with `restored` and the number each would take."""
+    done = {round(r["finished_ts"], 1) for r in db.load_restored_laps(conn)}
+    laps = db.fetch_laps(conn, since_ts=race_lap_floor(conn))
+    out = []
+    for c in db.find_discarded_laps(conn, DISCARDED_LAP_MIN_M):
+        before = [x for x in laps if x["finished_ts"] < c["finished_ts"]
+                  and x.get("lap") is not None
+                  and x.get("lap_source") != "restored"]
+        c["lap"] = (int(before[-1]["lap"]) + 1) if before else 1
+        c["restored"] = round(c["finished_ts"], 1) in done
+        out.append(c)
+    return out
+
+
+def _discard_json(c):
+    return {"finishedTs": c["finished_ts"], "lap": c["lap"],
+            "lapTimeS": c["lap_time_s"], "distanceM": c["distance_m"],
+            "energyWh": c["energy_wh"], "regenWh": c["regen_wh"],
+            "restored": c["restored"], "at": _clock(c["finished_ts"])}
+
+
+@app.get("/api/laps/discarded")
+def api_laps_discarded():
+    """Whole laps a restart threw away in the last hour, restored or not."""
+    def build():
+        with closing(ro_conn()) as conn:
+            return {"candidates": [_discard_json(c) for c in _discarded_laps(conn)]}
+    return cached(("laps_discarded",), build, ttl=15.0)
+
+
+class RestoreLapBody(BaseModel):
+    finishedTs: float
+    undo: bool = False
+
+
+@app.post("/api/laps/restore")
+def api_laps_restore(body: RestoreLapBody):
+    """Put a discarded lap back in the list, or take it out again (undo)."""
+    with closing(rw_conn()) as conn:
+        race_start = db.load_race_state(conn).get("race_start_time")
+        kept = [r for r in db.load_restored_laps(conn)
+                if abs(r["finished_ts"] - body.finishedTs) > 1.0]
+        restored = None
+        if not body.undo:
+            match = [c for c in _discarded_laps(conn)
+                     if abs(c["finished_ts"] - body.finishedTs) <= 1.0]
+            if not match:
+                raise HTTPException(404, "no discarded lap found at that time")
+            c = match[0]
+            restored = {k: c[k] for k in ("finished_ts", "lap", "lap_time_s",
+                                          "distance_m", "energy_wh", "regen_wh")}
+            restored["restored_at"] = time.time()
+            kept.append(restored)
+        save_app_state(conn, db.RESTORED_LAPS_KEY,
+                       {"race_start": race_start, "laps": kept})
+        car_count = (read_live_state(conn)[0] or {}).get("auto_lap")
+        # What the car's count SHOULD read now: this lap's number, plus every
+        # lap the car has finished since. Offered only when the car reads
+        # less -- the pit may well have corrected it already, and a hint to
+        # "fix" a count that is right is how it ends up one too many.
+        want = None
+        if restored is not None:
+            since = [x for x in db.fetch_laps(conn, since_ts=restored["finished_ts"])
+                     if x["finished_ts"] > restored["finished_ts"]
+                     and x.get("lap_source") != "restored"]
+            want = int(restored["lap"]) + len(since)
+    with _cache_lock:
+        _cache.clear()               # the lap list is cached; show it now
+    return {"ok": True, "restored": restored, "carCount": car_count,
+            "setCarLapTo": want if (want is not None and car_count is not None
+                                    and int(car_count) < want) else None}
+
+
 class LapDriverBody(BaseModel):
     # One lap, or a run of them -- a whole stint credited to the wrong name is
     # eighteen laps, and nobody should fix that with eighteen dropdowns.
