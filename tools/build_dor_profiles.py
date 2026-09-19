@@ -87,8 +87,10 @@ import track                                                # noqa: E402
 import generate_profiles as gen                             # noqa: E402
 from strategy_engine import TURN_START_TRACK_M              # noqa: E402
 
-# lap 33 of the 2026-09-19 race is what profiles/ is built from today:
-#     python tools/build_dor_profiles.py --as-driven lap33_290s --verify
+# lap 33 of the 2026-09-19 race is what profiles/ is built from today. The
+# workbook was arranged by the crew so that row 1 is the start/finish line, and
+# the lap is stretched onto the surveyed 4000 m -- so BOTH flags are needed:
+#     python tools/build_dor_profiles.py --as-driven lap33_290s --file-order --axis track --verify
 # "dor 17.xlsx" (the practice lap the dor_* ladder came from) is still beside
 # it; pass --source to build from that, or from any later lap export.
 SOURCE_XLSX = os.path.join(_REPO, "SolarRace_OS", "lap 33.xlsx")
@@ -96,6 +98,9 @@ OUT_DIR = os.path.join(_REPO, "profiles")
 
 # Column headings in the car's export, matched case-insensitively on a prefix
 # so a later export that renames "(km/h)" to "(kph)" still loads.
+# In a hand-arranged workbook, a backwards jump bigger than this is the paste
+# seam, not the car reversing: lap 33 goes 4190 m -> 210 m there.
+SEAM_JUMP_M = 1000.0
 COL_TIME = "time"
 COL_LAP = "lap"
 COL_LAP_DIST = "lap distance"
@@ -144,8 +149,20 @@ def _col(headers, want):
     raise SystemExit(f"no column starting {want!r} — got {headers}")
 
 
-def read_lap(path=SOURCE_XLSX, lap=None):
-    """[(lap_distance_m, speed_kmh)] for one lap, in the order logged."""
+def read_lap(path=SOURCE_XLSX, lap=None, file_order=False):
+    """[(lap_distance_m, speed_kmh)] for one lap, in the order logged.
+
+    `file_order` is for a workbook THE CREW HAS ARRANGED BY HAND, which is what
+    lap 33.xlsx is. On that lap GPS was down and laps were being cut by a
+    person, so the car's lap-distance zero sat ~630 m before the real line:
+    its own distance column put T1 at "39 km/h" and T8/9 flat out. The crew
+    cut and pasted the rows so that ROW 1 IS THE START/FINISH LINE, matched
+    against a lap whose corners they know. Then neither the clock column nor
+    the absolute lap distance means anything any more -- the rows are the lap,
+    in order, and only the distance BETWEEN rows is used: it is accumulated
+    from row 1, and the one big backwards jump (the paste seam, where the end
+    of the lap meets its beginning) counts as no distance at all.
+    """
     import openpyxl
     wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
     rows = list(wb[wb.sheetnames[0]].iter_rows(values_only=True))
@@ -156,14 +173,24 @@ def read_lap(path=SOURCE_XLSX, lap=None):
     # not written in time order (lap 33's first row is its 67th sample), and
     # everything below reads "the last sample" as "the end of the lap".
     body = [r for r in rows[1:] if r[i_d] is not None and r[i_v] is not None]
-    try:
-        i_t = _col(head, COL_TIME)
-        body.sort(key=lambda r: r[i_t])
-    except SystemExit:
-        pass                       # a car log with no clock column is in order
+    if not file_order:
+        try:
+            i_t = _col(head, COL_TIME)
+            body.sort(key=lambda r: r[i_t])
+        except SystemExit:
+            pass                   # a car log with no clock column is in order
     laps = {}
     for r in body:
         laps.setdefault(r[i_lap], []).append((float(r[i_d]), float(r[i_v])))
+    if file_order:
+        for key, rows_ in laps.items():
+            pos, out = 0.0, []
+            for j, (d, v) in enumerate(rows_):
+                if j:
+                    step = d - rows_[j - 1][0]
+                    pos += step if step > -SEAM_JUMP_M else 0.0
+                out.append((pos, v))
+            laps[key] = out
     if lap is None:
         if len(laps) != 1:
             raise SystemExit(f"{os.path.basename(path)} holds laps "
@@ -350,9 +377,9 @@ def lap_time_to(dist, speed, limit_m):
     return total
 
 
-def build_baseline(path=SOURCE_XLSX, lap=None, axis="odometer"):
+def build_baseline(path=SOURCE_XLSX, lap=None, axis="odometer", file_order=False):
     """The real lap as (dist, speed_ms, section) on the car's 10 m grid."""
-    lap_no, samples = read_lap(path, lap)
+    lap_no, samples = read_lap(path, lap, file_order)
     measured, scale, dist, kmh = to_track_grid(samples, axis)
 
     # The acceleration limit for the tail rebuild has to come from the part of
@@ -399,6 +426,10 @@ def main():
                          "as driven -- no target time, nothing scaled. For a "
                          "lap that is already the pace the crew wants (lap 33) "
                          "rather than raw material for a ladder of paces.")
+    ap.add_argument("--file-order", action="store_true",
+                    help="the workbook's rows are already the lap, in order, "
+                         "with row 1 on the start/finish line -- ignore its "
+                         "clock and its absolute lap distance. See read_lap().")
     ap.add_argument("--label", default="Base",
                     help="the human label written beside --as-driven's key")
     ap.add_argument("--out", default=OUT_DIR)
@@ -406,7 +437,7 @@ def main():
     ap.add_argument("--verify", action="store_true")
     args = ap.parse_args()
 
-    b = build_baseline(args.source, args.lap, args.axis)
+    b = build_baseline(args.source, args.lap, args.axis, args.file_order)
     dist, speed, section = b["dist"], b["speed_ms"], b["section"]
     base_t = gen.lap_time(dist, speed)
     accel_limit, brake_limit = gen.peak_accel_decel(dist, speed)

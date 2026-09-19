@@ -99,9 +99,12 @@ TARGET_LAP_TIME_MIN = 3.5
 # ONE PROFILE NOW, AND IT IS A RACE LAP: lap33_290s is lap 33 of the race on
 # 2026-09-19 exactly as driven (SolarRace_OS/lap 33.xlsx -- 285.6 s on the
 # clock, NORMAL mode, 101.1 Wh, which is the energy_wh below and is MEASURED,
-# not fitted). It replaced dor_265s/280s/300s, which were one practice in-lap
+# not fitted). THE ROWS OF THAT WORKBOOK WERE ARRANGED BY THE CREW so that row 1
+# is the start/finish line: GPS was down and laps were being cut by hand, so
+# the car's own lap distance sat ~630 m out, and a build that trusted it put
+# T1 at 39 km/h and T8/9 flat out. It replaced dor_265s/280s/300s, which were one practice in-lap
 # scaled three ways and sat ~100 m out of phase at T12. Rebuild it with
-#   python tools/build_dor_profiles.py --as-driven lap33_290s --verify
+#   python tools/build_dor_profiles.py --as-driven lap33_290s --file-order --axis track --verify
 # More profiles are added from the matrix editor, not by hand here.
 #
 # (History) THE PREVIOUS THREE CAME FROM A LAP THE CAR DROVE, not from a desk model. They replace
@@ -114,7 +117,7 @@ TARGET_LAP_TIME_MIN = 3.5
 # what each curve integrates to. Old CSVs are in profiles/_backup/.
 # >>> PROFILE MATRIX >>>
 PROFILE_MATRIX = {
-    "lap33_290s": {"label": "Base", "energy_wh": 101.1, "target_s": 290.3},
+    "lap33_290s": {"label": "Base", "energy_wh": 102.7, "target_s": 283.0},
 }
 # <<< PROFILE MATRIX <<<
 DEFAULT_STRATEGY_KEY = "lap33_290s"
