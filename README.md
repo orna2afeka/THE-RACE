@@ -235,7 +235,8 @@ THE RACE/                             # ← repo root
 │   ├── live_metrics.py               # Live Metrics tile catalogue
 │   ├── memo.py                       # Tiny memoiser (replaced st.cache_data in the shared modules)
 │   ├── .streamlit/config.toml        # Streamlit settings — for the profile builder only
-│   ├── 210s.xlsx                     # Baseline 210 s Zolder velocity profile
+│   ├── 210s.xlsx                     # RETIRED desk model (210 s, 92 km/h straight). Kept for reference
+│   │                                 #   only — the profiles now come from a lap the car drove
 │   ├── profile_builder.py            # Speed Profile Builder app (port 8502, reads telemetry.db READ-ONLY).
 │   │                                 #   Rows are DRIVES, not lap numbers — the counter repeats. Shows each
 │   │                                 #   lap's Wh, Wh/km and a nine-sector energy split that self-checks
@@ -246,17 +247,24 @@ THE RACE/                             # ← repo root
 │   ├── serviceAccountKey.json        # 🔒 Firebase admin key — SEE SECURITY NOTE BELOW
 │   └── telemetry.db                  # Local SQLite store (gitignored; created by collector.py)
 │
-├── profiles/                         # Target-speed CSVs, one per lap time. Generated:
-│   #  either synthetically by tools/generate_profiles.py, or from a lap the car
-│   #  really drove, by Pit_Dashboard/profile_builder.py. The car loads every
-│   #  file here ONCE at startup, so a replaced profile needs a HUD restart.
-│   ├── fast_189s.csv  med_fast_199s.csv  base_210s.csv
-│   └── med_slow_220s.csv  slow_231s.csv
+├── profiles/                         # Target-speed CSVs, one per lap time. All three are built from
+│   #  ONE lap the car really drove (SolarRace_OS/dor 17.xlsx, Zolder 2026-09-18)
+│   #  by tools/build_dor_profiles.py: corner speeds are exactly as driven, only
+│   #  the straights are re-paced. Pit_Dashboard/profile_builder.py adds more from
+│   #  later laps. The car loads every file here ONCE at startup, so a replaced
+│   #  profile needs a HUD restart.
+│   #  d(m) counts ODOMETER metres, not surveyed ones — the car's lookup is fed
+│   #  the raw odometer, which over-reads ~1.5% (track.py:63, untested tyre
+│   #  constant). Rebuild with --axis track once that constant is measured.
+│   ├── dor_265s.csv   4:25   dor_280s.csv   4:40   (the car's default)
+│   └── dor_300s.csv   5:00
 │
 ├── tools/                            # One-off / offline utilities (not part of the live system)
 │   ├── check_limits.py               # Headless checks: gauge tiers, blink edges, no-data
 │   ├── replay_limits.py              # Replays telemetry.db: how often each tier would fire
-│   ├── generate_profiles.py          # Builds profiles/*.csv from Pit_Dashboard/210s.xlsx
+│   ├── build_dor_profiles.py         # Builds profiles/*.csv from the car's own logged lap. --verify
+│   │                                 #   proves the corners land on the surveyed turns
+│   ├── generate_profiles.py          # SUPERSEDED as a generator; still the solver the above imports
 │   ├── hud_sim.py                    # Drives the driver HUD without a car, for UI work. On a Pi it
 │   │                                 #   also drives the real regen brake light on GPIO 17 (R holds it lit)
 │   ├── demo_seed.py / demo_feed.py   # Build and keep live the synthetic store Demo Dashboard.bat uses
@@ -265,7 +273,7 @@ THE RACE/                             # ← repo root
 │   │                                 #   spectator page and Pit_Dashboard/wall.html
 │   └── pit_wall.py                   # Serves wall.html + /live.json on the pit LAN (port 8503),
 │                                     #   telemetry.db READ-ONLY, one thread, never published.
-│                                     #   --demo drives it from base_210s.csv with no database at all
+│                                     #   --demo drives it from dor_280s.csv with no database at all
 │
 ├── deploy/                           # Raspberry Pi provisioning (systemd + desktop launcher)
 │   ├── README.md                     # ⭐ Pi setup guide — read this before touching the Pi
