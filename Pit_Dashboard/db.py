@@ -954,17 +954,61 @@ def lap_started_estimate(conn: sqlite3.Connection, lap,
 
     None when the lap is unknown or nothing is stored for it, which the caller
     shows as a dash rather than counting up from an invented datum.
+
+    THE EARLIEST SAMPLE OF THE CURRENT RUN, not of the tag. A lap number is
+    not unique: the car's counter goes back whenever the pit sets the lap
+    number, and at Zolder on 2026-09-19 tag 70 was used twice within five
+    minutes -- once for the nine seconds between a fallback cut and the pit's
+    own, and again for the lap being driven afterwards. MIN over the tag then
+    answered with the FIRST use, seven minutes earlier, and everything hung on
+    this read that datum: the wall's lap clock and its this-lap energy both
+    counted from a lap that had already ended. lap_run_start_ts finds where
+    the current run of the tag begins.
     """
     if lap is None:
         return None
     try:
-        row = conn.execute(
-            "SELECT MIN(device_ts) FROM telemetry "
-            "WHERE device_id = ? AND CAST(calculated_lap AS INTEGER) = ?",
-            (device_id, int(lap)),
-        ).fetchone()
+        return lap_run_start_ts(conn, lap, device_id)
     except Exception:                                    # noqa: BLE001
         return None
+
+
+def lap_run_start_ts(conn: sqlite3.Connection, lap, device_id: str = DEVICE_ID):
+    """When the CURRENT run of samples tagged `lap` begins, or None.
+
+    A lap tag names one lap only until the car's counter moves back over it --
+    a pit "set lap number", a green flag, a checkpoint restored between
+    sessions. Every one of those puts an OLDER stretch of the race under the
+    same number as the lap being driven now, and any question of the form
+    "when did lap N start" answered with MIN over the tag then reaches back
+    into that older stretch.
+
+    THE LAST RUN OF THE TAG, for a finished lap as much as for the one being
+    driven: when a number has been used twice, the later stretch is the lap
+    anybody means by it, and it is the one the lap list shows. So walk back
+    from this tag's newest sample to the last sample carrying a DIFFERENT tag,
+    and take the first sample of this tag after that. With no such sample --
+    one tag for the whole store -- it is the tag's own earliest, which is the
+    same answer.
+
+    Three index lookups (idx_telemetry_lap, and idx_telemetry_chart covers
+    calculated_lap so none of them need the table), each bounded by one lap of
+    rows rather than by the size of the race.
+    """
+    if lap is None:
+        return None
+    lo, hi = float(int(lap)), float(int(lap)) + 1.0
+    mine = "device_id = ? AND calculated_lap >= ? AND calculated_lap < ?"
+    row = conn.execute(
+        "SELECT MIN(device_ts) FROM telemetry WHERE " + mine +
+        "  AND device_ts > COALESCE(("
+        "      SELECT MAX(device_ts) FROM telemetry "
+        "      WHERE device_id = ? AND calculated_lap IS NOT NULL "
+        "        AND (calculated_lap < ? OR calculated_lap >= ?) "
+        "        AND device_ts < (SELECT MAX(device_ts) FROM telemetry "
+        "                         WHERE " + mine + ")), -1e18)",
+        (device_id, lo, hi, device_id, lo, hi, device_id, lo, hi),
+    ).fetchone()
     return row[0] if row and row[0] else None
 
 
@@ -1529,7 +1573,49 @@ def fetch_laps(conn: sqlite3.Connection, device_id: str = DEVICE_ID,
             lap["lap_source"] = None
         laps.append(lap)
     laps.sort(key=lambda lap: lap["finished_ts"])
-    return _merge_split_laps(laps)
+    return _drop_double_cuts(_merge_split_laps(laps))
+
+
+# A "lap" this short, cut by hand, that the CAR ITSELF marked distance_suspect
+# is not a lap: it is the second of two cuts for one crossing of the line.
+PHANTOM_LAP_MAX_M = 500.0
+PHANTOM_LAP_MAX_S = 60.0
+
+
+def _drop_double_cuts(laps):
+    """Leave out the phantom a double cut leaves behind.
+
+    WHAT HAPPENS. With GPS down the car cuts laps by odometer, on its own, at
+    4000 m. The pit (or the driver) watching the car cross the line presses Cut
+    lap as well -- and the press lands a few seconds after the car has already
+    cut. The car obeys: observed 2026-09-19 at 18:03, lap 58 cut by odometer
+    and then a "lap 59" of 9.1 s, 140 m and 6.5 Wh by hand, nine seconds later.
+
+    Every list of laps then carried it -- a bar of 6 Wh in the energy chart, a
+    nine-second point dragging the lap-time axis, a tab of 18 samples in the
+    per-lap workbook -- and once the count was corrected the NEXT real lap took
+    the same number, so the race had two lap 59s.
+
+    DELIBERATELY NARROW, because "every lap is listed" is the rule here and a
+    hidden lap is a serious thing. ALL of these must hold:
+
+      * the car marked it distance_suspect -- its own verdict, not the pit's;
+      * it was cut BY HAND -- the gate and the odometer cannot fire 140 m apart;
+      * it covered under PHANTOM_LAP_MAX_M and took under PHANTOM_LAP_MAX_S.
+
+    A short lap the car did NOT flag, a lap from an older car with no flags, a
+    real in-lap or out-lap: all stay. Nothing is deleted -- the samples are in
+    the store and in the time-ranged workbook; this is only what counts as a
+    lap. The COUNT on the car is a separate matter and is corrected from the
+    pit with Set car lap number.
+    """
+    def phantom(lap):
+        d, t = lap.get("distance_m"), lap.get("lap_time_s")
+        return ("distance_suspect" in (lap.get("flags") or [])
+                and lap.get("lap_source") == "manual"
+                and d is not None and d < PHANTOM_LAP_MAX_M
+                and t is not None and t < PHANTOM_LAP_MAX_S)
+    return [lap for lap in laps if not phantom(lap)]
 
 
 # What a split has to agree on before two fragments can be the same lap, and
@@ -1654,13 +1740,22 @@ def lap_start_energy(conn: sqlite3.Connection, lap: int,
     of driving under one lap tag, and this measured 200 ms over a 49k-row lap
     in a bench store. build_live() runs every 2 s for every viewer, so api.py
     caches the result per lap.
+
+    THE CURRENT RUN OF THE TAG, not every row that ever carried it. Lap
+    numbers repeat when the car's counter is moved back -- see
+    lap_run_start_ts -- and the baseline is the one figure where that is
+    unmissable: on 2026-09-19 the pit wall's "this lap" energy took its
+    baseline from the first use of tag 70, seven minutes and 197 Wh before the
+    lap it was labelling, and simply never reset.
     """
+    since = lap_run_start_ts(conn, lap, device_id)
     return conn.execute(
         "SELECT total_race_energy, lap_distance_m FROM telemetry "
         "WHERE device_id = ? AND calculated_lap >= ? AND calculated_lap < ? "
-        "  AND total_race_energy IS NOT NULL "
+        "  AND total_race_energy IS NOT NULL AND device_ts >= ? "
         "ORDER BY device_ts ASC LIMIT 1",
-        (device_id, float(int(lap)), float(int(lap)) + 1.0),
+        (device_id, float(int(lap)), float(int(lap)) + 1.0,
+         since if since is not None else -1e18),
     ).fetchone()
 
 
@@ -2183,16 +2278,42 @@ def load_driver_stints(conn: sqlite3.Connection) -> list:
     out = []
     for e in (st.get("log") or []):
         if isinstance(e, dict) and e.get("started_at") is not None:
-            out.append({"stint": e.get("stint"), "driver": e.get("driver") or None,
-                        "started_at": float(e["started_at"]),
-                        "ended_at": (None if e.get("ended_at") is None
-                                     else float(e["ended_at"]))})
-    # The stint in progress is not in the log — it is the record itself, so a
-    # rename ("Name current driver") lands on it with nothing to keep in sync.
+            out.extend(_stint_intervals(e, e.get("ended_at")))
+    # The stint in progress is not in the log — it is the record itself.
     if st.get("started_at") is not None:
-        out.append({"stint": st.get("stint"), "driver": st.get("driver") or None,
-                    "started_at": float(st["started_at"]), "ended_at": None})
+        out.extend(_stint_intervals(st, None))
     out.sort(key=lambda s: s["started_at"])
+    return out
+
+
+def _stint_intervals(e, ended_at):
+    """One stint as the intervals it was DRIVEN in, one per name it carried.
+
+    A NAME IS TRUE FROM WHEN IT WAS GIVEN, NOT BACKWARDS. "Name current driver"
+    used to overwrite the stint's one name, so typing the incoming driver a
+    moment before pressing "Driver changed" relabelled the outgoing driver's
+    whole stint -- on 2026-09-19 three hours and eighteen laps of Ido's became
+    Amit's that way. The pit now records each naming as {"driver", "from"} in
+    `names`, and a lap belongs to whichever name was current when it finished.
+
+    A stint with no `names` (every record written before this) is one interval
+    under its `driver`, exactly as it always was.
+    """
+    start = float(e["started_at"])
+    end = None if ended_at is None else float(ended_at)
+    names = [n for n in (e.get("names") or [])
+             if isinstance(n, dict) and n.get("from") is not None]
+    if not names:
+        return [{"stint": e.get("stint"), "driver": e.get("driver") or None,
+                 "started_at": start, "ended_at": end}]
+    names.sort(key=lambda n: float(n["from"]))
+    out = []
+    for i, n in enumerate(names):
+        a = max(start, float(n["from"])) if i else start
+        b = float(names[i + 1]["from"]) if i + 1 < len(names) else end
+        if b is None or b > a:
+            out.append({"stint": e.get("stint"), "driver": n.get("driver") or None,
+                        "started_at": a, "ended_at": b})
     return out
 
 
@@ -2217,8 +2338,58 @@ def driver_at(stints: list, ts) -> str:
     return None
 
 
-def attach_lap_drivers(laps: list, stints: list) -> list:
-    """Add a `driver` key to each lap from `fetch_laps`. Mutates and returns."""
+LAP_DRIVERS_KEY = "lap_drivers"
+
+
+def lap_key(lap) -> str:
+    """What a per-lap edit is filed under.
+
+    lap_seq, not the lap NUMBER: the pit can set the number, and on 2026-09-19
+    the race had two lap 61s an hour after a count correction. lap_seq only the
+    car moves. A lap from a car that predates lap_seq falls back to the instant
+    it finished, which is as unique as anything that car reports.
+    """
+    if lap.get("seq") is not None:
+        return "s%d" % int(lap["seq"])
+    return "t%d" % int(lap.get("finished_ts") or 0)
+
+
+def load_lap_driver_overrides(conn: sqlite3.Connection) -> dict:
+    """{lap_key: name} the pit set by hand for THIS race, or {}.
+
+    Scoped to the race start like the charging count: lap_seq starts again at
+    a green flag, and last race's edit must not name this race's lap 3.
+    """
+    row = conn.execute("SELECT value FROM app_state WHERE key = ?",
+                       (LAP_DRIVERS_KEY,)).fetchone()
+    if not row or not row["value"]:
+        return {}
+    try:
+        rec = json.loads(row["value"]) or {}
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(rec, dict):
+        return {}
+    if rec.get("race_start") != load_race_state(conn).get("race_start_time"):
+        return {}
+    by = rec.get("by_key")
+    return by if isinstance(by, dict) else {}
+
+
+def attach_lap_drivers(laps: list, stints: list, overrides: dict = None) -> list:
+    """Add `driver`, `key` and `driver_edited` to each lap. Mutates and returns.
+
+    The stint log answers first; a name the pit picked for that lap BY HAND
+    wins over it. Every view of laps -- the table, the Laps sheet, each tab of
+    the per-lap workbook -- comes through here, so an edit made in the table is
+    the name in the workbook too.
+    """
+    overrides = overrides or {}
     for lap in laps:
+        key = lap_key(lap)
+        lap["key"] = key
         lap["driver"] = driver_at(stints, lap.get("finished_ts"))
+        lap["driver_edited"] = key in overrides
+        if key in overrides:
+            lap["driver"] = overrides[key] or None
     return laps

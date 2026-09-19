@@ -725,7 +725,8 @@ def write_laps_xlsx(fileobj_or_path, first_lap=None, last_lap=None,
         # lap_time_s for exactly the lap most likely to be looked at. Fetch
         # every lap of the race, window them all, then select.
         laps = db.fetch_laps(conn, device_id=device_id, since_ts=race_start)
-        db.attach_lap_drivers(laps, db.load_driver_stints(conn))
+        db.attach_lap_drivers(laps, db.load_driver_stints(conn),
+                              db.load_lap_driver_overrides(conn))
 
         wanted = [(i, l) for i, l in enumerate(laps)
                   if l.get("lap") is not None
@@ -818,7 +819,8 @@ def write_xlsx(fileobj_or_path, start_ts=None, end_ts=None, metrics=None,
         # /api/laps makes, so the Driver column and the dashboard's per-lap
         # table cannot credit one lap to two different people.
         if include_laps:
-            db.attach_lap_drivers(laps, db.load_driver_stints(conn))
+            db.attach_lap_drivers(laps, db.load_driver_stints(conn),
+                              db.load_lap_driver_overrides(conn))
         fault_rows = []
         if include_faults:
             # limit=None: the default keeps only the newest 2000 fault rows,

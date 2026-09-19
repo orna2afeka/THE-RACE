@@ -9,6 +9,7 @@ import { StintPanel } from './DriverStint';
 import { StartTimePanel } from './StartTime';
 import { PublicNote } from './PublicNote';
 import { SpectatorEstimate } from './SpectatorEstimate';
+import { ChargePanel } from './ChargeClock';
 import { toast } from './toast';
 import type { Config, Live } from './types';
 
@@ -119,6 +120,12 @@ export default function Sidebar({
                     racing={!!race?.isRacing} />
       </Sec>
 
+      {/* Directly under the stint: both are clocks the crew acts on during a
+          stop, and a control needed with the car on the charger must not be
+          three sections of scrolling away. */}
+      <Sec icon="timer" title="Charging">
+        <ChargePanel charge={live?.charge} clockOffsetMs={clockOffsetMs} />
+      </Sec>
       <CutLap carLap={live?.state?.auto_lap ?? null}
               lapHeld={live?.lapClock?.heldAt != null}
               carLink={!config.demoStore} />

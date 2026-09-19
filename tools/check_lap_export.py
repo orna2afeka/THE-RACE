@@ -302,6 +302,29 @@ def check_existing_export(tmp):
     conn.close()
 
 
+def check_double_cuts():
+    """A double cut's phantom is left out -- and NOTHING else is."""
+    def lap(n, m, s, source="manual", flags=("distance_suspect",)):
+        return {"lap": n, "distance_m": m, "lap_time_s": s,
+                "lap_source": source, "flags": list(flags)}
+
+    phantom = lap(59, 140.0, 9.1)                 # 2026-09-19 18:03:23, verbatim
+    kept = [
+        lap(58, 4000.0, 306.6, "odometer", ("virtual_end",)),
+        lap(60, 140.0, 9.1, "manual", ()),            # short, but the car did not flag it
+        lap(61, 140.0, 9.1, "odometer"),              # flagged, but not cut by hand
+        lap(62, 3920.0, 1335.0),                      # flagged and manual, but a real lap
+        lap(63, 300.0, 400.0),                        # short, but it took minutes: a stop
+        {"lap": 64, "distance_m": None, "lap_time_s": None,
+         "lap_source": None, "flags": []},            # an old car: nothing to judge by
+    ]
+    out = db._drop_double_cuts([phantom] + kept)
+    check("PHANTOM: a 9 s, 140 m hand cut the car flagged is left out",
+          phantom not in out, "lap 59 of 140 m in 9.1 s")
+    check("         and every other lap stays listed",
+          out == kept, "%d of %d kept" % (len(out), len(kept)))
+
+
 def check_real_store():
     """The demo store, when the laptop has one. Not in git; skipped elsewhere."""
     real = os.path.join(_ROOT, "demo_telemetry.db")
@@ -329,6 +352,7 @@ def main():
     check_refusals(tmp)
     check_duplicate_numbers(tmp)
     check_existing_export(tmp)
+    check_double_cuts()
     check_real_store()
     if FAILED:
         print("\n%d FAILED:" % len(FAILED))

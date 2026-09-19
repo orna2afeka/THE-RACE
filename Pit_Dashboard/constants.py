@@ -322,3 +322,10 @@ def decode_error_bits(code, bit_defs):
     if not code:
         return ""
     return ", ".join(label for bit, label in bit_defs if code & (1 << bit))
+
+
+# The team's drivers, for every place a name is CHOSEN rather than typed: the
+# per-lap driver dropdown today. One list, served to the browser through
+# /api/config, because a name typed "ido" in one place and picked as "Ido" in
+# another is two drivers in the workbook's Driver column.
+DRIVERS = ["Ido", "Dor", "Amit", "Omer", "Guy", "Tal"]

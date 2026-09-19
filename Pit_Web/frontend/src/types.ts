@@ -48,6 +48,8 @@ export interface Config {
   targetLapTimeMin: number;
   driverStint: { limitS: number; warnS: number; critS: number };
   exportGroups: string[];
+  /** The team's drivers (constants.DRIVERS) - for every place a name is picked. */
+  drivers: string[];
   liveMetricCount: number;
   liveMetricsPerRow: number;
   mapFallback: { lat: number; lon: number };
@@ -348,6 +350,9 @@ export interface Live {
   tiers: Record<string, Tier>;
   liveMetrics: { group: string; metrics: LiveTile[] }[];
   driverStint: DriverStint;
+  /** The charging clock — pit-owned, see api.py "The charging clock". */
+  charge: { active: boolean; startedAt: Num; startedBy: string | null; limitS: number;
+            warnLeftS: number; count: number; maxStops: number; lastDurationS: Num };
 }
 
 export interface HistoryResponse {

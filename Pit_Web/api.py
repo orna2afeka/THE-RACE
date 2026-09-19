@@ -458,6 +458,153 @@ def _race_clock(conn):
                                - elapsed_min)
 
 
+# --------------------------------------------------------------------------- #
+# The charging clock
+#
+# Two limits sit on a charge, and until now both lived in somebody's head: the
+# crew's own ceiling of an hour on the charger (strategy_engine
+# MAX_STOP_DURATION_MIN -- the planner already refuses to plan past it), and the
+# REGULATION that a car charging more than MAX_STOPS times is classified behind
+# every car that did not. This counts down the first and counts the second.
+#
+# THE PIT OWNS THIS CLOCK, NOT THE CAR, for one reason: the charge detector
+# reads CAN current and RPM, so a car switched OFF on the charger reports
+# nothing at all. A clock driven by the car alone would miss exactly the stops
+# where someone saved power by turning the car off. So:
+#
+#   STARTS   when the car reports is_charging, or when the pit presses Start.
+#   RUNS     through any silence. A car that stops talking mid-charge has not
+#            stopped charging -- this is the whole reason the pit owns it.
+#   STOPS    when the car is heard MOVING again, or when the pit presses Stop.
+#            Not on is_charging going to 0: a car switched on at the end of a
+#            charge reports 0 for the detector's confirm window before it
+#            reports anything else, and that must not end the clock early.
+#
+# The count belongs to the RACE: it is keyed on the race start like the sector
+# bests are, so a new race opens at zero without this needing to know that the
+# reset endpoint exists. "Discard" is there because the count is regulation,
+# and a press by mistake must not cost one of three.
+# --------------------------------------------------------------------------- #
+CHARGE_CLOCK_KEY = "charge_clock"
+CHARGE_LIMIT_S = strategy_engine.MAX_STOP_DURATION_MIN * 60.0
+CHARGE_WARN_LEFT_S = 10 * 60.0          # amber from here down
+CHARGE_MOVING_KMH = 5.0                 # the car has left the box
+CHARGE_WATCH_S = 2.0
+
+
+def _charge_record(conn):
+    """The stored record, reset to empty when it belongs to another race."""
+    rec = load_app_state(conn, CHARGE_CLOCK_KEY) or {}
+    race_start = db.load_race_state(conn).get("race_start_time")
+    if rec.get("race_start") != race_start:
+        rec = {"race_start": race_start, "count": 0}
+    return rec
+
+
+def charge_clock(conn):
+    """The charging clock as the header and the sidebar show it."""
+    rec = _charge_record(conn)
+    return {
+        "active": rec.get("started_at") is not None,
+        "startedAt": rec.get("started_at"),
+        "startedBy": rec.get("started_by"),
+        "limitS": CHARGE_LIMIT_S,
+        "warnLeftS": CHARGE_WARN_LEFT_S,
+        "count": int(rec.get("count") or 0),
+        "maxStops": strategy_engine.MAX_STOPS,
+        "lastDurationS": rec.get("last_duration_s"),
+    }
+
+
+def _charge_start(conn, by, now=None):
+    rec = _charge_record(conn)
+    if rec.get("started_at") is not None:
+        return False                      # already running: never restart it
+    now = time.time() if now is None else now
+    rec.update({"started_at": now, "started_by": by,
+                "count": int(rec.get("count") or 0) + 1})
+    save_app_state(conn, CHARGE_CLOCK_KEY, rec)
+    return True
+
+
+def _charge_stop(conn, now=None, discard=False):
+    rec = _charge_record(conn)
+    if rec.get("started_at") is None:
+        return False
+    now = time.time() if now is None else now
+    if discard:
+        # Not a charge: give the count back and leave no duration behind.
+        rec["count"] = max(0, int(rec.get("count") or 0) - 1)
+    else:
+        rec["last_duration_s"] = max(0.0, now - float(rec["started_at"]))
+    rec["started_at"] = None
+    rec["started_by"] = None
+    save_app_state(conn, CHARGE_CLOCK_KEY, rec)
+    return True
+
+
+# A gap this long inside a run of is_charging samples ends the run: the car was
+# off or out of contact, and what came before may be a different plug-in.
+CHARGE_SPELL_GAP_S = 120.0
+
+
+def _charging_since(conn):
+    """The instant the car's CURRENT unbroken run of is_charging=1 began.
+
+    Walks back from the newest sample and stops at the first row that is not
+    charging, or at a silence longer than CHARGE_SPELL_GAP_S. Bounded to twice
+    the limit: a charge older than that is over the hour whatever it reads.
+    """
+    floor = time.time() - 2 * CHARGE_LIMIT_S
+    since = prev = None
+    for ts, ch in conn.execute(
+            "SELECT device_ts, is_charging FROM telemetry "
+            "WHERE device_id = ? AND device_ts >= ? ORDER BY device_ts DESC",
+            (db.DEVICE_ID, floor)):
+        if ch != 1 or (prev is not None and prev - ts > CHARGE_SPELL_GAP_S):
+            break
+        since = prev = ts
+    return since if since is not None else time.time()
+
+
+def charge_watch_once():
+    """One look at the car: start on is_charging, stop on movement.
+
+    Only a FRESH sample may do either. An hour-old backlog row that says the
+    car was charging is history arriving late, not a plug going in now.
+    """
+    with closing(ro_conn()) as conn:
+        state, age = read_live_state(conn)
+        active = _charge_record(conn).get("started_at") is not None
+    if age is None or age > C.DATA_STALE_AFTER_S:
+        return None
+    speed = state.get("speed_kmh")
+    if not active and state.get("is_charging") == 1:
+        with closing(rw_conn()) as conn:
+            # FROM WHEN THE CAR SAYS THE CHARGE BEGAN, not from when this loop
+            # noticed. They differ whenever Pit Web was restarted mid-charge or
+            # the samples arrived late, and "now" would under-read the one
+            # number this clock exists to get right.
+            changed = _charge_start(conn, "car", now=_charging_since(conn))
+    elif active and speed is not None and speed > CHARGE_MOVING_KMH:
+        with closing(rw_conn()) as conn:
+            changed = _charge_stop(conn)
+    else:
+        return False
+    if changed:
+        nudge_live()
+    return changed
+
+
+def _charge_watch_loop():
+    while True:
+        try:
+            charge_watch_once()
+        except Exception as e:                               # noqa: BLE001
+            print("[charge clock] watch failed, will retry: %s" % e, flush=True)
+        time.sleep(CHARGE_WATCH_S)
+
+
 def race_lap_floor(conn):
     """The instant the pit's lap views start from, or None for the whole store.
 
@@ -610,8 +757,13 @@ def _stint_log(st, ended_at):
     """
     log = list(st.get("log") or [])
     if st.get("started_at") is not None:
-        log.append({"stint": st.get("stint"), "driver": st.get("driver") or None,
-                    "started_at": st["started_at"], "ended_at": ended_at})
+        entry = {"stint": st.get("stint"), "driver": st.get("driver") or None,
+                 "started_at": st["started_at"], "ended_at": ended_at}
+        # Every name the stint carried and from when -- see api_driver_stint_name
+        # and db._stint_intervals. Absent on a stint that only ever had one.
+        if st.get("names"):
+            entry["names"] = list(st["names"])
+        log.append(entry)
     return log
 
 
@@ -1357,6 +1509,7 @@ def build_live(conn, manual_lap=-1):
         # earliest sample the pit holds for this lap and can read short; the
         # caption says so rather than presenting a guess as a measurement.
         "lapClock": _lap_clock(conn, state, active_lap, age),
+        "charge": charge_clock(conn),
     }
 
 
@@ -1374,6 +1527,11 @@ async def _lifespan(_app):
                          daemon=True).start()
     threading.Thread(target=_token_warm_loop, name="token-warm",
                      daemon=True).start()
+    # Not on a demo store: the demo's "car" is a replay, and a replayed charge
+    # must not start a clock that counts against the real race's three.
+    if not DEMO_STORE:
+        threading.Thread(target=_charge_watch_loop, name="charge-watch",
+                         daemon=True).start()
     yield
     _live_loop = None
 
@@ -1439,6 +1597,7 @@ def api_config():
                         "warnS": DRIVER_STINT_WARN_S,
                         "critS": DRIVER_STINT_CRIT_S},
         "exportGroups": list(export.METRIC_GROUPS.keys()),
+        "drivers": list(C.DRIVERS),
         "liveMetricCount": live_metrics.LIVE_METRIC_COUNT,
         "liveMetricsPerRow": live_metrics.LIVE_METRICS_PER_ROW,
         # Zolder paddock — where the map centres before the car reports.
@@ -1838,12 +1997,14 @@ def api_laps():
         # logged — the car reports no driver — so a lap driven before anyone
         # pressed "Driver changed", or by a crew that never typed a name, has
         # driver null. Null, never "unknown": a missing reading is missing.
-        db.attach_lap_drivers(rows, db.load_driver_stints(conn))
+        db.attach_lap_drivers(rows, db.load_driver_stints(conn),
+                              db.load_lap_driver_overrides(conn))
     # `kind` is the car's own verdict: flying | in | out | in_out | start |
     # suspect, or None from a car that predates it. Every lap is LISTED; only
     # flying laps feed best / average, because an in-lap's time holds a pit
     # stop and an out-lap starts from the pit lane.
-    laps = [{"lap": r["lap"], "driver": r["driver"], "energyWh": r["energy_wh"],
+    laps = [{"lap": r["lap"], "driver": r["driver"], "key": r["key"],
+             "driverEdited": r["driver_edited"], "energyWh": r["energy_wh"],
              "lapTimeS": r["lap_time_s"], "distanceM": r["distance_m"],
              "kind": r["kind"], "flags": r["flags"], "source": r["lap_source"],
              "stoppedS": r["stopped_s"], "finishedTs": r["finished_ts"],
@@ -1870,6 +2031,48 @@ def api_laps():
             "avgWh": (sum(energy) / len(energy)) if energy else None,
         },
     }
+
+
+class LapDriverBody(BaseModel):
+    # One lap, or a run of them -- a whole stint credited to the wrong name is
+    # eighteen laps, and nobody should fix that with eighteen dropdowns.
+    keys: list[str]
+    # A name from constants.DRIVERS, or "" to drop the edit and go back to
+    # whatever the stint log says.
+    driver: str = ""
+
+
+@app.post("/api/laps/driver")
+def api_laps_driver(body: LapDriverBody):
+    """Set, by hand, who drove these laps. The pit's word over the stint log.
+
+    Filed by lap_seq (db.lap_key), scoped to this race, and read back by
+    db.attach_lap_drivers -- the one function the lap table and both workbooks
+    share, so an edit here is the name in Excel too. Nothing about the STINT
+    changes: the countdown, the stint number and the public page are untouched.
+
+    Only names from the team's list are accepted. A free-typed name is how
+    "ido" and "Ido" become two drivers.
+    """
+    name = body.driver.strip()
+    if name and name not in C.DRIVERS:
+        raise HTTPException(400, "driver must be one of: %s" % ", ".join(C.DRIVERS))
+    if not body.keys or len(body.keys) > 1000:
+        raise HTTPException(400, "give between 1 and 1000 laps")
+    with closing(rw_conn()) as conn:
+        race_start = db.load_race_state(conn).get("race_start_time")
+        rec = load_app_state(conn, db.LAP_DRIVERS_KEY) or {}
+        if rec.get("race_start") != race_start:
+            rec = {"race_start": race_start, "by_key": {}}
+        by = dict(rec.get("by_key") or {})
+        for key in body.keys:
+            if name:
+                by[str(key)] = name
+            else:
+                by.pop(str(key), None)
+        rec["by_key"] = by
+        save_app_state(conn, db.LAP_DRIVERS_KEY, rec)
+    return {"ok": True, "edited": len(body.keys), "driver": name or None}
 
 
 @app.get("/api/faults")
@@ -2822,6 +3025,50 @@ def api_export_estimate(start: float | None = Query(None),
     return {"rows": rows}
 
 
+class ChargeBody(BaseModel):
+    # start | stop | discard | set_count. No default: the count behind this is
+    # regulation.
+    action: str
+    # start: the plug went in this many minutes ago (the press came late).
+    minutesAgo: float | None = None
+    # set_count: how many charges this race has REALLY used. The pit's word
+    # over the clock's -- a charge made with the car switched off and nobody
+    # pressing Start is a charge the store never saw.
+    count: int | None = None
+
+
+@app.post("/api/charge")
+def api_charge(body: ChargeBody):
+    """The pit's hand on the charging clock. See "The charging clock" above.
+
+    `start` for a car that cannot say so itself (switched off on the charger),
+    `stop` when the plug comes out, `discard` for a press that was not a
+    charge -- it stops the clock AND gives the count back.
+    """
+    if body.action not in ("start", "stop", "discard", "set_count"):
+        raise HTTPException(400, "action must be start, stop, discard or set_count")
+    with closing(rw_conn()) as conn:
+        if body.action == "set_count":
+            if body.count is None or not (0 <= body.count <= 20):
+                raise HTTPException(400, "count must be a number from 0 up")
+            rec = _charge_record(conn)
+            changed = int(rec.get("count") or 0) != body.count
+            rec["count"] = int(body.count)
+            save_app_state(conn, CHARGE_CLOCK_KEY, rec)
+        elif body.action == "start":
+            ago = float(body.minutesAgo or 0.0)
+            if not (0 <= ago <= 2 * strategy_engine.MAX_STOP_DURATION_MIN):
+                raise HTTPException(400, "minutesAgo must be between 0 and %d"
+                                    % (2 * strategy_engine.MAX_STOP_DURATION_MIN))
+            changed = _charge_start(conn, "pit", now=time.time() - ago * 60.0)
+        else:
+            changed = _charge_stop(conn, discard=body.action == "discard")
+        out = charge_clock(conn)
+    if changed:
+        nudge_live()
+    return {"ok": True, "changed": changed, "charge": out}
+
+
 class EstimateBody(BaseModel):
     # Both REQUIRED, no defaults: this puts a moving car on a public page, and
     # "lap 0 at the start line because a field was left out" is a worse thing
@@ -3198,6 +3445,7 @@ def api_driver_stint(body: StintBody):
             "previous_started_at": prev_started,
             "previous_stint": st.get("stint"),
             "previous_driver": st.get("driver"),
+            "previous_names": st.get("names"),
             "previous_accumulated_s": st.get("accumulated_s"),
             "previous_running_since": st.get("running_since"),
             # A change in progress ENDS here: this press is the new driver
@@ -3225,11 +3473,33 @@ def api_driver_stint_name(body: StintBody):
     only way to name driver one, who is started automatically by the green
     flag, would be "Driver changed", which restarts their two hours. Allowed
     before the race too; the name is then carried into stint one.
+
+    A NAME COUNTS FROM NOW, NEVER BACKWARDS. It used to overwrite the stint's
+    one name, so typing the incoming driver here a moment before pressing
+    "Driver changed" relabelled the OUTGOING driver's whole stint: three hours
+    and eighteen laps of Ido's became Amit's on 2026-09-19. Now:
+
+      * a stint nobody has named yet takes the name for the whole of it -- that
+        is driver one, started by the green flag, being named for the first
+        time, and there is nobody else those laps could belong to;
+      * a stint that already HAS a name keeps it for every lap driven so far,
+        and the new name applies to laps that finish from this instant on.
+
+    The per-lap dropdown in the lap table is the tool for correcting the past;
+    this button is not.
     """
     now = time.time()
     with closing(rw_conn()) as conn:
         st = load_app_state(conn, DRIVER_STINT_KEY) or {}
-        st["driver"] = _clean_driver(body.driver)
+        new = _clean_driver(body.driver)
+        old = st.get("driver") or None
+        if old and new != old and st.get("started_at") is not None:
+            names = list(st.get("names") or [])
+            if not names:
+                names.append({"driver": old, "from": st["started_at"]})
+            names.append({"driver": new, "from": now})
+            st["names"] = names
+        st["driver"] = new
         save_app_state(conn, DRIVER_STINT_KEY, st)
         _kick_public_driver()
         return driver_stint(conn, now)
@@ -3297,6 +3567,10 @@ def api_driver_stint_undo():
             # badge on the public page and the wall comes back with it.
             "change_started_at": st.get("previous_change_started_at"),
         }
+        # The names the restored stint had carried, so an undo does not
+        # flatten it back to one name.
+        if st.get("previous_names"):
+            restored["names"] = st["previous_names"]
         # Put the banked/running split back as it was, then re-sync it to the
         # race clock — the race may have been started or stopped in between.
         if st.get("previous_accumulated_s") is not None:

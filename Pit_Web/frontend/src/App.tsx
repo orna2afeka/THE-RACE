@@ -8,6 +8,7 @@ import { Cells, LiveMetrics, Strategy, Weather } from './tabs/Rest';
 import { ChargingBadge, FaultBanner, MetricTile, PowerMapBadge } from './components';
 import { ErrorBoundary } from './ErrorBoundary';
 import { StintBanner, StintClock, SwapBanner, stintNow } from './DriverStint';
+import { ChargeClock } from './ChargeClock';
 import { Icon } from './icons';
 import { MISSING, ageText, fmt, hms, lapTime, useAlignedServerNow, useConfig, useLive, useStored } from './lib';
 import { useSparklines } from './Sparkline';
@@ -288,6 +289,7 @@ export default function App() {
           <RaceClock race={race} clockOffsetMs={clockOffsetMs} />
           <span className="clock-sep" />
           <StintClock stint={live?.driverStint} clockOffsetMs={clockOffsetMs} />
+          <ChargeClock charge={live?.charge} clockOffsetMs={clockOffsetMs} />
           <span className="clock-sep" />
           <LapClock live={live} link={link} clockOffsetMs={clockOffsetMs} />
         </div>

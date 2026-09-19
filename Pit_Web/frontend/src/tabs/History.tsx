@@ -21,7 +21,8 @@ import { useEffect, useRef, useState } from 'react';
 import * as Plotly from 'plotly.js-dist-min';
 import { Disclosure, Pill, SectionTitle } from '../components';
 import { Icon } from '../icons';
-import { MISSING, ageText, fmtStat, getJSON, lapTime, lapTimeShort, usePoll, useResizePlot, useStored } from '../lib';
+import { MISSING, ageText, fmtStat, getJSON, lapTime, lapTimeShort, postJSON, usePoll, useResizePlot, useStored } from '../lib';
+import { toast } from '../toast';
 import { config as plotConfig, layoutBase, theme } from '../plotly-theme';
 import type { Config, HistoryResponse, Num, StatRow } from '../types';
 
@@ -383,7 +384,11 @@ export default function History({ config, dark, visible, fresh, age }: Props) {
         ))}
       </div>
 
-      <LapCharts dark={dark} visible={visible} />
+      {/* `?? []`: the frontend is reloaded with a click and the server is
+          restarted by hand, so for a while a NEW page talks to an OLD server
+          whose /api/config has no driver list. That must cost the dropdown its
+          names, not the whole History tab its render. */}
+      <LapCharts dark={dark} visible={visible} drivers={config.drivers ?? []} />
       <RecentSamples config={config} visible={visible} />
       <Faults visible={visible} />
     </>
@@ -393,7 +398,7 @@ export default function History({ config, dark, visible, fresh, age }: Props) {
 // --------------------------------------------------------------------------- //
 interface LapsResp {
   /** kind is the CAR's verdict; null from a car that predates it. */
-  laps: { lap: number; driver: string | null; energyWh: Num; lapTimeS: Num;
+  laps: { lap: number; driver: string | null; key: string; driverEdited: boolean; energyWh: Num; lapTimeS: Num;
           distanceM: Num; kind: string | null; flags: string[];
           source: string | null; stoppedS: Num; started: string | null }[];
   summary: { count: number; flyingCount: number; bestS: Num; avgS: Num; avgWh: Num };
@@ -408,8 +413,11 @@ const KIND_NAME: Record<string, string> = {
 const MUTED = '#8a93a6';
 const counts = (kind: string | null) => kind === null || kind === 'flying';
 
-function LapCharts({ dark, visible }: { dark: boolean; visible: boolean }) {
-  const { data } = usePoll(() => getJSON<LapsResp>('/api/laps'), 10000, [], visible);
+function LapCharts({ dark, visible, drivers }: { dark: boolean; visible: boolean; drivers: string[] }) {
+  // `edits` re-runs the poll the moment a driver is changed by hand, so the
+  // table answers the click instead of up to ten seconds later.
+  const [edits, setEdits] = useState(0);
+  const { data } = usePoll(() => getJSON<LapsResp>('/api/laps'), 10000, [edits], visible);
   const eRef = useRef<HTMLDivElement | null>(null);
   const tRef = useRef<HTMLDivElement | null>(null);
   useResizePlot(eRef, visible);
@@ -551,7 +559,7 @@ function LapCharts({ dark, visible }: { dark: boolean; visible: boolean }) {
                 marked suspect are drawn grey — the <b>Kind</b> column below says which.
               </div>
             )}
-            <LapTable laps={laps} />
+            <LapTable laps={laps} drivers={drivers} onEdited={() => setEdits((n) => n + 1)} />
           </>
         )}
     </Disclosure>
@@ -571,9 +579,40 @@ function LapCharts({ dark, visible }: { dark: boolean; visible: boolean }) {
  *  driven); the columns are deliberately the same ones in the same order, so a
  *  row here and a row there are read as the same record.
  */
-function LapTable({ laps }: { laps: LapsResp['laps'] }) {
+/** WHO DROVE A LAP CAN BE SET BY HAND, per lap or for a run of laps.
+ *
+ *  The stint log answers first, and it is only as good as the presses made
+ *  during a pit stop: on 2026-09-19 one press in the wrong order credited
+ *  eighteen of Ido's laps to Amit. The dropdown is the pit's word over the log.
+ *  It is filed per lap on the server and read back by the same function the
+ *  Excel workbooks use, so a fix made here is the name in the export too. The
+ *  small arrow on an edited lap drops the edit and goes back to the log.
+ *
+ *  Names come from the team's list (config.drivers), never typed, because
+ *  "ido" and "Ido" are two drivers in a pivot table. */
+function LapTable({ laps, drivers, onEdited }: {
+  laps: LapsResp['laps']; drivers: string[]; onEdited: () => void;
+}) {
   const rows = [...laps].reverse();
   const named = laps.some((l) => l.driver);
+  const [from, setFrom] = useState('');
+  const [to, setTo] = useState('');
+  const [who, setWho] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const setDriver = async (keys: string[], driver: string, what: string) => {
+    setBusy(true);
+    try {
+      await postJSON('/api/laps/driver', { keys, driver });
+      toast(driver ? `${what} → ${driver}` : `${what} → back to the stint log`);
+      onEdited();
+    } catch (e) { toast(`Driver not changed: ${e}`, 'err'); }
+    finally { setBusy(false); }
+  };
+
+  const a = Number(from), b = Number(to);
+  const range = from.trim() !== '' && to.trim() !== '' && Number.isInteger(a) && Number.isInteger(b) && a <= b
+    ? laps.filter((l) => l.lap >= a && l.lap <= b) : [];
   return (
     <Disclosure icon="table" title="Laps by driver" count={laps.length}>
       {!named && (
@@ -582,6 +621,25 @@ function LapTable({ laps }: { laps: LapsResp['laps'] }) {
           sidebar — press “Name current driver”, and every lap from then on is credited.
         </Pill>
       )}
+      {/* A RUN OF LAPS AT ONCE. A stint credited to the wrong name is a dozen
+          laps or more, and nobody should fix that one dropdown at a time. */}
+      <div className="btnrow" style={{ margin: '8px 0', alignItems: 'center' }}>
+        <span className="caption" style={{ margin: 0 }}>Set laps</span>
+        <input type="text" inputMode="numeric" placeholder="from" aria-label="From lap" value={from}
+               onChange={(e) => setFrom(e.target.value)} style={{ width: 64 }} disabled={busy} />
+        <span className="caption" style={{ margin: 0 }}>to</span>
+        <input type="text" inputMode="numeric" placeholder="to" aria-label="To lap" value={to}
+               onChange={(e) => setTo(e.target.value)} style={{ width: 64 }} disabled={busy} />
+        <select value={who} onChange={(e) => setWho(e.target.value)} disabled={busy} aria-label="Driver">
+          <option value="">driver…</option>
+          {drivers.map((d) => <option key={d} value={d}>{d}</option>)}
+        </select>
+        <button className="btn" disabled={busy || !who || !range.length}
+                onClick={() => setDriver(range.map((l) => l.key), who, `${range.length} laps (${a}–${b})`)
+                  .then(() => { setFrom(''); setTo(''); setWho(''); })}>
+          Apply{range.length ? ` to ${range.length}` : ''}
+        </button>
+      </div>
       <div className="scroll" style={{ marginTop: named ? 0 : 8 }}>
         <table className="tbl">
           <thead>
@@ -597,7 +655,21 @@ function LapTable({ laps }: { laps: LapsResp['laps'] }) {
             {rows.map((l, i) => (
               <tr key={`${l.lap}-${i}`} className={counts(l.kind) ? undefined : 'not-flying'}>
                 <td className="num mono">{l.lap}</td>
-                <td>{l.driver ?? MISSING}</td>
+                <td>
+                  <select className="cellselect" value={l.driver ?? ''} disabled={busy}
+                          aria-label={`Driver of lap ${l.lap}`}
+                          onChange={(e) => setDriver([l.key], e.target.value, `Lap ${l.lap}`)}>
+                    <option value="">{MISSING}</option>
+                    {/* A name from the stint log that is not on the list still
+                        has to show as itself, not as a dash. */}
+                    {l.driver && !drivers.includes(l.driver) && <option value={l.driver}>{l.driver}</option>}
+                    {drivers.map((d) => <option key={d} value={d}>{d}</option>)}
+                  </select>
+                  {l.driverEdited && (
+                    <button className="linkbtn" title="Set by hand. Click to go back to the stint log."
+                            disabled={busy} onClick={() => setDriver([l.key], '', `Lap ${l.lap}`)}>↺</button>
+                  )}
+                </td>
                 <td className="num mono">{l.started ?? MISSING}</td>
                 <td className="num mono">{lapTime(l.lapTimeS)}</td>
                 <td className="num">{fmtStat(l.energyWh)}</td>

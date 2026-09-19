@@ -29,6 +29,13 @@ checked rather than assumed:
               reason it queues instead of touching LapTracker.
   GATES       the id and age gates still protect the FIREBASE path. They exist
               for a retained node, and a local press must not disarm them.
+  ROUND       a press only counts a lap the car has actually been round, by
+              LapTracker.been_round -- the SAME test every gate passage is
+              judged by, not a second threshold. This is what stops the press
+              the button most invites: at Zolder the gate in the pit lane
+              closes the lap on the way IN, so a cut at pit exit used to add a
+              lap nobody drove, and the count never recovered. The PIT's cut
+              is deliberately still an override.
 """
 
 import os
@@ -70,9 +77,12 @@ def inbox():
 # The lap the driver is part way round when they reach for the button.
 PART_LAP_S = 200.0
 PART_LAP_WH = 47.0
+# How far round they are by default: past MIN_LAP_DISTANCE_M, so the press is
+# one the guard lets through. The refusals below pass a shorter one.
+PART_LAP_M = 3800.0
 
 
-def driven(laps=2, now=None):
+def driven(laps=2, now=None, part_m=PART_LAP_M):
     """A tracker `PART_LAP_S` into a lap, with `laps` counted behind it.
 
     Built on a CONTROLLED clock, passed in, so the lap time the cut produces is
@@ -88,8 +98,13 @@ def driven(laps=2, now=None):
         # Each earlier lap ends one PART_LAP_S before the next; the last of
         # them lands exactly PART_LAP_S before the press.
         t._trigger_lap("gate", now=now - PART_LAP_S * (laps - i))
-    t.odometer_m += 1500.0                 # part way round the next
+    t.odometer_m += part_m                 # part way round the next
     t.total_energy_wh += PART_LAP_WH
+    # CAN IS ALIVE, as it is on a running car: update_motion stamps this on
+    # every frame. Without it _can_is_dead() is true (it has never spoken),
+    # the tracker counts as blind, and been_round falls through to "time
+    # alone" -- which would quietly pass every distance check below.
+    t._last_motion_ts = now
     return t
 
 
@@ -210,6 +225,68 @@ def check_gates_intact():
           "the gates guard the retained node, not a thumb")
 
 
+def _applier(tracker, local=True):
+    """main._apply_lap_commands' cut_lap branch, verbatim.
+
+    Returns True when the lap was counted. The one line worth copying here is
+    the guard: everything else in that branch is printing and acks.
+    """
+    if local and not tracker.been_round():
+        return False
+    tracker.force_lap("manual")
+    return True
+
+
+def check_round():
+    """ROUND: a press cannot count a lap the car has not been round."""
+    import track
+
+    short = driven(laps=2, part_m=PART_LAP_M)
+    check("ROUND: a press past the gate's own distance counts",
+          _applier(short) and short.lap_count == 3,
+          "%.0f m in, MIN_LAP_DISTANCE_M = %.0f m"
+          % (PART_LAP_M, track.MIN_LAP_DISTANCE_M))
+
+    # THE ONE THAT BIT US. At Zolder the box is ~37 m past the line, so the
+    # gate in the pit lane closes the in-lap on the way IN; the lap running at
+    # pit exit is the out-lap, and it has only the pit lane behind it.
+    # Measured against the lap_tracker simulator: 658 m at the exit.
+    pit_exit = driven(laps=3, part_m=658.0)
+    before = pit_exit.lap_count
+    check("       a press at PIT EXIT counts nothing",
+          not _applier(pit_exit) and pit_exit.lap_count == before,
+          "658 m into the out-lap, lap stays %d" % pit_exit.lap_count)
+    check("       and the datum is not moved either",
+          abs(pit_exit.lap_distance_m - 658.0) < 1.0,
+          "still %.0f m into the lap -- a refusal is not a re-sync, because "
+          "a thumb press is nowhere in particular" % pit_exit.lap_distance_m)
+
+    # The pit is an engineer reading the data who can see the count is short.
+    # force_lap is their override and stays one.
+    pit = driven(laps=3, part_m=658.0)
+    check("       the PIT's cut is still an override at the same spot",
+          _applier(pit, local=False) and pit.lap_count == 4,
+          "force_lap is not second-guessed")
+
+    # THE FALLBACK THAT MATTERS. With no trustworthy distance the car is blind,
+    # and the driver's button is the only thing that can count a lap. A bare
+    # `metres > N` test would disable it in exactly that case.
+    blind = driven(laps=2, part_m=0.0)
+    blind._distance_untrusted = True
+    check("       a blind car can still be cut on time alone",
+          _applier(blind) and blind.lap_count == 3,
+          "no trustworthy distance: been_round falls back to elapsed")
+
+    # And the rule is the gate's, not a copy.
+    src = open(os.path.join(_ROOT, "SolarRace_OS", "modules", "lap_tracker.py"),
+               encoding="utf-8").read()
+    check("       one rule: the gate asks been_round() too",
+          src.count("MIN_LAP_DISTANCE_M") == 2
+          and "self.been_round(now, travelled=travelled" in src,
+          "MIN_LAP_DISTANCE_M appears only inside been_round, which "
+          "_on_gate_crossing calls")
+
+
 def check_hold():
     """HELD: the button's own guard, read off the HUD's constants."""
     import re
@@ -233,6 +310,7 @@ def main():
     check_counted()
     check_one_path()
     check_gates_intact()
+    check_round()
     check_hold()
     if FAILED:
         print("\n%d FAILED:" % len(FAILED))

@@ -794,3 +794,9 @@ details.disc .disc-body { border: 1px solid var(--line); border-top: none; borde
 .nocar { border: 0; margin: 0; padding: 0; min-width: 0; }
 .nocar[disabled] { opacity: 0.55; }
 .banner.demo { background: var(--warn-soft); color: var(--pit-warning); border-color: rgba(255, 153, 0, 0.45); }
+
+/* A select that sits in a table cell without turning the row into a form: no
+   box until hovered or focused, the cell's own type, and it can be changed. */
+.cellselect { background: transparent; color: inherit; font: inherit; border: 1px solid transparent; border-radius: 6px; padding: 2px 4px; cursor: pointer; }
+.cellselect:hover, .cellselect:focus { border-color: var(--line); outline: none; }
+.cellselect option { color: #111; background: #fff; }
