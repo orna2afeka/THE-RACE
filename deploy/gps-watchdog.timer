@@ -1,0 +1,23 @@
+[Unit]
+Description=Check once a minute that gpsd still holds the GNSS port
+# The failure this catches is silent and permanent: the modem re-enumerates,
+# gpsd drops the device, nothing gives it back, and the car goes on serving its
+# last fix with a growing age. A minute is the most GPS this car should ever
+# lose to it.
+
+[Timer]
+# Three minutes after boot, not immediately: gps-up.service can still be
+# waiting for the modem to enumerate for its first 120 s (GPS_WAIT_S), and a
+# watchdog that fired into the middle of the first handoff would restart it for
+# no reason. 180 s clears that wait with a margin.
+OnBootSec=180
+OnUnitActiveSec=60
+# Keep the ticks off the top of the minute, where every other timer on the Pi
+# lands. The work is two gpspipe calls, but a race weekend is not the time to
+# discover they queued behind something else.
+RandomizedDelaySec=10
+AccuracySec=5
+Unit=gps-watchdog.service
+
+[Install]
+WantedBy=timers.target

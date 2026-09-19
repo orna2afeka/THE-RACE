@@ -1,0 +1,34 @@
+[Unit]
+# Puts the GNSS port back when the modem takes it away. Run by
+# gps-watchdog.timer, not at boot: gps-up.service does the first handoff, and
+# this only repairs it afterwards. See deploy/gps_watchdog.sh for why it checks
+# before it acts -- running gps_up.sh unconditionally on a timer would interrupt
+# a working fix every minute.
+#
+# Install:
+#   sudo cp ~/Desktop/THE-RACE-main/deploy/gps-watchdog.service /etc/systemd/system/
+#   sudo cp ~/Desktop/THE-RACE-main/deploy/gps-watchdog.timer   /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now gps-watchdog.timer
+#
+# ABSOLUTE PATH below, like gps-up.service: if this repo moves or is cloned by
+# another user, fix ExecStart or the unit silently does nothing.
+Description=Re-attach the SolarRace GNSS port to gpsd if the modem dropped it
+# It repairs gps-up's work, so it needs the same two daemons present. Wants,
+# not Requires: a car with no modem must still boot cleanly, and the script
+# exits 0 when there is nothing to repair.
+After=gpsd.service gps-up.service
+Wants=gpsd.service
+
+[Service]
+Type=oneshot
+# NOT RemainAfterExit: this one is meant to run again and again. gps-up.service
+# keeps RemainAfterExit=yes because its work stays done; this unit's work is a
+# check, and a check that reads as "still active" would never be re-run by the
+# timer.
+ExecStart=/bin/bash /home/orna2/Desktop/THE-RACE-main/deploy/gps_watchdog.sh
+# Two gpspipe calls with 10 s timeouts, plus gps_up.sh's own wait when it
+# actually repairs something. Comfortably inside the timer's interval.
+TimeoutStartSec=240
+# No Restart=: the timer is the retry. A failed repair should wait for the next
+# tick rather than spin against a modem that is still enumerating.

@@ -70,6 +70,39 @@ so a re-enumeration cannot point it at the modem's AT port instead. Re-running
 it is harmless. On a car with a plain USB GPS dongle this unit is unnecessary —
 gpsd's own udev rule handles those.
 
+**`gps-up` runs once, and the modem can undo it at any time.** Point 2 above is
+not only a boot-time race: a cable change, an LTE reset or a power dip under
+transmit load re-enumerates the modem, gpsd drops the device, and — same missing
+udev rule — nothing gives it back. The receiver keeps emitting NMEA into a port
+nobody reads, the car goes on serving its last fix with a growing age, and
+nothing anywhere reports an error. On 2026-09-18 that ran for two hours before
+anyone looked, with `gpspipe -w` showing `{"class":"DEVICES","devices":[]}` the
+whole time.
+
+`gps-watchdog.timer` closes that. Once a minute it asks gpsd whether it holds a
+device and does nothing unless the answer is no:
+
+```bash
+sudo cp ~/Desktop/THE-RACE-main/deploy/gps-watchdog.service /etc/systemd/system/
+sudo cp ~/Desktop/THE-RACE-main/deploy/gps-watchdog.timer   /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now gps-watchdog.timer
+systemctl list-timers gps-watchdog   # next run and the last result
+journalctl -u gps-watchdog -f        # silent unless it repairs something
+```
+
+It checks before it acts on purpose: running `gps_up.sh` unconditionally on a
+timer would take the port off gpsd and possibly restart the GNSS session every
+minute, throwing away ephemeris the receiver spent 30 s per satellite decoding.
+It also does **not** care whether there is a fix — a car in a garage or under a
+carbon shell sits at `mode 1` forever and that is not something to restart
+anything over.
+
+One trap it encodes, found the hard way: `systemctl start gps-up` is a silent
+no-op once the unit has succeeded, because it is `Type=oneshot` with
+`RemainAfterExit=yes` — systemd reports success without running anything. Use
+`restart`.
+
 **Diagnosing "no fix":** start `main.py` and read its two `🛰️` lines. The
 hardware line names gpsd's device AND the kernel's serial ports, which is what
 separates the three causes — nothing enumerated (receiver unplugged), ports
