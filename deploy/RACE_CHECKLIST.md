@@ -104,15 +104,21 @@ The family link is then **`https://orna2afeka.github.io/THE-RACE/`**.
 
 ### ☑ Race window — set
 
-**13:00 Sat 19 Sept → 13:00 Sun 20 Sept 2026, Belgian time (CEST).** Confirmed
-against europeansolarchallenge.eu: 24 hours continuous, Le Mans-style start,
-sunset 19:47 Saturday and sunrise 07:22 Sunday, with at least one and at most
-three recharging stops overnight.
+**12:00 Sat 19 Sept → 12:00 Sun 20 Sept 2026, Belgian time (CEST)** — 13:00 to
+13:00 in Israel. 24 hours continuous, Le Mans-style start, sunset 19:47 Saturday
+and sunrise 07:22 Sunday, with at least one and at most three recharging stops
+overnight.
 
-Already baked into the spectator page. If it ever moves, rebuild:
+This said 13:00 until the morning of the race, from a reading of
+europeansolarchallenge.eu; the team confirmed 12:00 on the day. It is the hour
+every clock on the spectator page counts to, so it is worth re-checking against
+the printed timetable rather than this file.
+
+Baked into the spectator page on race morning. If it ever moves, rebuild and
+commit `docs/index.html` — GitHub Pages serves what is on `main`:
 
 ```bash
-python tools/build_zolder_animation.py --race-start "2026-09-19T13:00+02:00"
+python tools/build_zolder_animation.py --race-start "2026-09-19T12:00+02:00"
 ```
 
 or write `/public/race` with `start_ts` / `end_ts` in epoch seconds, which the
