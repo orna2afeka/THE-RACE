@@ -1332,6 +1332,13 @@ __BASE_CSS__
       <div style="margin-top:10px"><span class="pill off" id="status">
         <span class="dot"></span><span id="status-text">Connecting</span></span></div>
       <div class="sub" id="status-sub">&mdash;</div>
+      <!-- The race is over; docs/summary.html is the 24 hours in numbers. That
+           page is written by hand and is NOT built by this file -- only the
+           link to it lives here, so that a rebuild does not drop it. -->
+      <a href="summary.html" style="display:inline-block;margin-top:10px;
+         padding:6px 14px;border-radius:999px;background:var(--good);
+         color:#04130c;font-weight:700;letter-spacing:2px;font-size:0.8rem;
+         text-transform:uppercase;text-decoration:none">The race in numbers &rarr;</a>
       <!-- IN THE PIT. The one line on this page written for somebody who does
            not follow racing: a car that has stopped moving is the moment a
            family watching from home starts to worry, and "in the pit" is the
