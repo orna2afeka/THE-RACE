@@ -484,6 +484,18 @@ STALE_AFTER_S = 20
 # riding out.
 OLD_AFTER_S = 600
 
+# Distance the car's odometer LOST to a mid-race reset, added back by the
+# spectator page. On 2026-09-19 at 22:43 (+02:00) the Pi came back at lap 90
+# with its lap count restored and odometer_m at 0.0, so from then on the page
+# showed distance since the restart (407 km at lap 188) rather than the race's
+# (756 km). The car is not touched mid-race; the page adds the 348 812 m the
+# odometer read before the reset to every snapshot sampled inside the window.
+# Outside the window the entry does nothing, so it is safe to leave here.
+# (from_epoch, until_epoch, metres)
+ODO_CARRY = [
+    (1789850583.0, 1789898400.0 + OLD_AFTER_S, 348812.2),
+]
+
 BASE_CSS = """
   :root {
     --bg: #06090f;
@@ -1913,6 +1925,17 @@ function renderDayNight() {
 // Only fired for transitions SEEN while the page is open. Someone opening the
 // page on lap 137 should not be greeted by a stale celebration of lap 100.
 let seenLap = null, seenKm = null, milestoneTimer = null;
+// The race's distance, not the odometer's: the car's odometer_m plus whatever a
+// mid-race reset threw away (CONFIG.odoCarry, judged on the sample's own time).
+function raceOdo(obj) {
+  const odo = num(obj.odometer_m), ts = num(obj.ts);
+  if (odo == null) return null;
+  let carried = 0;
+  for (const [from, until, metres] of (CONFIG.odoCarry || [])) {
+    if (ts != null && ts >= from && ts <= until) carried += metres;
+  }
+  return odo + carried;
+}
 function celebrate(text) {
   const m = el("milestone");
   m.textContent = text;
@@ -1928,7 +1951,7 @@ function checkMilestones(obj) {
     }
     seenLap = lap;
   }
-  const km = num(obj.odometer_m) == null ? null : num(obj.odometer_m) / 1000;
+  const km = raceOdo(obj) == null ? null : raceOdo(obj) / 1000;
   if (km != null) {
     if (seenKm != null && Math.floor(km / 100) > Math.floor(seenKm / 100)) {
       celebrate(Math.floor(km / 100) * 100 + " km covered");
@@ -1983,7 +2006,7 @@ function render() {
                             : num(s.speed_kmh) == null ? "—"
                             : Math.round(num(s.speed_kmh));
   el("lastlap").textContent = fmtTime(num(s.last_lap_time_s));
-  const odo = num(s.odometer_m);
+  const odo = raceOdo(s);
   el("odo").textContent = odo == null ? "—" : dash(odo / 1000, 1);
 
   // Is the marker on GPS, and if not, when was the car last seen? Both the
@@ -2748,6 +2771,7 @@ def render_spectator(data, race_start, race_end):
         "oldAfterS": OLD_AFTER_S,
         "raceStart": race_start,
         "raceEnd": race_end,
+        "odoCarry": ODO_CARRY,
         "lat": track.FINISH_LINE_LAT,
         "lon": track.FINISH_LINE_LON,
     }
