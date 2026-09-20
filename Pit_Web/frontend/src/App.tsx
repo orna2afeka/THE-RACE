@@ -74,7 +74,7 @@ function TopStrip({ live }: { live: Live }) {
         <MetricTile title="Battery SoC" value={fmt(s.soc)} unit="%" tier={t.soc} trend={trend.SoC} />
         <MetricTile title="Battery temp" value={fmt(s.batt_temp)} unit="°C" tier={t.battTemp} />
         <MetricTile title="Power out" value={fmt(s.power_w)} unit="W" tier={t.power} trend={trend.Power} />
-        <MetricTile title="Lap distance" value={fmt(live.lapDistanceM)} unit="m" />
+        <MetricTile title="Lap distance" value={fmt(live.lapDistanceRawM ?? live.lapDistanceM)} unit="m" />
       </div>
       <div className="grid g4" style={{ marginTop: 12 }}>
         <MetricTile title="Last lap time" value={lapTime(s.last_lap_time_s)} unit={`m:ss${lapSrc}`} />

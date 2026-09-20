@@ -96,15 +96,16 @@ TARGET_LAP_TIME_MIN = 3.5
 # Profile Builder (profile_manage.write_saved_matrix). Editing it by hand is
 # fine — keep it a plain literal, and keep the two marker lines.
 #
-# ONE PROFILE NOW, AND IT IS A RACE LAP: lap33_290s is lap 33 of the race on
-# 2026-09-19 exactly as driven (SolarRace_OS/lap 33.xlsx -- 285.6 s on the
-# clock, NORMAL mode, 101.1 Wh, which is the energy_wh below and is MEASURED,
-# not fitted). THE ROWS OF THAT WORKBOOK WERE ARRANGED BY THE CREW so that row 1
-# is the start/finish line: GPS was down and laps were being cut by hand, so
-# the car's own lap distance sat ~630 m out, and a build that trusted it put
-# T1 at 39 km/h and T8/9 flat out. It replaced dor_265s/280s/300s, which were one practice in-lap
-# scaled three ways and sat ~100 m out of phase at T12. Rebuild it with
-#   python tools/build_dor_profiles.py --as-driven lap33_290s --file-order --axis track --verify
+# ONE PROFILE NOW, AND IT IS A RACE LAP: lap93_293s is lap 93 of the race on
+# 2026-09-19 exactly as driven (SolarRace_OS/lap 93.xlsx -- 23:17, 289.6 s on
+# the clock, NORMAL mode, 100.6 Wh, which is the energy_wh below and is
+# MEASURED, not fitted). The lap was cut by hand AT THE LINE, so its own lap
+# distance starts at 0 there and needs no re-arranging; the only thing done to
+# it is a 100 m bridge across the line, where one lap's start (56.9 km/h) and
+# end (49.4) do not meet. It replaced lap33_290s, an earlier lap the crew had to
+# re-order by hand to find the line in, and before that dor_265s/280s/300s,
+# one practice in-lap scaled three ways. Rebuild it with
+#   python tools/build_dor_profiles.py --as-driven lap93_293s --file-order --axis track --verify
 # More profiles are added from the matrix editor, not by hand here.
 #
 # (History) THE PREVIOUS THREE CAME FROM A LAP THE CAR DROVE, not from a desk model. They replace
@@ -117,10 +118,10 @@ TARGET_LAP_TIME_MIN = 3.5
 # what each curve integrates to. Old CSVs are in profiles/_backup/.
 # >>> PROFILE MATRIX >>>
 PROFILE_MATRIX = {
-    "lap33_290s": {"label": "Base", "energy_wh": 102.7, "target_s": 283.0},
+    "lap93_293s": {"label": "Base", "energy_wh": 100.6, "target_s": 293.3},
 }
 # <<< PROFILE MATRIX <<<
-DEFAULT_STRATEGY_KEY = "lap33_290s"
+DEFAULT_STRATEGY_KEY = "lap93_293s"
 
 # Returned whenever the profiles cannot be read, so this module can never fail
 # to import — collector.py and export.py import it too, and neither has any

@@ -6,9 +6,18 @@
 // forget, so the lap list could never show it -- but the samples say exactly
 // what was thrown away, and the server reads that back (api_laps_discarded).
 //
-// SHOWS ONLY WHEN THERE IS SOMETHING TO SAY. No discarded lap in the last
+// SHOWS ONLY WHEN THERE IS SOMETHING TO DECIDE. No discarded lap in the last
 // hour, nothing on screen. One found: what it was, and one press to restore
-// it. Restoring is the pit's decision and is undoable from the same place.
+// it.
+//
+// ONCE RESTORED IT GOES QUIET. The lap is back in the list, the charts and
+// the workbook, and that is the whole point of the press -- so the panel has
+// nothing left to ask. It used to answer by keeping the notice up with "Undo
+// -- take lap 76 back out" under it, which put a button that DELETES a real
+// driven lap on the pit wall for the rest of the race, next to the count the
+// pit had just corrected to match it. At Zolder that sat there for an hour.
+// A restore is undone the way anything else here is: press Restart lap again,
+// or ask for the lap back the next time it is discarded.
 //
 // THE RECORD AND THE COUNT ARE TWO FACTS. This puts the lap back in the list,
 // the charts and the workbook. The number on the car is "Set car lap number",
@@ -31,19 +40,21 @@ export function DiscardedLap() {
   const { data } = usePoll(
     () => getJSON<{ candidates: Candidate[] }>('/api/laps/discarded'), 10000, [bump]);
 
-  const list = data?.candidates ?? [];
+  // Only laps still waiting on a decision. A restored one is settled.
+  const list = (data?.candidates ?? []).filter((c) => !c.restored);
   if (!list.length) return null;
 
-  const act = async (c: Candidate, undo: boolean) => {
+  // The server still takes `undo` -- api_laps_restore is the one place a
+  // restore is recorded and the only place it can be withdrawn, and a restore
+  // filed by mistake has to be reachable. Nothing on this panel sends it.
+  const act = async (c: Candidate) => {
     setBusy(true);
     try {
       const r = await postJSON<{ setCarLapTo: number | null }>(
-        '/api/laps/restore', { finishedTs: c.finishedTs, undo });
-      toast(undo
-        ? `Lap ${c.lap} taken back out of the list`
-        : `Lap ${c.lap} restored` + (r.setCarLapTo !== null
-          ? ` — the car still counts one short: set its lap number to ${r.setCarLapTo}`
-          : ' — the car’s count already includes it'));
+        '/api/laps/restore', { finishedTs: c.finishedTs, undo: false });
+      toast(`Lap ${c.lap} restored` + (r.setCarLapTo !== null
+        ? ` — the car still counts one short: set its lap number to ${r.setCarLapTo}`
+        : ' — the car’s count already includes it'));
       setBump((n) => n + 1);
     } catch (e) { toast(`Restore failed: ${e}`, 'err'); }
     finally { setBusy(false); }
@@ -53,21 +64,20 @@ export function DiscardedLap() {
     <>
       {list.map((c) => (
         <div key={c.finishedTs} style={{ marginTop: 8 }}>
-          <div className={`pill ${c.restored ? 'info' : 'warn'}`} style={{ marginTop: 0 }}>
+          <div className="pill warn" style={{ marginTop: 0 }}>
             <Icon name="alert" size={14} style={{ marginTop: 2 }} />
             <span>
-              {c.restored ? 'Restored: ' : 'A whole lap was thrown away at '}
-              {c.restored ? <>lap <b>{c.lap}</b>, discarded at {c.at}</> : <b>{c.at}</b>}
+              A whole lap was thrown away at <b>{c.at}</b>
               {' — '}
               {c.lapTimeS !== null ? lapTime(c.lapTimeS) : '—'} · {Math.round(c.distanceM)} m
               {c.energyWh !== null ? ` · ${c.energyWh.toFixed(1)} Wh` : ''}.
-              {!c.restored && ' Restart lap was pressed with a full lap behind it.'}
+              {' Restart lap was pressed with a full lap behind it.'}
             </span>
           </div>
           <button className="btn block" style={{ marginTop: 6 }} disabled={busy}
-                  onClick={() => void act(c, c.restored)}>
-            <Icon name={c.restored ? 'trash' : 'check'} size={13} />
-            {c.restored ? `Undo — take lap ${c.lap} back out` : `Restore it as lap ${c.lap}`}
+                  onClick={() => void act(c)}>
+            <Icon name="check" size={13} />
+            {`Restore it as lap ${c.lap}`}
           </button>
         </div>
       ))}

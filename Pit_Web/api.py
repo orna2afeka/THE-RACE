@@ -485,6 +485,12 @@ def _race_clock(conn):
 # reset endpoint exists. "Discard" is there because the count is regulation,
 # and a press by mistake must not cost one of three.
 # --------------------------------------------------------------------------- #
+# How far past a full lap the car's lap distance may run before the pit says a
+# cut has been missed rather than is merely late. Every lap is cut by a person,
+# and 400 m is ~25 s at race pace: longer than any late press, shorter than it
+# takes to stop noticing.
+LAP_LATE_CUT_GRACE_M = 400.0
+
 CHARGE_CLOCK_KEY = "charge_clock"
 CHARGE_LIMIT_S = strategy_engine.MAX_STOP_DURATION_MIN * 60.0
 CHARGE_WARN_LEFT_S = 10 * 60.0          # amber from here down
@@ -1389,11 +1395,36 @@ def build_live(conn, manual_lap=-1):
     # crossing fires up to 400 m late), and "% 4000" turned those metres into
     # "Sector 1, Start - Turn 1" while the car was still in the last chicane.
     odo_km = state["odometer_km"]
+    lap_overrun_m = None         # metres past a lap with no cut; None = none due
+    lap_dist_raw = None          # the car's own count, unfolded; None = not from it
     if state.get("track_pos_m") is not None:
         lap_dist = float(state["track_pos_m"]) % C.TRACK_LENGTH_METERS
     elif state["lap_distance_m"] is not None:
-        lap_dist = min(max(float(state["lap_distance_m"]), 0.0),
-                       C.TRACK_LENGTH_METERS - 1.0)
+        # THE NUMBER IS SHOWN AS THE CAR COUNTS IT, AND IT NEVER STOPS. A
+        # person cuts every lap now (track.CUT_LAP_ON_GATE and
+        # CUT_LAP_ON_DISTANCE are both off), so the car's lap distance simply
+        # runs until somebody presses Cut lap -- and the pit reads it out
+        # exactly so: 4000, 4100, 7750. A lap distance over a lap is the
+        # plainest possible sign that a cut is owed.
+        #
+        # It used to be pinned at 3999 m, for a virtual crossing that could
+        # fire 400 m late. Nothing fires by itself any more, and when a cut was
+        # simply missed (Zolder, 2026-09-20 02:02) the pin sat at 3999 for a
+        # whole lap: the map parked on the line, the sector stuck at 9, and
+        # the pit's target speed frozen at the last chicane's -- while the CAR,
+        # which folds the same number (speed_profile._wrap), went on showing
+        # the driver the right one.
+        #
+        # So two values leave here. `lap_dist` is WHERE the car is, folded the
+        # way the car folds it, and is what the map, the sector strip and the
+        # target speed are read at. `lap_dist_raw` is the READOUT. The overrun
+        # is served past the grace a late press can reasonably take, and the
+        # Lap control block says it out loud.
+        raw_m = max(float(state["lap_distance_m"]), 0.0)
+        lap_dist = raw_m % C.TRACK_LENGTH_METERS
+        lap_dist_raw = raw_m
+        if raw_m >= C.TRACK_LENGTH_METERS + LAP_LATE_CUT_GRACE_M:
+            lap_overrun_m = raw_m - C.TRACK_LENGTH_METERS
     elif odo_km is not None:
         lap_dist = (odo_km * 1000.0) % C.TRACK_LENGTH_METERS
     else:
@@ -1479,6 +1510,12 @@ def build_live(conn, manual_lap=-1):
         "currentLapEnergy": lap_energy,
         "currentLapEnergyFromM": lap_energy_from_m,
         "lapDistanceM": lap_dist,
+        # The READOUT: the car's lap distance as it counts it, past 4000 m if
+        # no one has cut the lap. lapDistanceM above is the folded position.
+        "lapDistanceRawM": lap_dist if lap_dist_raw is None else lap_dist_raw,
+        # Null unless the car is more than a late cut's grace past a full lap
+        # with no cut: then it is how far past, and the Cut lap block says so.
+        "lapOverrunM": lap_overrun_m,
         "sectorId": sector_id,
         "sectorName": C.SECTION_NAMES.get(sector_id, "Section %d" % sector_id),
         "track": track,
@@ -2790,12 +2827,18 @@ def _measured_energy_wh():
 
 
 @memo(ttl=90)
-def _plan_strategies(time_left_min, battery_wh, active_lap, table_key):
-    """The cached search. `table_key` is a tuple so it can be hashed."""
+def _plan_strategies(time_left_min, battery_wh, active_lap, table_key,
+                     stops_used=0, align_stops=False):
+    """The cached search. `table_key` is a tuple so it can be hashed.
+
+    `stops_used` is part of the cache key, which it must be: the same clock
+    and the same pack plan a different race once a charge has been spent.
+    """
     consumption = [{"label": l, "lap_time_min": t, "energy_wh": w}
                    for l, t, w in table_key]
     return calculate_all_strategies(time_left_min, battery_wh, active_lap,
-                                    consumption)
+                                    consumption, stops_used=stops_used,
+                                    align_stops=align_stops)
 
 
 def _trace_json(plan):
@@ -2833,13 +2876,18 @@ def _trace_json(plan):
 
 
 def _strategy_payload(time_left_min, battery_wh, active_lap, table,
-                      measured_note=None):
+                      measured_note=None, stops_used=0, align_stops=False):
     """The whole Strategy screen for one set of inputs.
 
     Pure apart from the memo: tools/check_strategy.py calls this directly with
     the engine's own five scenarios and checks the served traces against the
     served rows, so the wire format is verified, not just the engine.
+
+    `stops_used` is how many charges this race has already made. It is the
+    charge clock's count on the live dashboard; it defaults to 0 so a caller
+    asking the whole-race question still gets the whole-race answer.
     """
+    stops_used = max(0, int(stops_used or 0))
     rounded_left = round(time_left_min / STRATEGY_TIME_ROUND_MIN) * STRATEGY_TIME_ROUND_MIN
     rounded_wh = round(battery_wh / STRATEGY_WH_ROUND) * STRATEGY_WH_ROUND
     # Never round a real charge down to nothing. _plan_one_strategy() reads a
@@ -2851,7 +2899,15 @@ def _strategy_payload(time_left_min, battery_wh, active_lap, table,
     table_key = tuple((r["label"], float(r["lap_time_min"]), float(r["energy_wh"]))
                       for r in table)
     rows = _plan_strategies(rounded_left, rounded_wh, int(active_lap or 0),
-                            table_key)
+                            table_key, stops_used, align_stops)
+    # THE SAME RACE PLANNED THE OTHER WAY, for the caption. A toggle whose
+    # cost is invisible is a toggle nobody can decide about: charging at the
+    # driver changes saves stationary minutes and loses laps, and the crew
+    # should read both numbers before choosing, not discover the second one
+    # by flipping it. It is the same search again (tens of milliseconds,
+    # memoised for 90 s), not an estimate.
+    other = _plan_strategies(rounded_left, rounded_wh, int(active_lap or 0),
+                             table_key, stops_used, not align_stops)
     return {
         "rows": [{k: v for k, v in r.items() if k != "_graph_data"} for r in rows],
         # Index-aligned with rows. Null where a strategy could not plan at all.
@@ -2870,14 +2926,52 @@ def _strategy_payload(time_left_min, battery_wh, active_lap, table,
         # states the rule the plan was made under, and reads it off the engine
         # rather than printing a number of its own.
         "maxStopMin": strategy_engine.MAX_STOP_DURATION_MIN,
+        # The driver rules the plan was made under, served for the same
+        # reason as the charge limits: the page explains the changes it is
+        # showing without holding a copy of the numbers that forced them.
+        "driverStintMin": strategy_engine.DRIVER_STINT_LIMIT_MIN,
+        "driverChangeMin": strategy_engine.DRIVER_CHANGE_TIME_MIN,
         "maxStops": strategy_engine.MAX_STOPS,
-        # Carried across from the engine so the screen shows its warning: the
-        # curve's shape is right, its numbers
-        # have never been checked against this charger or pack.
+        # THE CAP IS ON THE RACE, NOT ON WHAT IS LEFT OF IT. The charges
+        # already made are counted by the charge clock and the plan above was
+        # made with only the rest available, so the page states all three
+        # numbers rather than showing "max 3 charges" over a plan that can
+        # offer one. stopsLeft is the engine's own arithmetic, not a
+        # subtraction done here, so the two cannot drift.
+        "stopsUsed": stops_used,
+        "stopsLeft": strategy_engine.stops_remaining(stops_used),
+        # Whether these plans charge only at driver changes, and what the
+        # other answer would have been, per profile: {label: [laps, pit min]}.
+        "alignStops": bool(align_stops),
+        "alternate": {r["Label"]: [r["Total Laps"],
+                                   (r["_graph_data"] or {}).get("pit_min")]
+                      for r in other},
+        # THE CURVE'S PROVENANCE, carried across from the engine so the
+        # screen can name the charge it was measured from instead of saying a
+        # bare "measured" -- and can say where the measurement STOPS. The band
+        # is the part that is real; outside it the curve is extrapolated, and
+        # a crew planning a 90% charge deserves to know which of the two it is
+        # reading. tools/check_charge_curve.py re-derives all of this from the
+        # store.
         "chargingCurveIsMeasured": strategy_engine.CHARGING_CURVE_IS_MEASURED,
+        "chargingCurveMeasuredPct": list(strategy_engine.CHARGING_CURVE_MEASURED_PCT),
+        "measuredCharge": {
+            "when": strategy_engine.MEASURED_CHARGE["when"],
+            "fromPct": strategy_engine.MEASURED_CHARGE["from_pct"],
+            "toPct": strategy_engine.MEASURED_CHARGE["to_pct"],
+            "minutes": strategy_engine.MEASURED_CHARGE["minutes"],
+            "note": strategy_engine.MEASURED_CHARGE["note"],
+        },
         "measured": measured_note or {},
         "minLapsForMeasured": MIN_LAPS_FOR_MEASURED,
         "timeLeftMin": time_left_min,
+        # THE LAP THE PLAN STARTS FROM. Total Laps in the table is laps FROM
+        # NOW -- the search counts from zero over the time remaining -- so the
+        # race total is this plus that, and the page cannot show it without
+        # being told the lap. None when nothing has reported one: a lap count
+        # we do not have is not lap 0, and a race total built on a 0 we
+        # invented would read as fact.
+        "activeLap": None if active_lap is None else int(active_lap),
         # The race duration, which is also the cap on the demo screen's typed
         # "time remaining". Served so the browser holds no copy of it.
         "maxTimeLeftMin": strategy_engine.RACE_DURATION_MIN,
@@ -2888,15 +2982,26 @@ def _strategy_payload(time_left_min, battery_wh, active_lap, table,
 def api_strategy(manual_lap: int = Query(-1),
                  soc_pct: float | None = Query(None, gt=0, le=100),
                  time_left_min: float | None = Query(
-                     None, ge=0, le=strategy_engine.RACE_DURATION_MIN)):
-    """The strategy screen. `soc_pct` and `time_left_min` are DEMO-ONLY.
+                     None, ge=0, le=strategy_engine.RACE_DURATION_MIN),
+                 stops_used: int | None = Query(
+                     None, ge=0, le=strategy_engine.MAX_STOPS),
+                 align_stops: bool = Query(False)):
+    """The strategy screen. The three overrides are DEMO-ONLY.
 
-    On the real dashboard the plan is always made from what the car reported
-    and from the race clock in the store; both overrides are ignored there, so
-    a stray query string cannot put a typed number in front of the crew as if
-    the car had sent it. On the demo backend they replace the two inputs the
-    search actually takes, which is how the strategy can still be read when the
-    Pi has been silent for hours and the stored SoC is long out of date.
+    On the real dashboard the plan is always made from what the car reported,
+    from the race clock and from the charge clock's count; every override is
+    ignored there, so a stray query string cannot put a typed number in front
+    of the crew as if the car had sent it. On the demo backend they replace
+    the three inputs the search actually takes -- pack, time, and charges
+    already made -- which is how the strategy can still be read when the Pi
+    has been silent for hours and the stored SoC is long out of date, and how
+    the crew can ask "what does the rest of the race look like after the
+    second charge" before the second charge happens.
+
+    `align_stops` is NOT an override and is honoured everywhere: it is the
+    crew's planning preference -- charge only at a driver change, so the two
+    happen in one stop -- and the payload carries what the other answer would
+    have been, so the cost of it is on screen beside it.
 
     Nothing is written either way: this endpoint has always been a pure
     read + search, and an override only changes the arguments it is given.
@@ -2904,10 +3009,21 @@ def api_strategy(manual_lap: int = Query(-1),
     with closing(ro_conn()) as conn:
         state, _ = read_live_state(conn)
         _, _, clock_left_min = _race_clock(conn)
+        clock_used = charge_clock(conn)["count"]
     if not DEMO_STORE:
-        soc_pct = time_left_min = None
+        soc_pct = time_left_min = stops_used = None
     soc = state["soc"] if soc_pct is None else soc_pct
     left_min = clock_left_min if time_left_min is None else time_left_min
+    # CHARGES ALREADY MADE, from the clock that counts them -- the pit's, not
+    # the car's, because a car switched off on the charger reports nothing
+    # (see "The charging clock" above). The plan then offers what is LEFT of
+    # the three, which is the whole point: at hour 14 with two spent, three
+    # more stops is not a strategy, it is a disqualified finishing position.
+    #
+    # An override is honoured on the demo store only, and the same way as the
+    # other two: a typed 2 is planned as 2, including a typed 0 on a store
+    # whose clock has counted some.
+    used = int(clock_used or 0) if stops_used is None else stops_used
     active_lap = manual_lap if manual_lap >= 0 else state["auto_lap"]
     # `not soc` covers both a missing reading and a reported 0: neither is a
     # usable capacity, so the matrix assumes a full pack rather than telling
@@ -2938,7 +3054,9 @@ def api_strategy(manual_lap: int = Query(-1),
         measured_note[s["label"]] = {"laps": n, "wh": round(wh, 1),
                                      "storedWh": s["energy_wh"]}
 
-    out = _strategy_payload(left_min, battery_wh, active_lap, table, measured_note)
+    out = _strategy_payload(left_min, battery_wh, active_lap, table,
+                            measured_note, stops_used=used,
+                            align_stops=align_stops)
     out.update({
         "assumedFullPack": assumed_full,
         # Whether the typed-input panel may be shown at all, and what of it the
@@ -2946,11 +3064,15 @@ def api_strategy(manual_lap: int = Query(-1),
         # a page that decides for itself that an override took effect will
         # label a car-derived plan as typed the moment the two disagree.
         "demoStore": DEMO_STORE,
-        "overrides": {"socPct": soc_pct, "timeLeftMin": time_left_min},
+        "overrides": {"socPct": soc_pct, "timeLeftMin": time_left_min,
+                      "stopsUsed": stops_used},
         # What the car and the race clock say, so the panel can show what is
         # being overridden and offer the way back to it.
         "carSocPct": state["soc"],
         "clockTimeLeftMin": clock_left_min,
+        # What the charge clock has counted, beside the number actually
+        # planned with, for the same reason.
+        "clockStopsUsed": clock_used,
         # The profile list as it stands RIGHT NOW, so the selector beside this
         # table tracks a matrix edit on the next poll. /api/config carries the
         # same list, but the browser fetched that once when the page loaded --
@@ -3979,6 +4101,126 @@ def api_strategy_matrix_save(body: MatrixBody):
         raise HTTPException(500, "constants.py was not changed: %s" % e)
     C.set_profile_matrix(draft)
     return {"ok": True, "rows": _matrix_rows()}
+
+
+# --------------------------------------------------------------------------- #
+# Adding and removing a profile from the matrix editor
+# --------------------------------------------------------------------------- #
+# The same primitives the Speed Profile Builder uses -- profile_manage's
+# write_scaled() and remove_profile() -- so there is still one way a CSV gets
+# into profiles/ and one backup trail when it leaves. A new profile is the BASE
+# LAP RE-PACED to the lap time asked for: corners held at the speed they were
+# driven, straights scaled, inside the lap's own accel and brake limits. It is
+# not a new measurement, and the editor says so.
+#
+# !! THE CAR DOES NOT HAVE IT YET !! A profile added here exists on THIS laptop.
+# The car loads profiles/ from git at boot, and /api/strategy/select sends only
+# a NAME -- so a name the car has never heard of is refused by the car. The
+# pit can plan on the new row at once; SENDING it needs a commit, a push, and
+# the Pi to pull. Every response below carries that sentence, because the one
+# time it matters is the one time nobody will remember it.
+CAR_NEEDS_PULL = ("The car does not have this profile until it is committed, "
+                  "pushed, and the Pi has pulled (it pulls at every boot).")
+
+
+class MatrixAddBody(BaseModel):
+    label: str
+    target_s: float
+    # Left out, it is derived from the base row by the same energy model the
+    # Fill button uses -- a number the crew can then overwrite like any other.
+    energy_wh: float | None = None
+
+
+class MatrixRemoveBody(BaseModel):
+    key: str
+
+
+@app.post("/api/strategy/matrix/add")
+def api_strategy_matrix_add(body: MatrixAddBody):
+    """A new profile: the base lap re-paced to `target_s`, and its matrix row."""
+    import profile_manage as pm
+    label = " ".join(str(body.label).split())
+    if not (1 <= len(label) <= 24):
+        raise HTTPException(400, "give the profile a name of 1-24 characters")
+    if any((m.get("label") or "").lower() == label.lower()
+           for m in C.PROFILE_MATRIX.values()):
+        raise HTTPException(400, "there is already a profile called %r" % label)
+    key = pm.suggest_key(label, body.target_s)
+    on_disk = [os.path.splitext(f)[0] for f in os.listdir(pm.PROFILE_DIR)
+               if f.endswith(".csv")]
+    why = (pm.key_problem(key, list(C.PROFILE_MATRIX) + on_disk)
+           or pm.target_problem(body.target_s,
+                                {k: m.get("target_s")
+                                 for k, m in C.PROFILE_MATRIX.items()}))
+    if why:
+        raise HTTPException(400, why)
+
+    energy = body.energy_wh
+    if energy is None:
+        base = C.PROFILE_MATRIX.get(C.DEFAULT_STRATEGY_KEY) or {}
+        if not base.get("energy_wh"):
+            raise HTTPException(400, "the base profile has no Wh per lap to "
+                                     "derive one from - type one in")
+        ladder = energy_model.ladder_from_anchor(
+            [{"key": C.DEFAULT_STRATEGY_KEY, "target_s": base["target_s"]},
+             {"key": key, "target_s": body.target_s}],
+            C.DEFAULT_STRATEGY_KEY, base["target_s"], base["energy_wh"])
+        energy = round(next(r["energy_wh"] for r in ladder if r["key"] == key), 1)
+    if not (MATRIX_MIN_WH <= energy <= MATRIX_MAX_WH):
+        raise HTTPException(400, "%.1f Wh a lap is outside %.0f-%.0f Wh"
+                            % (energy, MATRIX_MIN_WH, MATRIX_MAX_WH))
+
+    # THE CURVE FIRST, THE MATRIX SECOND. A row with no CSV behind it would be
+    # a profile the dropdown offers and nothing can fly; a CSV with no row is
+    # only a file, and is cleaned up below if the row cannot be written.
+    try:
+        info = pm.write_scaled(key, body.target_s)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    draft = {k: dict(m) for k, m in C.PROFILE_MATRIX.items()}
+    draft[key] = {"label": label, "target_s": round(info["lap_s"], 1),
+                  "energy_wh": energy}
+    try:
+        pm.write_saved_matrix(draft)
+    except Exception as e:                                  # noqa: BLE001
+        try:
+            os.remove(os.path.join(pm.PROFILE_DIR, key + ".csv"))
+        except OSError:
+            pass
+        raise HTTPException(500, "nothing was added: %s" % e)
+    C.set_profile_matrix(draft)
+    return {"ok": True, "key": key, "rows": _matrix_rows(),
+            "lapS": info["lap_s"], "maxKmh": info["max_kmh"],
+            "avgKmh": info["avg_kmh"], "energyWh": energy,
+            "note": CAR_NEEDS_PULL}
+
+
+@app.post("/api/strategy/matrix/remove")
+def api_strategy_matrix_remove(body: MatrixRemoveBody):
+    """Take a profile out of the matrix and out of profiles/ (backed up)."""
+    import profile_manage as pm
+    if body.key not in C.PROFILE_MATRIX:
+        raise HTTPException(400, "unknown profile %r" % body.key)
+    if body.key in pm.PROTECTED_KEYS:
+        raise HTTPException(400, "%r is the base profile - the car boots on it "
+                                 "and every other profile is scaled from it"
+                                 % body.key)
+    # Not the one the pit is flying. Removing it would leave every target
+    # readout pointing at a curve that is gone; pick another and Send first.
+    if pit_strategy_choice() == body.key:
+        raise HTTPException(400, "%r is the profile the pit has selected - "
+                                 "send another one to the car first" % body.key)
+    draft = {k: dict(m) for k, m in C.PROFILE_MATRIX.items() if k != body.key}
+    try:
+        pm.write_saved_matrix(draft)
+    except Exception as e:                                  # noqa: BLE001
+        raise HTTPException(500, "nothing was removed: %s" % e)
+    C.set_profile_matrix(draft)
+    backup = pm.remove_profile(body.key)
+    return {"ok": True, "rows": _matrix_rows(),
+            "backup": os.path.basename(backup) if backup else None,
+            "note": "The car still holds %r until the removal is committed, "
+                    "pushed and pulled." % body.key}
 
 
 @app.post("/api/strategy/select")

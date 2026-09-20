@@ -27,6 +27,9 @@ that decides the result -- so what is checked is WHEN it moves, not how it draws
   LATE      the hour runs from the PLUG, not from the press or from Pit Web
             starting: a press can be backdated, and an auto-start is dated from
             the car's first unbroken report of charging.
+  PLAN      and the STRATEGY follows the count. The cap is on the whole race,
+            so a plan made after two charges may offer one -- the screen that
+            still offers three is planning a disqualified finish.
 """
 
 import os
@@ -179,6 +182,42 @@ def main():
     check("        a new race opens at zero",
           clock()["count"] == 0 and clock()["active"] is False,
           "count %d" % clock()["count"])
+
+    # PLAN: the one thing this clock is FOR, beyond the header countdown. The
+    # strategy search may book only what the count has left, so the two must
+    # be read from the same place -- this asks the endpoint, not the engine.
+    def plan_stops():
+        out = api.api_strategy(manual_lap=-1, soc_pct=None, time_left_min=None,
+                               stops_used=None)
+        return out["stopsUsed"], out["stopsLeft"], max(
+            (len(t["stops"]) for t in out["traces"] if t), default=0)
+
+    used, left, booked = plan_stops()
+    check("  PLAN: with nothing charged the plan may book all three",
+          (used, left) == (0, api.strategy_engine.MAX_STOPS),
+          "planned with %d used, %d left, longest plan books %d"
+          % (used, left, booked))
+    for _ in range(2):                                 # two charges, done
+        c.post("/api/charge", json={"action": "start"})
+        c.post("/api/charge", json={"action": "stop"})
+    used, left, booked = plan_stops()
+    check("        after two charges it may book one",
+          (used, left) == (2, 1) and booked <= 1,
+          "planned with %d used, %d left, longest plan books %d"
+          % (used, left, booked))
+    c.post("/api/charge", json={"action": "start"})
+    c.post("/api/charge", json={"action": "stop"})
+    used, left, booked = plan_stops()
+    check("        after three it may book none, and says so",
+          (used, left) == (3, 0) and booked == 0,
+          "planned with %d used, %d left, longest plan books %d"
+          % (used, left, booked))
+    # Giving a charge back gives the plan its stop back too.
+    c.post("/api/charge", json={"action": "start"})
+    c.post("/api/charge", json={"action": "discard"})
+    used, left, _ = plan_stops()
+    check("        a discarded press costs the plan nothing",
+          (used, left) == (3, 0), "planned with %d used, %d left" % (used, left))
 
     live = c.get("/api/config").status_code            # the app still serves
     with closing(api.ro_conn()) as ro:

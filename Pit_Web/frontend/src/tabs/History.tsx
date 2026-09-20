@@ -411,7 +411,16 @@ const KIND_NAME: Record<string, string> = {
   start: 'not from the line', suspect: 'suspect',
 };
 const MUTED = '#8a93a6';
-const counts = (kind: string | null) => kind === null || kind === 'flying';
+// A RESTORED LAP IS NOT AN UNTAGGED ONE. `kind === null` is here for a car
+// from before lap tags, whose laps all count -- but the lap the PIT put back
+// is tagged null too, on purpose, to keep it out of the flying-lap figures.
+// So in a race where the car tags everything and nothing came out flying, the
+// one restored lap was the single coloured bar in a chart of grey ones, with
+// nothing on screen to say why. The server already leaves it out of best and
+// average (db.flying_laps); it is drawn the same way here.
+type LapRow = LapsResp['laps'][number];
+const counts = (l: Pick<LapRow, 'kind' | 'source'>) =>
+  l.source !== 'restored' && (l.kind === null || l.kind === 'flying');
 
 function LapCharts({ dark, visible, drivers }: { dark: boolean; visible: boolean; drivers: string[] }) {
   // `edits` re-runs the poll the moment a driver is changed by hand, so the
@@ -487,7 +496,7 @@ function LapCharts({ dark, visible, drivers }: { dark: boolean; visible: boolean
     };
     void Plotly.newPlot(eRef.current, [{
       type: 'bar', x: lapX, y: laps.map((l) => l.energyWh),
-      marker: { color: laps.map((l) => (counts(l.kind) ? '#00B3FF' : MUTED)),
+      marker: { color: laps.map((l) => (counts(l) ? '#00B3FF' : MUTED)),
                 line: { width: 0 } }, width: 0.55,
       customdata: lapNo, hovertemplate: 'lap %{customdata} · %{y:.1f} Wh<extra></extra>',
     }], { ...base, margin: { l: 50, r: 12, t: 8, b: 36 }, bargap: 0.4,
@@ -522,7 +531,7 @@ function LapCharts({ dark, visible, drivers }: { dark: boolean; visible: boolean
       type: 'scatter', mode: 'lines+markers', x: lapX,
       y: laps.map((l) => l.lapTimeS),
       connectgaps: false, line: { color: '#00e0b4', width: 2 },
-      marker: { size: 8, color: laps.map((l) => (counts(l.kind) ? '#00e0b4' : MUTED)),
+      marker: { size: 8, color: laps.map((l) => (counts(l) ? '#00e0b4' : MUTED)),
                 line: { width: 2, color: t.card } },
       customdata: laps.map((l) => [l.lap, lapTimeShort(l.lapTimeS)]),
       hovertemplate: 'lap %{customdata[0]} · %{customdata[1]}<extra></extra>',
@@ -653,7 +662,7 @@ function LapTable({ laps, drivers, onEdited }: {
           </thead>
           <tbody>
             {rows.map((l, i) => (
-              <tr key={`${l.lap}-${i}`} className={counts(l.kind) ? undefined : 'not-flying'}>
+              <tr key={`${l.lap}-${i}`} className={counts(l) ? undefined : 'not-flying'}>
                 <td className="num mono">{l.lap}</td>
                 <td>
                   <select className="cellselect" value={l.driver ?? ''} disabled={busy}

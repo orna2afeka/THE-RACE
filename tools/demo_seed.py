@@ -26,7 +26,7 @@ WHAT THE DEMO IS BUILT TO SHOW, panel by panel:
 
   Track position The car is mid-lap with a target speed taken from the profile
                  it reports in `active_strategy`, so the card reads
-                 "from lap33_290s" rather than the assumed-profile warning.
+                 "from lap93_293s" rather than the assumed-profile warning.
 
   Driver stint   Started 108 minutes ago against a 2 hour limit, so the
                  countdown is inside the amber warning band and the banner is
@@ -158,7 +158,7 @@ def main():
                 rows.append({
                     "device_ts": ts, "device_id": "solarcar",
                     "lap_distance_m": d, "calculated_lap": float(tag),
-                    "active_strategy": "lap33_290s",
+                    "active_strategy": "lap93_293s",
                     "mms_vehicle_speed_kmh": speed,
                     "lat": lat, "lon": lon,
                     "bms_soc_percent": soc,

@@ -135,7 +135,13 @@ export function SectorCard({ live, config }: { live: Live; config: Config }) {
           <div className="sector-target" style={{ color: colour }}>
             {t.target_speed.toFixed(0)}<small>km/h</small>
           </div>
-          <div className="sector-dist">{live.lapDistanceM.toFixed(0)} m / {config.trackLengthM} m</div>
+          {/* The car's own count, which keeps running until a person cuts the
+              lap. Over a lap it is shown as it is — never pinned, never
+              folded — and coloured, because that number IS the warning. */}
+          <div className="sector-dist"
+               style={(live.lapDistanceRawM ?? 0) > config.trackLengthM ? { color: 'var(--pit-warning)' } : undefined}>
+            {(live.lapDistanceRawM ?? live.lapDistanceM).toFixed(0)} m / {config.trackLengthM} m
+          </div>
           {/* A target speed from an ASSUMED profile must never look like one
               the pit actually chose. Same rule as has_gps versus the paddock
               fallback. */}

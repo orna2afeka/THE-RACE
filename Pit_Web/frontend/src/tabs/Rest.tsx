@@ -348,7 +348,9 @@ function BatteryChart({ data, dark }: { data: StrategyResp; dark: boolean }) {
           type: 'scatter', mode: 'markers', name: `${tr.label} stops`, showlegend: false,
           x: tr.stops.map((s) => Math.max(0, tr.totalTimeMin - s.atMin)),
           y: tr.stops.map((s) => tr.capacityWh * s.socBefore / 100),
-          text: tr.stops.map((s) => `stop ${s.number} after lap ${s.afterLap} → ${s.socAfter.toFixed(0)}% · ${s.stopMin.toFixed(0)} min`),
+          // `number` is the charge OF THE RACE, so after two spent the first
+          // marker on this chart reads "charge 3", not "charge 1".
+          text: tr.stops.map((s) => `charge ${s.number} after lap ${s.afterLap} → ${s.socAfter.toFixed(0)}% · ${s.stopMin.toFixed(0)} min`),
           marker: { symbol: 'triangle-down', size: 9, color: c, line: { color: dark ? '#fff' : '#000', width: 0.6 } },
           hovertemplate: '%{text}<extra>' + tr.label + '</extra>',
         });
@@ -460,8 +462,13 @@ function lapText(seconds: number): string {
   return m + ':' + (s < 10 ? '0' : '') + s.toFixed(s % 1 ? 1 : 0);
 }
 
-function MatrixEditor({ onSaved, onCancel }:
-  { onSaved: () => void; onCancel: () => void }) {
+function MatrixEditor({ onSaved, onCancel, onChanged, baseKey }:
+  { onSaved: () => void; onCancel: () => void;
+    /** A profile was added or removed: re-plan now, but keep the editor open. */
+    onChanged: () => void;
+    /** The car's boot profile. Everything else is scaled from it, so it is the
+     *  one row with no Remove button. */
+    baseKey: string }) {
   const [saved, setSaved] = useState<MatrixRow[] | null>(null);
   const [draft, setDraft] = useState<Record<string, { lap: string; wh: string }>>({});
   const [busy, setBusy] = useState(false);
@@ -476,6 +483,53 @@ function MatrixEditor({ onSaved, onCancel }:
 
   const set = (key: string, field: 'lap' | 'wh', value: string) =>
     setDraft((d) => ({ ...d, [key]: { ...d[key], [field]: value } }));
+
+  // ADDING AND REMOVING A PROFILE. A new one is the base lap re-paced to the
+  // lap time typed here (corners as driven, straights scaled) — the server
+  // builds the CSV and the matrix row together, or neither. The list is taken
+  // from the server's answer, never patched locally, so what this shows is
+  // what is on disk.
+  const [adding, setAdding] = useState(false);
+  const [newRow, setNewRow] = useState({ label: '', lap: '', wh: '' });
+  const newLap = parseLap(newRow.lap);
+  const newWhBad = newRow.wh.trim() !== '' && !(Number(newRow.wh) > 0);
+  const newBad = !newRow.label.trim() || newLap == null || newWhBad;
+  const adopt = (rows: MatrixRow[]) => {
+    setSaved(rows);
+    setDraft((d) => Object.fromEntries(rows.map((r) =>
+      [r.key, d[r.key] ?? { lap: lapText(r.target_s), wh: String(r.energy_wh) }])));
+  };
+  const addProfile = async () => {
+    if (newBad || newLap == null) return;
+    setBusy(true);
+    try {
+      const out = await postJSON<{ rows: MatrixRow[]; key: string; lapS: number; maxKmh: number; energyWh: number; note: string }>(
+        '/api/strategy/matrix/add',
+        { label: newRow.label.trim(), target_s: newLap,
+          energy_wh: newRow.wh.trim() === '' ? null : Number(newRow.wh) });
+      adopt(out.rows);
+      setNewRow({ label: '', lap: '', wh: '' });
+      setAdding(false);
+      toast(`Added ${out.key}: ${lapText(out.lapS)}, peaks ${out.maxKmh.toFixed(0)} km/h, ${out.energyWh.toFixed(1)} Wh. ${out.note}`);
+      onChanged();
+    } catch (e) { toast('Not added: ' + e, 'err'); }
+    finally { setBusy(false); }
+  };
+  // Two presses, not a browser confirm(): the second press is on the same
+  // button, so it cannot be dismissed by a stray Enter.
+  const [removing, setRemoving] = useState<string | null>(null);
+  const removeProfile = async (r: MatrixRow) => {
+    if (removing !== r.key) { setRemoving(r.key); return; }
+    setBusy(true);
+    try {
+      const out = await postJSON<{ rows: MatrixRow[]; backup: string | null; note: string }>(
+        '/api/strategy/matrix/remove', { key: r.key });
+      adopt(out.rows);
+      toast(`Removed ${r.label}${out.backup ? ` — copy kept as profiles/_backup/${out.backup}` : ''}. ${out.note}`);
+      onChanged();
+    } catch (e) { toast('Not removed: ' + e, 'err'); }
+    finally { setBusy(false); setRemoving(null); }
+  };
 
   const parsed = (r: MatrixRow) => ({
     lap: parseLap(draft[r.key]?.lap ?? ''),
@@ -560,11 +614,64 @@ function MatrixEditor({ onSaved, onCancel }:
                         title="Keep this row and rebuild the other four around it: lap times at the spacing the matrix already has, Wh from the rolling+drag model anchored here.">
                   <Icon name="target" size={12} />Fill from this row
                 </button>
+                {r.key !== baseKey && (
+                  <button className="btn" disabled={busy} onClick={() => removeProfile(r)}
+                          onBlur={() => setRemoving(null)} style={{ marginLeft: 6 }}
+                          title="Takes the profile out of the matrix and out of profiles/. A copy is kept in profiles/_backup/. Refused for the profile the pit has selected.">
+                    <Icon name="trash" size={12} />{removing === r.key ? 'Press again to remove' : 'Remove'}
+                  </button>
+                )}
               </td>
             </tr>
           ))}
+          {adding && (
+            <tr>
+              <td>
+                <input value={newRow.label} placeholder="name, e.g. Fast" maxLength={24}
+                       onChange={(e) => setNewRow({ ...newRow, label: e.target.value })}
+                       style={{ width: 140 }} />
+              </td>
+              <td className="num">
+                <input value={newRow.lap} placeholder="4:30" size={7} inputMode="decimal"
+                       onChange={(e) => setNewRow({ ...newRow, lap: e.target.value })}
+                       style={{ width: 80, textAlign: 'right',
+                                borderColor: newRow.lap && newLap == null ? 'var(--pit-warning)' : undefined }} />
+              </td>
+              <td className="num">
+                <input value={newRow.wh} placeholder="auto" size={7} inputMode="decimal"
+                       onChange={(e) => setNewRow({ ...newRow, wh: e.target.value })}
+                       style={{ width: 80, textAlign: 'right',
+                                borderColor: newWhBad ? 'var(--pit-warning)' : undefined }} />
+              </td>
+              <td>
+                <button className="btn primary" disabled={busy || newBad} onClick={addProfile}>
+                  <Icon name="check" size={12} />Create
+                </button>
+                <button className="btn" disabled={busy} style={{ marginLeft: 6 }}
+                        onClick={() => { setAdding(false); setNewRow({ label: '', lap: '', wh: '' }); }}>
+                  Cancel
+                </button>
+              </td>
+            </tr>
+          )}
         </tbody>
       </table>
+      {!adding && (
+        <div className="btnrow" style={{ marginTop: 8 }}>
+          <button className="btn" disabled={busy} onClick={() => setAdding(true)}>
+            <Icon name="sliders" size={13} />Add a speed profile
+          </button>
+        </div>
+      )}
+      {adding && (
+        <div className="caption" style={{ marginTop: 6 }}>
+          The new profile is <b>the base lap re-paced</b> to the lap time you type — corners held at the
+          speed they were driven, straights scaled, inside the lap's own acceleration and braking. Leave
+          Wh empty and it is derived from the base row by the rolling + drag model.{' '}
+          <span className="warn-text">The car does not have it until it is committed, pushed and the Pi
+          has pulled</span> — plan on it at once, send it to the car only after that.
+        </div>
+      )}
       <div className="caption" style={{ marginTop: 8 }}>
         Lap time takes <code>4:45</code> or <code>285</code>. <b>Fill from this row</b> keeps the row you
         typed and derives the rest: lap times keep the spacing this matrix already has, and Wh comes from
@@ -622,7 +729,13 @@ function minutesText(mins: number): string {
   return h ? `${h} h ${String(m % 60).padStart(2, '0')} m` : `${m} m`;
 }
 
-export interface StrategyOverride { socPct: number | null; timeLeftMin: number | null }
+export interface StrategyOverride {
+  socPct: number | null; timeLeftMin: number | null;
+  /** Charges already made. 0 is a real answer here, not "unset": a store
+   *  whose clock counted two can be asked what a race with none spent looks
+   *  like. null is what means "use the clock". */
+  stopsUsed: number | null;
+}
 
 function StrategyInputs({ applied, onApply, onClear, manualLap, setManualLap, data }: {
   applied: StrategyOverride;
@@ -635,6 +748,7 @@ function StrategyInputs({ applied, onApply, onClear, manualLap, setManualLap, da
   const [soc, setSoc] = useState(applied.socPct == null ? '' : String(applied.socPct));
   const [left, setLeft] = useState(applied.timeLeftMin == null ? '' : String(applied.timeLeftMin));
   const [lap, setLap] = useState(manualLap >= 0 ? String(manualLap) : '');
+  const [used, setUsed] = useState(applied.stopsUsed == null ? '' : String(applied.stopsUsed));
 
   const socNum = soc.trim() === '' ? null : Number(soc);
   // Above 0, not from 0: the strategy engine reads an empty pack as an unknown
@@ -648,15 +762,22 @@ function StrategyInputs({ applied, onApply, onClear, manualLap, setManualLap, da
     && (leftNum === null || (data != null && leftNum > data.maxTimeLeftMin));
   const lapNum = lap.trim() === '' ? null : Number(lap);
   const lapBad = lapNum !== null && (!Number.isInteger(lapNum) || lapNum < 0);
-  const anyBad = socBad || leftBad || lapBad;
+  const usedNum = used.trim() === '' ? null : Number(used);
+  // A whole number from 0 to the cap. A fourth charge is not a plan the
+  // engine will draw — it classifies the car behind every car that made
+  // three — so it is not a number this asks it to draw one for.
+  const usedBad = usedNum !== null
+    && (!Number.isInteger(usedNum) || usedNum < 0
+        || (data != null && usedNum > data.maxStops));
+  const anyBad = socBad || leftBad || lapBad || usedBad;
 
   const apply = () => {
     if (anyBad) return;
     setManualLap(lapNum === null ? -1 : lapNum);
-    onApply({ socPct: socNum, timeLeftMin: leftNum });
+    onApply({ socPct: socNum, timeLeftMin: leftNum, stopsUsed: usedNum });
   };
   const clear = () => {
-    setSoc(''); setLeft(''); setLap('');
+    setSoc(''); setLeft(''); setLap(''); setUsed('');
     setManualLap(-1);
     onClear();
   };
@@ -694,6 +815,20 @@ function StrategyInputs({ applied, onApply, onClear, manualLap, setManualLap, da
             </td>
           </tr>
           <tr>
+            <td>Charges already made</td>
+            <td className="num">
+              <input value={used} size={7} inputMode="numeric" placeholder="—"
+                     onChange={(e) => setUsed(e.target.value)}
+                     style={{ width: 80, textAlign: 'right', ...(usedBad ? bad : {}) }} />
+              {data ? ` of ${data.maxStops}` : ''}
+            </td>
+            <td className="caption" style={{ margin: 0 }}>
+              the charge clock's count, <b>{data ? data.clockStopsUsed : '—'}</b>. The plan
+              may book what is left of the {data ? data.maxStops : 3}, so this is how the
+              rest of the race is read after a stop that has not happened yet.
+            </td>
+          </tr>
+          <tr>
             <td>Lap</td>
             <td className="num">
               <input value={lap} size={7} inputMode="numeric" placeholder="—"
@@ -719,7 +854,7 @@ function StrategyInputs({ applied, onApply, onClear, manualLap, setManualLap, da
         </button>
         <button className="btn" onClick={clear}>Back to the car's values</button>
         <span className="caption">
-          {anyBad ? `SoC is above 0 and up to 100, time is minutes or h:mm up to ${minutesText(data?.maxTimeLeftMin ?? 0)}, lap is a whole number.`
+          {anyBad ? `SoC is above 0 and up to 100, time is minutes or h:mm up to ${minutesText(data?.maxTimeLeftMin ?? 0)}, lap is a whole number, charges made is 0 to ${data?.maxStops ?? 3}.`
             : 'Demo dashboard only — the real pit dashboard always plans from the car.'}
         </span>
       </div>
@@ -742,11 +877,28 @@ export function Strategy({ config, manualLap, setManualLap, dark, selected }:
   // ignores them on the real store whatever is in here.
   const [editingInputs, setEditingInputs] = useState(false);
   const [override, setOverride] = useStored<StrategyOverride>(
-    'pit.strategyInputs', { socPct: null, timeLeftMin: null },
+    'pit.strategyInputs', { socPct: null, timeLeftMin: null, stopsUsed: null },
     (v) => !!v && typeof v === 'object');
-  const ovQuery = (override.socPct == null ? '' : `&soc_pct=${override.socPct}`)
-    + (override.timeLeftMin == null ? '' : `&time_left_min=${override.timeLeftMin}`);
+  // A PLANNING PREFERENCE, not an override: it is honoured on the real
+  // dashboard too, and kept across a reload because it is how the crew has
+  // decided to run the stops, not a thing they are trying out.
+  const [alignStops, setAlignStops] = useStored<boolean>(
+    'pit.alignStops', false, (v) => typeof v === 'boolean');
+  const ovQuery = (alignStops ? '&align_stops=true' : '')
+    + (override.socPct == null ? '' : `&soc_pct=${override.socPct}`)
+    + (override.timeLeftMin == null ? '' : `&time_left_min=${override.timeLeftMin}`)
+    + (override.stopsUsed == null ? '' : `&stops_used=${override.stopsUsed}`);
   const { data } = usePoll(() => getJSON<StrategyResp>(`/api/strategy?manual_lap=${manualLap}${ovQuery}`), 10000, [manualLap, matrixVersion, ovQuery]);
+  // What the OTHER setting would have given, per profile, so the toggle can
+  // state its own price. Served by the engine, not estimated here.
+  const altLaps = data
+    ? data.rows.map((r) => [Number(r['Total Laps']),
+                            data.alternate[String(r.Label)]?.[0] ?? null] as const)
+        .filter((x) => x[1] != null)
+    : [];
+  const altDelta = altLaps.length
+    ? altLaps.reduce((acc, [now, alt]) => acc + ((alt as number) - now), 0) / altLaps.length
+    : 0;
   const [choice, setChoice] = useState(selected ?? config.defaultStrategyKey);
   // Adopt the stored selection ONCE, when the live feed first carries one. Not
   // on every poll: this tab can be open with the dropdown half-changed, and
@@ -785,7 +937,7 @@ export function Strategy({ config, manualLap, setManualLap, dark, selected }:
   // there has ever been, and it has never raised a banner.
   const overridden = !!data && data.demoStore
     && (data.overrides.socPct != null || data.overrides.timeLeftMin != null
-        || manualLap >= 0);
+        || data.overrides.stopsUsed != null || manualLap >= 0);
   const cols = data?.rows.length ? Object.keys(data.rows[0]) : [];
   const isNum = (v: unknown) => typeof v === 'number';
   const measuredLabels = data ? Object.keys(data.measured) : [];
@@ -818,7 +970,7 @@ export function Strategy({ config, manualLap, setManualLap, dark, selected }:
       </div>
 
       <SectionTitle icon="table" title="Strategy matrix"
-                    right={data ? `${data.timeLeftMin.toFixed(0)} min remaining · max ${data.maxStops} charges (regulation) · each ${data.minStopMin.toFixed(0)}–${data.maxStopMin.toFixed(0)} min` : undefined} />
+                    right={data ? `${data.timeLeftMin.toFixed(0)} min remaining · ${data.stopsUsed} of ${data.maxStops} charges made, ${data.stopsLeft} left to plan (regulation) · each ${data.minStopMin.toFixed(0)}–${data.maxStopMin.toFixed(0)} min` : undefined} />
       <div className="btnrow" style={{ marginBottom: 8 }}>
         <button className="btn" onClick={() => setEditing((v) => !v)}>
           <Icon name="sliders" size={13} />{editing ? 'Close editor' : 'Edit matrix'}
@@ -826,15 +978,35 @@ export function Strategy({ config, manualLap, setManualLap, dark, selected }:
         {/* Only where the server will honour it. config.demoStore and the
             payload's demoStore are the same flag; this uses config so the
             button is there before the first plan arrives. */}
+        {/* The one planning choice on this screen, and its price. A driver
+            change costs five minutes mid-stint and nothing inside a charge
+            stop — but a charge taken at a change starts from a fuller pack,
+            and an hour puts less in. The caption carries the difference so
+            the choice is made on numbers. */}
+        <button className="btn" aria-pressed={alignStops}
+                onClick={() => setAlignStops(!alignStops)}>
+          <Icon name="timer" size={13} />
+          {alignStops ? 'Charging at the driver changes' : 'Charge when the pack is empty'}
+        </button>
         {config.demoStore && (
           <button className="btn" aria-pressed={overridden} onClick={() => setEditingInputs((v) => !v)}>
             <Icon name="target" size={13} />{editingInputs ? 'Close inputs' : 'Edit inputs'}
           </button>
         )}
-        {!editing && !editingInputs && <span className="caption">Lap time and Wh per lap, edited here and live at the next poll — no restart.</span>}
+        {!editing && !editingInputs && (
+          <span className="caption">
+            {data && altLaps.length
+              ? (alignStops
+                  ? `Every charge is taken at a driver change, so the change is free. Charging whenever the pack runs out instead: ${altDelta >= 0 ? '+' : ''}${altDelta.toFixed(0)} laps on average.`
+                  : `Charges are taken when the pack runs out; the driver change at each stop is already free. Charging only at the driver changes instead: ${altDelta >= 0 ? '+' : ''}${altDelta.toFixed(0)} laps on average.`)
+              : 'Lap time and Wh per lap, edited here and live at the next poll — no restart.'}
+          </span>
+        )}
       </div>
       {editing && (
         <MatrixEditor
+          baseKey={config.defaultStrategyKey}
+          onChanged={() => setMatrixVersion((v) => v + 1)}
           onSaved={() => { setEditing(false); setMatrixVersion((v) => v + 1); }}
           onCancel={() => setEditing(false)} />
       )}
@@ -842,7 +1014,7 @@ export function Strategy({ config, manualLap, setManualLap, dark, selected }:
         <StrategyInputs applied={override} data={data}
                         manualLap={manualLap} setManualLap={setManualLap}
                         onApply={(o) => { setOverride(o); setEditingInputs(false); }}
-                        onClear={() => { setOverride({ socPct: null, timeLeftMin: null }); setEditingInputs(false); }} />
+                        onClear={() => { setOverride({ socPct: null, timeLeftMin: null, stopsUsed: null }); setEditingInputs(false); }} />
       )}
       {/* Says what the SERVER used, not what this page asked for. Stays up
           while the panel is closed: a plan made from typed numbers must never
@@ -856,8 +1028,28 @@ export function Strategy({ config, manualLap, setManualLap, dark, selected }:
             data!.overrides.timeLeftMin != null
               ? `${minutesText(data!.overrides.timeLeftMin)} remaining (race clock: ${minutesText(data!.clockTimeLeftMin)})`
               : null,
+            data!.overrides.stopsUsed != null
+              ? `${data!.overrides.stopsUsed} of ${data!.maxStops} charges already made (charge clock: ${data!.clockStopsUsed})`
+              : null,
             manualLap >= 0 ? `lap ${manualLap}` : null,
           ].filter(Boolean).join(' · ')}.
+        </Pill>
+      )}
+      {/* THE PLAN BELOW CANNOT CHARGE. Said out loud, because the table's own
+          way of saying it — "No charges left" in a column the eye skips — is
+          not enough for the one fact that decides the rest of the race. */}
+      {data != null && data.stopsLeft === 0 && (
+        <Pill kind="warn">
+          <b>All {data.maxStops} charges are used.</b> The plans below run to the flag on what
+          is in the pack now; a fourth charge would classify the car behind every car that
+          made {data.maxStops} or fewer.
+        </Pill>
+      )}
+      {data != null && data.stopsLeft > 0 && data.stopsUsed > 0 && (
+        <Pill kind="info">
+          {data.stopsUsed} charge{data.stopsUsed === 1 ? '' : 's'} already made — the plans below
+          may book {data.stopsLeft} more, numbered {data.stopsUsed + 1}
+          {data.stopsLeft > 1 ? `–${data.maxStops}` : ''} of {data.maxStops}.
         </Pill>
       )}
       {data?.assumedFullPack && (
@@ -868,7 +1060,12 @@ export function Strategy({ config, manualLap, setManualLap, dark, selected }:
       )}
       <div className="scroll" style={{ maxHeight: 'none' }}>
         <table className="tbl">
-          <thead><tr>{cols.map((c) => <th key={c} className={isNum(data?.rows[0]?.[c]) ? 'num' : ''}>{c}</th>)}</tr></thead>
+          <thead><tr>{cols.map((c) => (
+            <th key={c} className={isNum(data?.rows[0]?.[c]) ? 'num' : ''}
+                title={c === 'Total Laps'
+                  ? 'Laps from NOW to the flag, not the race total. The tag beside each one is the race total: the lap the car is on plus these.'
+                  : undefined}>{c}</th>
+          ))}</tr></thead>
           <tbody>
             {(data?.rows ?? []).map((r, i) => (
               <tr key={i}>
@@ -880,13 +1077,26 @@ export function Strategy({ config, manualLap, setManualLap, dark, selected }:
                          is here. */
                       title={c === 'Charge Time' && data?.traces[i]?.stops.length
                         ? data.traces[i]!.stops.map((s) =>
-                            `stop ${s.number} (after lap ${s.afterLap}): `
+                            `charge ${s.number} of ${data!.maxStops} (after lap ${s.afterLap}): `
                             + `${s.socBefore.toFixed(0)}% → ${s.socAfter.toFixed(0)}% `
                             + `in ${s.chargeMin.toFixed(0)} min, ${s.stopMin.toFixed(0)} min in the box`)
                             .join('\n')
                         /* The sum, spelled out. Pit Time is stationary time,
                            so it is larger than the charging in Charge Time
                            beside it, and the difference is the changes. */
+                        /* THE COLUMN COUNTS THE PAID CHANGES ONLY. The one
+                           made inside each charge stop is free and is not in
+                           it, which reads as though the car changed drivers
+                           fewer times than it does. The total belongs here,
+                           where it can be said properly. */
+                        : c === 'Driver Swaps' && data?.traces[i]
+                        ? `${data.traces[i]!.swaps} change${data.traces[i]!.swaps === 1 ? '' : 's'} mid-stint at `
+                          + `${data.driverChangeMin.toFixed(0)} min each, plus `
+                          + `${data.traces[i]!.stops.length} inside the charge stops at no cost — `
+                          + `${data.traces[i]!.swaps + data.traces[i]!.stops.length} driver changes in all. `
+                          + `Every charge stop is a driver change: the car is stationary anyway. `
+                          + `The mid-stint ones are forced by the ${data.driverStintMin.toFixed(0)} min stint limit — `
+                          + `the pack outlasts a driver, so a run between charges needs more than one.`
                         : c === 'Pit Time' && data?.traces[i]
                         ? `${data.traces[i]!.pitMin.toFixed(0)} min stationary = `
                           + `${data.traces[i]!.chargeStopMin.toFixed(0)} min at ${data.traces[i]!.stops.length} charge `
@@ -903,6 +1113,21 @@ export function Strategy({ config, manualLap, setManualLap, dark, selected }:
                                    + `${data.measured[String(r.Label)].laps} laps the car drove on this profile cost `
                                    + `${data.measured[String(r.Label)].wh.toFixed(1)} Wh (median). The table shows the matrix.`}>
                           car: {data.measured[String(r.Label)].wh.toFixed(0)}
+                        </span>
+                      : null}
+                    {/* THE COLUMN IS LAPS FROM NOW — the search counts from
+                        zero over the time remaining. The race total is the
+                        lap the car is on plus that, and it is the number the
+                        crew is actually chasing, so it is shown beside it
+                        rather than left as arithmetic to do in the head.
+                        Nothing is shown while no lap has been reported: a
+                        missing lap is not lap 0. */}
+                    {c === 'Total Laps' && data?.activeLap != null && Number(r[c]) > 0
+                      ? <span className="measured-tag"
+                              title={`${r[c]} more laps from lap ${data.activeLap}, `
+                                   + `so ${data.activeLap + Number(r[c])} for the race. `
+                                   + `The column counts from now, not from the green flag.`}>
+                          {data.activeLap + Number(r[c])} in total race
                         </span>
                       : null}
                     {c === 'Pit Strategy' && String(r[c]).includes('limit')
@@ -933,7 +1158,12 @@ export function Strategy({ config, manualLap, setManualLap, dark, selected }:
       {data && (
         <div className="caption">
           {data.chargingCurveIsMeasured
-            ? <><span className="ok-text">Charge times from the measured pack curve.</span> <b>Charge Time</b> is one entry per stop, in the order of <b>Charge To</b>; a stop costs at least {data.minStopMin.toFixed(0)} min however quick the charge, and the charge stops at {data.maxStopMin.toFixed(0)} min wherever the SoC has got to. <b>Pit Time</b> is every stationary minute — the charge stops plus the mid-stint driver changes in <b>Driver Swaps</b>; a change made at a stop is free. Hover it for the sum.</>
+            ? <><span className="ok-text">Charge times from the car's own charge{' '}
+                <span title={`${data.measuredCharge.note} — ${data.measuredCharge.fromPct}% to ${data.measuredCharge.toPct}% in ${data.measuredCharge.minutes.toFixed(0)} min, integrated from CAN voltage and current on both packs. tools/check_charge_curve.py re-derives this from the store and holds the curve to it.`}>
+                  ({data.measuredCharge.when}: {data.measuredCharge.fromPct}% → {data.measuredCharge.toPct}% in {data.measuredCharge.minutes.toFixed(0)} min)
+                </span>, measured {data.chargingCurveMeasuredPct[0]}–{data.chargingCurveMeasuredPct[1]}%.</span>{' '}
+              <span className="warn-text">Above {data.chargingCurveMeasuredPct[1]}% the curve is extrapolated</span> — nobody has charged this car past it, so a plan that charges higher is the model talking, not the pack.{' '}
+              <b>Charge Time</b> is one entry per stop, in the order of <b>Charge To</b>; a stop costs at least {data.minStopMin.toFixed(0)} min however quick the charge, and the charge stops at {data.maxStopMin.toFixed(0)} min wherever the SoC has got to. <b>Pit Time</b> is every stationary minute — the charge stops plus the mid-stint driver changes in <b>Driver Swaps</b>; a change made at a stop is free. Hover it for the sum.</>
             : <><span className="warn-text">Charge times are MODELLED, not measured.</span> The SoC curve came from the charging branch marked <i>example data</i> and has never been checked against this charger or pack — its shape is right, its numbers are not ours. Lap counts are sound; treat <b>Pit Time</b> as an estimate until someone times a real charge.</>}
         </div>
       )}

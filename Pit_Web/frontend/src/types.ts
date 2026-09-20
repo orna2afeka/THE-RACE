@@ -208,7 +208,26 @@ export interface StrategyResp {
   /** A stop lasts at least `minStopMin` and at most `maxStopMin`: the charge
    *  stops at the ceiling wherever the SoC got to. */
   minStopMin: number; maxStopMin: number; maxStops: number;
+  /** The driver rules the plan obeys: no stint longer than `driverStintMin`,
+   *  and a change costs `driverChangeMin` unless it is made at a charge stop,
+   *  where the car is stationary anyway and it costs nothing. */
+  driverStintMin: number; driverChangeMin: number;
+  /** `maxStops` is the cap on the WHOLE race. `stopsUsed` is what the charge
+   *  clock has counted so far and `stopsLeft` is what the plan above was
+   *  actually allowed to book — never a subtraction done in the browser. */
+  stopsUsed: number; stopsLeft: number;
+  /** True when these plans charge ONLY at a driver change, so the change is
+   *  made inside the stop instead of costing five minutes of its own. */
+  alignStops: boolean;
+  /** The same race planned the other way — label → [laps, pit minutes] — so
+   *  the page can show what the toggle costs without flipping it. */
+  alternate: Record<string, [number, number | null]>;
   chargingCurveIsMeasured: boolean;
+  /** The SoC band the charge curve was actually measured over, [from, to].
+   *  Outside it the curve is extrapolated — the crew is told which. */
+  chargingCurveMeasuredPct: [number, number];
+  /** The charge it was measured from, as the car reported it. */
+  measuredCharge: { when: string; fromPct: number; toPct: number; minutes: number; note: string };
   /** Label -> what the car actually paid on that profile, BESIDE the matrix
    *  and never inside it: the table always shows `storedWh`. Absent for a
    *  profile with fewer than `minLapsForMeasured` completed laps. */
@@ -218,6 +237,10 @@ export interface StrategyResp {
    *  `config.strategies`, which the page fetched once on load. */
   matrix?: MatrixRow[];
   timeLeftMin: number;
+  /** The lap the plan starts from. `Total Laps` in a row is laps FROM NOW, so
+   *  the race total is this plus that. Null where no lap has been reported —
+   *  and a missing lap is not lap 0, so no total is shown at all. */
+  activeLap: Num;
   /** The race duration — the cap on the demo screen's typed time remaining. */
   maxTimeLeftMin: number;
   assumedFullPack: boolean;
@@ -227,11 +250,15 @@ export interface StrategyResp {
    *  written, so a typed plan can never be labelled as the car's or the other
    *  way round. */
   demoStore: boolean;
-  overrides: { socPct: Num; timeLeftMin: Num };
-  /** The two values the overrides replace, so the panel can show what it is
+  overrides: { socPct: Num; timeLeftMin: Num; stopsUsed: Num };
+  /** The values the overrides replace, so the panel can show what it is
    *  standing in for and offer the way back. */
   carSocPct: Num;
   clockTimeLeftMin: number;
+  /** What the charge clock has counted, beside `stopsUsed`, which is what the
+   *  plan was made with. They differ only on the demo store, when a count has
+   *  been typed. */
+  clockStopsUsed: number;
 }
 
 /** One cell on the Cell Voltages tab, classified server-side. */
@@ -342,7 +369,16 @@ export interface Live {
    *  above covers the whole lap; a large value means the start of the lap was
    *  never received and it understates. */
   currentLapEnergyFromM: Num;
+  /** WHERE the car is on the lap, folded into [0, lap) the way the car folds
+   *  it. The map, the sector strip and the target speed are read here. */
   lapDistanceM: number;
+  /** THE READOUT: the car's own lap distance, which runs past a lap for as
+   *  long as nobody cuts it. Every lap is cut by a person, so 4300 m is not an
+   *  error — it is a press that is owed. */
+  lapDistanceRawM: number;
+  /** Metres past a full lap with NO cut, once past the 400 m a late press can
+   *  take — a missed Cut lap — or null. */
+  lapOverrunM: number | null;
   sectorId: number;
   sectorName: string;
   track: TrackStatus;

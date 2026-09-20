@@ -194,11 +194,11 @@ def check_fields(db_path=None):
             for n in FIELDS if n not in cols and n not in metrics]
 
 
-DEMO_PROFILE = os.path.join(_REPO, "profiles", "lap33_290s.csv")
+DEMO_PROFILE = os.path.join(_REPO, "profiles", "lap93_293s.csv")
 
 
 class DemoFeed:
-    """A car that is not there, driving the lap33_290s profile round and round.
+    """A car that is not there, driving the lap93_293s profile round and round.
 
     So the TV, the LAN, the mount and the viewing angle can all be set up and
     argued about in the garage before anyone has driven a lap -- and so the wall
@@ -317,7 +317,7 @@ class DemoFeed:
             "regen_energy": round((lap - self.start_lap) * 4.0, 1),
             "lap_energy_wh": round(38.0 * (lap_t / self._lap_s), 1),
             "stint_energy": None, "stint_regen_energy": None,
-            "active_strategy": "lap33_290s",
+            "active_strategy": "lap93_293s",
             "lat": None, "lon": None,
             "bms_has_error": 0, "bms_error_code": 0,
             "mms_has_error": 0, "mms_error_code": 0,
@@ -679,7 +679,7 @@ def main():
     ap.add_argument("--once", action="store_true",
                     help="print one snapshot and exit, without serving")
     ap.add_argument("--demo", action="store_true",
-                    help="drive the page from profiles/lap33_290s.csv instead of "
+                    help="drive the page from profiles/lap93_293s.csv instead of "
                          "the database, for setting up the TV before the car "
                          "exists. The page says DEMO in large letters.")
     args = ap.parse_args()

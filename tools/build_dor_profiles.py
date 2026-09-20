@@ -87,13 +87,15 @@ import track                                                # noqa: E402
 import generate_profiles as gen                             # noqa: E402
 from strategy_engine import TURN_START_TRACK_M              # noqa: E402
 
-# lap 33 of the 2026-09-19 race is what profiles/ is built from today. The
-# workbook was arranged by the crew so that row 1 is the start/finish line, and
-# the lap is stretched onto the surveyed 4000 m -- so BOTH flags are needed:
-#     python tools/build_dor_profiles.py --as-driven lap33_290s --file-order --axis track --verify
-# "dor 17.xlsx" (the practice lap the dor_* ladder came from) is still beside
+# lap 93 of the 2026-09-19 race is what profiles/ is built from today:
+#     python tools/build_dor_profiles.py --as-driven lap93_293s --file-order --axis track --verify
+# --file-order means "the rows are the lap, row 1 on the line": lap 93 was cut by
+# hand AT the line so that is simply how it was logged, where lap 33 (the
+# profile before this one) had to be re-ordered by the crew to get there.
+# --axis track stretches the 3990 m the odometer counted onto the 4000 m lap.
+# "dor 17.xlsx", the practice lap the dor_* ladder came from, is still beside
 # it; pass --source to build from that, or from any later lap export.
-SOURCE_XLSX = os.path.join(_REPO, "SolarRace_OS", "lap 33.xlsx")
+SOURCE_XLSX = os.path.join(_REPO, "SolarRace_OS", "lap 93.xlsx")
 OUT_DIR = os.path.join(_REPO, "profiles")
 
 # Column headings in the car's export, matched case-insensitively on a prefix
@@ -125,6 +127,11 @@ CRAWL_MIN_M = 100.0
 # ... and only if the lap fails to close by more than this. A lap that ends
 # within a few km/h of where it started needs no rebuilding whatever its shape.
 CLOSE_TOL_KMH = 5.0
+# The line, when a lap does not meet itself there (close_seam). A step bigger
+# than SEAM_STEP_KMH between two grid points within SEAM_BLEND_M of the line is
+# two laps' worth of speed meeting, not the car.
+SEAM_BLEND_M = 50.0
+SEAM_STEP_KMH = 2.0
 # Two minima closer together than this are one corner taken in two parts.
 MERGE_M = 80.0
 # How far either side of an apex still counts as the corner.
@@ -274,6 +281,40 @@ def rebuild_tail(dist, kmh, accel_ms2):
                        f"replaced by acceleration at {accel_ms2:.2f} m/s²")
 
 
+def close_seam(dist, kmh):
+    """Bridge the start/finish line when the lap does not meet itself there.
+
+    One lap is one pass: it begins at whatever speed the car carried over the
+    line from the lap BEFORE and ends at whatever it had reached by the line
+    this time. Lap 93 starts at 56.9 km/h and ends at 49.4, so the raw curve
+    steps 8 km/h in 20 m at the one place the car is certainly not doing that
+    -- and the lap's "peak acceleration", which limits every re-paced profile
+    built from it, was being measured off that step (1.87 m/s^2 against a
+    real 1.1).
+
+    Only the SEAM_BLEND_M either side of the line is touched, and only when
+    there is a step there. It becomes a straight run between the speed driven
+    SEAM_BLEND_M before the line and the speed driven SEAM_BLEND_M after it:
+    the car on the main straight, accelerating through the line, which is
+    what both ends of the log say it was doing. Every corner is as driven.
+
+    Returns (speeds, note). note is None when nothing was done.
+    """
+    n = len(dist)
+    k = int(round(SEAM_BLEND_M / (dist[1] - dist[0])))
+    idx = [(n - k + j) % n for j in range(2 * k + 1)]      # ... n-1, 0, 1 ...
+    worst = max(abs(kmh[idx[j + 1]] - kmh[idx[j]]) for j in range(2 * k))
+    if worst <= SEAM_STEP_KMH:
+        return list(kmh), None
+    out = list(kmh)
+    v0, v1 = kmh[idx[0]], kmh[idx[-1]]
+    for j, i in enumerate(idx):
+        out[i] = v0 + (v1 - v0) * j / (2.0 * k)
+    return out, (f"line bridged {dist[idx[0]]:.0f} m -> {dist[idx[-1]]:.0f} m "
+                 f"({v0:.1f} -> {v1:.1f} km/h); the raw lap stepped "
+                 f"{worst:.1f} km/h in one grid point there")
+
+
 # --------------------------------------------------------------------------- #
 # 3. Corners
 # --------------------------------------------------------------------------- #
@@ -381,6 +422,9 @@ def build_baseline(path=SOURCE_XLSX, lap=None, axis="odometer", file_order=False
     """The real lap as (dist, speed_ms, section) on the car's 10 m grid."""
     lap_no, samples = read_lap(path, lap, file_order)
     measured, scale, dist, kmh = to_track_grid(samples, axis)
+    # Before anything is MEASURED off the curve: the seam's step would
+    # otherwise be read as the car's acceleration limit.
+    kmh, seam_note = close_seam(dist, kmh)
 
     # The acceleration limit for the tail rebuild has to come from the part of
     # the lap that is real driving, so it is measured BEFORE the rebuild — and
@@ -404,6 +448,7 @@ def build_baseline(path=SOURCE_XLSX, lap=None, axis="odometer", file_order=False
         "lap": lap_no, "measured_m": measured, "scale": scale,
         "dist": dist, "speed_ms": [v / 3.6 for v in kmh],
         "section": section, "corners": corners, "tail_note": tail_note,
+        "seam_note": seam_note,
         "axis": axis, "turn_scale": measured / track.TRACK_LENGTH_METERS
                                     if axis == "odometer" else 1.0,
         "tail_from_m": (dist[apex_i] if apex_i is not None else None),
@@ -424,7 +469,7 @@ def main():
     ap.add_argument("--as-driven", metavar="KEY", default=None,
                     help="write ONE profile, KEY.csv, that is the lap exactly "
                          "as driven -- no target time, nothing scaled. For a "
-                         "lap that is already the pace the crew wants (lap 33) "
+                         "lap that is already the pace the crew wants (lap 93) "
                          "rather than raw material for a ladder of paces.")
     ap.add_argument("--file-order", action="store_true",
                     help="the workbook's rows are already the lap, in order, "
@@ -452,6 +497,8 @@ def main():
         print(f"  tail untouched: {b['tail_note']}")
     else:
         print(f"  tail: {b['tail_note']}, from {b['tail_from_m']:.0f} m")
+    if b.get("seam_note"):
+        print(f"  seam: {b['seam_note']}")
     print(f"  baseline now {base_t:.2f} s, "
           f"{(dist[-1] / base_t) * 3.6:.1f} km/h avg")
     print(f"  limits from the lap: accel {accel_limit:.2f}, "

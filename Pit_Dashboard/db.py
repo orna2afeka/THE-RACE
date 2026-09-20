@@ -1575,6 +1575,12 @@ def fetch_laps(conn: sqlite3.Connection, device_id: str = DEVICE_ID,
     laps.sort(key=lambda lap: lap["finished_ts"])
     laps = _drop_double_cuts(_merge_split_laps(laps))
 
+    # DOUBLE LAPS THE PIT HAS SPLIT (a missed cut; see load_split_laps). Here
+    # for the reason restored laps are: one lap builder, so everything that
+    # lists laps changes together. After the merge and the phantom filter, so
+    # neither can fold the halves back together or drop the short one.
+    _apply_splits(laps, load_split_laps(conn), since_ts, until_ts)
+
     # LAPS THE PIT PUT BACK. "Restart lap, don't count it" pressed at the line
     # in place of "Cut lap now" throws a whole driven lap away, and the car
     # publishes nothing for it -- so by the rule above it could never be
@@ -1598,23 +1604,95 @@ def fetch_laps(conn: sqlite3.Connection, device_id: str = DEVICE_ID,
                      "finished_ts": ts})
     laps.sort(key=lambda lap: lap["finished_ts"])
 
-    # THE LAPS THE CAR NUMBERED BEFORE ITS COUNT WAS CORRECTED. Until the pit
-    # presses Set car lap number, the car goes on one short, so the lap after
-    # a restored 76 is published as 76 too and the list would hold two 76s and
-    # no 77. After a restored lap, a car lap whose number has not moved past
-    # the one before it is shown one higher; the first lap numbered properly
-    # means the count was fixed, and the car's numbers are taken as they are.
-    catching_up, last_n = False, None
+    # WHAT THE LAPS ARE CALLED. The car names them and the pit takes the name
+    # as published -- but the car's counter and this list part company in
+    # three ways, and all three are walked out here, in one pass, oldest lap
+    # first.
+    #
+    #   * THE PIT LISTS A LAP THE CAR NEVER COUNTED -- a lap put back by hand.
+    #     The car was told to forget it and counts it no more, so until Set car
+    #     lap number is pressed the car runs one BEHIND: the lap after a
+    #     restored 76 is published as 76 as well.
+    #   * THE CAR COUNTED A LAP THIS LIST DOES NOT CARRY -- the phantom of a
+    #     double cut, dropped just above, or a cut whose samples never reached
+    #     the pit at all. The car runs that many AHEAD, and every lap after it
+    #     reads high until the count is corrected. Zolder, 2026-09-19 21:22:48:
+    #     three presses of Cut lap inside 1.7 s made a "lap 85" and a "lap 86"
+    #     that were never driven, and the real lap after them was published as
+    #     87. Nobody drove an 85 or an 86, so the 87th lap cut is lap 85.
+    #   * THE CAR STARTS COUNTING AGAIN -- a Pi restart with no checkpoint.
+    #     Same night, 22:50: the car came back with lap_seq 1 and published
+    #     "lap 1" for the 89th lap of the race.
+    #
+    # `ahead` is how many numbers the car is in front of this list. A lap is
+    # called (car number - ahead) for as long as that keeps moving forward.
+    #
+    # WHEN IT STOPS MOVING FORWARD, WHY IT DID DECIDES WHAT HAPPENS, and the
+    # three answers are different:
+    #
+    #   THE COUNT WAS CORRECTED. The car was ahead and has just been set back
+    #   -- Set car lap number lands a lap or two after the phantom that
+    #   prompted it. `ahead` is spent: from here the car's own numbers are
+    #   right and are taken as they are. (18:03 tonight: the count went
+    #   61 -> 60 twelve minutes after the phantom, and lap_seq 60 published 61
+    #   just as lap_seq 59 had.)
+    #
+    #   THE CAR IS BEHIND, because the pit put a lap back. Each lap after the
+    #   restore takes the next number after the one before it, until the car's
+    #   own numbers overtake again -- that is the count being fixed, and from
+    #   there the car is believed. The pit named the restored lap and it is
+    #   NEVER moved: it renamed a restored 76 to 77 once, while the crew were
+    #   telling the officials 76.
+    #
+    #   THE CAR STARTED OVER, which lap_seq going backwards says outright. Its
+    #   number means nothing now, so the lap is simply the one after the lap
+    #   before it.
+    #
+    #   NONE OF THE THREE -- the car repeated a number with nothing to explain
+    #   it. It is left exactly as published. A repeated number is visible and
+    #   arguable; an invented one is neither, and the charts plot by POSITION
+    #   so a repeat still draws as two bars (see History.tsx).
+    #
+    # NUMBERS ARE RECLAIMED ONLY WHERE THERE WAS NO TIME TO DRIVE THEM.
+    # `ahead` grows by the lap_seq values missing between two listed laps, but
+    # ONLY when the time they swallowed is too short to have been laps at all
+    # (PHANTOM_LAP_MAX_S each, the same verdict the phantom filter uses above).
+    # A lap the pit never heard about because the link was down took a real
+    # four minutes; its number stays missing and the count stays honest.
+    ahead, catching_up = 0, False
+    prev_n, prev_seq, prev_ts = None, None, None
     for lap in laps:
+        seq, n, ts = lap.get("seq"), lap.get("lap"), lap["finished_ts"]
+        restarted = seq is not None and prev_seq is not None and seq < prev_seq
+        if seq is not None and prev_seq is not None and seq > prev_seq + 1:
+            missing = seq - prev_seq - 1
+            t = lap.get("lap_time_s")
+            # The end of the last listed lap to the start of this one: all the
+            # time the laps in between could possibly have taken.
+            room = None if t is None or prev_ts is None else ts - t - prev_ts
+            if room is not None and room < missing * PHANTOM_LAP_MAX_S:
+                ahead += missing
+        if seq is not None:
+            prev_seq = seq
+        prev_ts = ts
+        if n is None:
+            continue
         if lap["lap_source"] == "restored":
-            catching_up = True
-        elif catching_up and last_n is not None and lap.get("lap") is not None:
-            if lap["lap"] <= last_n:
-                lap["lap"] = last_n + 1
-            else:
-                catching_up = False
-        if lap.get("lap") is not None:
-            last_n = lap["lap"]
+            prev_n, catching_up = n, True      # the pit named it. Never move it
+            continue
+        if prev_n is None:
+            prev_n = n
+            continue
+        moved_on = n - ahead
+        if moved_on <= prev_n and ahead:
+            ahead, moved_on = 0, n             # the count was corrected
+        if moved_on > prev_n:
+            lap["lap"], catching_up = moved_on, False
+        elif restarted or catching_up:
+            lap["lap"], ahead = prev_n + 1, 0
+        else:
+            lap["lap"] = moved_on              # a repeat with nothing behind it
+        prev_n = lap["lap"]
     return laps
 
 
@@ -1646,6 +1724,91 @@ def load_restored_laps(conn: sqlite3.Connection) -> list:
     laps = rec.get("laps")
     return [r for r in laps if isinstance(r, dict) and r.get("finished_ts")] \
         if isinstance(laps, list) else []
+
+
+SPLIT_LAPS_KEY = "split_laps"
+# How close a stored split's finish time must be to a listed lap's before it is
+# the same lap. finished_ts is the first sample carrying the new lap_seq, so it
+# is stable to the millisecond; the slack only covers a re-ingested store.
+SPLIT_MATCH_S = 5.0
+
+
+def load_split_laps(conn: sqlite3.Connection) -> list:
+    """The laps the pit has split in two for THIS race, or [].
+
+    A MISSED CUT. Nobody pressed Cut lap at the line, so the car drove straight
+    on and published two laps as one: Zolder, 2026-09-20 02:07 -- "lap 114",
+    629 s, 7750 m, 176 Wh, which was an out-lap and a full lap. The samples
+    say exactly where the line was (one normal lap's odometer distance back
+    from the cut that did happen), so the pit can say what the two laps were.
+
+    Stored as the pit's DECISION, the way a restored lap is, and for the same
+    reasons: scoped to the race start, applied in fetch_laps so every list,
+    chart and workbook changes together, and undone by deleting the record.
+    No sample is touched. Each record:
+
+        {"seq": 27, "finished_ts": <the double lap's>,
+         "a": {finished_ts, lap, lap_time_s, distance_m, energy_wh, regen_wh,
+               kind},                       # the first half, ends at the line
+         "b": {lap_time_s, distance_m, energy_wh, regen_wh}}   # the second
+    """
+    try:
+        row = conn.execute("SELECT value FROM app_state WHERE key = ?",
+                           (SPLIT_LAPS_KEY,)).fetchone()
+    except sqlite3.Error:
+        return []
+    if not row or not row["value"]:
+        return []
+    try:
+        rec = json.loads(row["value"]) or {}
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(rec, dict):
+        return []
+    if rec.get("race_start") != load_race_state(conn).get("race_start_time"):
+        return []
+    splits = rec.get("splits")
+    return [r for r in splits
+            if isinstance(r, dict) and r.get("finished_ts")
+            and isinstance(r.get("a"), dict) and isinstance(r.get("b"), dict)]         if isinstance(splits, list) else []
+
+
+def _apply_splits(laps, splits, since_ts=None, until_ts=None):
+    """Turn each double lap the pit has split into its two laps, in place.
+
+    THE SECOND HALF KEEPS THE CAR'S ENTRY -- its lap_seq, its finish time, its
+    source -- because that is the lap the car's cut actually closed; only its
+    figures change, from the pair's to its own. The car's distance_suspect
+    flag goes with them: it was the car saying "7750 m is not a lap", which is
+    true of the pair and not of the half.
+
+    THE FIRST HALF IS THE PIT'S, exactly like a restored lap, and joins as
+    one: lap_source "restored" so the numbering below never moves the name the
+    pit gave it and counts the car as one BEHIND from here (it published one
+    lap where two were driven) until Set car lap number puts that right.
+    """
+    for sp in splits:
+        whole = next((lap for lap in laps
+                      if lap.get("seq") == sp.get("seq")
+                      and abs(lap["finished_ts"] - sp["finished_ts"]) <= SPLIT_MATCH_S),
+                     None)
+        if whole is None:
+            continue                  # outside this window, or not ingested yet
+        a, b = sp["a"], sp["b"]
+        for f in ("lap_time_s", "distance_m", "energy_wh", "regen_wh"):
+            whole[f] = b.get(f)
+        whole["flags"] = [f for f in whole["flags"] if f != "distance_suspect"]             + ["split_by_pit"]
+        ts = a["finished_ts"]
+        if (since_ts is not None and ts < since_ts) or                 (until_ts is not None and ts > until_ts):
+            continue
+        laps.append({"lap": a.get("lap"), "seq": None,
+                     "energy_wh": a.get("energy_wh"), "regen_wh": a.get("regen_wh"),
+                     "lap_time_s": a.get("lap_time_s"),
+                     "distance_m": a.get("distance_m"),
+                     "lap_source": "restored", "kind": a.get("kind"),
+                     "flags": ["split_by_pit"], "stopped_s": None,
+                     "finished_ts": ts})
+    return laps
 
 
 # How far back find_discarded_laps looks. The mistake it exists for is noticed

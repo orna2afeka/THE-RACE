@@ -127,7 +127,8 @@ export default function Sidebar({
       <Sec icon="timer" title="Charging">
         <ChargePanel charge={live?.charge} clockOffsetMs={clockOffsetMs} />
       </Sec>
-      <CutLap carLap={live?.state?.auto_lap ?? null}
+      <CutLap overrunM={live?.lapOverrunM ?? null}
+              carLap={live?.state?.auto_lap ?? null}
               lapHeld={live?.lapClock?.heldAt != null}
               carLink={!config.demoStore} />
       <DriverMessage carLink={!config.demoStore} />
@@ -169,8 +170,10 @@ function lastLapLabel(kind: string | null, stoppedS: number | null): string {
     ? `${label} · stood ${Math.round(stoppedS)} s` : label;
 }
 
-function CutLap({ carLap, lapHeld, carLink }:
-  { carLap: number | null; lapHeld: boolean; carLink: boolean }) {
+function CutLap({ carLap, lapHeld, carLink, overrunM }:
+  { carLap: number | null; lapHeld: boolean; carLink: boolean;
+    /** Metres past a full lap with no cut, or null. See lapOverrunM in api.py. */
+    overrunM: number | null }) {
   const [sent, setSent] = useState<string | null>(null);
   const [freshSent, setFreshSent] = useState<string | null>(null);
   const [setSentAt, setSetSentAt] = useState<string | null>(null);
@@ -272,6 +275,16 @@ function CutLap({ carLap, lapHeld, carLink }:
 
   return (
     <Sec icon="timer" title="Lap control">
+      {/* A MISSED CUT, said where the fix is. Laps are cut by the gate or by a
+          person, never by distance alone, so with GPS down a lap nobody cuts
+          simply keeps going — and the car then publishes two laps as one. */}
+      {overrunM != null && (
+        <div className="pill warn" style={{ marginBottom: 8 }}>
+          <span><b>Lap cut missed?</b> The car is {Math.round(overrunM)} m past a full lap with no
+          cut. Press <b>Cut lap</b> as it next crosses the line; the lap it closes will be a
+          double one and can be split afterwards.</span>
+        </div>
+      )}
       <CarControls enabled={carLink}>
       <button className="btn block" onClick={async () => {
         try {

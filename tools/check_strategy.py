@@ -40,7 +40,8 @@ SCENARIOS = [
     ("6 h, part charged",      360.0,     3000.0),
     ("45 min, no stop fits",   45.0,      se.BATTERY_FULL_WH),
     ("20 min, nearly empty",   20.0,      600.0),
-    ("24 h from the floor",    24 * 60.0, 500.0),
+    ("24 h from the floor",    24 * 60.0, se.BATTERY_FLOOR_WH),
+    ("24 h from under it",     24 * 60.0, 500.0),
 ]
 COLUMNS = ["Label", "Lap Time", "Speed (km/h)", "Total Laps", "Energy/Lap (Wh)",
            "Pit Strategy", "Charge To", "Charge Time", "Pit Time", "Driver Swaps",
@@ -55,8 +56,22 @@ def want(cond, msg):
         print("      ** FAIL ** " + msg)
 
 
-print("charging curve (NOT measured -- CHARGING_CURVE_IS_MEASURED=%s):"
-      % se.CHARGING_CURVE_IS_MEASURED)
+print("charging curve (measured %g-%g%% from the %s charge; "
+      "tools/check_charge_curve.py re-derives it from the store):"
+      % (se.CHARGING_CURVE_MEASURED_PCT[0], se.CHARGING_CURVE_MEASURED_PCT[1],
+         se.MEASURED_CHARGE["when"]))
+# The payload must carry the provenance, not just the flag: a screen that says
+# "measured" without saying over what band invites a 90% charge to be read as
+# measured when it is extrapolation.
+_prov = api._strategy_payload(60.0, se.BATTERY_FULL_WH, 0, TABLE)
+want(_prov["chargingCurveIsMeasured"] is se.CHARGING_CURVE_IS_MEASURED
+     and _prov["chargingCurveMeasuredPct"] == list(se.CHARGING_CURVE_MEASURED_PCT)
+     and _prov["measuredCharge"]["minutes"] == se.MEASURED_CHARGE["minutes"],
+     "the payload does not carry the curve's provenance")
+want(abs(se.charging_time_min(se.MEASURED_CHARGE["from_pct"],
+                              se.MEASURED_CHARGE["to_pct"])
+         - se.MEASURED_CHARGE["minutes"]) <= 0.05 * se.MEASURED_CHARGE["minutes"],
+     "the curve no longer reproduces the charge it was measured from")
 # check 10: monotonic, zero to or below, and the taper
 want(se.charging_time_min(5, 55) < se.charging_time_min(5, 70)
      < se.charging_time_min(5, 90) < se.charging_time_min(5, 100),
@@ -93,12 +108,16 @@ for name, left, start_wh in SCENARIOS:
     # The two SoC rules, stated as percentages of the pack the page is told
     # about. A capacity entered as the 95% ceiling (which is how 8550 Wh got
     # in) makes both of these come out wrong, and nothing else here notices.
-    want(abs(out["floorWh"] / out["capacityWh"] * 100.0 - 5.0) < 1e-9,
-         "the served floor is %.2f%% of the served capacity, not 5%%"
-         % (out["floorWh"] / out["capacityWh"] * 100.0))
+    want(abs(out["floorWh"] / out["capacityWh"] * 100.0 - se.MIN_SOC_PCT) < 1e-9,
+         "the served floor is %.2f%% of the served capacity, not the %.0f%% "
+         "the engine plans to" % (out["floorWh"] / out["capacityWh"] * 100.0,
+                                  se.MIN_SOC_PCT))
     want(abs(out["ceilingWh"] / out["capacityWh"] * 100.0 - 95.0) < 1e-9,
          "the served ceiling is %.2f%% of the served capacity, not 95%%"
          % (out["ceilingWh"] / out["capacityWh"] * 100.0))
+    want(out["minSocPct"] == se.MIN_SOC_PCT,
+         "the served floor SoC is %s, the engine plans to %s"
+         % (out["minSocPct"], se.MIN_SOC_PCT))
     want(out["minStopMin"] == se.MIN_STOP_DURATION_MIN
          and out["maxStopMin"] == se.MAX_STOP_DURATION_MIN,
          "served stop limits disagree with the engine")
@@ -127,7 +146,10 @@ for name, left, start_wh in SCENARIOS:
 
         # 3-5: the race must be legal
         want(pts[-1]["minute"] <= left + 1e-6, "%s: runs past the flag" % nm)
-        want(min(p["wh"] for p in pts) >= se.BATTERY_FLOOR_WH - 1e-6,
+        # The floor binds the PLAN, not the pack it was handed: a car already
+        # under the planning floor is a real state and the plan's job there
+        # is to charge, so the start point is allowed to sit below it.
+        want(min(p["wh"] for p in pts) >= min(se.BATTERY_FLOOR_WH, start_wh) - 1e-6,
              "%s: goes below the floor" % nm)
         want(max(p["wh"] for p in pts) <= tr["capacityWh"] + 1e-6,
              "%s: goes above capacity" % nm)
@@ -194,6 +216,84 @@ for name, left, start_wh in SCENARIOS:
         print("    %-16s %3d laps | %-26s | pit %5.1f (charge %5.1f + %d swaps) | %d points"
               % (nm, row["Total Laps"], row["Pit Strategy"], tr["pitMin"], pit,
                  tr["swaps"], len(pts)))
+
+# --------------------------------------------------------------------------- #
+# Total Laps counts from NOW
+# --------------------------------------------------------------------------- #
+# The column is laps still to come, and the page adds the lap the car is on to
+# show the race total. That only works while the engine ignores the lap it was
+# given for everything except the "after lap N" on a stop -- so this asks both
+# halves: the count does not move with the lap, and the stops do.
+print("\nTotal Laps is from now, stops are numbered for the race:")
+from_zero = api._strategy_payload(12 * 60.0, se.BATTERY_FULL_WH, 0, TABLE)
+from_120 = api._strategy_payload(12 * 60.0, se.BATTERY_FULL_WH, 120, TABLE)
+want(from_zero["activeLap"] == 0 and from_120["activeLap"] == 120,
+     "the payload does not carry the lap it planned from")
+for a, b in zip(from_zero["rows"], from_120["rows"]):
+    want(a["Total Laps"] == b["Total Laps"],
+         "%s: Total Laps moved with the lap count (%s vs %s) -- it is supposed "
+         "to be laps from now" % (a["Label"], a["Total Laps"], b["Total Laps"]))
+for ta, tb in zip(from_zero["traces"], from_120["traces"]):
+    if ta is None or tb is None:
+        continue
+    want([st["afterLap"] + 120 for st in ta["stops"]]
+         == [st["afterLap"] for st in tb["stops"]],
+         "%s: the stops are not numbered from the lap the car is on" % ta["label"])
+print("    lap 0: %s laps | lap 120: %s laps, stops after %s"
+      % (from_zero["rows"][0]["Total Laps"], from_120["rows"][0]["Total Laps"],
+         [st["afterLap"] for st in (from_120["traces"][0] or {"stops": []})["stops"]]))
+# A lap nobody has reported is not lap 0 -- the page shows no race total at
+# all rather than one built on a zero it invented.
+want(api._strategy_payload(60.0, se.BATTERY_FULL_WH, None, TABLE)["activeLap"] is None,
+     "an unknown lap is served as a number")
+
+
+# --------------------------------------------------------------------------- #
+# Charges already made, on the wire
+# --------------------------------------------------------------------------- #
+# The regulation cap is on the WHOLE race, so a plan served at hour 14 after
+# two charges may offer one. This checks the served payload says so in all
+# three places the screen reads it: the allowance it was planned with, the
+# stops it actually booked, and the numbers on those stops (which are charges
+# OF THE RACE, so the chart's first marker after two spent says 3, not 1).
+print("\ncharges already made (12 h left, 40% pack):")
+for used in range(0, se.MAX_STOPS + 1):
+    out = api._strategy_payload(12 * 60.0, se.BATTERY_FULL_WH * 0.40, 0, TABLE,
+                                stops_used=used)
+    left = se.stops_remaining(used)
+    want(out["stopsUsed"] == used and out["stopsLeft"] == left,
+         "%d used: served %s/%s" % (used, out["stopsUsed"], out["stopsLeft"]))
+    want(out["maxStops"] == se.MAX_STOPS, "the cap itself moved")
+    for row, tr in zip(out["rows"], out["traces"]):
+        if tr is None:
+            continue
+        want(len(tr["stops"]) <= left,
+             "%s: %d charges made, the plan books %d more of %d left"
+             % (row["Label"], used, len(tr["stops"]), left))
+        want([st["number"] for st in tr["stops"]]
+             == list(range(used + 1, used + 1 + len(tr["stops"]))),
+             "%s: %d made, stops numbered %s"
+             % (row["Label"], used, [st["number"] for st in tr["stops"]]))
+        # The charge markers the chart draws must not outnumber the allowance
+        # either: they are drawn from these same stops, one per stop.
+        want(sum(1 for pt in tr["points"] if pt["kind"] == "stop") <= left,
+             "%s: the trace charges more often than the allowance" % row["Label"])
+    print("    %d used -> %d left | %s" % (
+        used, left, " | ".join("%s %s" % (r["Label"], r["Pit Strategy"])
+                               for r in out["rows"])))
+
+# A spent allowance must SAY it is spent, not read as a plan that simply chose
+# not to stop.
+spent = api._strategy_payload(12 * 60.0, se.BATTERY_FULL_WH * 0.40, 0, TABLE,
+                              stops_used=se.MAX_STOPS)
+want(all("No charges left" in r["Pit Strategy"] for r in spent["rows"]),
+     "with no charges left the rows read %s"
+     % [r["Pit Strategy"] for r in spent["rows"]])
+# And the default is still the whole-race question, for the Energy Matrix and
+# for every caller that does not know about the clock.
+want(api._strategy_payload(60.0, se.BATTERY_FULL_WH, 0, TABLE)["stopsUsed"] == 0,
+     "the default payload assumes charges have been made")
+
 
 # --------------------------------------------------------------------------- #
 # The matrix editor's arithmetic, which is now a thing the crew presses mid-race

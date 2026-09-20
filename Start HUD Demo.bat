@@ -10,7 +10,7 @@ REM  Keys: M pit message . N clear . T turn warning . P pause
 REM        H next hazard . X clear hazard . Alt+F4 quit
 REM
 REM  Extra options pass straight through, for example:
-REM     "Start HUD Demo.bat" --profile lap33_290s
+REM     "Start HUD Demo.bat" --profile lap93_293s
 REM     "Start HUD Demo.bat" --fullscreen --no-tour
 REM
 REM  WHY THIS SEARCHES FOR A PYTHON instead of reusing the pit's:
