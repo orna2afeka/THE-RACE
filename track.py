@@ -109,6 +109,28 @@ ODOMETER_FORCE_LAP_M = 4400.0
 # Turning it back on is this one line, and the code it guards is untouched.
 CUT_LAP_ON_DISTANCE = False
 
+# ---------------------------------------------------------------------------
+# MAY THE GPS GATE CUT A LAP? No -- a person cuts every lap, always.
+#
+# OFF since 2026-09-20, at the team's decision. It was the last thing on the
+# car that could cut a lap by itself, and it was only quiet because GPS is dead
+# whenever the car is running -- the moment a fix came back mid-race it would
+# have started cutting laps, moving the lap datum onto its own idea of the line
+# ("gps_start", "resync") and re-phasing the driver's target speed, beside a
+# crew who have been cutting every lap by hand for a day and whose numbers the
+# officials are being told. Two cutters that do not know about each other is
+# how the 9-second and 0.6-second "laps" of 2026-09-19 were made.
+#
+# With this off the gate does NOTHING to the lap: it does not count, it does
+# not start the first lap, it does not move the datum. The lap distance simply
+# keeps counting until a person presses Cut lap -- the pit's button or the
+# driver's -- and a missed press shows up as a lap distance over 4000 m, in
+# plain sight, instead of as a lap the car invented. GPS is still read for the
+# map, the pit-lane zone and the track position.
+#
+# Turning it back on is this one line, and the code it guards is untouched.
+CUT_LAP_ON_GATE = False
+
 # --------------------------------------------------------------------------- #
 # The finish GATE
 # --------------------------------------------------------------------------- #
