@@ -422,7 +422,7 @@ process, so it cannot slow the dashboard down.
 
 ### ☐ Set the TV up before the car exists
 
-`python tools/pit_wall.py --demo` drives the page from `profiles/lap33_290s.csv`
+`python tools/pit_wall.py --demo` drives the page from `profiles/lap93_293s.csv`
 instead of the database - a car that is not there, lapping Zolder. Use it to sort
 out the TV, the mount, the viewing angle and the LAN without waiting for a
 session. It opens no database at all, so it works on any laptop.
@@ -452,7 +452,7 @@ database cannot supply at all, which is a bug in the wall, not in the car.
 
 ### ☐ The lap delta names a strategy
 
-Bottom of the LAP card: `Last 4:41.2 · +1.2 s vs lap33_290s`. If it says "no
+Bottom of the LAP card: `Last 4:41.2 · +1.2 s vs lap93_293s`. If it says "no
 strategy set", the car has not reported `active_strategy` and there is nothing
 to compare a lap against - the wall shows no target rather than inventing one.
 

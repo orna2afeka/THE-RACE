@@ -206,8 +206,8 @@ VEHICLE_INPUT_POLL_S = 0.2
 PROFILE_TICK_S = 0.2
 
 # Which profile the car runs until the pit says otherwise. It is also the ONLY
-# one in profiles/ today: lap 33 of the 2026-09-19 race, exactly as driven.
-DEFAULT_STRATEGY = "lap33_290s"
+# one in profiles/ today: lap 93 of the 2026-09-19 race, exactly as driven.
+DEFAULT_STRATEGY = "lap93_293s"
 
 # ==============================================================================
 # SMART CAN WORKER (Core Background Thread)

@@ -611,6 +611,12 @@ class LapTracker:
 
     def _on_gate_crossing(self, hit, prev_ts, fix_ts, now):
         """The GPS path met the gate. Decide what that was."""
+        if not track.CUT_LAP_ON_GATE:
+            # A PERSON CUTS EVERY LAP -- see track.CUT_LAP_ON_GATE. Returned
+            # before anything is touched: no count, no "gps_start" datum, no
+            # resync, no backwards-passage debt. The lap distance keeps
+            # running until Cut lap is pressed.
+            return None
         t, lateral, sign = hit
 
         if self._is_stationary(now):
@@ -1346,6 +1352,30 @@ class LapTracker:
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":
     import random
+
+    # THE GATE IS SWITCHED OFF ON THE CAR (track.CUT_LAP_ON_GATE) and ON for
+    # everything below, because everything below is the gate's own logic --
+    # arming, resync, the pit lane, backwards passages -- and that code has to
+    # stay right for the day the switch goes back. What the car does TODAY,
+    # with it off, is checked first, on its own.
+    print("0. the gate switched off: a person cuts every lap")
+    assert track.CUT_LAP_ON_GATE is False,         "the car is meant to ship with CUT_LAP_ON_GATE = False"
+    _t = LapTracker()
+    _t.update_distance_from_odometer(0.0) if hasattr(_t, "update_distance_from_odometer") else None
+    _hit = (0.5, 0.0, 1.0)                  # a clean forward pass, mid-gate
+    for _ in range(3):
+        _out = _t._on_gate_crossing(_hit, 100.0, 101.0, 101.0)
+        assert _out is None, "a gate crossing did something: %r" % (_out,)
+    assert _t.lap_count == 0 and _t.lap_seq == 0 and not _t._armed,         "the gate counted, cut or armed with the switch off"
+    _t.cut_lap(now=200.0) if hasattr(_t, "cut_lap") else None
+    print("  ok    three clean gate passes: nothing counted, nothing armed, "
+          "no datum moved")
+    track.CUT_LAP_ON_GATE = True
+    # The same for the distance fallback, which has been off on the car since
+    # 2026-09-19 while section 4 below went on testing it -- and failing, in
+    # a self-check nobody could then trust the rest of.
+    assert track.CUT_LAP_ON_DISTANCE is False,         "the car is meant to ship with CUT_LAP_ON_DISTANCE = False"
+    track.CUT_LAP_ON_DISTANCE = True
 
     L = track.TRACK_LENGTH_METERS
     # Every route piece that ends at the line runs this far past it — the last
