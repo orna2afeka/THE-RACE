@@ -61,6 +61,7 @@ for _p in (_REPO, os.path.join(_REPO, "Pit_Dashboard")):
 
 import constants as C  # noqa: E402
 import db  # noqa: E402
+import race_totals  # noqa: E402
 # THE lap clock. The dashboard's header and this page show the same number, so
 # they work it out with the same function rather than each having a go -- see
 # Pit_Dashboard/lap_clock.py. Importing it costs this process nothing and does
@@ -164,6 +165,15 @@ FIELDS = (
 )
 
 
+# "THE BATTERY" ON THE WALL IS THE MAIN PACK (constants.MAIN_BMS). The page
+# reads these three keys by name and has no idea there are two packs, so the
+# names stay and the column each is read FROM follows the setting -- pack B
+# since pack A's BMS froze mid-race on 2026-09-20 and the wall went on showing
+# its last 77 % for an hour.
+FIELD_SOURCE = dict(zip(("bms_soc_percent", "bms_voltage_V", "bms_current_A"),
+                        C.BMS_COLUMNS[C.MAIN_BMS]))
+
+
 def check_fields(db_path=None):
     """[(field, why)] for anything in FIELDS this database cannot supply.
 
@@ -191,7 +201,9 @@ def check_fields(db_path=None):
             except Exception:
                 pass
     return [(n, "no such column in telemetry, and never seen in last_known")
-            for n in FIELDS if n not in cols and n not in metrics]
+            for n in FIELDS
+            if FIELD_SOURCE.get(n, n) not in cols
+            and FIELD_SOURCE.get(n, n) not in metrics]
 
 
 DEMO_PROFILE = os.path.join(_REPO, "profiles", "lap93_293s.csv")
@@ -432,11 +444,14 @@ class Feed:
         carried = {}
         cols = set(row.keys()) if row is not None else set()
         for name in FIELDS:
-            value = row[name] if name in cols else None
+            # The feed's KEY is the page's contract and does not move; the
+            # COLUMN behind the three battery keys is the main pack's.
+            src = FIELD_SOURCE.get(name, name)
+            value = row[src] if src in cols else None
             if value is not None:
                 out[name] = value
                 continue
-            pair = known.get(name)
+            pair = known.get(src)
             if pair is None:
                 out[name] = None
                 continue
@@ -468,6 +483,16 @@ class Feed:
         )
         out["lap_energy_wh"] = self._lap_energy(
             conn, out.get("calculated_lap"), out.get("total_race_energy"))
+
+        # What a lost checkpoint took out of the car's running totals, added
+        # back -- race_totals.py, and the same call the dashboard makes, so
+        # the TV and the dashboard show one total. AFTER the lap energy above,
+        # which subtracts two of the car's own figures and needs them raw.
+        if out["is_racing"]:
+            owed = race_totals.offsets(conn, out["race_start_time"])
+            for name in race_totals.COLUMNS:
+                if name in out:
+                    out[name] = race_totals.corrected(out[name], owed[name])
 
         with self._lock:
             out["recent_laps"] = list(self._laps)

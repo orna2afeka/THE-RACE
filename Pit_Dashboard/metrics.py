@@ -24,6 +24,7 @@ from collections import namedtuple
 #            arithmetic is bit-for-bit the same everywhere (odo / 1000.0).
 Metric = namedtuple("Metric", "key label unit color source divisor")
 
+
 HISTORY_CHARTS = [
     # The controller's own speed field, the same one the driver HUD reads.
     # Deliberately NO fallback to a value derived from RPM.
@@ -47,7 +48,18 @@ HISTORY_CHARTS = [
            "mms_power_W", None),
     Metric("RPM", "Motor RPM", "rpm", "#9b59b6",
            "mms_rpm", None),
-    Metric("SoC", "Battery SoC", "%", "#f1c40f",
+    # PACK A'S, AND NAMED SO. Everything live on the pit reads the main pack
+    # (constants.MAIN_BMS, normally A; it was B for the end of the 2026-09-20 race, after A's BMS froze),
+    # but these two charts cannot simply follow it: the History tab runs off
+    # idx_telemetry_chart, a covering index that carries pack A's columns and
+    # not pack B's, and charting a column outside it drags the whole 350 MB
+    # store through the page cache (35 s a query, see db.CHART_COLUMNS).
+    # Putting bms2_* in the index means rebuilding it on the live store, which
+    # blocks the collector while it runs -- a job for a quiet moment, not for
+    # mid-race. Until then the label says which pack this is, so a flat line
+    # after 01:50 reads as "pack A froze" and not as "the battery stopped
+    # draining". Pack B's full trace is in the time-ranged workbook.
+    Metric("SoC", "Battery A SoC", "%", "#f1c40f",
            "bms_soc_percent", None),
     # The CONTROLLER's measurement, not the BMS's. NO fallback to bms_voltage_V:
     # the two disagree by ~2.25x, so gap-filling from the other would draw a
@@ -55,7 +67,7 @@ HISTORY_CHARTS = [
     # event. A gap is honest.
     Metric("Voltage", "Battery Voltage", "V", "#2ecc71",
            "mms_measured_voltage_V", None),
-    Metric("Current", "Battery Current", "A", "#e67e22",
+    Metric("Current", "Battery A Current", "A", "#e67e22",
            "bms_current_A", None),
     Metric("BattTemp", "Battery Temp", "°C", "#ff9900",
            "battery_temp_C", None),

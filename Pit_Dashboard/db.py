@@ -1684,7 +1684,18 @@ def fetch_laps(conn: sqlite3.Connection, device_id: str = DEVICE_ID,
             prev_n = n
             continue
         moved_on = n - ahead
-        if moved_on <= prev_n and ahead:
+        # NOT WHILE A RESTORED LAP IS BEING CAUGHT UP WITH. The test for "the
+        # count was corrected" is that the car's adjusted number has stopped
+        # moving forward -- but a lap the PIT put back occupies the next
+        # number itself, so the very next car lap collides with it and looks
+        # like a correction that never happened. Zolder, 2026-09-20 03:15:47:
+        # a full lap restarted away and restored as 129, then TWO phantoms
+        # cut inside one second (the car counted 129 and 130, nobody drove
+        # either), then the real lap at 03:20:35 published as 131. The
+        # phantoms were proven phantoms -- 1.3 s of room for two laps -- so
+        # the answer is 130, and `catching_up` is exactly the flag that says
+        # the collision is the restore's doing and not the car's.
+        if moved_on <= prev_n and ahead and not catching_up:
             ahead, moved_on = 0, n             # the count was corrected
         if moved_on > prev_n:
             lap["lap"], catching_up = moved_on, False

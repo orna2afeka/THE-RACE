@@ -96,6 +96,30 @@ TARGET_LAP_TIME_MIN = 3.5
 # Profile Builder (profile_manage.write_saved_matrix). Editing it by hand is
 # fine — keep it a plain literal, and keep the two marker lines.
 #
+# --------------------------------------------------------------------------- #
+# WHICH BATTERY IS "THE BATTERY"
+# --------------------------------------------------------------------------- #
+# Two packs, two BMSs: A (can0, columns bms_*) and B (can1, columns bms2_*).
+# Wherever the pit needs ONE answer -- the SoC the strategy plans from, the
+# header gauge, the pit wall, the spectator estimate, and the current that has
+# to agree before a charge is counted -- it reads THIS pack. Both packs keep
+# their own tiles, history and workbook columns, under their own letters.
+#
+# "A", the normal setting. It was "B" for the end of the 2026-09-19/20 race
+# only, after pack A's BMS froze at about 01:50 that night: 77 %,
+# 53.7 V and +35.9 A, its last values from the charger, repeated for over an
+# hour while pack B fell from 68 % to 59 % on track. The strategy was planning
+# 18 points of charge the car did not have. SolarRace_OS/config.py holds the
+# car's copy of the same setting (the driver's gauge, the charge detector);
+# change them together.
+MAIN_BMS = "A"
+# pack letter -> (SoC, voltage, current) columns in telemetry.db
+BMS_COLUMNS = {
+    "A": ("bms_soc_percent", "bms_voltage_V", "bms_current_A"),
+    "B": ("bms2_soc_percent", "bms2_voltage_V", "bms2_current_A"),
+}
+
+
 # ONE PROFILE NOW, AND IT IS A RACE LAP: lap93_293s is lap 93 of the race on
 # 2026-09-19 exactly as driven (SolarRace_OS/lap 93.xlsx -- 23:17, 289.6 s on
 # the clock, NORMAL mode, 100.6 Wh, which is the energy_wh below and is
@@ -118,7 +142,7 @@ TARGET_LAP_TIME_MIN = 3.5
 # what each curve integrates to. Old CSVs are in profiles/_backup/.
 # >>> PROFILE MATRIX >>>
 PROFILE_MATRIX = {
-    "lap93_293s": {"label": "Base", "energy_wh": 100.6, "target_s": 293.3},
+    "lap93_293s": {"label": "Base", "energy_wh": 105.0, "target_s": 280.0},
 }
 # <<< PROFILE MATRIX <<<
 DEFAULT_STRATEGY_KEY = "lap93_293s"

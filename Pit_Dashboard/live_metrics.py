@@ -35,6 +35,21 @@ _KNOWN_DERIVED = {
     "charging_label",
 }
 
+def _main_note(pack):
+    """' - MAIN' on the tiles of the pack the pit plans from, '' on the other.
+
+    Read from constants so the tile and the setting cannot disagree. Falls
+    back to nothing if constants cannot be imported: a tile without the word
+    is still a correct tile.
+    """
+    try:
+        from constants import MAIN_BMS
+    except Exception:                                        # noqa: BLE001
+        return ""
+    return (" - MAIN: the strategy, the header and the charge guard read this "
+            "pack") if pack == MAIN_BMS else ""
+
+
 LIVE_METRIC_GROUPS = [
     ("Motion", [
         dict(label="Target Speed", unit="km/h", spec=".1f", field="state.target_speed_kmh",
@@ -60,20 +75,23 @@ LIVE_METRIC_GROUPS = [
              note="calibrate efficiency.py from this: pedal released, then floored"),
     ]),
     ("Battery", [
-        dict(label="Battery A SoC", unit="%", spec=".0f", limit="SOC", field="state.soc",
-             note="battery A's BMS (can0) coulomb count"),
-        dict(label="Battery A Voltage", unit="V", spec=".2f", field="state.voltage",
-             note="measured by battery A's BMS (CAN 0x100)"),
-        dict(label="Battery A Current", unit="A", spec=".1f", limit="BATT_CURRENT", field="state.current", mag=True,
-             note="battery A's BMS - negative = discharge"),
+        # "Battery A" IS ALWAYS PACK A, whichever pack is the main one: these
+        # read state.soc_a, not state.soc (which is constants.MAIN_BMS's). The
+        # main pack's tiles say so in their note, below.
+        dict(label="Battery A SoC", unit="%", spec=".0f", limit="SOC", field="state.soc_a",
+             note="battery A's BMS (can0) coulomb count" + _main_note("A")),
+        dict(label="Battery A Voltage", unit="V", spec=".2f", field="state.voltage_a",
+             note="measured by battery A's BMS (CAN 0x100)" + _main_note("A")),
+        dict(label="Battery A Current", unit="A", spec=".1f", limit="BATT_CURRENT", field="state.current_a", mag=True,
+             note="battery A's BMS - negative = discharge" + _main_note("A")),
         dict(label="Pack Voltage", unit="V", spec=".2f", limit="PACK_VOLTAGE", field="state.pack_voltage",
              note="measured by the motor controller (CAN 0x618)"),
         dict(label="Battery B SoC", unit="%", spec=".0f", limit="SOC", field="state.soc_b",
-             note="battery B's BMS (can1) coulomb count"),
+             note="battery B's BMS (can1) coulomb count" + _main_note("B")),
         dict(label="Battery B Voltage", unit="V", spec=".2f", field="state.voltage_b",
-             note="measured by battery B's BMS (CAN 0x100 on can1)"),
+             note="measured by battery B's BMS (CAN 0x100 on can1)" + _main_note("B")),
         dict(label="Battery B Current", unit="A", spec=".1f", limit="BATT_CURRENT", field="state.current_b", mag=True,
-             note="battery B's BMS - negative = discharge"),
+             note="battery B's BMS - negative = discharge" + _main_note("B")),
     ]),
     ("Energy", [
         dict(label="Total Race Energy", unit="Wh", spec=".0f", field="state.total_race_energy",
@@ -87,7 +105,7 @@ LIVE_METRIC_GROUPS = [
         dict(label="Current Stint Energy", unit="Wh", spec=".1f", field="state.stint_energy",
              note="since the last charging stop the car detected - race total until the first"),
         dict(label="Current Stint Regen Energy", unit="Wh", spec=".1f", field="state.stint_regen_energy",
-             note="stop = stopped + battery A charging over 1 A for 5 s"),
+             note="stop = stopped + the main battery charging over 1 A for 5 s"),
         dict(label="Current Stint Relative Regen", unit="%", spec=".1f", derived="relative_regen_stint",
              note="share of drive energy recovered, this stint"),
         dict(label="Last Lap Energy", unit="Wh", spec=".1f", field="state.last_lap_energy",

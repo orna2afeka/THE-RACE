@@ -52,6 +52,7 @@ from lap_clock import (                                # noqa: E402
     LAP_DATUM_KEY, LAP_HOLD_KEY, lap_clock)
 import limits                                          # noqa: E402
 import live_metrics                                    # noqa: E402
+import race_totals                                     # noqa: E402
 from metrics import HISTORY_CHARTS, value_from_row     # noqa: E402
 from pit_config import SQLITE_PATH, export_local, export_zone   # noqa: E402
 # The state helpers and the stint rule are the web backend's own, so they live
@@ -233,9 +234,17 @@ def _val(row, key, default=None):
 # state key -> telemetry.db column. Kept as DATA so the whole mapping reads at
 # a glance; the fields with their own rules are handled explicitly below.
 _STATE_COLUMNS = {
-    "soc": "bms_soc_percent", "voltage": "bms_voltage_V",
-    "current": "bms_current_A", "pack_voltage": "mms_measured_voltage_V",
-    # Battery B's BMS (can1). The unprefixed three above are battery A's.
+    # THE UNPREFIXED THREE ARE THE MAIN PACK'S (constants.MAIN_BMS), not pack
+    # A's. Everything that asks for "the battery" -- the strategy, the header,
+    # the limits colouring, the charge guard below -- reads these, so choosing
+    # the other pack is the one line in constants.py and nothing here.
+    "soc": C.BMS_COLUMNS[C.MAIN_BMS][0], "voltage": C.BMS_COLUMNS[C.MAIN_BMS][1],
+    "current": C.BMS_COLUMNS[C.MAIN_BMS][2],
+    "pack_voltage": "mms_measured_voltage_V",
+    # Each pack under its own letter, whichever is main: these are what the
+    # Battery tiles show, so "Battery A" is always pack A.
+    "soc_a": "bms_soc_percent", "voltage_a": "bms_voltage_V",
+    "current_a": "bms_current_A",
     "soc_b": "bms2_soc_percent", "voltage_b": "bms2_voltage_V",
     "current_b": "bms2_current_A",
     "motor_current": "mms_current_A", "regen_energy": "regen_energy",
@@ -496,6 +505,9 @@ CHARGE_LIMIT_S = strategy_engine.MAX_STOP_DURATION_MIN * 60.0
 CHARGE_WARN_LEFT_S = 10 * 60.0          # amber from here down
 CHARGE_MOVING_KMH = 5.0                 # the car has left the box
 CHARGE_WATCH_S = 2.0
+# Current INTO the main pack that counts as a charger, for the auto-start
+# guard in charge_watch_once. The same 1 A the car's own detector uses.
+CHARGE_CONFIRM_A = 1.0
 
 
 def _charge_record(conn):
@@ -585,6 +597,19 @@ def charge_watch_once():
     if age is None or age > C.DATA_STALE_AFTER_S:
         return None
     speed = state.get("speed_kmh")
+    # THE CAR'S WORD IS NOT ENOUGH WHEN THE MAIN PACK DISAGREES. The detector
+    # on the car reads one pack's current, and a BMS that freezes on the
+    # charger goes on saying "+36 A in" for ever after (pack A, 2026-09-20):
+    # every time the car then stands still for five seconds it reports a
+    # charge. This clock COUNTS charges against the three the regulations
+    # allow, so an auto-start also needs the main pack's current to be flowing
+    # IN. A missing current is not a "no" -- an older car, or a pack that is
+    # simply quiet, still starts the clock as before. The pit's own Start
+    # button is never subject to this: a person saw the plug go in.
+    amps = state.get("current")
+    agrees = amps is None or amps > CHARGE_CONFIRM_A
+    if not active and state.get("is_charging") == 1 and not agrees:
+        return False
     if not active and state.get("is_charging") == 1:
         with closing(rw_conn()) as conn:
             # FROM WHEN THE CAR SAYS THE CHARGE BEGAN, not from when this loop
@@ -1452,6 +1477,25 @@ def build_live(conn, manual_lap=-1):
             or C.decode_error_bits(state["mms_error_code"], C.MMS_ERROR_BITS)
             or "error 0x%X" % int(state["mms_error_code"] or 0)))
 
+    # WHAT THE CAR FORGOT, ADDED BACK -- see race_totals.py. A Pi restart that
+    # finds no checkpoint starts the three running totals again from zero (the
+    # 2026-09-19 21:44 restart took 10154 Wh and 348.8 km out of them), and the
+    # store says exactly how much went.
+    #
+    # HERE AND NO EARLIER. Everything above subtracts one of the car's figures
+    # from another -- this lap's energy from its stored baseline, the lap
+    # position from the odometer -- and those must stay on the car's own
+    # numbers, where the loss cancels. From this line on the totals are only
+    # shown.
+    totals_offset = ({c: 0.0 for c in race_totals.COLUMNS}
+                     if not race["is_racing"] else
+                     race_totals.offsets(conn, race["race_start_time"]))
+    for key in ("total_race_energy", "regen_energy"):
+        state[key] = race_totals.corrected(state[key], totals_offset[key])
+    if odo_km is not None:
+        odo_km += totals_offset["odometer_m"] / 1000.0
+        state["odometer_km"] = odo_km
+
     ctx = {
         "active_lap": active_lap,
         "current_lap_dist_m": lap_dist,
@@ -1503,6 +1547,9 @@ def build_live(conn, manual_lap=-1):
         # looks like the car is losing the race.
         "lapDelta": None if active_lap is None else active_lap - expected,
         "odometerKm": odo_km,
+        # What was added to total_race_energy / regen_energy / odometer_m
+        # above; all zeros in a race where the car never lost its totals.
+        "totalsOffset": totals_offset,
         # Wh used since this lap's trigger, net of regen — null until the car
         # has reported both a lap and an energy total. `FromM` is how far into
         # the lap the baseline sample sits, so the tile can flag a figure that
