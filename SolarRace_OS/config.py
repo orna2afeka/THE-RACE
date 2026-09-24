@@ -672,3 +672,28 @@ def open_usb_candidates():
 # Verify traffic with:   candump can0
 # Inspect bus health / errors:   ip -details -statistics link show can0
 # ----------------------------------------------------------------------- #
+
+
+# ----------------------------------------------------------------------- #
+# WHICH BATTERY IS "THE BATTERY"
+# ----------------------------------------------------------------------- #
+# The car has two packs, each with its own BMS: A on can0, B on can1 (B's
+# readings are the ones prefixed bms2_). Wherever the car needs ONE answer --
+# the driver's SoC gauge, the battery current beside it, and the charge
+# detector's "is current flowing into the pack" -- it reads this pack.
+#
+# "A", the normal setting. It was "B" for the end of the 2026-09-19/20 race
+# only, after pack A's BMS froze at about 01:50 that night, mid-race:
+# it went on reporting 77 %, 53.7 V and +35.9 A, its last values from the
+# charger, for over an hour while the car was driving and pack B fell from
+# 68 % to 59 %. The driver's gauge read 77 %. Worse, +35.9 A is CHARGING as
+# far as the charge detector is concerned, so the first time the car stood
+# still for five seconds it would have announced a charge that was not
+# happening -- and the pit counts those against the three the regulations
+# allow.
+#
+# Both packs are still read, logged and sent to the pit exactly as before, and
+# a fault on EITHER pack still reaches the driver. This only chooses which one
+# answers when the question is "the battery's". Pit_Dashboard/constants.py has
+# the pit's copy of the same setting; change them together.
+MAIN_BMS = "A"

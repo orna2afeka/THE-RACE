@@ -94,6 +94,7 @@ from config import (
     USB_SILENCE_FALLBACK_S,
     USB_FALLBACK_RETRY_S,
     BMS_POLL_IDS,
+    MAIN_BMS,
     BMS_POLL_BYTE,
     BMS_POLL_INTERVAL_S,
     BMS_POLL_CHANNELS,
@@ -178,6 +179,18 @@ LAP_GPS_SAMPLE_INTERVAL_S = 0.1
 # gitignored for the same reason.
 LAP_CHECKPOINT_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "lap_checkpoint.json")
+# THE CHECKPOINT BEFORE THIS ONE, kept because one copy was not enough. Zolder,
+# 2026-09-19 21:44: fifteen restarts in the race, fourteen resumed to the
+# watt-hour, and one came up with no usable checkpoint -- 10154 Wh, 1010 Wh of
+# regen and 348.8 km went out of the running totals and the pit under-read all
+# three for fourteen hours. Whatever took the file (nothing here could tell:
+# a missing checkpoint was not even worth a log line), the save before it,
+# fifteen seconds older and long since on the card, would have cost the race
+# one corner's worth of energy instead.
+#
+# Deliberately NOT an fsync of every save instead: this runs on the CAN worker
+# thread, and a slow SD-card flush there is the HUD freeze of 2026-09-18 again.
+LAP_CHECKPOINT_PREV_PATH = LAP_CHECKPOINT_PATH + ".prev"
 
 # Written on the CAN worker thread inside the read loop (same as _publish_gps
 # below), so a value this small is cheap: it's a stat + a small JSON dump, not
@@ -1125,7 +1138,8 @@ class SmartCANWorker(CANWorker):
                 # A pit command is a deliberate, infrequent edit to state that
                 # a reboot must not silently undo -- don't make it wait for the
                 # next throttled tick (up to LAP_CHECKPOINT_INTERVAL_S away).
-                self._save_lap_checkpoint(force=True)
+                self._save_lap_checkpoint(force=True,
+                                          keep_previous=action != "new_race")
 
     def _load_lap_checkpoint(self) -> None:
         """Restore LapTracker's running totals from disk, if a checkpoint exists.
@@ -1140,20 +1154,33 @@ class SmartCANWorker(CANWorker):
         already tolerates a malformed dict; this only has to handle the file
         not existing or not parsing as JSON at all.
         """
-        try:
-            with open(LAP_CHECKPOINT_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except FileNotFoundError:
-            return
-        except Exception as exc:
-            print(f"⚠️ lap checkpoint unreadable, starting from zero: {exc}")
-            return
-        if self.laps.restore(data):
+        # The newest checkpoint, then the one before it. Every way of not
+        # getting one SAYS SO: the 2026-09-19 loss left nothing in the log,
+        # because a missing file used to return without a word.
+        for path in (LAP_CHECKPOINT_PATH, LAP_CHECKPOINT_PREV_PATH):
+            name = os.path.basename(path)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except FileNotFoundError:
+                print(f"⚠️ {name}: not there")
+                continue
+            except Exception as exc:
+                print(f"⚠️ {name}: unreadable ({exc})")
+                continue
+            if not self.laps.restore(data):
+                print(f"⚠️ {name}: read, but not a checkpoint")
+                continue
             age_s = time.time() - (data.get("saved_at") or time.time())
-            print(f"🔢 resumed from checkpoint: odometer {self.laps.odometer_m:.0f} m, "
+            print(f"🔢 resumed from {name}: odometer {self.laps.odometer_m:.0f} m, "
                   f"lap {self.laps.lap_count}, saved {age_s:.0f}s ago")
+            return
+        print("🔢 NO LAP CHECKPOINT — laps, distance and energy start from ZERO. "
+              "Right before a race; mid-race it means the totals were lost, "
+              "and the pit adds them back (Pit_Dashboard/race_totals.py).")
 
-    def _save_lap_checkpoint(self, force: bool = False) -> None:
+    def _save_lap_checkpoint(self, force: bool = False,
+                             keep_previous: bool = True) -> None:
         """Persist LapTracker's running totals, throttled to
         LAP_CHECKPOINT_INTERVAL_S. `force=True` (used by _teardown, on a clean
         quit) bypasses the throttle so the very latest state is captured.
@@ -1167,6 +1194,11 @@ class SmartCANWorker(CANWorker):
         torn/corrupt checkpoint behind. restore() already tolerates a missing
         OR corrupt file either way, but avoiding the corrupt case outright
         costs nothing.
+
+        The checkpoint being replaced is kept as LAP_CHECKPOINT_PREV_PATH, and
+        _load_lap_checkpoint falls back to it. `keep_previous=False` is for
+        the green flag alone: the save before a new race holds the warm-up's
+        totals, which are exactly what must not come back.
         """
         now = time.time()
         if not force and now - self._last_checkpoint_save < LAP_CHECKPOINT_INTERVAL_S:
@@ -1176,6 +1208,13 @@ class SmartCANWorker(CANWorker):
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(self.laps.state_dict(), f)
+            # Two renames, and a power cut between them leaves .prev and no
+            # main -- which is what the fallback is for.
+            if keep_previous:
+                if os.path.exists(LAP_CHECKPOINT_PATH):
+                    os.replace(LAP_CHECKPOINT_PATH, LAP_CHECKPOINT_PREV_PATH)
+            elif os.path.exists(LAP_CHECKPOINT_PREV_PATH):
+                os.remove(LAP_CHECKPOINT_PREV_PATH)
             os.replace(tmp_path, LAP_CHECKPOINT_PATH)
         except Exception as exc:
             print(f"⚠️ failed to save lap checkpoint: {exc}")
@@ -1476,9 +1515,15 @@ class SmartCANWorker(CANWorker):
             # Drive the driver HUD's SoC gauge from the REAL BMS (same value the
             # pit shows). The LYNX 0x618 SoC is only the controller's estimate
             # and is suppressed once we have a real reading (see _decode_battery).
-            if "bms_soc_percent" in bms_data:
+            #
+            # FROM THE MAIN PACK ONLY (config.MAIN_BMS). Both packs come
+            # through here, each under its own prefix, and the gauge must not
+            # flick between them -- nor follow one whose BMS has frozen, which
+            # is why this is a setting and not "whichever spoke last".
+            _main = "bms2_" if MAIN_BMS == "B" else "bms_"
+            if _main + "soc_percent" in bms_data:
                 self._have_bms_soc = True
-                self.soc_updated.emit(int(round(bms_data["bms_soc_percent"])))
+                self.soc_updated.emit(int(round(bms_data[_main + "soc_percent"])))
             # Surface BMS protection faults on the HUD alert bar too — not just
             # the pit. `bms_protections` is present only on the 0x102 frame and
             # is [] when nothing is active, so this also CLEARS them on recovery.
@@ -1486,9 +1531,12 @@ class SmartCANWorker(CANWorker):
             # alerts (both have an "overvoltage", for instance).
             # Real battery current for DS002 (the HUD otherwise derives it as
             # P/V, which is only an estimate and goes wrong at low voltage).
-            if "bms_current_A" in bms_data:
-                self.battery_current_updated.emit(float(bms_data["bms_current_A"]))
-                self._last_bms_current_A = float(bms_data["bms_current_A"])
+            # The main pack's again: this is also what the charge detector
+            # reads, and a frozen pack's last "+36 A" would be a charge the
+            # moment the car stood still.
+            if _main + "current_A" in bms_data:
+                self.battery_current_updated.emit(float(bms_data[_main + "current_A"]))
+                self._last_bms_current_A = float(bms_data[_main + "current_A"])
             # Faults are tracked PER PACK. After _remap_bms_frame the second
             # pack's key is bms2_protections, so testing only the plain name
             # would have made every fault on pack B invisible to the driver —
