@@ -23,7 +23,7 @@ giving engineers live battery, motor, temperature, and strategy data.
 </td>
 <td width="50%">
 
-**Pit Wall** — `Pit_Dashboard`, sample telemetry
+**Pit Wall** — `Pit_Web`, demo data (`Start Demo Dashboard.bat`)
 <img src=".github/screenshots/pit_dashboard_simulation.png" alt="Pit Wall dashboard with sample telemetry">
 
 </td>
